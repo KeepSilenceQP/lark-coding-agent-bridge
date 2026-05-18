@@ -14,14 +14,18 @@ import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/m
 import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
 import type { AppConfig, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
+  getAgentStopGraceMs,
   getMaxConcurrentRuns,
   getMessageReplyMode,
   getRequireMentionInGroup,
   getRunIdleTimeoutMs,
   getShowToolCalls,
+  isAdmin,
+  secretKeyForApp,
 } from '../config/schema';
-import { saveConfig } from '../config/store';
-import { log, readRecentLogs } from '../core/logger';
+import { setSecret } from '../config/keystore';
+import { buildEncryptedAccountConfig, saveConfig } from '../config/store';
+import { log, readRecentLogs, sanitizeLogsForDoctor } from '../core/logger';
 import { renderCard } from '../card/run-renderer';
 import {
   finalizeIfRunning,
@@ -100,6 +104,26 @@ const handlers: Record<string, Handler> = {
   '/reconnect': handleReconnect,
 };
 
+/**
+ * Commands that can mutate credentials, lifecycle, filesystem reach, or
+ * surface sensitive runtime state. Gated on the configured admin allowlist;
+ * empty list = no restriction (every allowed user can run them — see
+ * `isAdmin` in config/schema).
+ */
+const ADMIN_COMMANDS = new Set([
+  '/account',
+  '/config',
+  '/exit',
+  '/reconnect',
+  '/doctor',
+  '/cd',
+  '/ws',
+]);
+
+function isAdminCommand(cmd: string): boolean {
+  return ADMIN_COMMANDS.has(cmd.startsWith('/') ? cmd : `/${cmd}`);
+}
+
 export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
   const trimmed = ctx.msg.content.trim();
   if (!trimmed.startsWith('/')) return false;
@@ -108,6 +132,14 @@ export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
   const args = parts.slice(1).join(' ');
   const h = handlers[cmd];
   if (!h) return false;
+  if (isAdminCommand(cmd) && !isAdmin(ctx.controls.cfg, ctx.msg.senderId)) {
+    log.info('command', 'admin-deny', {
+      cmd,
+      sender: ctx.msg.senderId.slice(-6),
+    });
+    await reply(ctx, '❌ 此命令仅管理员可用。');
+    return true;
+  }
   try {
     await h(args, ctx);
   } catch (err) {
@@ -124,6 +156,17 @@ export async function runCommandHandler(
 ): Promise<boolean> {
   const h = handlers[`/${name}`];
   if (!h) return false;
+  if (isAdminCommand(name) && !isAdmin(ctx.controls.cfg, ctx.msg.senderId)) {
+    log.info('command', 'admin-deny', {
+      cmd: name,
+      sender: ctx.msg.senderId.slice(-6),
+      via: 'card',
+    });
+    // Card actions can't reply naturally (the `msg` is synthesized); the
+    // click is silently denied. The button only renders for users who got
+    // the original admin card in the first place, so this is an edge case.
+    return true;
+  }
   try {
     await h(args, ctx);
   } catch (err) {
@@ -549,12 +592,15 @@ ${logs}
 }
 
 async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
-  log.info('command', 'doctor', { hasDescription: args.trim().length > 0 });
+  log.info('command', 'doctor', {
+    hasDescription: args.trim().length > 0,
+    chatMode: ctx.chatMode,
+  });
   // Killing any in-flight run on this chat — /doctor is a "I'm stuck" call.
   ctx.activeRuns.interrupt(ctx.scope);
 
-  const logs = await readRecentLogs({ maxBytes: 60_000 });
-  if (!logs.trim()) {
+  const rawLogs = await readRecentLogs({ maxBytes: 60_000 });
+  if (!rawLogs.trim()) {
     await ctx.channel.send(
       ctx.msg.chatId,
       { text: '没有找到日志文件 — bridge 可能刚启动或日志目录不可写。' },
@@ -562,45 +608,94 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
     );
     return;
   }
+  // Scrub identifying / credential material before the logs (a) reach
+  // Anthropic via the agent prompt, and (b) end up in any card payload
+  // Lark may cache server-side.
+  const logs = sanitizeLogsForDoctor(rawLogs);
+
+  // In group / topic chats other members would see the result card. Ack
+  // in-channel, deliver the actual analysis privately to the operator's
+  // open_id (Lark auto-opens the p2p chat with the bot).
+  const isP2p = ctx.chatMode === 'p2p';
+  if (!isP2p) {
+    await reply(ctx, '🔍 已收到诊断请求，分析结果将私信发给你。');
+  }
 
   const prompt = buildDoctorPrompt(args, logs);
-  const run = ctx.agent.run({ prompt, cwd: homedir() });
+  const run = ctx.agent.run({
+    prompt,
+    cwd: homedir(),
+    stopGraceMs: getAgentStopGraceMs(ctx.controls.cfg),
+  });
   const handle = ctx.activeRuns.register(ctx.scope, run);
 
   try {
-    await ctx.channel.stream(
-      ctx.msg.chatId,
-      {
-        card: {
-          initial: renderCard(initialState),
-          producer: async (ctrl) => {
-            let state: RunState = initialState;
-            const flush = (): Promise<void> => ctrl.update(renderCard(state));
-            for await (const evt of handle.run.events) {
-              if (handle.interrupted) break;
-              // /doctor runs are session-less: skip 'system' so we don't
-              // persist a doctor's sessionId over the user's real session.
-              if (evt.type === 'system') continue;
-              if (evt.type === 'usage') {
-                if (evt.costUsd !== undefined) {
-                  log.info('agent', 'usage', { step: 'doctor', costUsd: Number(evt.costUsd.toFixed(4)) });
+    if (isP2p) {
+      // Streaming card path — operator is the only viewer in p2p.
+      await ctx.channel.stream(
+        ctx.msg.chatId,
+        {
+          card: {
+            initial: renderCard(initialState),
+            producer: async (ctrl) => {
+              let state: RunState = initialState;
+              const flush = (): Promise<void> => ctrl.update(renderCard(state));
+              for await (const evt of handle.run.events) {
+                if (handle.interrupted) break;
+                // /doctor runs are session-less: skip 'system' so we don't
+                // persist a doctor's sessionId over the user's real session.
+                if (evt.type === 'system') continue;
+                if (evt.type === 'usage') {
+                  if (evt.costUsd !== undefined) {
+                    log.info('agent', 'usage', { step: 'doctor', costUsd: Number(evt.costUsd.toFixed(4)) });
+                  }
+                  continue;
                 }
-                continue;
+                state = reduce(state, evt);
+                await flush();
+                // Don't wait for stdout to close — some claude versions hang
+                // briefly post-result, which would leave the for-await stuck.
+                if (state.terminal !== 'running') break;
               }
-              state = reduce(state, evt);
+              state = handle.interrupted ? markInterrupted(state) : finalizeIfRunning(state);
               await flush();
-              // Don't wait for stdout to close — some claude versions hang
-              // briefly post-result, which would leave the for-await stuck.
-              if (state.terminal !== 'running') break;
-            }
-            state = handle.interrupted ? markInterrupted(state) : finalizeIfRunning(state);
-            await flush();
-            await handle.run.stop();
+              await handle.run.stop();
+            },
           },
         },
-      },
-      { replyTo: ctx.msg.messageId },
-    );
+        { replyTo: ctx.msg.messageId },
+      );
+    } else {
+      // Group / topic: buffer to completion, then DM the final card to the
+      // operator. No live streaming — the group should see nothing past the
+      // ack reply above.
+      let state: RunState = initialState;
+      for await (const evt of handle.run.events) {
+        if (handle.interrupted) break;
+        if (evt.type === 'system') continue;
+        if (evt.type === 'usage') {
+          if (evt.costUsd !== undefined) {
+            log.info('agent', 'usage', { step: 'doctor', costUsd: Number(evt.costUsd.toFixed(4)) });
+          }
+          continue;
+        }
+        state = reduce(state, evt);
+        if (state.terminal !== 'running') break;
+      }
+      state = handle.interrupted ? markInterrupted(state) : finalizeIfRunning(state);
+      await handle.run.stop();
+      // Send a one-shot interactive card by open_id. Lark routes it to the
+      // user's p2p chat with the bot (auto-creates it if needed); other
+      // group members never see this payload.
+      await ctx.channel.rawClient.im.v1.message.create({
+        params: { receive_id_type: 'open_id' },
+        data: {
+          receive_id: ctx.msg.senderId,
+          msg_type: 'interactive',
+          content: JSON.stringify(renderCard(state)),
+        },
+      });
+    }
   } catch (err) {
     log.fail('command', err, { step: 'doctor' });
   } finally {
@@ -711,10 +806,12 @@ async function submitAccount(ctx: CommandContext): Promise<void> {
       await updateManagedCard(channel, formMsgId, accountFailureCard(errorMessage))
         .catch((err) => console.warn('[account] mark old form failed:', err));
       forgetManagedCard(formMsgId);
+      // Don't prefill the secret on retry — pre-filled secrets can get
+      // echoed back into the card payload and may persist in Lark's
+      // server-side card cache. Keep appId prefilled (non-sensitive).
       const retry = accountFormCard({
         initialTenant: tenant,
         prefillAppId: appId,
-        prefillAppSecret: appSecret,
       });
       await sendManagedCard(channel, chatId, retry).catch((err) =>
         console.warn('[account] post retry form failed:', err),
@@ -732,12 +829,22 @@ async function submitAccount(ctx: CommandContext): Promise<void> {
       return;
     }
 
-    const newCfg: AppConfig = { accounts: { app: { id: appId, secret: appSecret, tenant } } };
+    // Encrypted-at-rest path: store the plaintext secret in the AES keystore,
+    // and write config.json with an exec-provider SecretRef instead of the
+    // raw secret. lark-cli's `config bind --source lark-channel` reads the
+    // same SecretRef and goes through the exec protocol to retrieve the
+    // plaintext into its own OS keychain — no plaintext on disk.
+    const newCfg: AppConfig = buildEncryptedAccountConfig(
+      appId,
+      tenant,
+      ctx.controls.cfg.preferences,
+    );
     try {
+      await setSecret(secretKeyForApp(appId), appSecret);
       await saveConfig(newCfg, configPath);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await finishFailure(`保存 config 失败：${msg}`);
+      await finishFailure(`保存凭据失败：${msg}`);
       return;
     }
 
@@ -782,12 +889,16 @@ async function handleConfig(args: string, ctx: CommandContext): Promise<void> {
 
 async function showConfigForm(ctx: CommandContext): Promise<void> {
   const ms = getRunIdleTimeoutMs(ctx.controls.cfg);
+  const access = ctx.controls.cfg.preferences?.access ?? {};
   const card = configFormCard({
     messageReply: getMessageReplyMode(ctx.controls.cfg),
     showToolCalls: getShowToolCalls(ctx.controls.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
     requireMentionInGroup: getRequireMentionInGroup(ctx.controls.cfg),
+    allowedUsers: (access.allowedUsers ?? []).join(', '),
+    allowedChats: (access.allowedChats ?? []).join(', '),
+    admins: (access.admins ?? []).join(', '),
   });
   if (ctx.fromCardAction) await recallMessage(ctx, ctx.msg.messageId);
   await sendManagedCard(ctx.channel, ctx.msg.chatId, card);
@@ -847,6 +958,62 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
   else if (rawRequireMention === 'no') requireMentionInGroup = false;
   else requireMentionInGroup = getRequireMentionInGroup(ctx.controls.cfg);
 
+  // Parse access lists. Comma-separated; trim each, drop empties, dedupe.
+  // Empty list = unrestricted (back-compat).
+  const parseList = (raw: unknown): string[] => {
+    return [...new Set(
+      String(raw ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    )];
+  };
+  const allowedUsers = parseList(fv.allowed_users);
+  const allowedChats = parseList(fv.allowed_chats);
+  const admins = parseList(fv.admins);
+
+  // Self-lockout guard: if the submitter sets a non-empty admins list that
+  // doesn't include themselves, they immediately lose the ability to reopen
+  // /config. Refuse the submit and tell them what's wrong.
+  if (admins.length > 0 && !admins.includes(ctx.msg.senderId)) {
+    log.warn('command', 'config-lockout-refused', {
+      kind: 'admins',
+      sender: ctx.msg.senderId.slice(-6),
+      proposedAdmins: admins.length,
+    });
+    await reply(
+      ctx,
+      `❌ 拒绝提交:你设置了非空的管理员列表,但其中不包含你自己的 open_id (\`${ctx.msg.senderId}\`)。这会立即把你自己锁出 /config。请把自己的 open_id 加进去再提交。`,
+    );
+    return;
+  }
+
+  // Symmetrical guard for chat allowlist: if the submitter restricts chats
+  // but the chat they're currently in isn't on the list, every message
+  // (including the next /config) is silently dropped at intake. Common
+  // mistake: filling in *another* chat's id and forgetting the current one.
+  //
+  // Skipped for p2p: `allowedChats` is group-only (see intakeMessage), so
+  // submitting from a DM never locks the submitter out regardless of the
+  // chat list contents. Using `chatMode` not `msg.chatType` because card
+  // submissions arrive with a synthesized msg that always has chatType='p2p'.
+  if (
+    ctx.chatMode !== 'p2p' &&
+    allowedChats.length > 0 &&
+    !allowedChats.includes(ctx.msg.chatId)
+  ) {
+    log.warn('command', 'config-lockout-refused', {
+      kind: 'chats',
+      currentChat: ctx.msg.chatId.slice(-6),
+      proposedChats: allowedChats.length,
+    });
+    await reply(
+      ctx,
+      `❌ 拒绝提交:你设置了非空的群白名单,但其中不包含当前会话的 chat_id (\`${ctx.msg.chatId}\`)。提交后这个会话的消息会被 intake 静默丢弃,bot 不再响应。要么把当前 chat_id 加进白名单,要么清空"群白名单"留待空(=所有会话都响应)。`,
+    );
+    return;
+  }
+
   const formMsgId = ctx.msg.messageId;
   const channel = ctx.channel;
   const configPath = ctx.controls.configPath;
@@ -877,6 +1044,9 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
+      // Empty arrays serialize fine but read identically to omitted ones
+      // (isUserAllowed / isAdmin both treat length===0 as unrestricted).
+      access: { allowedUsers, allowedChats, admins },
     };
 
     try {
@@ -895,6 +1065,9 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
+      allowedUsersCount: allowedUsers.length,
+      allowedChatsCount: allowedChats.length,
+      adminsCount: admins.length,
     });
     await waitForSettle();
     await updateManagedCard(
@@ -906,6 +1079,9 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         maxConcurrentRuns,
         runIdleTimeoutMinutes,
         requireMentionInGroup,
+        allowedUsers: allowedUsers.join(', '),
+        allowedChats: allowedChats.join(', '),
+        admins: admins.join(', '),
       }),
     ).catch((err) =>
       log.warn('command', 'config-save-update-failed', { err: String(err) }),

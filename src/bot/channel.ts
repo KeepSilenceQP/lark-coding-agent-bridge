@@ -20,12 +20,16 @@ import { renderText } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
+  getAgentStopGraceMs,
   getMaxConcurrentRuns,
   getMessageReplyMode,
   getRequireMentionInGroup,
   getRunIdleTimeoutMs,
   getShowToolCalls,
+  isChatAllowed,
+  isUserAllowed,
 } from '../config/schema';
+import { resolveAppSecret } from '../config/secret-resolver';
 import { log, withTrace } from '../core/logger';
 import { MediaCache, type LocalAttachment } from '../media/cache';
 import type { SessionStore } from '../session/store';
@@ -126,9 +130,15 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // safe to call on every startChannel (used by /account change hot-reload too).
   const netOverrides = configureNetwork();
 
+  // Resolve the App Secret to plaintext. The config field can be a literal
+  // string, a "${VAR}" template, or a {source, id} SecretRef referencing
+  // the encrypted keystore / env / file / exec provider. Re-resolved on
+  // every startChannel so /account change picks up new secrets.
+  const appSecret = await resolveAppSecret(cfg);
+
   const opts: LarkChannelOptions = {
     appId: cfg.accounts.app.id,
-    appSecret: cfg.accounts.app.secret,
+    appSecret,
     domain: cfg.accounts.app.tenant === 'lark' ? Domain.Lark : Domain.Feishu,
     source: 'lark-channel-bridge',
     loggerLevel: LoggerLevel.info,
@@ -357,6 +367,29 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     resources: msg.resources.length,
   });
 
+  // Access control. Silent drop — replying would reveal the bot to
+  // unauthorized users and let them spam the chat with denial messages.
+  // Operator-defined lists; both empty = allow all (back-compat).
+  if (!isUserAllowed(controls.cfg, msg.senderId)) {
+    log.info('intake', 'skip-not-allowed-user', {
+      scope,
+      sender: msg.senderId.slice(-6),
+    });
+    return;
+  }
+  // `allowedChats` is intentionally a group-only gate. p2p chat_ids are
+  // generated per-user-pair and can't be hijacked by an unauthorized
+  // sender, so the user allowlist above is already authoritative for DMs.
+  // Restricting p2p by chat_id would also create a chicken-and-egg lockout
+  // hazard (the operator must know the chat_id before they ever DM the bot).
+  if (msg.chatType !== 'p2p' && !isChatAllowed(controls.cfg, msg.chatId)) {
+    log.info('intake', 'skip-not-allowed-chat', {
+      scope,
+      chatId: msg.chatId.slice(-6),
+    });
+    return;
+  }
+
   // Group-mention policy. p2p is always unrestricted; in groups (regular and
   // topic) we drop messages that don't @bot when the user has opted into the
   // quiet-by-default behavior. Slash commands are NOT exempt — the user
@@ -476,7 +509,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
-  const run = agent.run({ prompt, sessionId: resumeFrom, cwd });
+  const run = agent.run({
+    prompt,
+    sessionId: resumeFrom,
+    cwd,
+    stopGraceMs: getAgentStopGraceMs(controls.cfg),
+  });
   const handle = activeRuns.register(scope, run);
 
   // Resolve idle-timeout for this run: scope override (on SessionEntry) wins
@@ -584,15 +622,28 @@ async function processAgentStream(
 ): Promise<void> {
   let state: RunState = initialState;
 
-  // Idle watchdog: any agent event resets the timer. If claude goes silent
-  // for `idleTimeoutMs`, we presume the run is hung and trigger stop().
-  // Setting `idleFired` lets the post-loop finalize render the timeout
-  // marker instead of the generic interrupted one.
+  // Idle watchdog: claude going silent for `idleTimeoutMs` is treated as
+  // "presumed hung", we stop() and surface a timeout marker on the card.
+  //
+  // BUT — claude can legitimately be silent for a long time when it's
+  // waiting on a long-running tool call (e.g. `lark-cli` printing an
+  // OAuth URL and blocking until the user clicks authorize). In that
+  // case there's no event stream activity from claude itself, only the
+  // tool subprocess running. We track which tool_use ids haven't matched
+  // a tool_result yet, and pause the watchdog whenever the set is
+  // non-empty.
+  //
+  // The watchdog re-arms when:
+  //  - a tool_result drains the in-flight set to zero, OR
+  //  - any non-tool event arrives while the set is empty.
   let idleFired = false;
   let timer: NodeJS.Timeout | undefined;
-  const resetIdle = (): void => {
+  const inFlightTools = new Set<string>();
+  const armOrPauseIdle = (): void => {
     if (!idleTimeoutMs) return;
     if (timer) clearTimeout(timer);
+    timer = undefined;
+    if (inFlightTools.size > 0) return;
     timer = setTimeout(() => {
       idleFired = true;
       handle.interrupted = true;
@@ -602,12 +653,26 @@ async function processAgentStream(
       });
     }, idleTimeoutMs);
   };
-  resetIdle();
+  armOrPauseIdle();
 
   try {
     for await (const evt of handle.run.events) {
       if (handle.interrupted) break;
-      resetIdle();
+
+      // Track tool flight before re-arming the idle timer so the arm step
+      // sees the correct set size. tool_use opens a window; tool_result
+      // closes it. Other event types are bookkept after the if/else.
+      if (evt.type === 'tool_use') {
+        inFlightTools.add(evt.id);
+        log.info('agent', 'tool-in-flight', {
+          tool: evt.name,
+          inFlight: inFlightTools.size,
+        });
+      } else if (evt.type === 'tool_result') {
+        inFlightTools.delete(evt.id);
+        log.info('agent', 'tool-done', { inFlight: inFlightTools.size });
+      }
+      armOrPauseIdle();
 
       if (evt.type === 'system') {
         if (evt.sessionId) {
@@ -655,9 +720,30 @@ async function processAgentStream(
   }
   log.info('card', 'final', { terminal: state.terminal, interrupted: handle.interrupted });
   await flush(state);
-  // Reap the subprocess if it's still alive (no-op if already exited).
-  await handle.run.stop();
+    // Reap the subprocess. Two regimes:
+  //  - Interrupted (user /stop, idle watchdog, disconnect): stop() was already
+  //    fire-and-forgotten by whoever set handle.interrupted; this awaits it.
+  //  - Natural done: stream-json emits `result` ~1ms before claude actually
+  //    closes stdout (telemetry flush). Wait it out so the run exits with
+  //    code 0; only SIGTERM as a hung-process safety net.
+  if (handle.interrupted) {
+    await handle.run.stop();
+  } else {
+    const exited = await handle.run.waitForExit(POST_DONE_EXIT_GRACE_MS);
+    if (!exited) {
+      log.warn('agent', 'post-done-timeout', { graceMs: POST_DONE_EXIT_GRACE_MS });
+      await handle.run.stop();
+    }
+  }
 }
+
+/**
+ * How long to wait for claude to close stdout after a terminal event before
+ * forcing a SIGTERM. Empirically claude's post-`result` tail is well under a
+ * second; 2s leaves headroom for slow flushes without making the user notice
+ * a stall (the card has already rendered terminal state by this point).
+ */
+const POST_DONE_EXIT_GRACE_MS = 2000;
 
 function buildPrompt(
   batch: NormalizedMessage[],

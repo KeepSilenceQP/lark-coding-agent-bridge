@@ -67,6 +67,21 @@ sender_name: ...
   }]
 }
 \`\`\`
+
+## 飞书 OAuth 授权（\`lark-cli auth login\`）
+
+授权流程要让 \`lark-cli\` 进程一直活到用户在浏览器里点完为止。bridge 在你的 run 结束之后会回收 claude，**你 spawn 的任何后台 bash 也会跟着死**——所以授权必须用"前台阻塞"的方式跑：
+
+1. **仅在 p2p 里发起授权**。从 \`bridge_context.chat_type\` 看：
+   - \`chat_type: p2p\` —— 正常按下面流程走。
+   - \`chat_type: group\`（含 topic 群）—— **不要**调 \`lark-cli auth login\`。device flow 把 \`verification_url\` 发到群里，谁先点谁拿走 token——会绑定到错的身份。正确做法是回复用户："授权要在私聊里做，请单独私信我。"
+2. **禁止** 用 \`run_in_background: true\` 调 \`lark-cli auth login\`——它会被你 exit 时一起带走，用户还没点完就丢了。
+3. **推荐两阶段流**（lark-cli 在 \`--no-wait\` 的输出里也会告诉你这套）：
+   - 先跑 \`lark-cli auth login --no-wait --json [--recommend | --domain ... | --scope ...]\`，**这一步秒返回**，stdout 里有 \`verification_url\` 和 \`device_code\`。
+   - 把 \`verification_url\` **原样**用代码块发给用户（不要 Markdown 链接化、不要 URL 编码）。
+   - 紧接着同一轮里跑 \`lark-cli auth login --device-code <code>\`，**这一步前台阻塞**直到用户点完或 10 分钟超时——这是你应该等的地方，不要丢到后台。
+4. 你前台阻塞期间，用户发的新消息 bridge 会自动排队，**不会打断你**；等你 tool_result 一回来，下一批消息再进来。所以放心阻塞。
+5. 如果用户中途想取消，他们会发 \`/stop\`——那时被 kill 是预期行为，不用兜底。
 `;
 
 export class ClaudeAdapter implements AgentAdapter {
@@ -142,22 +157,51 @@ export class ClaudeAdapter implements AgentAdapter {
       log.info('agent', 'exit', { pid: child.pid ?? null, code, signal });
     });
 
+    // Default 5s if caller didn't specify — claude often has live
+    // subprocesses (lark-cli waiting for OAuth, long Bash, etc.) and the
+    // old 500ms was nowhere near enough for them to flush state before the
+    // SIGKILL cascade. Callers (channel.ts, /doctor) override per-run with
+    // a value derived from preferences.
+    const stopGraceMs = opts.stopGraceMs ?? 5000;
+
     return {
       events: createEventStream(child, stderrChunks, () => runtimeError),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
+        log.info('agent', 'stop-sigterm', { pid: child.pid ?? null, graceMs: stopGraceMs });
         child.kill('SIGTERM');
         await new Promise<void>((resolve) => {
           const timer = setTimeout(() => {
             if (child.exitCode === null && child.signalCode === null) {
+              log.warn('agent', 'stop-sigkill', {
+                pid: child.pid ?? null,
+                graceMs: stopGraceMs,
+                reason: 'grace-period-expired',
+              });
               child.kill('SIGKILL');
             }
             resolve();
-          }, 500);
+          }, stopGraceMs);
           child.once('exit', () => {
             clearTimeout(timer);
             resolve();
           });
+        });
+      },
+      waitForExit(timeoutMs: number): Promise<boolean> {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          return Promise.resolve(true);
+        }
+        return new Promise<boolean>((resolve) => {
+          const onExit = (): void => {
+            clearTimeout(timer);
+            resolve(true);
+          };
+          const timer = setTimeout(() => {
+            child.removeListener('exit', onExit);
+            resolve(false);
+          }, timeoutMs);
+          child.once('exit', onExit);
         });
       },
     };

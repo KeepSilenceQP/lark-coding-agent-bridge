@@ -5,10 +5,11 @@ import { ClaudeAdapter } from '../../agent/claude/adapter';
 import { startChannel, type BridgeChannel } from '../../bot/channel';
 import { runRegistrationWizard } from '../../bot/wizard';
 import type { Controls } from '../../commands';
+import { setSecret } from '../../config/keystore';
 import { paths } from '../../config/paths';
 import type { AppConfig } from '../../config/schema';
-import { isComplete } from '../../config/schema';
-import { loadConfig, saveConfig } from '../../config/store';
+import { isComplete, secretKeyForApp } from '../../config/schema';
+import { buildEncryptedAccountConfig, loadConfig, saveConfig } from '../../config/store';
 import { gcOldLogs, log } from '../../core/logger';
 import { gcMediaCache } from '../../media/cache';
 import {
@@ -53,9 +54,16 @@ export async function runStart(opts: StartOptions): Promise<void> {
   let cfg: AppConfig;
   if (isComplete(existing)) {
     cfg = existing;
+    // Migrate legacy plaintext configs: any time we see a raw string in
+    // accounts.app.secret that isn't a "${VAR}" template, move it into
+    // the encrypted keystore and rewrite config.json with an exec ref.
+    // Idempotent — already-encrypted configs (SecretRef) pass through.
+    cfg = await maybeMigratePlaintextSecret(cfg, configPath);
   } else {
-    cfg = await runRegistrationWizard();
-    await saveConfig(cfg, configPath);
+    const fresh = await runRegistrationWizard();
+    // Fresh credentials from the wizard arrive as a plaintext secret;
+    // immediately encrypt before persisting so disk never holds the raw value.
+    cfg = await persistEncrypted(fresh, configPath);
     console.log(`配置已保存到 ${configPath}\n`);
     printScopeReminder();
   }
@@ -253,6 +261,60 @@ function formatAgo(ms: number): string {
   if (ms < 3_600_000) return `${Math.floor(ms / 60_000)} 分钟前`;
   if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)} 小时前`;
   return `${Math.floor(ms / 86_400_000)} 天前`;
+}
+
+/**
+ * If `cfg.accounts.app.secret` is a literal plaintext string (not a
+ * "${VAR}" template, not a SecretRef), move it into the encrypted keystore
+ * and rewrite `config.json` with an exec-provider SecretRef pointing at
+ * the bridge. Returns the (possibly rewritten) cfg.
+ *
+ * Idempotent: configs already in the encrypted form return unchanged.
+ */
+async function maybeMigratePlaintextSecret(
+  cfg: AppConfig,
+  configPath: string,
+): Promise<AppConfig> {
+  const s = cfg.accounts.app.secret;
+  if (typeof s !== 'string') return cfg; // already a SecretRef
+  if (/^\$\{[A-Z][A-Z0-9_]*\}$/.test(s)) return cfg; // env-template, leave alone
+
+  const next = buildEncryptedAccountConfig(
+    cfg.accounts.app.id,
+    cfg.accounts.app.tenant,
+    cfg.preferences,
+  );
+  try {
+    await setSecret(secretKeyForApp(cfg.accounts.app.id), s);
+    await saveConfig(next, configPath);
+    console.log('🔒 已把 App Secret 加密迁移到 ~/.lark-channel/secrets.enc');
+  } catch (err) {
+    log.warn('config', 'migrate-encrypted-failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    // Migration failure isn't fatal — the runtime resolver still handles
+    // the plaintext path. Keep using cfg as-is.
+    return cfg;
+  }
+  return next;
+}
+
+/** Encrypt the (plaintext) secret from a freshly-wizard'd cfg and persist. */
+async function persistEncrypted(cfg: AppConfig, configPath: string): Promise<AppConfig> {
+  const s = cfg.accounts.app.secret;
+  if (typeof s !== 'string') {
+    // Wizard returns plaintext today; if that ever changes, just save as-is.
+    await saveConfig(cfg, configPath);
+    return cfg;
+  }
+  const next = buildEncryptedAccountConfig(
+    cfg.accounts.app.id,
+    cfg.accounts.app.tenant,
+    cfg.preferences,
+  );
+  await setSecret(secretKeyForApp(cfg.accounts.app.id), s);
+  await saveConfig(next, configPath);
+  return next;
 }
 
 function printScopeReminder(): void {

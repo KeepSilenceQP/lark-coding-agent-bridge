@@ -109,6 +109,79 @@ lark-channel-bridge --help                List all commands
 
 > Upgrading from before 0.1.11? Run `lark-channel-bridge migrate` once — it moves anything under `~/.config/lark-channel-bridge/` and `~/.cache/lark-channel-bridge/` to the new location and upgrades `config.json` to the new schema.
 
+## Access control (optional)
+
+Out of the box the bot is **open**: anyone who can find it can DM it, any group member can `@`-mention it to trigger a run, and commands like `/account` or `/cd` are usable by all. **That's fine for personal use** — but for a shared team setup, or anywhere you don't want strangers calling `/cd /`, you can tighten three allowlists by sending `/config` inside Feishu.
+
+### Common scenarios
+
+**Just me**
+
+In the `/config` form:
+- **Allowed users**: your own `open_id`
+- Leave the other two blank
+
+Messages from anyone else are silently dropped — no denial reply, since that would just confirm the bot exists to outsiders.
+
+**A small team**
+
+- **Allowed users**: comma-separated `open_id`s of team members
+- Other two blank
+
+**Bot only responds in specific work groups**
+
+DMs are unaffected; only listed groups trigger responses:
+- **Allowed chats**: comma-separated `chat_id`s of the groups
+- DMs are **always** exempt from this list — so you can always DM the bot to change config later.
+
+**Anyone can chat with the bot, but only I can change settings**
+
+- **Admins**: your own `open_id`
+- Other two blank
+
+Others running `/account`, `/config`, `/exit`, `/reconnect`, `/doctor`, `/cd`, or `/ws` get a `❌ 此命令仅管理员可用` reply. Normal conversation (asking the bot to do things) is unaffected.
+
+**Lock everything down**
+
+Fill all three. The `/config` form catches common mistakes — e.g. if your admin list doesn't include yourself, or your chat allowlist doesn't include the chat you're submitting from, the submit is rejected with a message explaining why, so you can't accidentally lock yourself out.
+
+### Finding `open_id` and `chat_id`
+
+Easiest path: have the target user send the bot a message (or `@`-mention it in the target group), then in your terminal:
+
+```bash
+grep '"event":"enter"' ~/.lark-channel/logs/$(date +%Y-%m-%d).log | tail -5
+```
+
+Every line carries `chatId` (group or DM id) and `senderId` (the user's `open_id`). Copy them from there.
+
+The Feishu open-platform "Get user info" API also works but needs the `contact:user` scope, which is overkill if you just need a couple of IDs.
+
+### Worth knowing
+
+- Changes take effect on the **next message** — no restart needed.
+- An empty field means **unrestricted**, not "nobody allowed".
+- To revert a restricted list back to fully open, clear that field in `/config` and submit.
+- DMs are deliberately exempt from the chat allowlist — meaning if you ever accidentally restrict the bot out of every group, **DM the bot and send `/config`** to recover.
+
+### Advanced: editing the config file directly
+
+The `/config` form writes to `~/.lark-channel/config.json` under `preferences.access`:
+
+```json
+{
+  "preferences": {
+    "access": {
+      "allowedUsers": ["ou_xxxxxxxxxxxxx"],
+      "allowedChats": ["oc_xxxxxxxxxxxxx"],
+      "admins":       ["ou_xxxxxxxxxxxxx"]
+    }
+  }
+}
+```
+
+After a manual edit, **restart the bridge** or send **`/reconnect`** from any allowed chat to pick up the changes. The form is usually faster; direct edits make sense mostly for deployment scripts where you want to pre-seed access policy.
+
 ## FAQ
 
 **The bot stays silent / Claude never replies.** Usually the `claude` CLI itself is not logged in, or the session points to a cwd that no longer exists. Send `/status` to inspect; `/new` to start a fresh session.

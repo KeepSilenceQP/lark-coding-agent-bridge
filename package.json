@@ -1,6 +1,6 @@
 {
   "name": "lark-channel-bridge",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "description": "Bridge Feishu/Lark messenger with local CLI coding agents (Claude Code, ...)",
   "type": "module",
   "bin": {
@@ -41,6 +41,9 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "protobufjs"]
   },
   "keywords": [
     "feishu",

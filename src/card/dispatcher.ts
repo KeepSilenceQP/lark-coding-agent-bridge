@@ -4,6 +4,7 @@ import type { ActiveRuns } from '../bot/active-runs';
 import type { ChatModeCache } from '../bot/chat-mode-cache';
 import type { PendingQueue } from '../bot/pending-queue';
 import { runCommandHandler, type CommandContext, type Controls } from '../commands';
+import { isChatAllowed, isUserAllowed } from '../config/schema';
 import { log } from '../core/logger';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
@@ -33,6 +34,9 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   if (!value || typeof value !== 'object') return;
   const payload = value as Record<string, unknown>;
 
+  const operatorId = deps.evt.operator.openId;
+  const chatId = deps.evt.chatId;
+
   // CardKit 2.0 form submits drop user-input values from action.value; they
   // arrive on raw.action.form_value. The SDK forwards the raw event when
   // includeRawEvent: true is set on the channel options.
@@ -44,7 +48,28 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   // Resolve the click's session scope. For topic groups we need to know
   // the message's thread_id so the action targets the right topic's
   // session — look up the carrier message (the card lives on it) once.
+  // Done before the access check so we know the chat mode (p2p vs group)
+  // and can skip the chat allowlist for DMs.
   const { scope, threadId, mode } = await resolveScope(deps);
+
+  // Access control. Operator must be on the same allowlists as message
+  // senders. Silent drop — sending a denial card to an unauthorized user
+  // just confirms the bot exists.
+  if (!isUserAllowed(deps.controls.cfg, operatorId)) {
+    log.info('cardAction', 'skip-not-allowed-user', {
+      operator: operatorId.slice(-6),
+    });
+    return;
+  }
+  // `allowedChats` is group-only — see intakeMessage in bot/channel.ts for
+  // the rationale (p2p chat_ids aren't a meaningful access boundary, the
+  // user check above is authoritative for DMs).
+  if (mode !== 'p2p' && !isChatAllowed(deps.controls.cfg, chatId)) {
+    log.info('cardAction', 'skip-not-allowed-chat', {
+      chatId: chatId.slice(-6),
+    });
+    return;
+  }
 
   // Claude-driven callback: the button was rendered by claude itself via
   // lark-cli, with `__claude_cb` set on the value. Forward the click back

@@ -239,6 +239,43 @@ export function newTraceId(): string {
 }
 
 /**
+ * Scrub a log buffer of identifying / credential material before it leaves
+ * the local machine — specifically, before /doctor feeds it to Claude (the
+ * Anthropic API will see it) and before the analysis card lands in a
+ * Feishu chat (the Lark server may cache card contents).
+ *
+ * Conservative: keeps log structure intact so Claude can still correlate by
+ * traceId / phase / event. Only the *values* of identifying fields shrink
+ * to a last-6-char suffix, and known credential fields become [REDACTED].
+ *
+ * Pattern-based on purpose — parsing each line as JSON would skip lines the
+ * scrubber doesn't fully understand and is much slower for ~60KB of input.
+ */
+export function sanitizeLogsForDoctor(logs: string): string {
+  let out = logs;
+  // ID-like JSON fields → last 6 chars only. The 8-char minimum on the
+  // value avoids matching short metadata that happens to share a key name.
+  out = out.replace(
+    /"(chatId|senderId|sender|openId|operatorId|userId|msgId|messageId)":"([^"]{8,})"/g,
+    (_, key: string, val: string) => `"${key}":"…${val.slice(-6)}"`,
+  );
+  // Credential fields → fully redacted. Case-insensitive on the key.
+  out = out.replace(
+    /"(secret|app_secret|appSecret|token|access_token|tenant_access_token|app_access_token|authorization)":"[^"]*"/gi,
+    (_, key: string) => `"${key}":"[REDACTED]"`,
+  );
+  // URL-style tokens in error messages: `?access_token=t-xxx`.
+  out = out.replace(
+    /\b(access_token|tenant_access_token|app_access_token)=[A-Za-z0-9._\-+/=]+/g,
+    '$1=[REDACTED]',
+  );
+  // HTTP Authorization headers embedded in stringified errors.
+  out = out.replace(/\bBearer\s+[A-Za-z0-9._\-+/=]+/g, 'Bearer [REDACTED]');
+  out = out.replace(/\bAuthorization\s*[:=]\s*\S+/gi, 'Authorization=[REDACTED]');
+  return out;
+}
+
+/**
  * Read the tail of today's (and optionally yesterday's) log file.
  *
  * Returns up to `maxBytes` of complete JSON lines, oldest-first. If the

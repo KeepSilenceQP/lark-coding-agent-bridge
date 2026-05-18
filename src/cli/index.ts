@@ -2,6 +2,12 @@ import { Command } from 'commander';
 import pkg from '../../package.json';
 import { runMigrate } from './commands/migrate';
 import { runPs, runStopCli } from './commands/ps';
+import {
+  runSecretsGet,
+  runSecretsList,
+  runSecretsRemove,
+  runSecretsSet,
+} from './commands/secrets';
 import { runStart } from './commands/start';
 
 const program = new Command();
@@ -43,6 +49,40 @@ program
   .description('Stop a running start process by short id or list index (SIGTERM, then SIGKILL after 2s)')
   .action(async (target: string) => {
     await runStopCli(target);
+  });
+
+const secrets = program
+  .command('secrets')
+  .description('Manage the bridge\'s encrypted secret keystore (~/.lark-channel/secrets.enc)');
+
+secrets
+  .command('get')
+  .description('Exec-provider protocol: read JSON request from stdin, write JSON response to stdout. Used by lark-cli config bind --source lark-channel.')
+  .action(async () => {
+    await runSecretsGet();
+  });
+
+secrets
+  .command('set')
+  .description('Encrypt and store an App Secret. Prompts for the secret without echoing.')
+  .requiredOption('--app-id <id>', 'App ID (e.g. cli_xxxxxxxxxxxx)')
+  .action(async (opts: { appId: string }) => {
+    await runSecretsSet(opts.appId);
+  });
+
+secrets
+  .command('list')
+  .description('List the IDs of secrets in the encrypted keystore (no secrets shown)')
+  .action(async () => {
+    await runSecretsList();
+  });
+
+secrets
+  .command('remove')
+  .description('Delete an entry from the encrypted keystore')
+  .requiredOption('--app-id <id>', 'App ID to remove')
+  .action(async (opts: { appId: string }) => {
+    await runSecretsRemove(opts.appId);
   });
 
 program

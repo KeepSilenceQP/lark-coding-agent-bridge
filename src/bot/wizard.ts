@@ -23,12 +23,13 @@ export async function runRegistrationWizard(): Promise<AppConfig> {
   });
 
   const tenant: TenantBrand = result.user_info?.tenant_brand ?? 'feishu';
+  const operatorOpenId = result.user_info?.open_id;
 
   console.log('\n✓ 应用创建成功');
   console.log(`  App ID:  ${result.client_id}`);
-  console.log(`  Tenant:  ${tenant}\n`);
+  console.log(`  Tenant:  ${tenant}`);
 
-  return {
+  const cfg: AppConfig = {
     accounts: {
       app: {
         id: result.client_id,
@@ -37,4 +38,27 @@ export async function runRegistrationWizard(): Promise<AppConfig> {
       },
     },
   };
+
+  // Bootstrap the QR scanner as the initial admin. Without this seed the
+  // /config gate stays open to everyone in any chat the bot joins, making
+  // it awkward to ever tighten things (the operator would need to hand-edit
+  // config.json to set the first admin).
+  //
+  // `allowedUsers` and `allowedChats` stay empty (unrestricted) by default
+  // so the bot remains inviteable and responds anywhere it's invited; the
+  // operator can tighten via /config later.
+  if (operatorOpenId) {
+    cfg.preferences = {
+      access: { admins: [operatorOpenId] },
+    };
+    console.log(`  Admin:   ${operatorOpenId} (你自己，已自动加入管理员名单)`);
+  } else {
+    console.log(
+      '  ⚠️ 未拿到扫码用户的 open_id；管理员列表留空 = 所有用户都能跑敏感命令。' +
+        '\n     你可以稍后在飞书发 /config 手动设置管理员。',
+    );
+  }
+
+  console.log('');
+  return cfg;
 }

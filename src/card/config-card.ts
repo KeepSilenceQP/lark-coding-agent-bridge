@@ -7,6 +7,12 @@ export interface ConfigFormOpts {
   /** 0 means "disabled". */
   runIdleTimeoutMinutes: number;
   requireMentionInGroup: boolean;
+  /** Comma-separated open_id allowlist; empty string = unrestricted. */
+  allowedUsers: string;
+  /** Comma-separated chat_id allowlist; empty string = unrestricted. */
+  allowedChats: string;
+  /** Comma-separated admin open_id list; empty string = no admin gating. */
+  admins: string;
 }
 
 /** Form card for `/config`. */
@@ -108,6 +114,55 @@ export function configFormCard(opts: ConfigFormOpts): object {
                 { text: { tag: 'plain_text', content: '否' }, value: 'no' },
               ],
             },
+            { tag: 'hr' },
+            {
+              tag: 'markdown',
+              content:
+                '🔒 **访问控制**\n\n' +
+                '_控制谁能跟 bot 交互、谁能跑敏感命令。留空 = 不限制（默认）_',
+            },
+            {
+              tag: 'markdown',
+              content:
+                '\n**用户白名单**(`allowedUsers`)\n' +
+                '_只允许列表内的 open_id 跟 bot 交互。多个用英文逗号分隔。留空 = 不限制_\n' +
+                '_open_id 可从日志 `~/.lark-channel/logs/*.log` 里 grep `senderId` 字段_',
+            },
+            {
+              tag: 'input',
+              name: 'allowed_users',
+              default_value: opts.allowedUsers,
+              placeholder: { tag: 'plain_text', content: 'ou_xxx, ou_yyy（留空=不限制）' },
+              input_type: 'text',
+            },
+            {
+              tag: 'markdown',
+              content:
+                '\n**群白名单**(`allowedChats`)\n' +
+                '_只限制群（含话题群）——bot 只在名单内的群响应。多个用英文逗号分隔。留空 = 所有群都响应_\n' +
+                '_⚠️ 私聊不受此约束,DM 的访问权由"用户白名单"决定_',
+            },
+            {
+              tag: 'input',
+              name: 'allowed_chats',
+              default_value: opts.allowedChats,
+              placeholder: { tag: 'plain_text', content: 'oc_xxx, oc_yyy（留空=所有群）' },
+              input_type: 'text',
+            },
+            {
+              tag: 'markdown',
+              content:
+                '\n**管理员**(`admins`)\n' +
+                '_只允许这些 open_id 跑敏感命令: `/account` `/config` `/exit` `/reconnect` `/doctor` `/cd` `/ws`_\n' +
+                '_留空 = 不做管理员限制(所有放行的用户都能跑)。⚠️ 改为非空时务必把自己包含在内,否则会自锁出 /config_',
+            },
+            {
+              tag: 'input',
+              name: 'admins',
+              default_value: opts.admins,
+              placeholder: { tag: 'plain_text', content: 'ou_xxx, ou_yyy（留空=不限制）' },
+              input_type: 'text',
+            },
             {
               tag: 'column_set',
               flex_mode: 'flow',
@@ -155,6 +210,10 @@ export function configSavedCard(opts: ConfigFormOpts): object {
       : opts.messageReply === 'markdown'
         ? '消息卡片'
         : '纯文本';
+  const summarizeList = (raw: string): string => {
+    const items = raw.split(',').map((s) => s.trim()).filter(Boolean);
+    return items.length === 0 ? '_(不限制)_' : `${items.length} 项`;
+  };
   return {
     schema: '2.0',
     config: { summary: { content: '偏好已保存' } },
@@ -169,6 +228,10 @@ export function configSavedCard(opts: ConfigFormOpts): object {
             `**并发上限**:\`${opts.maxConcurrentRuns}\`\n` +
             `**run 探活**:\`${opts.runIdleTimeoutMinutes > 0 ? `${opts.runIdleTimeoutMinutes} 分钟` : '关闭'}\`\n` +
             `**群里需要 @ bot**:\`${opts.requireMentionInGroup ? '是' : '否'}\`\n\n` +
+            '🔒 **访问控制**\n' +
+            `**用户白名单**:${summarizeList(opts.allowedUsers)}\n` +
+            `**群白名单**:${summarizeList(opts.allowedChats)}\n` +
+            `**管理员**:${summarizeList(opts.admins)}\n\n` +
             '下条消息开始生效。',
         },
       ],

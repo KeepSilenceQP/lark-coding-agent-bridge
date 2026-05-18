@@ -42,12 +42,11 @@ export function accountCurrentCard(info: CurrentInfo): object {
 export interface FormCardOpts {
   initialTenant?: TenantBrand;
   prefillAppId?: string;
-  prefillAppSecret?: string;
   errorMessage?: string;
 }
 
 export function accountFormCard(opts: FormCardOpts = {}): object {
-  const { initialTenant = 'feishu', prefillAppId, prefillAppSecret, errorMessage } = opts;
+  const { initialTenant = 'feishu', prefillAppId, errorMessage } = opts;
   const bodyElements: object[] = [];
   if (errorMessage) {
     bodyElements.push({
@@ -72,7 +71,8 @@ export function accountFormCard(opts: FormCardOpts = {}): object {
         name: 'app_secret',
         label: { tag: 'plain_text', content: 'App Secret' },
         placeholder: { tag: 'plain_text', content: '32 位字符串' },
-        ...(prefillAppSecret ? { default_value: prefillAppSecret } : {}),
+        // Never prefill secret — even on validation retry. Pre-filled secrets
+        // can leak into Lark's server-side card cache.
         required: true,
       },
       { tag: 'markdown', content: '**Tenant**' },
