@@ -9,7 +9,12 @@ import { setSecret } from '../../config/keystore';
 import { paths } from '../../config/paths';
 import type { AppConfig } from '../../config/schema';
 import { isComplete, secretKeyForApp } from '../../config/schema';
-import { buildEncryptedAccountConfig, loadConfig, saveConfig } from '../../config/store';
+import {
+  buildEncryptedAccountConfig,
+  ensureSecretsGetterWrapper,
+  loadConfig,
+  saveConfig,
+} from '../../config/store';
 import { gcOldLogs, log } from '../../core/logger';
 import { gcMediaCache } from '../../media/cache';
 import {
@@ -276,27 +281,64 @@ async function maybeMigratePlaintextSecret(
   configPath: string,
 ): Promise<AppConfig> {
   const s = cfg.accounts.app.secret;
-  if (typeof s !== 'string') return cfg; // already a SecretRef
-  if (/^\$\{[A-Z][A-Z0-9_]*\}$/.test(s)) return cfg; // env-template, leave alone
 
-  const next = buildEncryptedAccountConfig(
-    cfg.accounts.app.id,
-    cfg.accounts.app.tenant,
-    cfg.preferences,
-  );
+  // Path A: still plaintext → encrypt + rewrite config.
+  if (typeof s === 'string' && !/^\$\{[A-Z][A-Z0-9_]*\}$/.test(s)) {
+    try {
+      const next = await buildEncryptedAccountConfig(
+        cfg.accounts.app.id,
+        cfg.accounts.app.tenant,
+        cfg.preferences,
+      );
+      await setSecret(secretKeyForApp(cfg.accounts.app.id), s);
+      await saveConfig(next, configPath);
+      console.log('🔒 已把 App Secret 加密迁移到 ~/.lark-channel/secrets.enc');
+      return next;
+    } catch (err) {
+      log.warn('config', 'migrate-encrypted-failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      // Migration failure isn't fatal — runtime resolver still handles
+      // the plaintext path.
+      return cfg;
+    }
+  }
+
+  // Path B: env-template — leave entirely alone.
+  if (typeof s === 'string') return cfg;
+
+  // Path C: already a SecretRef. Two things to keep fresh:
+  //   1. The wrapper script content (node / bridge paths may have moved).
+  //   2. The config's `secrets.providers.bridge` block — older bridge
+  //      versions wrote `command: <node path>`; the new format points
+  //      at the wrapper. Rewrite if out of date so lark-cli's audit
+  //      sees a user-owned, non-symlinked command path.
   try {
-    await setSecret(secretKeyForApp(cfg.accounts.app.id), s);
-    await saveConfig(next, configPath);
-    console.log('🔒 已把 App Secret 加密迁移到 ~/.lark-channel/secrets.enc');
+    const wrapperPath = await ensureSecretsGetterWrapper();
+    if (needsProviderRewrite(cfg, wrapperPath)) {
+      const next = await buildEncryptedAccountConfig(
+        cfg.accounts.app.id,
+        cfg.accounts.app.tenant,
+        cfg.preferences,
+      );
+      await saveConfig(next, configPath);
+      console.log('🔒 已把 secrets provider 切到 wrapper 形态');
+      return next;
+    }
   } catch (err) {
-    log.warn('config', 'migrate-encrypted-failed', {
+    log.warn('config', 'wrapper-refresh-failed', {
       err: err instanceof Error ? err.message : String(err),
     });
-    // Migration failure isn't fatal — the runtime resolver still handles
-    // the plaintext path. Keep using cfg as-is.
-    return cfg;
   }
-  return next;
+  return cfg;
+}
+
+function needsProviderRewrite(cfg: AppConfig, wrapperPath: string): boolean {
+  const provider = cfg.secrets?.providers?.bridge;
+  if (!provider) return true;
+  if (provider.command !== wrapperPath) return true;
+  if (!Array.isArray(provider.args) || provider.args.length !== 0) return true;
+  return false;
 }
 
 /** Encrypt the (plaintext) secret from a freshly-wizard'd cfg and persist. */
@@ -307,7 +349,7 @@ async function persistEncrypted(cfg: AppConfig, configPath: string): Promise<App
     await saveConfig(cfg, configPath);
     return cfg;
   }
-  const next = buildEncryptedAccountConfig(
+  const next = await buildEncryptedAccountConfig(
     cfg.accounts.app.id,
     cfg.accounts.app.tenant,
     cfg.preferences,

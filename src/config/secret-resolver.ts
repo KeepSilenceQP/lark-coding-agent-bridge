@@ -137,17 +137,19 @@ async function resolveExecRef(
 }
 
 function isSelfBridgeCommand(command: string, args: string[] | undefined): boolean {
-  // Heuristic: the provider command looks like our own bridge if its
-  // arg list starts with "secrets get". We avoid path matching (paths
-  // differ across npm-global / pnpm / volta installs) and just trust
-  // the subcommand signature, which we own end-to-end.
-  if (!args || args.length === 0) return false;
-  // args could be ['secrets', 'get'] or ['/path/bridge.mjs', 'secrets', 'get']
-  // — match the LAST two args being 'secrets' then 'get'.
-  if (args.length < 2) return false;
-  const a = args[args.length - 2];
-  const b = args[args.length - 1];
-  return a === 'secrets' && b === 'get';
+  // Canonical form (post-wrapper): command is our own secrets-getter
+  // script and args is empty. Match path exactly.
+  if (command === paths.secretsGetterScript) return true;
+  // Legacy / hand-edited form: command is node and args end with
+  // ['secrets', 'get']. Keep this branch so configs written by older
+  // bridge versions, or by power-users editing config.json directly,
+  // still short-circuit and avoid a re-spawn.
+  if (args && args.length >= 2) {
+    const a = args[args.length - 2];
+    const b = args[args.length - 1];
+    if (a === 'secrets' && b === 'get') return true;
+  }
+  return false;
 }
 
 async function spawnExecProvider(pc: ProviderConfig, ref: SecretRef): Promise<string> {

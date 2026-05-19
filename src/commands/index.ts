@@ -834,12 +834,13 @@ async function submitAccount(ctx: CommandContext): Promise<void> {
     // raw secret. lark-cli's `config bind --source lark-channel` reads the
     // same SecretRef and goes through the exec protocol to retrieve the
     // plaintext into its own OS keychain — no plaintext on disk.
-    const newCfg: AppConfig = buildEncryptedAccountConfig(
-      appId,
-      tenant,
-      ctx.controls.cfg.preferences,
-    );
+    let newCfg: AppConfig;
     try {
+      newCfg = await buildEncryptedAccountConfig(
+        appId,
+        tenant,
+        ctx.controls.cfg.preferences,
+      );
       await setSecret(secretKeyForApp(appId), appSecret);
       await saveConfig(newCfg, configPath);
     } catch (err) {
