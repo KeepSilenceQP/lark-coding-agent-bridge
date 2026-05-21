@@ -5,6 +5,7 @@ import type {
 } from '@larksuiteoapi/node-sdk';
 import { normalize } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
+import { expandInteractiveCard } from './interactive-card';
 
 export interface QuotedContext {
   messageId: string;
@@ -33,6 +34,31 @@ export interface QuotedContext {
  * normalize doesn't validate them, and downstream only uses the resulting
  * `content`. Same for mentions (we don't pass any).
  */
+/**
+ * Rewrite an interactive sub-message's body.content so the SDK's
+ * `convertInteractive` → `walkCard` finds a text node and emits real card
+ * content instead of the literal `[interactive card]` placeholder. We wrap
+ * our expanded `<interactive_card>` block as a `plain_text` node — that's
+ * one of the three tags walkCard treats as text-bearing
+ * (plain_text / lark_md / markdown).
+ *
+ * This is the merge_forward fix: sub-messages bypass the parent-level
+ * expansion because the SDK assembles `<forwarded_messages>` internally from
+ * each sub's flattened form, so we have to inject expansion at the sub-fetch
+ * layer.
+ */
+function preExpandInteractive(item: ApiMessageItem): ApiMessageItem {
+  if (item.msg_type !== 'interactive') return item;
+  const raw = item.body?.content;
+  if (typeof raw !== 'string' || raw.length === 0) return item;
+  const expanded = expandInteractiveCard('[interactive card]', raw);
+  // expandInteractiveCard returns the placeholder unchanged when there's
+  // nothing to expand — skip rewriting in that case to avoid double wrapping.
+  if (expanded === '[interactive card]') return item;
+  const wrapper = JSON.stringify({ tag: 'plain_text', content: expanded });
+  return { ...item, body: { ...item.body, content: wrapper } };
+}
+
 export async function fetchQuotedContext(
   channel: LarkChannel,
   messageId: string,
@@ -41,6 +67,9 @@ export async function fetchQuotedContext(
   try {
     const r = (await channel.rawClient.im.v1.message.get({
       path: { message_id: messageId },
+      // Ask for the original card JSON (incl. v2 user_dsl) instead of the
+      // default v1-canonical fallback that strips it. Requires SDK ≥ 1.65.0.
+      params: { card_msg_content_type: 'user_card_content' },
     })) as { data?: { items?: ApiMessageItem[] } };
     items = r?.data?.items ?? [];
   } catch (err) {
@@ -57,12 +86,13 @@ export async function fetchQuotedContext(
   // this same id (merge_forward case). For nested merge_forwards inside, fall
   // back to a fresh API call.
   const fetchSubMessages = async (mid: string): Promise<ApiMessageItem[]> => {
-    if (mid === parent.message_id) return items;
+    if (mid === parent.message_id) return items.map(preExpandInteractive);
     try {
       const r = (await channel.rawClient.im.v1.message.get({
         path: { message_id: mid },
+        params: { card_msg_content_type: 'user_card_content' },
       })) as { data?: { items?: ApiMessageItem[] } };
-      return r?.data?.items ?? [];
+      return (r?.data?.items ?? []).map(preExpandInteractive);
     } catch {
       return [];
     }
@@ -102,7 +132,9 @@ export async function fetchQuotedContext(
       createdAt: Number.isFinite(createMs) && createMs > 0
         ? new Date(createMs).toISOString()
         : '',
-      content: normalized.content,
+      // For zero-text interactive cards the SDK gave us "[interactive card]"
+      // — substitute the raw JSON so Claude can still see what was quoted.
+      content: expandInteractiveCard(normalized.content, parent.body?.content),
       rawContentType: parent.msg_type ?? 'text',
     };
   } catch (err) {

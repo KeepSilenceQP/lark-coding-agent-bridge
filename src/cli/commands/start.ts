@@ -143,36 +143,43 @@ export async function runStart(opts: StartOptions): Promise<void> {
       if (restarting) return;
       restarting = true;
       try {
+        const next = await loadConfig(configPath);
+        if (!isComplete(next)) throw new Error('config incomplete after change');
+        console.log(
+          `[restart] connecting new bridge with appId=${next.accounts.app.id} tenant=${next.accounts.app.tenant}...`,
+        );
+        // Connect-before-disconnect: if the new bridge fails to come up
+        // (e.g. network outage during a force-reconnect), throwing here
+        // leaves the old bridge — and its keepalive timer — untouched, so
+        // the next keepalive tick (~15s later) can retry restart. Without
+        // this ordering, a failed restart would tear down the only
+        // keepalive in the process and the bot would never recover until
+        // someone manually restarts it.
+        const next_bridge = await startChannel({
+          cfg: next,
+          agent,
+          sessions,
+          workspaces,
+          controls,
+        });
         console.log('[restart] disconnecting old bridge...');
         try {
           await bridge.disconnect();
         } catch (err) {
-          console.warn('[restart] disconnect failed:', err);
+          console.warn('[restart] old disconnect failed:', err);
         }
-        const next = await loadConfig(configPath);
-        if (!isComplete(next)) throw new Error('config incomplete after change');
+        bridge = next_bridge;
         controls.cfg = next;
         // Keep the registry in sync so /ps reflects the new app after an
-        // /account change. Same process id, new app fields. botName is
-        // refreshed below once the new channel is up.
+        // /account change. Same process id, new app fields.
         await updateEntry(entry.id, {
           appId: next.accounts.app.id,
           tenant: next.accounts.app.tenant,
           configPath,
-          botName: undefined,
+          botName: bridge.channel.botIdentity?.name,
         }).catch((err) =>
           log.warn('registry', 'update-failed', { err: String(err) }),
         );
-        console.log(
-          `[restart] reconnecting with appId=${next.accounts.app.id} tenant=${next.accounts.app.tenant}...`,
-        );
-        bridge = await startChannel({ cfg: next, agent, sessions, workspaces, controls });
-        const restartedBotName = bridge.channel.botIdentity?.name;
-        if (restartedBotName) {
-          await updateEntry(entry.id, { botName: restartedBotName }).catch((err) =>
-            log.warn('registry', 'update-failed', { step: 'botName', err: String(err) }),
-          );
-        }
         console.log('✓ 已用新凭据重连');
       } finally {
         restarting = false;

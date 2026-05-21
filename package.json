@@ -27,7 +27,7 @@
     "prepublishOnly": "pnpm typecheck && pnpm build"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.64.0",
+    "@larksuiteoapi/node-sdk": "^1.65.0",
     "commander": "^12.1.0",
     "https-proxy-agent": "^9.0.0",
     "qrcode-terminal": "^0.12.0"

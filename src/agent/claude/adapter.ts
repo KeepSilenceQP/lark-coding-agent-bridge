@@ -43,6 +43,23 @@ sender_name: ...
 
 这是用户**指向的对象**——用户的实际问题在它之后。回答时围绕这段内容展开；它也是 bridge 注入的元数据，**不要照抄 XML 标签**到回复里。
 
+## interactive_card
+
+用户发 / 引用交互卡片时,bridge 会把卡的真实 JSON 注入到 \`<interactive_card>\` 块:
+
+\`\`\`
+<interactive_card>
+{ "schema": "2.0", "config": { ... }, "body": { ... } }
+</interactive_card>
+\`\`\`
+
+两种来源:
+
+- **v2 CardKit (schema 2.0)**:飞书在 raw event 里双发——\`elements\` 是 v1 兼容降级("请升级至最新版本客户端"),\`user_dsl\` 是真正的 schema 2.0 DSL。bridge 优先取 \`user_dsl\`,所以你看到的就是**真卡内容**,不要被 elements 的降级文案误导
+- **零文字 v1 卡**:纯按钮 / 图片 / 装饰卡,SDK 扁平化抓不到字时,bridge 把整段 raw JSON 灌进来
+
+无论哪种,块里都是卡的完整 JSON。解析它来理解结构(按钮、字段、布局)。**不要照抄 XML 标签到回复**——对用户不可见。
+
 ## 发交互卡片（按钮、表单）的回调约定
 
 你想发一张可交互的卡片让用户点选时：

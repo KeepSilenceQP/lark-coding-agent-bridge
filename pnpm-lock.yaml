@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@larksuiteoapi/node-sdk':
-        specifier: ^1.64.0
-        version: 1.64.0
+        specifier: ^1.65.0
+        version: 1.65.0
       commander:
         specifier: ^12.1.0
         version: 12.1.0
@@ -346,8 +346,8 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@larksuiteoapi/node-sdk@1.64.0':
-    resolution: {integrity: sha512-r3ae0lAi3ipH1g1geUo1fmb7DK5e0WAKrrrDi25yJCKBvxtiKLsR3ldss3OZnqyfP7yGHkjeN0BYuzyaWgxFoA==}
+  '@larksuiteoapi/node-sdk@1.65.0':
+    resolution: {integrity: sha512-SkMeiFvi4mMVGrmBBh50vWPOgAvfbcpdcAW+iryheFFHUmji49aDch/YtxsKGFtzFlL/rseQXFzNFL8+LdQQ5Q==}
 
   '@protobufjs/aspromise@1.1.2':
     resolution: {integrity: sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ==}
@@ -1217,7 +1217,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@larksuiteoapi/node-sdk@1.64.0':
+  '@larksuiteoapi/node-sdk@1.65.0':
     dependencies:
       axios: 1.13.6
       lodash.identity: 3.0.0
