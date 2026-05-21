@@ -21,7 +21,8 @@ program
   .command('start')
   .description('Start the bot (runs first-run wizard if bot config is missing)')
   .option('-c, --config <path>', 'path to config file')
-  .action(async (opts: { config?: string }) => {
+  .option('--skip-check-lark-cli', 'skip lark-cli pre-flight check (auto-install + bind)')
+  .action(async (opts: { config?: string; skipCheckLarkCli?: boolean }) => {
     await runStart(opts);
   });
 
