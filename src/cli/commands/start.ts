@@ -17,6 +17,7 @@ import {
 } from '../../config/store';
 import { gcOldLogs, log } from '../../core/logger';
 import { gcMediaCache } from '../../media/cache';
+import { preFlightChecks } from '../preflight';
 import {
   cleanupTmpFiles,
   register,
@@ -50,6 +51,7 @@ const MEDIA_GC_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export interface StartOptions {
   config?: string;
+  skipCheckLarkCli?: boolean;
 }
 
 export async function runStart(opts: StartOptions): Promise<void> {
@@ -72,6 +74,8 @@ export async function runStart(opts: StartOptions): Promise<void> {
     console.log(`配置已保存到 ${configPath}\n`);
     printScopeReminder();
   }
+
+  await preFlightChecks({ skipCheckLarkCli: opts.skipCheckLarkCli });
 
   const agent = new ClaudeAdapter();
   if (!(await agent.isAvailable())) {

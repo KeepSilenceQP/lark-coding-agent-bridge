@@ -27,6 +27,7 @@
     "prepublishOnly": "pnpm typecheck && pnpm build"
   },
   "dependencies": {
+    "@clack/prompts": "^1.4.0",
     "@larksuiteoapi/node-sdk": "^1.65.0",
     "commander": "^12.1.0",
     "https-proxy-agent": "^9.0.0",
@@ -43,7 +44,10 @@
     "node": ">=20.0.0"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "protobufjs"]
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "protobufjs"
+    ]
   },
   "keywords": [
     "feishu",
