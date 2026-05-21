@@ -41,23 +41,6 @@ lark-channel-bridge start
 3. 选择 / 创建 PersonalAgent 应用
 4. 成功后凭据写入 `~/.lark-channel/config.json`
 
-### 开放平台补齐 scope 和事件订阅
-
-向导只负责创建应用，平台侧还需要手动确认：
-
-**权限 scope**：
-- `im:message`
-- `im:message:send_as_bot`
-- `im:resource`
-
-**事件订阅（使用长连接接收）**：
-- `im.message.receive_v1`
-- `card.action.trigger`
-- `im.message.reaction.created_v1` / `deleted_v1`（可选）
-- `im.chat.member.bot.added_v1`（可选）
-
-启用以后再次 `lark-channel-bridge start`，看到 `✓ 已连接` 就可以在飞书里找 bot 对话了。
-
 ## 命令速查
 
 ### 宿主 CLI

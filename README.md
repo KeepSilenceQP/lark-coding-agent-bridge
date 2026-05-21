@@ -41,23 +41,6 @@ The first run detects there's no app configured and **opens a QR-code wizard**:
 3. Pick or create a PersonalAgent app.
 4. Credentials are written to `~/.lark-channel/config.json`.
 
-### Granting scopes and event subscriptions
-
-The wizard creates the app shell, but you still need to confirm a few things on the Lark Developer Console:
-
-**Permission scopes:**
-- `im:message`
-- `im:message:send_as_bot`
-- `im:resource`
-
-**Event subscriptions (over long-lived WebSocket):**
-- `im.message.receive_v1`
-- `card.action.trigger`
-- `im.message.reaction.created_v1` / `deleted_v1` (optional)
-- `im.chat.member.bot.added_v1` (optional)
-
-After enabling those, run `lark-channel-bridge start` again. Once you see `✓ Connected`, find the bot in Feishu / Lark and start chatting.
-
 ## Commands
 
 ### Host CLI
