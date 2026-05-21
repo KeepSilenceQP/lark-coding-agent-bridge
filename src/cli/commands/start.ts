@@ -70,7 +70,6 @@ export async function runStart(opts: StartOptions): Promise<void> {
     // immediately encrypt before persisting so disk never holds the raw value.
     cfg = await persistEncrypted(fresh, configPath);
     console.log(`配置已保存到 ${configPath}\n`);
-    printScopeReminder();
   }
 
   const agent = new ClaudeAdapter();
@@ -366,18 +365,3 @@ async function persistEncrypted(cfg: AppConfig, configPath: string): Promise<App
   return next;
 }
 
-function printScopeReminder(): void {
-  console.log('请到开放平台为该应用确认以下能力：\n');
-  console.log('  权限 scope:');
-  console.log('    - im:message');
-  console.log('    - im:message:send_as_bot');
-  console.log('    - im:resource');
-  console.log('    - im:chat (创建群需要)');
-  console.log('    - drive:drive (读写云文档评论需要)\n');
-  console.log('  事件订阅（长连接模式）:');
-  console.log('    - im.message.receive_v1');
-  console.log('    - card.action.trigger');
-  console.log('    - drive.notice.comment_add_v1 (云文档 @bot 需要)');
-  console.log('    - im.message.reaction.created_v1 / deleted_v1（可选）');
-  console.log('    - im.chat.member.bot.added_v1（可选）\n');
-}
