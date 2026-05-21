@@ -37,6 +37,7 @@ import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
+import { expandInteractiveCard } from './interactive-card';
 import { startKeepalive } from './keepalive';
 import { configureNetwork } from './network-config';
 import { PendingQueue } from './pending-queue';
@@ -745,6 +746,21 @@ async function processAgentStream(
  */
 const POST_DONE_EXIT_GRACE_MS = 2000;
 
+/**
+ * For interactive-card messages the SDK flattens to text-bearing nodes or
+ * the literal "[interactive card]" placeholder, losing v2 `user_dsl` and the
+ * raw v1 JSON. Pull the raw webhook content (attached via `includeRawEvent`)
+ * and feed it to `expandInteractiveCard` so direct-receive cards get the
+ * same `<interactive_card>` injection that quoted cards already get.
+ */
+function expandedMessageContent(m: NormalizedMessage): string {
+  if (m.rawContentType !== 'interactive') return m.content;
+  const rawContent = (m.raw as { message?: { content?: unknown } } | undefined)
+    ?.message?.content;
+  if (typeof rawContent !== 'string') return m.content;
+  return expandInteractiveCard(m.content, rawContent);
+}
+
 function buildPrompt(
   batch: NormalizedMessage[],
   attachments: LocalAttachment[],
@@ -752,7 +768,7 @@ function buildPrompt(
 ): string {
   const fileKeys = batch.flatMap((m) => m.resources.map((r) => r.fileKey));
   const texts = batch
-    .map((m) => stripAttachmentRefs(m.content, fileKeys).trim())
+    .map((m) => stripAttachmentRefs(expandedMessageContent(m), fileKeys).trim())
     .filter(Boolean);
   const ctxHeader = buildBridgeContextHeader(batch);
   const quoteBlock = renderQuotedBlock(quotes);
