@@ -176,3 +176,9 @@ grep '"event":"enter"' ~/.lark-channel/logs/$(date +%Y-%m-%d).log | tail -5
 ## 许可
 
 [MIT](./LICENSE)
+
+## 反馈
+
+如果有建议或者反馈，欢迎加入[飞书反馈群](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=898n02fa-c8f3-473f-a29d-e999024ead4c)！
+
+<img src="./assets/feedback-group-qr.png" alt="飞书反馈群二维码" width="360">
