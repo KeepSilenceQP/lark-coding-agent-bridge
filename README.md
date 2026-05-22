@@ -176,3 +176,9 @@ After a manual edit, **restart the bridge** or send **`/reconnect`** from any al
 ## License
 
 [MIT](./LICENSE)
+
+## Feedback
+
+If you have any suggestions or feedback, feel free to join the [feedback group on Lark](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=898n02fa-c8f3-473f-a29d-e999024ead4c)!
+
+<img src="./assets/feedback-group-qr.png" alt="Feedback group QR code" width="360">
