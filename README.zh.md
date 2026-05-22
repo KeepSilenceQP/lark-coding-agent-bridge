@@ -33,7 +33,7 @@ pnpm add -g lark-channel-bridge
 ## 首次启动
 
 ```bash
-lark-channel-bridge start
+lark-channel-bridge run
 ```
 
 第一次跑会检测到没配置应用，**自动进入扫码向导**：
@@ -47,14 +47,35 @@ lark-channel-bridge start
 
 ### 宿主 CLI
 
+**进程层**（在你自己的 shell 里直接跑 bridge）:
+
 ```
-lark-channel-bridge start [-c <config>]   启动 bot
-lark-channel-bridge ps                    列出本机所有正在跑的 start 进程
-lark-channel-bridge stop <id|#>           终止指定 start 进程（SIGTERM，2s 后 SIGKILL）
+lark-channel-bridge run [-c <config>]     前台启动 bot
+lark-channel-bridge ps                    列出本机所有正在跑的 bridge 进程
+lark-channel-bridge kill <id|#>           kill 指定 bridge 进程（SIGTERM，2s 后 SIGKILL）
 lark-channel-bridge --help                列所有命令
 ```
 
-> 多开同一个 app 时，开放平台会把事件随机推到其中一个长连接。`start` 启动前会检测同 app 已有的进程，TTY 下提示 `[c]ontinue / [k]ill old / [a]bort` 三选；非 TTY 只 warn 并继续。
+**服务层**（让 OS 在后台托管 bridge）:
+
+> ⚠️ **服务层命令必须先全局安装,不能直接用 npx**。daemon 的 launchd plist / systemd unit / Windows 任务里会**硬编码** bridge CLI 的路径;通过 `npx lark-channel-bridge start` 调用时,这条路径在 npm 的临时缓存里(`~/.npm/_npx/<hash>/...`),会被 GC 清掉 — 一旦缓存清理,daemon 就起不来了。请先 `npm install -g lark-channel-bridge`,再 `lark-channel-bridge start`。`bridge run` 用 npx 调用没问题(单次进程)。
+
+```
+lark-channel-bridge start                 注册（如需）+ 启动后台 daemon
+lark-channel-bridge stop                  停止 daemon 并关闭开机自启
+lark-channel-bridge restart               重启 daemon
+lark-channel-bridge status                查看 daemon 状态（pid、日志路径、上次退出码）
+lark-channel-bridge unregister            撤销注册（停止 + 删除服务定义文件）
+```
+
+daemon 崩溃会被自动拉起，用户登录时也会自动启动。平台映射:
+- **macOS** → `launchd` 用户代理 `~/Library/LaunchAgents/ai.lark-channel-bridge.bot.plist`
+- **Linux** → `systemd` 用户单元 `~/.config/systemd/user/lark-channel-bridge.bot.service`。要让 daemon 在退出登录后还能跑，执行一次 `loginctl enable-linger $USER`。
+- **Windows** → Task Scheduler 任务 `LarkChannelBridge.Bot`，触发条件为 ONLOGON。启动脚本位于 `~/.lark-channel/daemon-launcher.cmd`。
+
+daemon 的 stdout / stderr 写到 `~/.lark-channel/logs/daemon-stdout.log` 和 `daemon-stderr.log`，跟 bridge 自己的每日结构化日志放在同一个目录。
+
+> 多开同一个 app 时，开放平台会把事件随机推到其中一个长连接。`run` 启动前会检测同 app 已有的进程，TTY 下提示 `[c]ontinue / [k]ill old / [a]bort` 三选；非 TTY 只 warn 并继续。
 
 ### 在飞书里用的斜杠命令
 

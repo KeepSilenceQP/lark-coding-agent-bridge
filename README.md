@@ -33,7 +33,7 @@ pnpm add -g lark-channel-bridge
 ## First run
 
 ```bash
-lark-channel-bridge start
+lark-channel-bridge run
 ```
 
 The first run detects there's no app configured and **opens a QR-code wizard**:
@@ -47,14 +47,35 @@ The first run detects there's no app configured and **opens a QR-code wizard**:
 
 ### Host CLI
 
+**Process-level** (run the bridge directly in your shell):
+
 ```
-lark-channel-bridge start [-c <config>]   Start the bot
-lark-channel-bridge ps                    List all running start processes on this machine
-lark-channel-bridge stop <id|#>           Stop a start process (SIGTERM, SIGKILL after 2s)
+lark-channel-bridge run [-c <config>]     Run the bot in the foreground
+lark-channel-bridge ps                    List all running bridge processes on this machine
+lark-channel-bridge kill <id|#>           Kill a bridge process (SIGTERM, SIGKILL after 2s)
 lark-channel-bridge --help                List all commands
 ```
 
-> When the same app is started multiple times, Lark's open platform routes events to one of the live WebSocket connections at random. `start` detects existing processes for the same app and (in a TTY) prompts: `[c]ontinue / [k]ill old / [a]bort`. In non-TTY mode it warns and continues.
+**Service-level** (run the bridge as a background OS-managed daemon):
+
+> ⚠️ **Install globally before using service-level commands**. The daemon's launchd plist / systemd unit / Windows task hard-codes the path to the bridge CLI; if you invoke via `npx lark-channel-bridge start`, that path lives in npm's temp cache (`~/.npm/_npx/<hash>/...`) and will be garbage-collected — your daemon stops working as soon as the cache is cleaned. Use `npm install -g lark-channel-bridge` first, then run `lark-channel-bridge start`. `bridge run` is fine via npx (one-shot process).
+
+```
+lark-channel-bridge start                 Install (if needed) and start the daemon
+lark-channel-bridge stop                  Stop the daemon and disable autostart
+lark-channel-bridge restart               Restart the daemon in place
+lark-channel-bridge status                Show daemon status (pid, log paths, last exit)
+lark-channel-bridge unregister            Remove the service definition and stop
+```
+
+The daemon auto-restarts on crash and on user login. Platform mapping:
+- **macOS** → `launchd` user agent at `~/Library/LaunchAgents/ai.lark-channel-bridge.bot.plist`
+- **Linux** → `systemd` user unit at `~/.config/systemd/user/lark-channel-bridge.bot.service`. For the daemon to survive logout, run `loginctl enable-linger $USER` once.
+- **Windows** → Task Scheduler task `LarkChannelBridge.Bot`, triggered ONLOGON. Launcher script at `~/.lark-channel/daemon-launcher.cmd`.
+
+Daemon logs go to `~/.lark-channel/logs/daemon-stdout.log` and `daemon-stderr.log` alongside the bridge's per-day structured logs.
+
+> When the same app is started multiple times, Lark's open platform routes events to one of the live WebSocket connections at random. `run` detects existing processes for the same app and (in a TTY) prompts: `[c]ontinue / [k]ill old / [a]bort`. In non-TTY mode it warns and continues.
 
 ### Slash commands inside Feishu / Lark
 

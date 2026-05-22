@@ -240,7 +240,7 @@ async function resolveConflict(
 
   if (!process.stdin.isTTY) {
     console.warn(
-      '⚠️  当前不是交互式启动,已自动取消。如需替换,先用 `lark-channel-bridge stop <bot id>` 关掉旧的。\n',
+      '⚠️  当前不是交互式启动,已自动取消。如需替换,先用 `kill <bot id>` 关掉旧的。\n',
     );
     return false;
   }
