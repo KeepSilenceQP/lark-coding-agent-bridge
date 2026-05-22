@@ -1,13 +1,20 @@
 import { Command } from 'commander';
 import pkg from '../../package.json';
 import { runMigrate } from './commands/migrate';
-import { runPs, runStopCli } from './commands/ps';
+import { runKillCli, runPs } from './commands/ps';
 import {
   runSecretsGet,
   runSecretsList,
   runSecretsRemove,
   runSecretsSet,
 } from './commands/secrets';
+import {
+  runServiceRestart,
+  runServiceStart,
+  runServiceStatus,
+  runServiceStop,
+  runServiceUnregister,
+} from './commands/service';
 import { runStart } from './commands/start';
 
 const program = new Command();
@@ -17,9 +24,11 @@ program
   .description('Bridge Feishu/Lark messenger with local CLI coding agents')
   .version(pkg.version, '-v, --version');
 
+// === process-level commands (work directly on bridge processes) ===
+
 program
-  .command('start')
-  .description('Start the bot (runs first-run wizard if bot config is missing)')
+  .command('run')
+  .description('Run the bridge in the foreground (was `start` in older versions)')
   .option('-c, --config <path>', 'path to config file')
   .option('--skip-check-lark-cli', 'skip lark-cli pre-flight check (auto-install + bind)')
   .action(async (opts: { config?: string; skipCheckLarkCli?: boolean }) => {
@@ -27,29 +36,55 @@ program
   });
 
 program
-  .command('migrate')
-  .description(
-    'Migrate from pre-0.1.11 setup: move ~/.config/lark-channel-bridge/* and ' +
-      '~/.cache/lark-channel-bridge/* into ~/.lark-channel/, and rewrite ' +
-      'config.json from { app } to { accounts.app }',
-  )
-  .option('-c, --config <path>', 'path to config file (after migration)')
-  .action(async (opts: { config?: string }) => {
-    await runMigrate(opts);
-  });
-
-program
   .command('ps')
-  .description('List running lark-channel-bridge start processes (this machine)')
+  .description('List running bridge processes on this machine')
   .action(() => {
     runPs();
   });
 
 program
-  .command('stop <target>')
-  .description('Stop a running start process by short id or list index (SIGTERM, then SIGKILL after 2s)')
+  .command('kill <target>')
+  .description('Kill a running bridge process by short id or list index (SIGTERM, then SIGKILL after 2s). Was `stop <target>` in older versions.')
   .action(async (target: string) => {
-    await runStopCli(target);
+    await runKillCli(target);
+  });
+
+// === service-level commands (OS-managed daemon: launchd/systemd/schtasks) ===
+
+program
+  .command('start')
+  .description('Install (if needed) and start the bridge as an OS-managed daemon')
+  .option('--skip-check-lark-cli', 'skip lark-cli pre-flight check (auto-install + bind)')
+  .action(async (opts: { skipCheckLarkCli?: boolean }) => {
+    await runServiceStart(opts);
+  });
+
+program
+  .command('stop')
+  .description('Stop the OS-managed daemon (unload from launchd; plist stays)')
+  .action(async () => {
+    await runServiceStop();
+  });
+
+program
+  .command('restart')
+  .description('Restart the OS-managed daemon')
+  .action(async () => {
+    await runServiceRestart();
+  });
+
+program
+  .command('status')
+  .description('Show OS service status (pid, last exit, log paths)')
+  .action(async () => {
+    await runServiceStatus();
+  });
+
+program
+  .command('unregister')
+  .description('Remove the OS service registration (bootout + delete plist)')
+  .action(async () => {
+    await runServiceUnregister();
   });
 
 const secrets = program

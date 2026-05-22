@@ -30,9 +30,9 @@ export function runPs(): void {
   printTable([headers, ...rows]);
 }
 
-export async function runStopCli(target: string | undefined): Promise<void> {
+export async function runKillCli(target: string | undefined): Promise<void> {
   if (!target) {
-    console.error('用法: lark-channel-bridge stop <bot id 或序号>');
+    console.error('用法: lark-channel-bridge kill <bot id 或序号>');
     process.exit(1);
   }
   const entry = resolveTarget(target);
