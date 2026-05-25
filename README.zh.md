@@ -197,3 +197,5 @@ grep '"event":"enter"' ~/.lark-channel/logs/$(date +%Y-%m-%d).log | tail -5
 ## 许可
 
 [MIT](./LICENSE)
+
+<img src="./assets/feedback-group-qr.png" alt="飞书反馈群二维码" width="360">
