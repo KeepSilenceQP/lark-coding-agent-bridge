@@ -194,6 +194,32 @@ grep '"event":"enter"' ~/.lark-channel/logs/$(date +%Y-%m-%d).log | tail -5
 
 **图片发过去 Claude 说看不到**：升级到最新版，0.1.0 之前的版本有文件名去重 bug。
 
+## 可选：遥测（Telemetry）
+
+默认情况下 bridge **不上报任何数据**：没有指标、没有日志离开你的机器，也不引入任何遥测依赖。下面这个钩子在你主动开启前完全是空操作。
+
+想接自己的监控时，用环境变量指向一个 default export（或导出 `createAdapter`）`AdapterFactory` 的模块：
+
+```bash
+LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package lark-channel-bridge start
+```
+
+该模块会收到每一条 `log.*` 事件，以及错误 / 指标钩子，转发到任何你想要的地方。接口从包根导出：
+
+```ts
+import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'lark-channel-bridge';
+
+const createAdapter: AdapterFactory = (meta) => ({
+  emit(event) {/* 上报事件 */},
+  recordError(err, ctx) {/* 上报异常 */},
+  recordMetric(name, value, tags) {/* 上报指标 */},
+  flush(timeoutMs) {/* 冲刷缓冲事件 */},
+});
+export default createAdapter;
+```
+
+模块不存在、工厂函数不合法、或者 adapter 抛错，都会降级为空操作——遥测永远不会阻止 bridge 启动，也不会打断日志。
+
 ## 许可
 
 [MIT](./LICENSE)

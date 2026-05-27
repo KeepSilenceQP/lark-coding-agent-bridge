@@ -194,6 +194,32 @@ After a manual edit, **restart the bridge** or send **`/reconnect`** from any al
 
 **Claude says it can't see the image I sent.** Upgrade to the latest version — releases before 0.1.0 had a filename-dedup bug.
 
+## Optional telemetry
+
+By default the bridge reports **nothing**: no metrics, no logs leave your machine, and it pulls in zero telemetry dependencies. The hook below is inert unless you opt in.
+
+To wire up your own monitoring, point an environment variable at a module that default-exports (or exports `createAdapter`) an `AdapterFactory`:
+
+```bash
+LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package lark-channel-bridge start
+```
+
+That module receives every `log.*` event plus error/metric hooks and forwards them wherever you like. The interface is exported from the package root:
+
+```ts
+import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'lark-channel-bridge';
+
+const createAdapter: AdapterFactory = (meta) => ({
+  emit(event) {/* ship event */},
+  recordError(err, ctx) {/* ship exception */},
+  recordMetric(name, value, tags) {/* ship metric */},
+  flush(timeoutMs) {/* drain buffered events */},
+});
+export default createAdapter;
+```
+
+A missing module, a bad factory, or a throwing adapter all degrade to noop — telemetry can never stop the bridge from starting or break logging.
+
 ## License
 
 [MIT](./LICENSE)
