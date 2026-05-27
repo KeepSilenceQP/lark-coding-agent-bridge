@@ -16,6 +16,7 @@ import {
   saveConfig,
 } from '../../config/store';
 import { gcOldLogs, log } from '../../core/logger';
+import { loadTelemetryAdapter, telemetry } from '../../core/telemetry';
 import { gcMediaCache } from '../../media/cache';
 import { preFlightChecks } from '../preflight';
 import {
@@ -42,9 +43,11 @@ dns.setDefaultResultOrder('ipv4first');
 // keep the bot alive — losing a single reply is better than crashing.
 process.on('unhandledRejection', (reason) => {
   log.fail('process', reason, { kind: 'unhandledRejection' });
+  telemetry().recordError(reason, { kind: 'unhandledRejection' });
 });
 process.on('uncaughtException', (err) => {
   log.fail('process', err, { kind: 'uncaughtException' });
+  telemetry().recordError(err, { kind: 'uncaughtException' });
 });
 
 const MEDIA_GC_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -75,6 +78,15 @@ export async function runStart(opts: StartOptions): Promise<void> {
   }
 
   await preFlightChecks({ skipCheckLarkCli: opts.skipCheckLarkCli });
+
+  // Optional telemetry: noop unless LARK_CHANNEL_TELEMETRY_MODULE is set.
+  // Loaded after pre-flight (so config is known) and before the channel comes
+  // up (so startup events are captured). Never throws.
+  await loadTelemetryAdapter({
+    version: pkg.version,
+    appId: cfg.accounts.app.id,
+    tenant: cfg.accounts.app.tenant,
+  });
 
   const agent = new ClaudeAdapter();
   if (!(await agent.isAvailable())) {
@@ -129,6 +141,13 @@ export async function runStart(opts: StartOptions): Promise<void> {
       await bridge.disconnect();
     } catch (err) {
       console.error('[disconnect-failed]', err);
+    }
+    // Give the telemetry sink a bounded window to ship buffered events before
+    // the process goes away. Best-effort: a slow/failed flush must not block exit.
+    try {
+      await telemetry().flush?.(2000);
+    } catch {
+      /* ignore — exiting anyway */
     }
     // unregister is best-effort sync — we're about to exit anyway.
     unregisterSync(entry.id);
@@ -204,6 +223,12 @@ export async function runStart(opts: StartOptions): Promise<void> {
 
   process.on('SIGINT', () => void stop('SIGINT'));
   process.on('SIGTERM', () => void stop('SIGTERM'));
+  // If the event loop ever drains without a signal, give telemetry one last
+  // bounded flush. `beforeExit` doesn't fire on explicit process.exit(), which
+  // is why stop() flushes too.
+  process.on('beforeExit', () => {
+    void Promise.resolve(telemetry().flush?.(2000)).catch(() => {});
+  });
   // Last-ditch sync unregister in case something exits without going through
   // stop() (e.g. uncaughtException with process.exit(1)).
   process.on('exit', () => {
