@@ -3,6 +3,7 @@ import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { open, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { paths } from '../config/paths';
+import { telemetry } from './telemetry';
 
 /** Days of `YYYY-MM-DD.log` history to keep. Override via env. */
 const LOG_RETENTION_DAYS = Math.max(
@@ -119,6 +120,15 @@ function emit(level: Level, phase: string, event: string, fields: LogFields = {}
     } catch {
       /* swallow disk errors — logging should never crash the bot */
     }
+  }
+
+  // Fan out the raw event to the optional telemetry sink (noop unless an
+  // adapter is loaded). Done before the stdout early-return so the sink sees
+  // *every* event, not just the curated stdout subset. Never break logging.
+  try {
+    telemetry().emit({ level, phase, event, fields, ctx, ts: entry.ts as string });
+  } catch {
+    /* never break logging */
   }
 
   // Stdout is the user-facing tail: warns, errors, and a curated list
@@ -349,4 +359,24 @@ async function readTail(path: string, maxBytes: number): Promise<string> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
     throw err;
   }
+}
+
+/**
+ * Record a numeric metric to the telemetry sink. Noop unless an adapter is
+ * loaded (see {@link import('./telemetry')}). Crash-safe.
+ */
+export function reportMetric(
+  name: string,
+  value: number,
+  tags?: Record<string, string>,
+): void {
+  telemetry().recordMetric(name, value, tags);
+}
+
+/**
+ * Record an error/exception to the telemetry sink. Noop unless an adapter is
+ * loaded. Crash-safe.
+ */
+export function reportError(err: unknown, ctx?: Record<string, unknown>): void {
+  telemetry().recordError(err, ctx);
 }
