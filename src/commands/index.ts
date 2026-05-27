@@ -12,7 +12,7 @@ import {
 import { configCancelledCard, configFormCard, configSavedCard } from '../card/config-card';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
-import type { AppConfig, MessageReplyMode, TenantBrand } from '../config/schema';
+import type { AppAccess, AppConfig, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
   getAgentStopGraceMs,
   getMaxConcurrentRuns,
@@ -40,6 +40,7 @@ import type { SessionStore } from '../session/store';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import type { WorkspaceStore } from '../workspace/store';
 import { createBoundChat, defaultChatName } from '../bot/group';
+import { fetchAppOwnerId, fetchKnownChats, type KnownChat } from '../bot/lark-info';
 
 export interface Controls {
   /** Restart the bridge in-process: disconnect WS, kill claude runs, reload
@@ -55,6 +56,26 @@ export interface Controls {
   /** This process's short id in the registry. Used by /ps to highlight the
    * receiving process and by /exit to detect self-target. */
   processId: string;
+  /**
+   * Current Lark app owner's open_id. Populated by channel.ts on connect
+   * via the `application/v6/applications` API; refreshed on reconnect and
+   * every 30 minutes. `undefined` when the fetch failed — caller treats
+   * that as "no creator", letting access control fall through to the
+   * explicit whitelists (fail-secure).
+   *
+   * The owner is the only identity that bypasses every whitelist (DM /
+   * group / admin), so this field IS the access-control "creator" concept
+   * — there is no parallel config-file list.
+   */
+  botOwnerId?: string;
+  /**
+   * Chats (groups + topic groups) the bot is currently a member of.
+   * Populated by channel.ts on connect via `im/v1/chats`. Used by
+   * `/config` to render the group whitelist dropdown — operators can
+   * still hand-paste chat_ids via the sibling text input for chats not in
+   * this cache (e.g. when the cache was truncated at 500).
+   */
+  knownChats: KnownChat[];
 }
 
 export interface CommandContext {
@@ -102,13 +123,15 @@ const handlers: Record<string, Handler> = {
   '/exit': handleExit,
   '/doctor': handleDoctor,
   '/reconnect': handleReconnect,
+  '/invite': handleInvite,
+  '/remove': handleRemove,
 };
 
 /**
  * Commands that can mutate credentials, lifecycle, filesystem reach, or
- * surface sensitive runtime state. Gated on the configured admin allowlist;
- * empty list = no restriction (every allowed user can run them — see
- * `isAdmin` in config/schema).
+ * surface sensitive runtime state. Gated on the admin allowlist + creator:
+ * empty admin list = only the bot creator (current Lark app owner) can
+ * run them. See `isAdmin` in config/schema.
  */
 const ADMIN_COMMANDS = new Set([
   '/account',
@@ -118,6 +141,8 @@ const ADMIN_COMMANDS = new Set([
   '/doctor',
   '/cd',
   '/ws',
+  '/invite',
+  '/remove',
 ]);
 
 function isAdminCommand(cmd: string): boolean {
@@ -132,7 +157,7 @@ export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
   const args = parts.slice(1).join(' ');
   const h = handlers[cmd];
   if (!h) return false;
-  if (isAdminCommand(cmd) && !isAdmin(ctx.controls.cfg, ctx.msg.senderId)) {
+  if (isAdminCommand(cmd) && !isAdmin(ctx.controls, ctx.msg.senderId)) {
     log.info('command', 'admin-deny', {
       cmd,
       sender: ctx.msg.senderId.slice(-6),
@@ -156,7 +181,7 @@ export async function runCommandHandler(
 ): Promise<boolean> {
   const h = handlers[`/${name}`];
   if (!h) return false;
-  if (isAdminCommand(name) && !isAdmin(ctx.controls.cfg, ctx.msg.senderId)) {
+  if (isAdminCommand(name) && !isAdmin(ctx.controls, ctx.msg.senderId)) {
     log.info('command', 'admin-deny', {
       cmd: name,
       sender: ctx.msg.senderId.slice(-6),
@@ -872,6 +897,216 @@ async function recallMessage(ctx: CommandContext, messageId: string): Promise<vo
   }
 }
 
+// ────────────── /invite — add to access whitelists ──────────────
+
+/**
+ * /invite manages access whitelists via slash commands. Replaces the in-form
+ * picker that didn't reliably search the Lark directory.
+ *
+ *   /invite user @user     → add the mentioned non-bot users to allowedUsers
+ *   /invite admin @user    → add them to admins
+ *   /invite group          → add the current chat_id to allowedChats
+ *
+ * Token order is flexible (the parser scans for the keyword anywhere),
+ * but the canonical form is keyword-first to match the way humans read
+ * the command aloud ("invite user @周杰").
+ *
+ * Admin-gated so a stranger who manages to reach the bot can't escalate
+ * themselves. Removals are done via the per-row buttons in /config.
+ */
+async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
+  const tokens = args.trim().split(/\s+/).filter(Boolean).map((t) => t.toLowerCase());
+
+  // `all group` — add every chat the bot is in, directly (no confirmation).
+  if (tokens.includes('all') && tokens.includes('group')) {
+    const access = { ...(ctx.controls.cfg.preferences?.access ?? {}) };
+    const list = new Set(access.allowedChats ?? []);
+    let added = 0;
+    for (const c of ctx.controls.knownChats) {
+      if (!list.has(c.id)) {
+        list.add(c.id);
+        added += 1;
+      }
+    }
+    access.allowedChats = [...list];
+    await persistAccess(ctx, access);
+    if (ctx.controls.knownChats.length === 0) {
+      await reply(ctx, '当前 bot 还不在任何群里，没有可加入的群。');
+    } else {
+      await reply(ctx, `✅ 已把 bot 所在的 ${added} 个群加入响应群名单（共 ${list.size} 个）。`);
+    }
+    return;
+  }
+
+  const kind = tokens.find((t) => /^(user|admin|group)$/.test(t)) as
+    | 'user'
+    | 'admin'
+    | 'group'
+    | undefined;
+  if (!kind) {
+    await reply(
+      ctx,
+      '用法：\n' +
+        '• `/invite user @某人` — 加入允许私聊\n' +
+        '• `/invite admin @某人` — 加入管理员\n' +
+        '• `/invite group` — 把当前群加入响应群名单\n' +
+        '• `/invite all group` — 把 bot 所在的所有群一键加入',
+    );
+    return;
+  }
+
+  const cfg = ctx.controls.cfg;
+  const access = { ...(cfg.preferences?.access ?? {}) };
+
+  if (kind === 'group') {
+    if (ctx.chatMode === 'p2p') {
+      await reply(ctx, '❌ `/invite group` 只能在群里发——在私聊里没有 chat_id 可以加。');
+      return;
+    }
+    const chatId = ctx.msg.chatId;
+    const list = new Set(access.allowedChats ?? []);
+    if (list.has(chatId)) {
+      await reply(ctx, '✅ 当前群已在白名单里，无需重复添加。');
+      return;
+    }
+    list.add(chatId);
+    access.allowedChats = [...list];
+    await persistAccess(ctx, access);
+    await reply(ctx, `✅ 已把当前群（\`${chatId}\`）加入响应群名单。`);
+    return;
+  }
+
+  // kind === 'user' or 'admin' — pull non-bot mentions
+  const targets = ctx.msg.mentions
+    .filter((m) => !m.isBot && typeof m.openId === 'string' && m.openId.length > 0)
+    .map((m) => ({ openId: m.openId as string, name: m.name }));
+  if (targets.length === 0) {
+    await reply(
+      ctx,
+      `❌ 没检测到 @ 的用户。请像这样发：\`/invite ${kind} @某人\`（注意 @ 用户不是 @ bot）。`,
+    );
+    return;
+  }
+  const listKey = kind === 'user' ? 'allowedUsers' : 'admins';
+  const list = new Set(access[listKey] ?? []);
+  const added: string[] = [];
+  const already: string[] = [];
+  for (const t of targets) {
+    if (list.has(t.openId)) already.push(t.name ?? t.openId);
+    else {
+      list.add(t.openId);
+      added.push(t.name ?? t.openId);
+    }
+  }
+  access[listKey] = [...list];
+  await persistAccess(ctx, access);
+  const label = kind === 'user' ? '用户白名单' : '管理员';
+  const parts: string[] = [];
+  if (added.length > 0) parts.push(`✅ 已把 ${added.join('、')} 加入${label}。`);
+  if (already.length > 0) parts.push(`_${already.join('、')} 已经在${label}里，跳过。_`);
+  await reply(ctx, parts.join('\n'));
+}
+
+/**
+ * `/remove` is the symmetrical counterpart of `/invite`:
+ *
+ *   /remove user  @某人   → drop from allowedUsers
+ *   /remove admin @某人   → drop from admins
+ *   /remove group         → drop the current chat from allowedChats
+ *
+ * Same admin gate as /invite. Targets that aren't on the list get a
+ * friendly "本来就不在名单里" note rather than an error.
+ */
+async function handleRemove(args: string, ctx: CommandContext): Promise<void> {
+  const tokens = args.trim().split(/\s+/).filter(Boolean).map((t) => t.toLowerCase());
+  const kind = tokens.find((t) => /^(user|admin|group)$/.test(t)) as
+    | 'user'
+    | 'admin'
+    | 'group'
+    | undefined;
+  if (!kind) {
+    await reply(
+      ctx,
+      '用法：\n' +
+        '• `/remove user @某人` — 移出用户白名单\n' +
+        '• `/remove admin @某人` — 移出管理员\n' +
+        '• `/remove group` — 把当前群移出响应群名单',
+    );
+    return;
+  }
+
+  const access = { ...(ctx.controls.cfg.preferences?.access ?? {}) };
+
+  if (kind === 'group') {
+    if (ctx.chatMode === 'p2p') {
+      await reply(ctx, '`/remove group` 请在要移除的群里发——私聊里没有可移除的群。');
+      return;
+    }
+    const chatId = ctx.msg.chatId;
+    const list = new Set(access.allowedChats ?? []);
+    if (!list.has(chatId)) {
+      await reply(ctx, '✅ 当前群本来就不在响应名单里，无需移除。');
+      return;
+    }
+    list.delete(chatId);
+    access.allowedChats = [...list];
+    await persistAccess(ctx, access);
+    await reply(ctx, `✅ 已把当前群移出响应群名单。`);
+    return;
+  }
+
+  const targets = ctx.msg.mentions
+    .filter((m) => !m.isBot && typeof m.openId === 'string' && m.openId.length > 0)
+    .map((m) => ({ openId: m.openId as string, name: m.name }));
+  if (targets.length === 0) {
+    await reply(ctx, `请 @ 上要移除的人，例如：\`/remove ${kind} @某人\`。`);
+    return;
+  }
+  const listKey = kind === 'user' ? 'allowedUsers' : 'admins';
+  const list = new Set(access[listKey] ?? []);
+  const removed: string[] = [];
+  const notThere: string[] = [];
+  for (const t of targets) {
+    if (list.has(t.openId)) {
+      list.delete(t.openId);
+      removed.push(t.name ?? t.openId);
+    } else {
+      notThere.push(t.name ?? t.openId);
+    }
+  }
+  access[listKey] = [...list];
+  await persistAccess(ctx, access);
+  const label = kind === 'user' ? '用户白名单' : '管理员';
+  const parts: string[] = [];
+  if (removed.length > 0) parts.push(`✅ 已把 ${removed.join('、')} 移出${label}。`);
+  if (notThere.length > 0) parts.push(`👌 ${notThere.join('、')} 本来就不在${label}里，无需移除。`);
+  await reply(ctx, parts.join('\n'));
+}
+
+/**
+ * Mutate cfg.preferences.access in place + persist to disk. Shared by
+ * /invite and /remove.
+ */
+async function persistAccess(
+  ctx: CommandContext,
+  newAccess: AppAccess,
+): Promise<void> {
+  ctx.controls.cfg.preferences = {
+    ...(ctx.controls.cfg.preferences ?? {}),
+    access: newAccess,
+  };
+  try {
+    await saveConfig(ctx.controls.cfg, ctx.controls.configPath);
+  } catch (err) {
+    log.fail('command', err, { step: 'invite.save' });
+  }
+  log.info('command', 'access-mutated', {
+    allowedUsers: newAccess.allowedUsers?.length ?? 0,
+    allowedChats: newAccess.allowedChats?.length ?? 0,
+    admins: newAccess.admins?.length ?? 0,
+  });
+}
+
 // ────────────── /config — preferences form ──────────────
 
 async function handleConfig(args: string, ctx: CommandContext): Promise<void> {
@@ -889,6 +1124,27 @@ async function handleConfig(args: string, ctx: CommandContext): Promise<void> {
 }
 
 async function showConfigForm(ctx: CommandContext): Promise<void> {
+  // Refresh the cached owner AND chat list on demand. The startup /
+  // 30-min refresh timer occasionally fails fetchKnownChats with a
+  // transient SDK token error ("Cannot destructure tenant_access_token"),
+  // leaving controls.knownChats empty — which makes the group whitelist
+  // render as "(未知群)" because the names can't be resolved. /config is a
+  // stable, user-triggered moment (these fetches succeed reliably here),
+  // so re-pull both and refresh the cache. Each fetch is independently
+  // guarded so one failing doesn't blank the other.
+  await Promise.all([
+    fetchAppOwnerId(ctx.channel, ctx.controls.cfg.accounts.app.id)
+      .then((ownerId) => {
+        if (ownerId) ctx.controls.botOwnerId = ownerId;
+      })
+      .catch(() => {}),
+    fetchKnownChats(ctx.channel)
+      .then((chats) => {
+        if (chats.length > 0) ctx.controls.knownChats = chats;
+      })
+      .catch(() => {}),
+  ]);
+
   const ms = getRunIdleTimeoutMs(ctx.controls.cfg);
   const access = ctx.controls.cfg.preferences?.access ?? {};
   const card = configFormCard({
@@ -897,12 +1153,38 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
     requireMentionInGroup: getRequireMentionInGroup(ctx.controls.cfg),
-    allowedUsers: (access.allowedUsers ?? []).join(', '),
-    allowedChats: (access.allowedChats ?? []).join(', '),
-    admins: (access.admins ?? []).join(', '),
+    allowedUsers: access.allowedUsers ?? [],
+    allowedChats: access.allowedChats ?? [],
+    admins: access.admins ?? [],
+    knownChats: ctx.controls.knownChats,
   });
   if (ctx.fromCardAction) await recallMessage(ctx, ctx.msg.messageId);
   await sendManagedCard(ctx.channel, ctx.msg.chatId, card);
+}
+
+/**
+ * Replace the form card in place with a result card. The managed-card map
+ * is per-process and wiped on restart (and after the card is forgotten),
+ * so `updateManagedCard` can throw "no managed card registered" for a card
+ * rendered by a previous process — which used to silently swallow the
+ * confirmation and make the user think their submit didn't take (they'd
+ * click again). On any update failure we fall back to posting a fresh
+ * card to the chat so there's always visible feedback after one submit.
+ */
+async function showResultCardInPlace(
+  ctx: CommandContext,
+  formMsgId: string,
+  card: object,
+): Promise<void> {
+  try {
+    await updateManagedCard(ctx.channel, formMsgId, card);
+  } catch (err) {
+    log.warn('command', 'config-card-update-fallback', { err: String(err) });
+    await sendManagedCard(ctx.channel, ctx.msg.chatId, card).catch((e) =>
+      log.warn('command', 'config-card-fallback-send-failed', { err: String(e) }),
+    );
+  }
+  forgetManagedCard(formMsgId);
 }
 
 async function cancelConfig(ctx: CommandContext): Promise<void> {
@@ -910,10 +1192,7 @@ async function cancelConfig(ctx: CommandContext): Promise<void> {
     const formMsgId = ctx.msg.messageId;
     void (async () => {
       await new Promise((r) => setTimeout(r, FORM_SETTLE_MS));
-      await updateManagedCard(ctx.channel, formMsgId, configCancelledCard()).catch((err) =>
-        log.warn('command', 'config-cancel-update-failed', { err: String(err) }),
-      );
-      forgetManagedCard(formMsgId);
+      await showResultCardInPlace(ctx, formMsgId, configCancelledCard());
     })();
   }
 }
@@ -959,64 +1238,15 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
   else if (rawRequireMention === 'no') requireMentionInGroup = false;
   else requireMentionInGroup = getRequireMentionInGroup(ctx.controls.cfg);
 
-  // Parse access lists. Comma-separated; trim each, drop empties, dedupe.
-  // Empty list = unrestricted (back-compat).
-  const parseList = (raw: unknown): string[] => {
-    return [...new Set(
-      String(raw ?? '')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    )];
-  };
-  const allowedUsers = parseList(fv.allowed_users);
-  const allowedChats = parseList(fv.allowed_chats);
-  const admins = parseList(fv.admins);
-
-  // Self-lockout guard: if the submitter sets a non-empty admins list that
-  // doesn't include themselves, they immediately lose the ability to reopen
-  // /config. Refuse the submit and tell them what's wrong.
-  if (admins.length > 0 && !admins.includes(ctx.msg.senderId)) {
-    log.warn('command', 'config-lockout-refused', {
-      kind: 'admins',
-      sender: ctx.msg.senderId.slice(-6),
-      proposedAdmins: admins.length,
-    });
-    await reply(
-      ctx,
-      `❌ 拒绝提交:你设置了非空的管理员列表,但其中不包含你自己的 open_id (\`${ctx.msg.senderId}\`)。这会立即把你自己锁出 /config。请把自己的 open_id 加进去再提交。`,
-    );
-    return;
-  }
-
-  // Symmetrical guard for chat allowlist: if the submitter restricts chats
-  // but the chat they're currently in isn't on the list, every message
-  // (including the next /config) is silently dropped at intake. Common
-  // mistake: filling in *another* chat's id and forgetting the current one.
-  //
-  // Skipped for p2p: `allowedChats` is group-only (see intakeMessage), so
-  // submitting from a DM never locks the submitter out regardless of the
-  // chat list contents. Using `chatMode` not `msg.chatType` because card
-  // submissions arrive with a synthesized msg that always has chatType='p2p'.
-  if (
-    ctx.chatMode !== 'p2p' &&
-    allowedChats.length > 0 &&
-    !allowedChats.includes(ctx.msg.chatId)
-  ) {
-    log.warn('command', 'config-lockout-refused', {
-      kind: 'chats',
-      currentChat: ctx.msg.chatId.slice(-6),
-      proposedChats: allowedChats.length,
-    });
-    await reply(
-      ctx,
-      `❌ 拒绝提交:你设置了非空的群白名单,但其中不包含当前会话的 chat_id (\`${ctx.msg.chatId}\`)。提交后这个会话的消息会被 intake 静默丢弃,bot 不再响应。要么把当前 chat_id 加进白名单,要么清空"群白名单"留待空(=所有会话都响应)。`,
-    );
-    return;
-  }
+  // Whitelists are managed entirely by /invite and /remove now — the
+  // /config form is read-only for access control. Pass the current values
+  // through unchanged so saving preferences doesn't clobber them.
+  const access = ctx.controls.cfg.preferences?.access ?? {};
+  const allowedUsers = access.allowedUsers ?? [];
+  const allowedChats = access.allowedChats ?? [];
+  const admins = access.admins ?? [];
 
   const formMsgId = ctx.msg.messageId;
-  const channel = ctx.channel;
   const configPath = ctx.controls.configPath;
 
   // Detach: same reason as account submit — Lark's client locks the form
@@ -1045,8 +1275,9 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
-      // Empty arrays serialize fine but read identically to omitted ones
-      // (isUserAllowed / isAdmin both treat length===0 as unrestricted).
+      // Empty arrays serialize fine. Under the post-2026-05 semantics
+      // empty list = nobody (DM / group whitelists) or only-creator (admins),
+      // so empty is meaningful, not a stand-in for "unrestricted".
       access: { allowedUsers, allowedChats, admins },
     };
 
@@ -1055,8 +1286,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
     } catch (err) {
       log.fail('command', err, { step: 'config.save' });
       await waitForSettle();
-      await updateManagedCard(channel, formMsgId, configCancelledCard()).catch(() => {});
-      forgetManagedCard(formMsgId);
+      await showResultCardInPlace(ctx, formMsgId, configCancelledCard());
       return;
     }
 
@@ -1071,8 +1301,8 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       adminsCount: admins.length,
     });
     await waitForSettle();
-    await updateManagedCard(
-      channel,
+    await showResultCardInPlace(
+      ctx,
       formMsgId,
       configSavedCard({
         messageReply,
@@ -1080,13 +1310,11 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         maxConcurrentRuns,
         runIdleTimeoutMinutes,
         requireMentionInGroup,
-        allowedUsers: allowedUsers.join(', '),
-        allowedChats: allowedChats.join(', '),
-        admins: admins.join(', '),
+        allowedUsers,
+        allowedChats,
+        admins,
+        knownChats: ctx.controls.knownChats,
       }),
-    ).catch((err) =>
-      log.warn('command', 'config-save-update-failed', { err: String(err) }),
     );
-    forgetManagedCard(formMsgId);
   })();
 }
