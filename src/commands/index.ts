@@ -25,7 +25,7 @@ import {
 } from '../config/schema';
 import { setSecret } from '../config/keystore';
 import { buildEncryptedAccountConfig, saveConfig } from '../config/store';
-import { log, readRecentLogs, sanitizeLogsForDoctor } from '../core/logger';
+import { log, readRecentLogs, reportMetric, sanitizeLogsForDoctor } from '../core/logger';
 import { renderCard } from '../card/run-renderer';
 import {
   finalizeIfRunning,
@@ -169,6 +169,7 @@ export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
     await h(args, ctx);
   } catch (err) {
     log.fail('command', err, { cmd });
+    reportMetric('command_fail', 1, { step: 'dispatch' });
   }
   return true;
 }
@@ -196,6 +197,7 @@ export async function runCommandHandler(
     await h(args, ctx);
   } catch (err) {
     log.fail('command', err, { cmd: name });
+    reportMetric('command_fail', 1, { step: 'handler' });
   }
   return true;
 }
@@ -210,6 +212,7 @@ async function reply(ctx: CommandContext, markdown: string): Promise<void> {
     await ctx.channel.send(ctx.msg.chatId, { markdown }, { replyTo: ctx.msg.messageId });
   } catch (err) {
     log.fail('command', err, { step: 'reply' });
+    reportMetric('command_fail', 1, { step: 'reply' });
   }
 }
 
@@ -572,6 +575,7 @@ async function handleReconnect(_args: string, ctx: CommandContext): Promise<void
     log.info('command', 'reconnect-ok');
   } catch (err) {
     log.fail('command', err, { step: 'reconnect' });
+    reportMetric('command_fail', 1, { step: 'reconnect' });
     await reply(ctx, `❌ 重连失败:${err instanceof Error ? err.message : String(err)}`);
   }
 }
@@ -723,6 +727,7 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
     }
   } catch (err) {
     log.fail('command', err, { step: 'doctor' });
+    reportMetric('command_fail', 1, { step: 'doctor' });
   } finally {
     ctx.activeRuns.unregister(ctx.scope, run);
   }
@@ -1099,6 +1104,7 @@ async function persistAccess(
     await saveConfig(ctx.controls.cfg, ctx.controls.configPath);
   } catch (err) {
     log.fail('command', err, { step: 'invite.save' });
+    reportMetric('command_fail', 1, { step: 'invite.save' });
   }
   log.info('command', 'access-mutated', {
     allowedUsers: newAccess.allowedUsers?.length ?? 0,
@@ -1285,6 +1291,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       await saveConfig(ctx.controls.cfg, configPath);
     } catch (err) {
       log.fail('command', err, { step: 'config.save' });
+      reportMetric('command_fail', 1, { step: 'config.save' });
       await waitForSettle();
       await showResultCardInPlace(ctx, formMsgId, configCancelledCard());
       return;

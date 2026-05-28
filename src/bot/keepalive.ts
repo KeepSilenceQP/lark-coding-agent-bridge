@@ -1,5 +1,5 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
-import { log } from '../core/logger';
+import { log, reportMetric } from '../core/logger';
 
 /**
  * App-level keepalive loop. Defense-in-depth against silent SDK / network
@@ -116,6 +116,7 @@ export function startKeepalive(deps: KeepaliveDeps): KeepaliveHandle {
     //     force-reconnecting.
     if (consecutiveDown >= DEAD_THRESHOLD) {
       log.warn('keepalive', 'force-reconnect', { state: status.state });
+      reportMetric('ws_reconnect', 1, { kind: 'keepalive' });
       consecutiveDown = 0;
       try {
         await forceReconnect();

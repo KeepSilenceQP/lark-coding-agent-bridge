@@ -31,7 +31,7 @@ import {
   isUserAllowed,
 } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
-import { log, withTrace } from '../core/logger';
+import { log, reportMetric, withTrace } from '../core/logger';
 import { MediaCache, type LocalAttachment } from '../media/cache';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
@@ -261,6 +261,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     reconnecting: () => {
       consecutiveReconnects++;
       log.warn('ws', 'reconnecting', { consecutive: consecutiveReconnects });
+      reportMetric('ws_reconnect', 1, { kind: 'ws' });
       // Stdout escalation — surface jitter that's hidden in the file log.
       if (consecutiveReconnects === 3) {
         console.error('⚠️ 已连续重连 3 次,网络可能不稳。');
@@ -699,6 +700,7 @@ async function processAgentStream(
   idleTimeoutMs: number | undefined,
   flush: (state: RunState) => Promise<void>,
 ): Promise<void> {
+  const runStart = Date.now();
   let state: RunState = initialState;
 
   // Idle watchdog: claude going silent for `idleTimeoutMs` is treated as
@@ -762,8 +764,16 @@ async function processAgentStream(
         continue;
       }
       if (evt.type === 'usage') {
-        if (evt.costUsd !== undefined) {
-          log.info('agent', 'usage', { costUsd: Number(evt.costUsd.toFixed(4)) });
+        const { costUsd, inputTokens, outputTokens } = evt;
+        if (costUsd !== undefined || inputTokens !== undefined || outputTokens !== undefined) {
+          log.info('agent', 'usage', {
+            ...(costUsd !== undefined ? { costUsd: Number(costUsd.toFixed(4)) } : {}),
+            ...(inputTokens !== undefined ? { inputTokens } : {}),
+            ...(outputTokens !== undefined ? { outputTokens } : {}),
+          });
+          if (costUsd !== undefined) reportMetric('cost_usd', costUsd);
+          if (inputTokens !== undefined) reportMetric('tokens_in', inputTokens);
+          if (outputTokens !== undefined) reportMetric('tokens_out', outputTokens);
         }
         continue;
       }
@@ -798,6 +808,7 @@ async function processAgentStream(
     }
   }
   log.info('card', 'final', { terminal: state.terminal, interrupted: handle.interrupted });
+  reportMetric('run_e2e_ms', Date.now() - runStart, { terminal: state.terminal });
   await flush(state);
     // Reap the subprocess. Two regimes:
   //  - Interrupted (user /stop, idle watchdog, disconnect): stop() was already
