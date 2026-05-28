@@ -1,4 +1,5 @@
 import dns from 'node:dns';
+import os from 'node:os';
 import { createInterface } from 'node:readline';
 import pkg from '../../../package.json';
 import { ClaudeAdapter } from '../../agent/claude/adapter';
@@ -86,6 +87,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
     version: pkg.version,
     appId: cfg.accounts.app.id,
     tenant: cfg.accounts.app.tenant,
+    hostname: os.hostname(),
   });
 
   const agent = new ClaudeAdapter();

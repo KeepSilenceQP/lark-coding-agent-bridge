@@ -42,6 +42,9 @@ export interface AdapterMeta {
   version: string;
   appId?: string;
   tenant?: string;
+  /** Host machine identifier (e.g. `os.hostname()`). Useful as a stable
+   *  `deviceId` for the telemetry sink — survives process restarts. */
+  hostname?: string;
 }
 
 /** The shape an external module must default-export (or expose as `createAdapter`). */
