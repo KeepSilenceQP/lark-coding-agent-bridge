@@ -130,6 +130,17 @@ function emit(level: Level, phase: string, event: string, fields: LogFields = {}
   } catch {
     /* never break logging */
   }
+  // Errors additionally fire recordError so Slardar's exception list (separate
+  // from the Custom Log list) also picks them up. `log.fail` puts the original
+  // error in `fields.err`; fall back to `phase.event` when not present.
+  if (level === 'error') {
+    try {
+      const errLike = fields.err ?? `${phase}.${event}`;
+      telemetry().recordError(errLike, { phase, event, ...ctx, ...fields });
+    } catch {
+      /* never break logging */
+    }
+  }
 
   // Stdout is the user-facing tail: warns, errors, and a curated list
   // of info events (WS lifecycle, message intake, run final). The full
