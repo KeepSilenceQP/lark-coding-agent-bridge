@@ -1,5 +1,5 @@
 import * as launchd from './launchd';
-import { WINDOWS_TASK_NAME, launchAgentPlistPath, systemdUnitPath } from './paths';
+import { launchAgentPlistPath, systemdUnitPath, windowsTaskName } from './paths';
 import * as schtasks from './schtasks';
 import * as systemd from './systemd';
 
@@ -61,22 +61,22 @@ export interface ServiceAdapter {
   parseStatus(text: string): { pid?: string; lastExit?: string };
 }
 
-function makeLaunchdAdapter(): ServiceAdapter {
+function makeLaunchdAdapter(profile: string): ServiceAdapter {
   return {
     platformName: 'launchd (macOS)',
-    fileExists: launchd.plistExists,
-    isRunning: launchd.isLoaded,
-    servicePath: launchAgentPlistPath,
-    install: launchd.writePlist,
-    start: launchd.bootstrap,
-    stop: launchd.bootout,
+    fileExists: () => launchd.plistExists(profile),
+    isRunning: () => launchd.isLoaded(profile),
+    servicePath: () => launchAgentPlistPath(profile),
+    install: () => launchd.writePlist(profile),
+    start: () => launchd.bootstrap(profile),
+    stop: () => launchd.bootout(profile),
     // launchd has no separate "disable" — bootout already removes the
     // service from launchd, which also nukes KeepAlive / RunAtLoad.
-    stopAndDisableAutostart: launchd.bootout,
-    restart: launchd.kickstart,
-    waitUntilStopped: launchd.waitUntilUnloaded,
-    deleteFile: launchd.deletePlist,
-    describeStatus: launchd.describeService,
+    stopAndDisableAutostart: () => launchd.bootout(profile),
+    restart: () => launchd.kickstart(profile),
+    waitUntilStopped: (timeoutMs) => launchd.waitUntilUnloaded(profile, timeoutMs),
+    deleteFile: () => launchd.deletePlist(profile),
+    describeStatus: () => launchd.describeService(profile),
     parseStatus: (text) => ({
       pid: text.match(/pid\s*=\s*(\d+)/)?.[1],
       lastExit: text.match(/last exit code\s*=\s*(-?\d+)/i)?.[1],
@@ -84,27 +84,27 @@ function makeLaunchdAdapter(): ServiceAdapter {
   };
 }
 
-function makeSystemdAdapter(): ServiceAdapter {
+function makeSystemdAdapter(profile: string): ServiceAdapter {
   return {
     platformName: 'systemd (Linux user)',
-    fileExists: systemd.unitExists,
-    isRunning: systemd.isActive,
-    servicePath: systemdUnitPath,
+    fileExists: () => systemd.unitExists(profile),
+    isRunning: () => systemd.isActive(profile),
+    servicePath: () => systemdUnitPath(profile),
     install: async () => {
-      await systemd.writeUnit();
+      await systemd.writeUnit(profile);
       // systemd needs daemon-reload after any unit file change.
       systemd.daemonReload();
     },
-    start: systemd.enableAndStart,
-    stop: systemd.stop,
-    stopAndDisableAutostart: systemd.disableAndStop,
-    restart: systemd.restart,
-    waitUntilStopped: systemd.waitUntilInactive,
+    start: () => systemd.enableAndStart(profile),
+    stop: () => systemd.stop(profile),
+    stopAndDisableAutostart: () => systemd.disableAndStop(profile),
+    restart: () => systemd.restart(profile),
+    waitUntilStopped: (timeoutMs) => systemd.waitUntilInactive(profile, timeoutMs),
     deleteFile: async () => {
-      await systemd.deleteUnit();
+      await systemd.deleteUnit(profile);
       systemd.daemonReload();
     },
-    describeStatus: systemd.describeService,
+    describeStatus: () => systemd.describeService(profile),
     // `systemctl status` includes a "Main PID:" line and an "Active:"
     // line. There's no single "last exit code" field in the standard
     // output but the "Process: <pid> ExecStart=... status=<n>" line on
@@ -116,29 +116,29 @@ function makeSystemdAdapter(): ServiceAdapter {
   };
 }
 
-function makeSchtasksAdapter(): ServiceAdapter {
+function makeSchtasksAdapter(profile: string): ServiceAdapter {
   return {
     platformName: 'Task Scheduler (Windows)',
-    fileExists: schtasks.isTaskRegistered,
-    isRunning: schtasks.isTaskRunning,
+    fileExists: () => schtasks.isTaskRegistered(profile),
+    isRunning: () => schtasks.isTaskRunning(profile),
     // Windows doesn't have a single "service file" — there's the task
     // registration (queryable via schtasks) and the launcher .cmd we wrote.
     // The task name is what the user would search for in Task Scheduler UI.
-    servicePath: () => WINDOWS_TASK_NAME,
+    servicePath: () => windowsTaskName(profile),
     install: async () => {
-      const r = await schtasks.installTask();
+      const r = await schtasks.installTask(profile);
       if (!r.ok) throw new Error(r.stderr || 'schtasks /Create failed');
     },
-    start: schtasks.runTask,
-    stop: schtasks.endTask,
-    stopAndDisableAutostart: schtasks.endAndDisable,
+    start: () => schtasks.runTask(profile),
+    stop: () => schtasks.endTask(profile),
+    stopAndDisableAutostart: () => schtasks.endAndDisable(profile),
     // schtasks has no native /Restart — adapter awaits end+wait+run.
-    restart: schtasks.restartTask,
-    waitUntilStopped: schtasks.waitUntilStopped,
+    restart: () => schtasks.restartTask(profile),
+    waitUntilStopped: (timeoutMs) => schtasks.waitUntilStopped(profile, timeoutMs),
     deleteFile: async () => {
-      await schtasks.deleteTask();
+      await schtasks.deleteTask(profile);
     },
-    describeStatus: schtasks.describeTask,
+    describeStatus: () => schtasks.describeTask(profile),
     parseStatus: (text) => ({
       // `Process ID: <n>` shows up in verbose listing only when task is running.
       pid: text.match(/Process ID:\s*(\d+)/i)?.[1],
@@ -154,9 +154,9 @@ function makeSchtasksAdapter(): ServiceAdapter {
  * Return the right adapter for the current platform, or null if this OS
  * isn't supported. Callers should null-check and surface a friendly error.
  */
-export function getServiceAdapter(): ServiceAdapter | null {
-  if (process.platform === 'darwin') return makeLaunchdAdapter();
-  if (process.platform === 'linux') return makeSystemdAdapter();
-  if (process.platform === 'win32') return makeSchtasksAdapter();
+export function getServiceAdapter(profile = 'claude'): ServiceAdapter | null {
+  if (process.platform === 'darwin') return makeLaunchdAdapter(profile);
+  if (process.platform === 'linux') return makeSystemdAdapter(profile);
+  if (process.platform === 'win32') return makeSchtasksAdapter(profile);
   return null;
 }

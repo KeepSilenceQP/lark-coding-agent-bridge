@@ -101,15 +101,32 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
     }
 
     case 'error': {
-      return { ...state, terminal: 'error', errorMsg: evt.message, footer: null };
+      const terminal =
+        evt.terminationReason === 'interrupted'
+          ? 'interrupted'
+          : evt.terminationReason === 'timeout'
+            ? 'idle_timeout'
+            : 'error';
+      return {
+        ...state,
+        terminal,
+        errorMsg: terminal === 'error' ? evt.message : state.errorMsg,
+        footer: null,
+      };
     }
 
     case 'done': {
+      const terminal =
+        evt.terminationReason === 'interrupted'
+          ? 'interrupted'
+          : evt.terminationReason === 'timeout'
+            ? 'idle_timeout'
+            : 'done';
       return {
         ...state,
         blocks: closeStreamingText(state.blocks),
         reasoning: { ...state.reasoning, active: false },
-        terminal: 'done',
+        terminal,
         footer: null,
       };
     }

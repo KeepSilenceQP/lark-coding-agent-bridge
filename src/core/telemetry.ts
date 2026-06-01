@@ -121,7 +121,7 @@ export async function loadTelemetryAdapter(meta: AdapterMeta): Promise<void> {
   const mod = process.env.LARK_CHANNEL_TELEMETRY_MODULE;
   if (!mod) return;
   try {
-    const imported = (await import(mod)) as {
+    const imported = (await import(normalizeModuleSpecifier(mod))) as {
       default?: unknown;
       createAdapter?: unknown;
     };
@@ -144,6 +144,10 @@ export async function loadTelemetryAdapter(meta: AdapterMeta): Promise<void> {
       err: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+function normalizeModuleSpecifier(specifier: string): string {
+  return specifier.startsWith('file:') ? specifier.replace(/%7E/gi, '~') : specifier;
 }
 
 /** The active adapter — noop until/unless `loadTelemetryAdapter` installs one. */

@@ -3,30 +3,42 @@ import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import type { ChatModeCache } from '../bot/chat-mode-cache';
 import type { PendingQueue } from '../bot/pending-queue';
+import type { ProcessPool } from '../bot/process-pool';
+import type { CallbackAuth } from './callback-auth';
 import { runCommandHandler, type CommandContext, type Controls } from '../commands';
-import { isChatAllowed, isUserAllowed } from '../config/schema';
 import { log } from '../core/logger';
+import { canUseDm, canUseGroup } from '../policy/access';
+import type { RunExecutor } from '../runtime/run-executor';
+import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
+import { commandSessionCatalogIdentity } from '../bot/session-catalog-identity';
 
 /** Marker key on a button's value object that flags the cardAction as
- * a callback that should be forwarded back to the agent (Claude) instead
+ * a callback that should be forwarded back to the agent instead
  * of dispatched to a built-in command handler. The double-underscore
  * sigils make it virtually impossible to collide with normal payload
  * fields the agent might set.
  */
-const CLAUDE_CALLBACK_MARKER = '__claude_cb';
+const BRIDGE_CALLBACK_MARKER = '__bridge_cb';
+const LEGACY_CLAUDE_CALLBACK_MARKER = '__claude_cb';
 
 export interface CardDispatchDeps {
   channel: LarkChannel;
   evt: CardActionEvent;
   sessions: SessionStore;
+  sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   activeRuns: ActiveRuns;
   agent: AgentAdapter;
+  processPool?: ProcessPool;
+  runExecutor?: RunExecutor;
   controls: Controls;
   pending: PendingQueue;
   chatModeCache: ChatModeCache;
+  callbackAuth?: CallbackAuth;
+  callbackPolicyFingerprint?: string;
+  callbackPolicyFingerprintForScope?: (scope: string) => string | undefined;
 }
 
 export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
@@ -52,62 +64,80 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   // and can skip the chat allowlist for DMs.
   const { scope, threadId, mode } = await resolveScope(deps);
 
-  // Access control. Operator must pass the same gates as message senders.
-  // Silent drop — sending a denial card to an unauthorized user just
-  // confirms the bot exists. See intakeMessage in bot/channel.ts and
-  // schema.ts AppAccess docstring for the post-2026-05 semantics.
-  const isP2p = mode === 'p2p';
-  if (!isUserAllowed(deps.controls, operatorId, isP2p)) {
+  const accessDecision =
+    mode === 'p2p'
+      ? canUseDm(deps.controls.profileConfig, deps.controls, operatorId)
+      : canUseGroup(deps.controls.profileConfig, deps.controls, chatId, operatorId);
+  if (!accessDecision.ok) {
     log.info('cardAction', 'skip-not-allowed-user', {
       operator: operatorId.slice(-6),
-    });
-    return;
-  }
-  if (!isP2p && !isChatAllowed(deps.controls, chatId, operatorId)) {
-    log.info('cardAction', 'skip-not-allowed-chat', {
-      chatId: chatId.slice(-6),
-      operator: operatorId.slice(-6),
+      reason: accessDecision.reason,
     });
     return;
   }
 
-  // Claude-driven callback: the button was rendered by claude itself via
-  // lark-cli, with `__claude_cb` set on the value. Forward the click back
-  // into the scope's pending queue so claude resumes its session and sees
-  // the click as a follow-up message, with full context of what it sent.
-  if (CLAUDE_CALLBACK_MARKER in payload) {
-    forwardToClaude(deps, payload, formValue, scope, threadId);
+  if (LEGACY_CLAUDE_CALLBACK_MARKER in payload) {
+    log.info('cardAction', 'skip-legacy-callback-marker', { scope });
     return;
   }
 
   const cmd = typeof payload.cmd === 'string' ? payload.cmd : '';
-  if (!cmd) return;
-  log.info('cardAction', 'cmd', { cmd, scope });
+  if (cmd) {
+    if (isSignedBridgeCallback(payload) && !verifyBridgeToken(deps, payload, scope, cmd)) {
+      return;
+    }
+    log.info('cardAction', 'cmd', { cmd, scope });
+    const msg = makeFakeMsg(deps.evt, threadId);
 
-  const ctx: CommandContext = {
-    channel: deps.channel,
-    msg: makeFakeMsg(deps.evt, threadId),
-    scope,
-    chatMode: mode,
-    sessions: deps.sessions,
-    workspaces: deps.workspaces,
-    activeRuns: deps.activeRuns,
-    agent: deps.agent,
-    controls: deps.controls,
-    formValue,
-    fromCardAction: true,
-  };
+    const ctx: CommandContext = {
+      channel: deps.channel,
+      msg,
+      scope,
+      chatMode: mode,
+      sessions: deps.sessions,
+      sessionCatalog: deps.sessionCatalog,
+      sessionCatalogIdentity: await commandSessionCatalogIdentity({
+        msg,
+        scope,
+        mode,
+        workspaces: deps.workspaces,
+        controls: deps.controls,
+        access: accessDecision,
+      }),
+      workspaces: deps.workspaces,
+      activeRuns: deps.activeRuns,
+      agent: deps.agent,
+      processPool: deps.processPool,
+      runExecutor: deps.runExecutor,
+      controls: deps.controls,
+      formValue,
+      fromCardAction: true,
+    };
 
-  const [name, ...rest] = cmd.split('.');
-  const sub = rest.join(' ');
-  const args = composeArgs(sub, payload);
+    const [name, ...rest] = cmd.split('.');
+    const sub = rest.join(' ');
+    const args = composeArgs(sub, payload);
 
-  try {
-    const ok = await runCommandHandler(name ?? '', args, ctx);
-    if (!ok) log.warn('cardAction', 'unknown', { cmd });
-  } catch (err) {
-    log.fail('cardAction', err, { cmd });
+    try {
+      const ok = await runCommandHandler(name ?? '', args, ctx);
+      if (!ok) log.warn('cardAction', 'unknown', { cmd });
+    } catch (err) {
+      log.fail('cardAction', err, { cmd });
+    }
+    return;
   }
+
+  // Agent-driven callback: the button was rendered by an agent via lark-cli,
+  // with `__bridge_cb` set on the value. Forward the click back into the
+  // scope's pending queue so the agent resumes its session and sees the click
+  // as a follow-up message, with full context of what it sent.
+  if (BRIDGE_CALLBACK_MARKER in payload) {
+    if (!verifyBridgeToken(deps, payload, scope, 'agent_callback')) return;
+    forwardToAgent(deps, payload, formValue, scope, threadId, mode);
+    return;
+  }
+
+  return;
 }
 
 async function resolveScope(
@@ -147,24 +177,29 @@ async function lookupMessageThreadId(
   }
 }
 
-function forwardToClaude(
+function forwardToAgent(
   deps: CardDispatchDeps,
   payload: Record<string, unknown>,
   formValue: Record<string, unknown> | undefined,
   scope: string,
   threadId: string | undefined,
+  mode: 'p2p' | 'group' | 'topic',
 ): void {
-  // Strip the marker so claude only sees the meaningful fields it set.
-  const { [CLAUDE_CALLBACK_MARKER]: _marker, ...claudePayload } = payload;
-  const merged = formValue ? { ...claudePayload, form_value: formValue } : claudePayload;
-  log.info('cardAction', 'forward-claude', {
+  // Strip the marker so the agent only sees the meaningful fields it set.
+  const {
+    [BRIDGE_CALLBACK_MARKER]: _marker,
+    bridge_token: _token,
+    ...agentPayload
+  } = payload;
+  const merged = formValue ? { ...agentPayload, form_value: formValue } : agentPayload;
+  log.info('cardAction', 'forward-agent', {
     scope,
     payload: JSON.stringify(merged).slice(0, 200),
   });
   const synthetic: NormalizedMessage = {
     messageId: deps.evt.messageId,
     chatId: deps.evt.chatId,
-    chatType: 'p2p',
+    chatType: mode === 'p2p' ? 'p2p' : 'group',
     threadId,
     senderId: deps.evt.operator.openId,
     senderName: deps.evt.operator.name,
@@ -177,6 +212,46 @@ function forwardToClaude(
     createTime: Date.now(),
   };
   deps.pending.push(scope, synthetic);
+}
+
+function verifyBridgeToken(
+  deps: CardDispatchDeps,
+  payload: Record<string, unknown>,
+  scope: string,
+  action: string,
+): boolean {
+  const token = typeof payload.bridge_token === 'string' ? payload.bridge_token : '';
+  const active = deps.activeRuns.get(scope);
+  if (!deps.callbackAuth || !token || !active) {
+    log.info('cardAction', 'skip-callback-auth-missing', { scope, action });
+    log.warn('callback', 'denied', { scope, action, reason: 'missing-token-or-run' });
+    return false;
+  }
+  const result = deps.callbackAuth.verify(token, {
+    runId: active.run.runId,
+    scope,
+    chatId: deps.evt.chatId,
+    operatorOpenId: deps.evt.operator.openId,
+    action,
+    policyFingerprint:
+      deps.callbackPolicyFingerprintForScope?.(scope) ??
+      deps.callbackPolicyFingerprint ??
+      '',
+  });
+  if (!result.ok) {
+    log.info('cardAction', 'skip-callback-auth-failed', {
+      scope,
+      action,
+      reason: result.reason,
+    });
+    log.warn('callback', 'denied', { scope, action, reason: result.reason });
+    return false;
+  }
+  return true;
+}
+
+function isSignedBridgeCallback(payload: Record<string, unknown>): boolean {
+  return BRIDGE_CALLBACK_MARKER in payload || typeof payload.bridge_token === 'string';
 }
 
 /** Turn a button payload like {cmd:'ws.use', name:'proj-a'} into the arg

@@ -1,32 +1,58 @@
-import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import type { CommentEvent, LarkChannel } from '@larksuiteoapi/node-sdk';
-import type { AgentAdapter } from '../agent/types';
+import { claudeCapability, codexCapability } from '../agent/capability';
+import type { AgentAdapter, AgentEvent } from '../agent/types';
+import { getAgentStopGraceMs } from '../config/schema';
+import type { Controls } from '../commands';
+import { resolveAppPaths } from '../config/app-paths';
 import { log } from '../core/logger';
+import { evaluateRunPolicy } from '../policy/run-policy';
+import { resolveWorkingDirectory } from '../policy/workspace';
+import { RunRejected } from '../runtime/errors';
+import type { ActiveRuns } from './active-runs';
+import { recordRunSessionEvent } from './run-flow';
+import type { RunExecutor } from '../runtime/run-executor';
+import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 import { addCommentReaction, removeCommentReaction } from './reaction';
+import {
+  commentDocumentScopeId,
+  commentScopeId,
+  commentTokenDigest,
+  resolveCommentTarget,
+  type ResolvedCommentTarget,
+} from './comment-resource';
+
+export { commentDocumentScopeId, commentScopeId } from './comment-resource';
 
 export interface CommentDeps {
   channel: LarkChannel;
   evt: CommentEvent;
   agent: AgentAdapter;
   sessions: SessionStore;
+  sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
+  activeRuns?: ActiveRuns;
+  executor: RunExecutor;
+  controls: Controls;
 }
 
 // File types supported by drive.v1.fileComment.get; other types (slides,
 // bitable, mindnote) use different APIs and are out of scope for now.
-const SUPPORTED_FILE_TYPES = new Set(['doc', 'docx', 'sheet', 'file']);
-
 const REPLY_MAX_CHARS = 2000;
+const SUPPORTED_FILE_TYPES = new Set(['doc', 'docx', 'sheet', 'file']);
+const activeCommentAgentSessionRuns = new Map<string, number>();
 
-interface ReplyContentElement {
+export interface ReplyContentElement {
   type: 'text_run' | 'docs_link' | 'person';
   text_run?: { text: string };
   docs_link?: { url: string };
   person?: { user_id: string };
 }
-interface CommentReply {
+export interface CommentReply {
   reply_id?: string;
   content?: { elements?: ReplyContentElement[] };
 }
@@ -43,7 +69,7 @@ interface CommentListResponse {
   data?: { items?: CommentListItem[]; has_more?: boolean; page_token?: string };
 }
 
-interface CommentContext {
+export interface CommentContext {
   question: string;
   quote?: string;
   isWhole: boolean;
@@ -53,21 +79,33 @@ interface CommentContext {
   targetReplyId?: string;
 }
 
+export interface ExtractCommentQuestionInput {
+  replyId?: string;
+  replies: CommentReply[];
+}
+
+export interface ExtractCommentQuestionResult {
+  question: string;
+  targetReplyId?: string;
+}
+
 /**
  * Handle a `comment` event: when the bot is @-mentioned in a cloud-doc
  * comment, fetch the comment text, run the agent, and post the answer as
  * a reply in the same comment thread.
  */
 export async function handleCommentMention(deps: CommentDeps): Promise<void> {
-  const { channel, evt, agent, sessions, workspaces } = deps;
+  const { channel, evt, sessions, sessionCatalog, workspaces, controls } = deps;
+  const eventDocScopeId = commentDocumentScopeId(evt.fileToken);
+  const eventCommentScopeId = commentScopeId(evt.fileToken, evt.commentId);
   // Log every comment event we receive, regardless of whether we'll act on it.
   // `mentionedBot` and `replyId` here let us tell apart top-level comments
   // from thread replies (the latter requires SDK ≥ 1.65.0-alpha.0).
   log.info('comment', 'enter', {
-    doc: evt.fileToken,
+    docScopeId: eventDocScopeId,
     fileType: evt.fileType,
-    commentId: evt.commentId,
-    replyId: evt.replyId,
+    commentScopeId: eventCommentScopeId,
+    replyDigest: evt.replyId ? commentTokenDigest(evt.replyId) : undefined,
     mentionedBot: evt.mentionedBot,
     sender: evt.operator.openId,
   });
@@ -79,17 +117,29 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
     log.info('comment', 'skip', { reason: 'unsupported-fileType', fileType: evt.fileType });
     return;
   }
-
-  const target = await resolveTarget(channel, evt);
-  if (!target) {
-    log.info('comment', 'skip', { reason: 'unsupported-target' });
+  if (isBridgeSelfReply(channel, evt)) {
+    log.info('comment', 'skip', {
+      reason: 'bridge-self-reply',
+      commentScopeId: eventCommentScopeId,
+    });
     return;
   }
+  const target = await resolveCommentTarget(channel, evt);
+  if (!target) {
+    log.info('comment', 'skip', { reason: 'unsupported-target', commentScopeId: eventCommentScopeId });
+    return;
+  }
+  const targetDocScopeId = commentDocumentScopeId(target.fileToken);
+  const commentThreadScopeId = eventCommentScopeId;
+  const runScopeId = commentExecutionScopeId(commentThreadScopeId);
+  const docSessionScopeId = commentDocumentSessionScopeId(target.fileToken);
+  const legacyDocSessionScopeId = legacyCommentDocumentSessionScopeId(target.fileToken);
+  const agentSessionScopeId = docSessionScopeId;
 
   const ctx = await fetchCommentContext(channel, target, evt).catch((err) => {
     const code = (err as { response?: { data?: { code?: number } } })?.response?.data?.code;
     if (code === 1069307) {
-      log.warn('comment', 'no-access', { token: target.fileToken });
+      log.warn('comment', 'no-access', { docDigest: commentTokenDigest(target.fileToken) });
     } else {
       log.fail('comment', err, { step: 'fetchCommentContext' });
     }
@@ -100,20 +150,40 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
     return;
   }
   log.info('comment', 'parsed', {
+    commentScopeId: runScopeId,
     isWhole: ctx.isWhole,
     questionPreview: preview(ctx.question),
     hasQuote: Boolean(ctx.quote),
   });
   const prompt = buildCommentPrompt(target, ctx);
-
-  // One Claude session per cloud-doc; subsequent @-mentions in the same
-  // doc continue the same conversation. cwd defaults to $HOME — the agent
-  // probably won't do filesystem work for doc replies but we keep a sane
-  // default in case it does.
-  const synthChatId = `doc:${evt.fileToken}`;
-  const cwd = workspaces.cwdFor(synthChatId) ?? homedir();
-  const resumeFrom = sessions.resumeFor(synthChatId, cwd);
-  log.info('comment', 'session', { synthChatId, resumeFrom: resumeFrom ?? null, cwd });
+  const workspace = await resolveCommentWorkingDirectory(
+    workspaces.cwdFor(docSessionScopeId) ?? workspaces.cwdFor(legacyDocSessionScopeId),
+    controls.profileConfig.workspaces.default,
+    managedDefaultWorkspaceForComments(controls),
+  );
+  const requestedCwd = workspace.requestedCwd;
+  const cwdRealpath = workspace.cwdRealpath;
+  if (workspace.ok && workspace.fallback) {
+    log.info('comment', 'workspace-fallback', {
+      reason: workspace.fallback.reason,
+      from: workspace.fallback.from,
+      to: workspace.fallback.to,
+      commentScopeId: runScopeId,
+    });
+  }
+  if (!workspace.ok) {
+    log.info('comment', 'skip', {
+      reason: 'workspace-rejected',
+      code: workspace.reason,
+      commentScopeId: runScopeId,
+    });
+    await postCommentReply(channel, target, evt, `工作目录不可用：${workspace.userVisible}`, {
+      isWhole: ctx.isWhole,
+    }).catch((err) => {
+      log.fail('comment', err, { step: 'postInvalidWorkspaceReply' });
+    });
+    return;
+  }
 
   // Cloud-doc comments have no streaming UI — the user just sees their
   // @-mention sit there until our reply lands. Mark the triggering reply
@@ -124,50 +194,210 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
     : false;
 
   try {
-    const run = agent.run({ prompt, sessionId: resumeFrom, cwd });
-    let answer = '';
-    let errorMsg: string | undefined;
-    let terminal = false;
-    for await (const e of run.events) {
-      switch (e.type) {
-        case 'text':
-          answer += e.delta;
-          break;
-        case 'system':
-          if (e.sessionId) {
-            const effectiveCwd = e.cwd ?? cwd;
-            sessions.set(synthChatId, e.sessionId, effectiveCwd);
-          }
-          break;
-        case 'error':
-          errorMsg = e.message;
-          terminal = true;
-          break;
-        case 'usage':
-          if (e.costUsd !== undefined) {
-            log.info('comment', 'usage', { costUsd: Number(e.costUsd.toFixed(4)) });
-          }
-          break;
-        case 'done':
-          terminal = true;
-          break;
-      }
-      // Don't wait for the subprocess to actually close stdout — break as soon
-      // as we have the final result. Some claude versions hang briefly post-
-      // result on telemetry, which would leave the for-await stuck forever.
-      if (terminal) break;
+    const capability =
+      controls.profileConfig.agentKind === 'codex'
+        ? codexCapability(controls.profileConfig)
+        : claudeCapability(controls.profileConfig);
+    const runTimeoutMs = commentRunTimeoutMs(sessions, runScopeId);
+    const threadTimeoutMs = commentRunTimeoutMs(sessions, commentThreadScopeId);
+    const commentTimeoutMs = runTimeoutMs !== undefined ? runTimeoutMs : threadTimeoutMs;
+    if (typeof commentTimeoutMs === 'number') {
+      log.info('comment', 'timeout-watchdog', { commentScopeId: runScopeId, timeoutMs: commentTimeoutMs });
     }
-    // Reap the subprocess if it didn't exit on its own. No-op if already gone.
-    await run.stop();
-
-    let reply = stripMarkdown(answer.trim());
-    if (errorMsg) reply = `⚠️ Claude 报错：${errorMsg}`;
-    if (!reply) reply = '（无回复内容）';
-    if (reply.length > REPLY_MAX_CHARS) reply = `${reply.slice(0, REPLY_MAX_CHARS - 1)}…`;
-
-    await postCommentReply(channel, target, evt, reply).catch((err) => {
-      log.fail('comment', err, { step: 'postCommentReply' });
+    const policy = evaluateRunPolicy({
+      scope: {
+        source: 'comment',
+        actorId: evt.operator.openId,
+        commentScopeId: agentSessionScopeId,
+        resourceBindings: [{ kind: 'doc', id: targetDocScopeId, verified: true }],
+      },
+      attachments: [],
+      prompt,
+      requestedCwd,
+      cwdRealpath,
+      access: { ok: true, reason: 'comment-mention' },
+      capability,
+      profileConfig: controls.profileConfig,
+      now: Date.now(),
+      codexHome: controls.profileConfig.codex?.codexHome,
+      inheritCodexHome: controls.profileConfig.codex?.inheritCodexHome,
+      ...(typeof commentTimeoutMs === 'number' ? { ttlMs: commentTimeoutMs } : {}),
     });
+    if (!policy.ok) {
+      log.warn('policy', 'denied', {
+        scope: runScopeId,
+        source: 'comment',
+        code: policy.rejectReason.code,
+      });
+      return;
+    }
+    const commentExpiresAt = typeof commentTimeoutMs === 'number' ? policy.expiresAt : undefined;
+
+    const agentSessionRun = markCommentAgentSessionRun(agentSessionScopeId);
+    try {
+      const canResumeAgentSession = !agentSessionRun.wasActive;
+      const catalogEntry = canResumeAgentSession
+        ? sessionCatalog?.activeFor({
+            scopeId: agentSessionScopeId,
+            agentId: capability.agentId,
+            cwdRealpath,
+            policyFingerprint: policy.policyFingerprint,
+          }) ??
+          sessionCatalog?.activeFor({
+            scopeId: legacyDocSessionScopeId,
+            agentId: capability.agentId,
+            cwdRealpath,
+            policyFingerprint: policy.policyFingerprint,
+          })
+        : undefined;
+      const sessionId =
+        canResumeAgentSession && capability.agentId === 'claude'
+          ? sessions.resumeFor(docSessionScopeId, cwdRealpath) ??
+            sessions.resumeFor(legacyDocSessionScopeId, cwdRealpath)
+          : undefined;
+      const threadId = capability.agentId === 'codex' ? catalogEntry?.threadId : undefined;
+      log.info('comment', 'session', {
+        commentScopeId: runScopeId,
+        sessionScopeId: agentSessionScopeId,
+        resume: Boolean(sessionId ?? threadId),
+        sessionScopeActive: agentSessionRun.wasActive,
+        cwd: cwdRealpath,
+      });
+
+      const execution = await deps.executor.submit({
+        scopeId: runScopeId,
+        policy,
+        sessionId,
+        threadId,
+        stopGraceMs: getAgentStopGraceMs(controls.cfg),
+        observability: {
+          profile: controls.profile,
+          agent: capability.agentId,
+          source: 'comment',
+          stage: 'submit',
+        },
+      }).catch(async (err: unknown) => {
+        if (err instanceof RunRejected) {
+          log.info('comment', 'skip', {
+            reason: err.code,
+            commentScopeId: runScopeId,
+          });
+          const reply = commentRunRejectedReply(err.code);
+          if (reply) {
+            await postCommentReply(channel, target, evt, reply, { isWhole: ctx.isWhole }).catch((replyErr) => {
+              log.fail('comment', replyErr, { step: 'postRunRejectedReply' });
+            });
+          }
+          return undefined;
+        }
+        throw err;
+      });
+      if (!execution) return;
+      let answer = '';
+      let errorMsg: string | undefined;
+      let terminal = false;
+      let timedOut = false;
+      const eventStream = execution.subscribe()[Symbol.asyncIterator]();
+      try {
+        while (true) {
+          const next = await nextCommentEvent(eventStream, commentExpiresAt);
+          if (next === 'expired') {
+            await execution.stop().catch((err) => {
+              log.warn('comment', 'expired-stop-failed', {
+                commentScopeId: runScopeId,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            });
+            timedOut = true;
+            terminal = true;
+            break;
+          }
+          if (commentExpiresAt !== undefined && Date.now() > commentExpiresAt) {
+            await execution.stop().catch((err) => {
+              log.warn('comment', 'expired-stop-failed', {
+                commentScopeId: runScopeId,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            });
+            timedOut = true;
+            terminal = true;
+            break;
+          }
+          if (next.done || execution.handle.interrupted) {
+            terminal = true;
+            break;
+          }
+          const e = next.value;
+          recordCommentSessionEvent({
+            scopeId: agentSessionScopeId,
+            sessions,
+            sessionCatalog,
+            capability,
+            policy,
+            event: e,
+          });
+          if (capability.agentId === 'claude' && e.type === 'system' && e.sessionId) {
+            sessions.set(docSessionScopeId, e.sessionId, policy.cwdRealpath);
+          }
+          switch (e.type) {
+            case 'text':
+              answer += e.delta;
+              break;
+            case 'system':
+              break;
+            case 'error':
+              errorMsg = e.message;
+              terminal = true;
+              break;
+            case 'usage':
+              break;
+            case 'done':
+              terminal = true;
+              break;
+          }
+          // Don't wait for the subprocess to actually close stdout — break as soon
+          // as we have the final result. Some claude versions hang briefly post-
+          // result on telemetry, which would leave the for-await stuck forever.
+          if (terminal) break;
+        }
+      } finally {
+        await eventStream.return?.();
+      }
+
+      if (timedOut) {
+        log.info('comment', 'reply-skip', {
+          reason: 'policy-expired',
+          commentScopeId: runScopeId,
+        });
+        await postCommentReply(channel, target, evt, '本次评论任务已超时，请重新 @ 我。', { isWhole: ctx.isWhole }).catch((err) => {
+          log.fail('comment', err, { step: 'postTimeoutReply' });
+        });
+        return;
+      }
+
+      if (execution.handle.interrupted) {
+        log.info('comment', 'reply-skip', {
+          reason: 'interrupted',
+          commentScopeId: runScopeId,
+        });
+        return;
+      }
+
+      let reply = stripMarkdown(answer.trim());
+      if (errorMsg) reply = `⚠️ Claude 报错：${errorMsg}`;
+      if (!reply) reply = '（无回复内容）';
+      if (reply.length > REPLY_MAX_CHARS) reply = `${reply.slice(0, REPLY_MAX_CHARS - 1)}…`;
+
+      await postCommentReply(channel, target, evt, reply, { isWhole: ctx.isWhole }).catch((err) => {
+        log.fail('comment', err, { step: 'postCommentReply' });
+        log.warn('comment', 'reply_failed', {
+          commentScopeId: runScopeId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    } finally {
+      agentSessionRun.release();
+    }
   } finally {
     if (reactionAdded && ctx.targetReplyId) {
       await removeCommentReaction(
@@ -180,50 +410,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
   }
 }
 
-interface ResolvedTarget {
-  fileToken: string;
-  fileType: 'doc' | 'docx' | 'sheet' | 'file';
-}
-
-/**
- * Resolve the (fileToken, fileType) we should hit for the comment APIs.
- * If the event token is a wiki node, swap to the underlying obj_token.
- * Otherwise pass through.
- */
-async function resolveTarget(
-  channel: LarkChannel,
-  evt: CommentEvent,
-): Promise<ResolvedTarget | null> {
-  const passthrough: ResolvedTarget = {
-    fileToken: evt.fileToken,
-    fileType: evt.fileType as ResolvedTarget['fileType'],
-  };
-  if (!SUPPORTED_FILE_TYPES.has(evt.fileType)) return null;
-
-  // Try wiki node lookup; if the token isn't a wiki node, this throws and we
-  // fall back to the original token.
-  try {
-    const r = (await channel.rawClient.wiki.v2.space.getNode({
-      params: { token: evt.fileToken },
-    })) as {
-      data?: { node?: { obj_token?: string; obj_type?: string } };
-    };
-    const node = r?.data?.node;
-    if (node?.obj_token && node.obj_type && SUPPORTED_FILE_TYPES.has(node.obj_type)) {
-      log.info('comment', 'wiki-resolved', {
-        objToken: node.obj_token,
-        objType: node.obj_type,
-      });
-      return {
-        fileToken: node.obj_token,
-        fileType: node.obj_type as ResolvedTarget['fileType'],
-      };
-    }
-  } catch {
-    // not a wiki node — fall through to passthrough
-  }
-  return passthrough;
-}
+export type ResolvedTarget = ResolvedCommentTarget;
 
 async function fetchCommentContext(
   channel: LarkChannel,
@@ -245,17 +432,33 @@ async function fetchCommentContext(
     isWhole = Boolean(r?.data?.is_whole);
   } catch (err) {
     const code = (err as { response?: { data?: { code?: number } } })?.response?.data?.code;
-    log.warn('comment', 'get-failed-fallback-list', { code });
+    log.info('comment', 'get-fallback-list', { code });
     const found = await findCommentViaList(channel, target, evt.commentId);
     replies = found?.reply_list?.replies ?? [];
     quote = found?.quote || undefined;
     isWhole = Boolean(found?.is_whole);
   }
 
-  const target_reply =
-    (evt.replyId ? replies.find((rr) => rr.reply_id === evt.replyId) : null) ??
-    replies[replies.length - 1];
-  const elements = target_reply?.content?.elements ?? [];
+  const parsed = extractCommentQuestionFromReplies({ replyId: evt.replyId, replies });
+  return {
+    question: parsed?.question ?? '',
+    quote,
+    isWhole,
+    targetReplyId: parsed?.targetReplyId,
+  };
+}
+
+export function extractCommentQuestionFromReplies(
+  input: ExtractCommentQuestionInput,
+): ExtractCommentQuestionResult | null {
+  let targetReply: CommentReply | undefined;
+  if (input.replyId) {
+    targetReply = input.replies.find((reply) => reply.reply_id === input.replyId);
+  }
+  targetReply ??= input.replies.at(-1);
+  if (!targetReply) return null;
+
+  const elements = targetReply.content?.elements ?? [];
   const question = elements
     .map((el) => {
       if (el.type === 'text_run') return el.text_run?.text ?? '';
@@ -264,8 +467,7 @@ async function fetchCommentContext(
     })
     .join('')
     .trim();
-
-  return { question, quote, isWhole, targetReplyId: target_reply?.reply_id };
+  return { question, targetReplyId: targetReply.reply_id };
 }
 
 async function findCommentViaList(
@@ -292,10 +494,10 @@ async function findCommentViaList(
   return null;
 }
 
-function buildCommentPrompt(target: ResolvedTarget, ctx: CommentContext): string {
-  // Construct a doc URL Claude can hand to lark-cli. The exact subdomain
-  // depends on the user's tenant, but feishu.cn / larksuite.com generic
-  // hosts redirect properly within the tenant.
+export function buildCommentPrompt(
+  target: ResolvedTarget,
+  ctx: CommentContext,
+): string {
   const docUrl = `https://feishu.cn/${target.fileType}/${target.fileToken}`;
   const parts: string[] = [];
   parts.push('我在飞书云文档里被 @了。文档信息：');
@@ -312,9 +514,10 @@ function buildCommentPrompt(target: ResolvedTarget, ctx: CommentContext): string
   parts.push('');
   parts.push(`用户的问题：${ctx.question}`);
   parts.push('');
+  parts.push(commentReadInstruction(target));
+  parts.push('');
   parts.push(
-    '需要读文档内容时，可以用 lark-cli：\n' +
-      `  \`lark-cli docs +fetch --doc ${target.fileToken}\``,
+    '评论回复由 bridge 负责：不要调用云文档评论或回复接口，也不要给评论添加或删除 reaction；最终答案直接用纯文本交给 bridge。',
   );
   parts.push('');
   parts.push(
@@ -323,12 +526,223 @@ function buildCommentPrompt(target: ResolvedTarget, ctx: CommentContext): string
   return parts.join('\n');
 }
 
+function recordCommentSessionEvent(
+  input: Parameters<typeof recordRunSessionEvent>[0],
+): void {
+  const event =
+    input.event.type === 'system'
+      ? { ...input.event, cwd: input.policy.cwdRealpath }
+      : input.event;
+  recordRunSessionEvent({ ...input, event });
+}
+
+function commentRunRejectedReply(code: RunRejected['code']): string | undefined {
+  switch (code) {
+    case 'run-already-active':
+      return '当前评论线程已有任务在执行，请稍后再试。';
+    case 'pool-full':
+      return '当前任务较多，请稍后再试。';
+    case 'reconnect-in-progress':
+      return '当前 bot 正在重连，请稍后再试。';
+    case 'policy-expired':
+      return '本次评论任务已超时，请重新 @ 我。';
+  }
+}
+
+function commentExecutionScopeId(commentThreadScopeId: string): string {
+  return `${commentThreadScopeId}:${randomUUID().slice(0, 12)}`;
+}
+
+function commentDocumentSessionScopeId(fileToken: string): string {
+  return `doc:${commentTokenDigest(fileToken)}`;
+}
+
+function legacyCommentDocumentSessionScopeId(fileToken: string): string {
+  return `doc:${fileToken}`;
+}
+
+function markCommentAgentSessionRun(scopeId: string): {
+  wasActive: boolean;
+  release(): void;
+} {
+  const count = activeCommentAgentSessionRuns.get(scopeId) ?? 0;
+  activeCommentAgentSessionRuns.set(scopeId, count + 1);
+  let released = false;
+  return {
+    wasActive: count > 0,
+    release() {
+      if (released) return;
+      released = true;
+      const next = (activeCommentAgentSessionRuns.get(scopeId) ?? 1) - 1;
+      if (next > 0) {
+        activeCommentAgentSessionRuns.set(scopeId, next);
+      } else {
+        activeCommentAgentSessionRuns.delete(scopeId);
+      }
+    },
+  };
+}
+
+async function resolveCommentWorkingDirectory(
+  configuredCwd: string | undefined,
+  defaultCwd: string | undefined,
+  managedFallbackCwd: string,
+): Promise<
+  | {
+      ok: true;
+      requestedCwd: string;
+      cwdRealpath: string;
+      fallback?: { from: string; to: 'profile-default' | 'managed-default'; reason: string };
+    }
+  | {
+      ok: false;
+      requestedCwd: string;
+      cwdRealpath: string;
+      reason: string;
+      userVisible: string;
+    }
+> {
+  const failures: string[] = [];
+  if (configuredCwd) {
+    const configured = await resolveWorkingDirectory(configuredCwd);
+    if (configured.ok) return configured;
+    failures.push(configured.userVisible);
+    if (defaultCwd) {
+      const fallback = await resolveWorkingDirectory(defaultCwd);
+      if (fallback.ok) {
+        return {
+          ...fallback,
+          fallback: {
+            from: 'document',
+            to: 'profile-default',
+            reason: configured.reason,
+          },
+        };
+      }
+      failures.push(fallback.userVisible);
+      return resolveManagedCommentWorkingDirectory(
+        managedFallbackCwd,
+        'document/profile-default',
+        fallback.reason,
+        failures,
+      );
+    }
+    return resolveManagedCommentWorkingDirectory(managedFallbackCwd, 'document', configured.reason, failures);
+  }
+
+  if (!defaultCwd) {
+    return resolveManagedCommentWorkingDirectory(
+      managedFallbackCwd,
+      'missing-default',
+      'missing-default-cwd',
+      failures,
+    );
+  }
+  const workspace = await resolveWorkingDirectory(defaultCwd);
+  if (workspace.ok) return workspace;
+  failures.push(workspace.userVisible);
+  return resolveManagedCommentWorkingDirectory(managedFallbackCwd, 'profile-default', workspace.reason, failures);
+}
+
+async function resolveManagedCommentWorkingDirectory(
+  managedFallbackCwd: string,
+  fallbackFrom: string,
+  fallbackReason: string,
+  failures: string[],
+): Promise<
+  | {
+      ok: true;
+      requestedCwd: string;
+      cwdRealpath: string;
+      fallback: { from: string; to: 'managed-default'; reason: string };
+    }
+  | {
+      ok: false;
+      requestedCwd: string;
+      cwdRealpath: string;
+      reason: string;
+      userVisible: string;
+    }
+> {
+  try {
+    await mkdir(managedFallbackCwd, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    return {
+      ok: false,
+      requestedCwd: managedFallbackCwd,
+      cwdRealpath: managedFallbackCwd,
+      reason: 'managed-fallback-unavailable',
+      userVisible: [
+        ...failures,
+        `托管工作目录不可用：${err instanceof Error ? err.message : String(err)}`,
+      ].join('；'),
+    };
+  }
+  const workspace = await resolveWorkingDirectory(managedFallbackCwd);
+  if (workspace.ok) {
+    return {
+      ...workspace,
+      fallback: {
+        from: fallbackFrom,
+        to: 'managed-default',
+        reason: fallbackReason,
+      },
+    };
+  }
+  return {
+    ok: false,
+    requestedCwd: managedFallbackCwd,
+    cwdRealpath: managedFallbackCwd,
+    reason: workspace.reason,
+    userVisible: [...failures, workspace.userVisible].join('；'),
+  };
+}
+
+function managedDefaultWorkspaceForComments(controls: Controls): string {
+  return resolveAppPaths({
+    rootDir: dirname(controls.configPath),
+    profile: controls.profile,
+  }).defaultWorkspaceDir;
+}
+
+function commentReadInstruction(target: ResolvedTarget): string {
+  if (target.fileType === 'doc' || target.fileType === 'docx') {
+    return (
+      '读取文档内容：优先使用当前 docs v2 读取命令：\n' +
+      `  \`lark-cli docs +fetch --api-version v2 --doc ${target.fileToken} --doc-format markdown\`\n` +
+      '如果本机 lark-cli 不支持上述参数，不要在同一错误上反复重试；使用当前可用的等价读取命令读取同一 file_token。'
+    );
+  }
+  if (target.fileType === 'sheet') {
+    return (
+      '读取表格内容：这是 sheet 类型，不要使用 docs +fetch。请按当前可用的表格读取工具或本机 lark-cli 支持的表格读取命令读取同一 file_token；如果命令参数不兼容，不要在同一错误上反复重试。'
+    );
+  }
+  return (
+    '读取文件内容：这是 file 类型，不要使用 docs +fetch。请按当前可用的云空间文件工具或本机 lark-cli 支持的文件读取/下载命令处理同一 file_token；如果命令参数不兼容，不要在同一错误上反复重试。'
+  );
+}
+
+function isBridgeSelfReply(channel: LarkChannel, evt: CommentEvent): boolean {
+  const botOpenId = (channel as { botIdentity?: { openId?: string } }).botIdentity?.openId;
+  if (botOpenId && evt.operator.openId === botOpenId) return true;
+
+  const raw = evt as unknown as Record<string, unknown>;
+  if (raw.bridgeReply === true) return true;
+  if (raw.bridge_reply === true) return true;
+
+  const metadata = raw.replyMetadata ?? raw.reply_metadata ?? raw.metadata;
+  if (!metadata || typeof metadata !== 'object') return false;
+  const record = metadata as Record<string, unknown>;
+  return record.bridge === true || record.bridgeReply === true || record.source === 'lark-channel-bridge';
+}
+
 /**
  * Strip the most common markdown markers so a plain-text comment doesn't
  * show literal `**` / `#` / `> ` etc. Conservative — only touches bold,
  * italic, headings, blockquote, list bullets, and inline code.
  */
-function stripMarkdown(s: string): string {
+export function stripMarkdown(s: string): string {
   return s
     // headings: "# foo" -> "foo"
     .replace(/^#{1,6}\s+/gm, '')
@@ -348,12 +762,51 @@ function stripMarkdown(s: string): string {
     .replace(/```/g, '');
 }
 
+function commentRunTimeoutMs(
+  sessions: SessionStore,
+  scopeId: string,
+): number | null | undefined {
+  const scopeOverride = sessions.getIdleTimeoutMinutes(scopeId);
+  if (scopeOverride !== undefined) {
+    return scopeOverride > 0 ? scopeOverride * 60_000 : null;
+  }
+  return undefined;
+}
+
+async function nextCommentEvent(
+  iterator: AsyncIterator<AgentEvent>,
+  expiresAt: number | undefined,
+): Promise<IteratorResult<AgentEvent> | 'expired'> {
+  if (expiresAt === undefined) {
+    return iterator.next();
+  }
+  const delayMs = Math.max(0, expiresAt - Date.now() + 1);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      iterator.next(),
+      new Promise<'expired'>((resolve) => {
+        timer = setTimeout(() => resolve('expired'), delayMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function postCommentReply(
   channel: LarkChannel,
   target: ResolvedTarget,
   evt: CommentEvent,
   text: string,
+  opts: { isWhole?: boolean } = {},
 ): Promise<void> {
+  if (opts.isWhole) {
+    await createTopLevelCommentReply(channel, target, text);
+    log.info('comment', 'replied', { mode: 'new-top-level', reason: 'whole-comment' });
+    return;
+  }
+
   // First try replying in-thread. SDK doesn't expose
   // drive.v1.fileCommentReply.create, so we go through the generic
   // Client.request which still handles auth.
@@ -374,9 +827,18 @@ async function postCommentReply(
     // thread, only a flat list. Fall back to posting a fresh top-level
     // comment that quotes the user's question.
     if (code !== 1069302) throw err;
-    log.warn('comment', 'reply-rejected-fallback-create', { code });
+    log.info('comment', 'reply-fallback-create', { code });
   }
 
+  await createTopLevelCommentReply(channel, target, text);
+  log.info('comment', 'replied', { mode: 'new-top-level' });
+}
+
+async function createTopLevelCommentReply(
+  channel: LarkChannel,
+  target: ResolvedTarget,
+  text: string,
+): Promise<void> {
   await channel.rawClient.drive.v1.fileComment.create({
     params: { file_type: target.fileType as 'doc' | 'docx' },
     path: { file_token: target.fileToken },
@@ -386,7 +848,6 @@ async function postCommentReply(
       },
     },
   });
-  log.info('comment', 'replied', { mode: 'new-top-level' });
 }
 
 function preview(text: string): string {

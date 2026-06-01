@@ -35,13 +35,13 @@ export function workspacesCard(current: string | undefined, named: Record<string
   const entries = Object.entries(named);
   const elements: object[] = [];
 
-  elements.push(divMd(`当前 cwd：\`${escapeCode(current ?? '(未设置，使用 $HOME)')}\``));
+  elements.push(divMd(`当前 cwd：\`${escapeCode(current ?? '(未设置)')}\``));
 
   if (entries.length === 0) {
     elements.push(HR);
-    elements.push(divMd('暂无命名工作空间。'));
+    elements.push(divMd('暂无命名工作目录。'));
     elements.push(
-      divMd('💡 发送 `/ws save <name>` 把当前 cwd 存为命名工作空间'),
+      divMd('💡 发送 `/ws save <name>` 把当前 cwd 存为命名工作目录'),
     );
   } else {
     elements.push(HR);
@@ -58,14 +58,24 @@ export function workspacesCard(current: string | undefined, named: Record<string
     });
   }
 
-  return shell('📂 工作空间', elements);
+  return shell('📂 工作目录', elements);
 }
 
 export interface StatusInfo {
-  cwd: string;
+  profileName: string;
+  cwd?: string;
   sessionId?: string;
+  emptySessionText?: string;
   sessionStale: boolean;
   agentName: string;
+  runtimeAccess: {
+    label: string;
+    value: string;
+  };
+  activeRun: boolean;
+  activeCommentScopes?: string[];
+  queue?: { active: number; waiting: number; cap: number };
+  ownerState: string;
   /** Session scope (= chatId or chatId:threadId in topic groups). */
   scope: string;
   /** Chat mode — used to label scope. */
@@ -75,18 +85,32 @@ export interface StatusInfo {
 export function statusCard(info: StatusInfo): object {
   const sessionLine = info.sessionId
     ? `\`${info.sessionId.slice(0, 8)}…\`${info.sessionStale ? ' ⚠️ 旧 cwd，下一条会新建' : ''}`
-    : '(无)';
+    : (info.emptySessionText ?? '(无)');
   // For topic groups, surface that the scope is per-topic so the user
   // knows /cd / /new only affect this topic.
   const scopeLine =
     info.chatMode === 'topic'
       ? `\`${escapeCode(info.scope)}\` _（话题独立 session）_`
       : `\`${escapeCode(info.scope)}\``;
+  const cwdLine = info.cwd ? `\`${escapeCode(info.cwd)}\`` : '(未设置)';
+  const queueLine = info.queue
+    ? `${info.queue.active}/${info.queue.cap} active, ${info.queue.waiting} waiting`
+    : 'unknown';
   const lines = [
     `🧭 **scope**: ${scopeLine}`,
-    `📁 **cwd**: \`${escapeCode(info.cwd)}\``,
+    `🧩 **profile**: ${escapeMd(info.profileName)}`,
+    `📁 **cwd**: ${cwdLine}`,
     `🔗 **session**: ${sessionLine}`,
     `🤖 **agent**: ${escapeMd(info.agentName)}`,
+    `🛡 **${escapeMd(info.runtimeAccess.label)}**: ${escapeMd(info.runtimeAccess.value)}`,
+    `🏃 **active run**: ${info.activeRun ? 'yes' : 'no'}`,
+    ...(info.activeCommentScopes && info.activeCommentScopes.length > 0
+      ? [
+          `📝 **comment runs**: ${info.activeCommentScopes.map((scope) => `\`${escapeCode(scope)}\``).join(', ')}`,
+        ]
+      : []),
+    `🚦 **queue**: ${queueLine}`,
+    `👤 **owner API**: ${escapeMd(info.ownerState)}`,
   ];
   return shell('📊 当前状态', [
     divMd(lines.join('\n')),
@@ -94,7 +118,7 @@ export function statusCard(info: StatusInfo): object {
     actions([
       { text: '🆕 新会话', value: { cmd: 'new' }, style: 'primary' },
       { text: '🔁 恢复会话', value: { cmd: 'resume' } },
-      { text: '📂 工作空间', value: { cmd: 'ws.list' } },
+      { text: '📂 工作目录', value: { cmd: 'ws.list' } },
       { text: '💡 帮助', value: { cmd: 'help' } },
     ]),
   ]);
@@ -102,9 +126,11 @@ export function statusCard(info: StatusInfo): object {
 
 export interface ResumeEntry {
   sessionId: string;
+  displayId?: string;
   preview: string;
   relTime: string;
-  lineCount: number;
+  lineCount?: number;
+  detail?: string;
   current?: boolean;
 }
 
@@ -121,9 +147,11 @@ export function resumeCard(cwd: string, entries: ResumeEntry[]): object {
   elements.push(HR);
   entries.forEach((e, i) => {
     const marker = e.current ? '  ← 当前' : '';
+    const detail = e.detail ?? `${e.lineCount ?? 0} 条`;
+    const displayId = e.displayId ?? e.sessionId;
     elements.push(
       divMd(
-        `**${i + 1}.** ${escapeMd(e.preview)}${marker}\n\`${e.sessionId.slice(0, 8)}…\` · ${e.relTime} · ${e.lineCount} 条`,
+        `**${i + 1}.** ${escapeMd(e.preview)}${marker}\n\`${displayId.slice(0, 8)}…\` · ${e.relTime} · ${escapeMd(detail)}`,
       ),
     );
     elements.push(
@@ -141,7 +169,8 @@ export function resumeCard(cwd: string, entries: ResumeEntry[]): object {
   return shell('🔁 恢复历史会话', elements);
 }
 
-export function helpCard(): object {
+export function helpCard(agentName = 'Agent'): object {
+  const escapedAgentName = escapeMd(agentName);
   return shell('💡 使用帮助', [
     divMd(
       [
@@ -151,26 +180,28 @@ export function helpCard(): object {
         '- `/new chat [name]` — 新建群+新会话，自动拉你进群',
         '- `/resume [N]` — 列出并恢复历史会话（最多 N 条）',
         '- `/cd <path>` — 切换工作目录（会重置 session）',
-        '- `/ws list|save <name>|use <name>|remove <name>` — 工作空间',
+        '- `/ws list|save <name>|use <name>|remove <name>` — 工作目录',
         '- `/account` — 查看当前应用；`/account change` 换 appId/secret 并重连',
         '- `/config` — 调整偏好（消息回复方式、工具调用显示）',
         '- `/status` — 当前状态',
         '- `/stop` — 结束当前正在跑的任务（也可点卡片底部 ⏹ 终止 按钮）',
+        '- `/stop comment:<scopeHash>` — 管理员停止云文档评论任务',
         '- `/timeout [N|off|default]` — 当前 session 的探活分钟数,`/config` 改全局默认',
+        '- `/timeout comment:<scopeHash> N` — 管理员设置云文档评论任务探活',
         '- `/ps` — 列出本机所有 bot,标识当前正在回复的那个',
         '- `/exit <id|#>` — 关掉指定 bot(用 `/ps` 看 id/序号)',
         '- `/reconnect` — 强制重连 WebSocket(网络抖动后 bot 没反应时用)',
-        '- `/doctor [描述]` — 把日志和描述喂给 Claude 自助诊断',
+        `- \`/doctor [描述]\` — 把日志和描述交给 ${escapedAgentName} 自助诊断`,
         '- `/help` — 本帮助',
         '',
-        '其他内容直接交给 Claude。',
+        `其他内容直接交给 ${escapedAgentName}。`,
       ].join('\n'),
     ),
     HR,
     actions([
       { text: '📊 状态', value: { cmd: 'status' }, style: 'primary' },
       { text: '🔁 恢复会话', value: { cmd: 'resume' } },
-      { text: '📂 工作空间', value: { cmd: 'ws.list' } },
+      { text: '📂 工作目录', value: { cmd: 'ws.list' } },
       { text: '🆕 新会话', value: { cmd: 'new' } },
     ]),
   ]);

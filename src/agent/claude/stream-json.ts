@@ -19,7 +19,11 @@ interface ClaudeRawEvent {
   cwd?: string;
   model?: string;
   message?: { content?: ContentBlock[] };
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
   total_cost_usd?: number;
 }
 
@@ -72,9 +76,10 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
         type: 'usage',
         inputTokens: evt.usage.input_tokens,
         outputTokens: evt.usage.output_tokens,
+        cachedInputTokens: evt.usage.cache_read_input_tokens,
         costUsd: evt.total_cost_usd,
       };
     }
-    yield { type: 'done', sessionId: evt.session_id };
+    yield { type: 'done', sessionId: evt.session_id, terminationReason: 'normal' };
   }
 }

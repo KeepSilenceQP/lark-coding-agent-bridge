@@ -1,30 +1,54 @@
+import type { AgentAvailability } from './preflight';
+import type { ClaudePermissionMode, CodexSandboxMode } from '../config/permissions';
+
+export type { ClaudePermissionMode } from '../config/permissions';
+
 export type AgentEvent =
-  | { type: 'system'; sessionId?: string; cwd?: string; model?: string }
+  | { type: 'system'; sessionId?: string; threadId?: string; cwd?: string; model?: string }
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
   | { type: 'tool_result'; id: string; output: string; isError: boolean }
-  | { type: 'usage'; inputTokens?: number; outputTokens?: number; costUsd?: number }
-  | { type: 'done'; sessionId?: string }
-  | { type: 'error'; message: string };
+  | {
+      type: 'usage';
+      inputTokens?: number;
+      outputTokens?: number;
+      cachedInputTokens?: number;
+      reasoningOutputTokens?: number;
+      costUsd?: number;
+    }
+  | {
+      type: 'done';
+      sessionId?: string;
+      threadId?: string;
+      terminationReason: 'normal' | 'interrupted' | 'timeout';
+    }
+  | { type: 'error'; message: string; terminationReason: 'failed' | 'interrupted' | 'timeout' };
+
+export const CLAUDE_DEFAULT_PERMISSION_MODE: ClaudePermissionMode = 'bypassPermissions';
 
 export interface AgentRunOptions {
+  runId: string;
   prompt: string;
   cwd?: string;
   sessionId?: string;
+  threadId?: string;
   model?: string;
-  permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
+  images?: readonly string[];
+  sandbox?: CodexSandboxMode;
+  permissionMode?: ClaudePermissionMode;
   /**
    * Grace period (ms) between SIGTERM and SIGKILL when stop() is called on
    * the returned run. Lets the agent (and any subprocess it spawned, e.g.
    * lark-cli mid-OAuth) clean up before the kernel reaps the tree.
    * Adapters that don't kill via signals are free to ignore this. Defaults
    * are adapter-specific.
-   */
+  */
   stopGraceMs?: number;
 }
 
 export interface AgentRun {
+  readonly runId: string;
   readonly events: AsyncIterable<AgentEvent>;
   stop(): Promise<void>;
   /**
@@ -45,5 +69,7 @@ export interface AgentAdapter {
   readonly id: string;
   readonly displayName: string;
   isAvailable(): Promise<boolean>;
+  checkAvailability?(): Promise<AgentAvailability>;
+  prepareRun?(opts: AgentRunOptions): Promise<void>;
   run(opts: AgentRunOptions): AgentRun;
 }

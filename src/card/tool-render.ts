@@ -81,7 +81,7 @@ function renderInput(tool: ToolEntry): string {
   const input = tool.input;
   if (!input || typeof input !== 'object') return '';
   const rec = input as Record<string, unknown>;
-  const str = (k: string): string => (typeof rec[k] === 'string' ? (rec[k] as string) : '');
+  const str = (k: string): string => (typeof rec[k] === 'string' ? rec[k] as string : '');
 
   switch (tool.name) {
     case 'Bash': {
@@ -116,10 +116,6 @@ function renderBashOutput(out: string): string {
 }
 
 function shortenPath(p: string): string {
-  if (!p) return p;
-  // Trim home prefix for readability.
-  const home = process.env.HOME || '';
-  if (home && p.startsWith(home)) return `~${p.slice(home.length)}`;
   return p;
 }
 

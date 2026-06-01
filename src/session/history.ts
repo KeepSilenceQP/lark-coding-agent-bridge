@@ -3,6 +3,7 @@ import { readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { normalizeSessionPreview } from './preview';
 
 export interface SessionSummary {
   sessionId: string;
@@ -12,7 +13,7 @@ export interface SessionSummary {
 }
 
 function encodeCwd(cwd: string): string {
-  return cwd.replace(/\//g, '-');
+  return cwd.replace(/[^A-Za-z0-9]/g, '-');
 }
 
 function claudeProjectDir(cwd: string): string {
@@ -70,7 +71,7 @@ async function summarize(path: string): Promise<{ preview: string; lineCount: nu
           const obj = JSON.parse(line) as { type?: string; message?: { content?: unknown } };
           if (obj.type === 'user' && obj.message) {
             const text = extractUserText(obj.message.content);
-            if (text) preview = text.slice(0, 80);
+            if (text) preview = normalizeSessionPreview(text);
           }
         } catch {
           /* malformed line */

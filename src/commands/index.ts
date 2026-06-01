@@ -1,6 +1,8 @@
-import { stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
+import { dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
+import { claudeCapability, codexCapability } from '../agent/capability';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
@@ -12,7 +14,7 @@ import {
 import { configCancelledCard, configFormCard, configSavedCard } from '../card/config-card';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
-import type { AppAccess, AppConfig, MessageReplyMode, TenantBrand } from '../config/schema';
+import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
   getAgentStopGraceMs,
   getMaxConcurrentRuns,
@@ -20,12 +22,26 @@ import {
   getRequireMentionInGroup,
   getRunIdleTimeoutMs,
   getShowToolCalls,
-  isAdmin,
   secretKeyForApp,
 } from '../config/schema';
+import type { ProfileAccess, ProfileConfig } from '../config/profile-schema';
+import { resolveAppPaths } from '../config/app-paths';
+import { accessToClaudePermissionMode } from '../config/permissions';
+import {
+  loadRootConfig,
+  runtimeProfileConfig,
+  saveRootConfig,
+  withConfigFileLock,
+} from '../config/profile-store';
+import {
+  canRunAdminCommand,
+  canUseDm,
+  canUseGroup,
+  type OwnerRefreshState,
+} from '../policy/access';
 import { setSecret } from '../config/keystore';
 import { buildEncryptedAccountConfig, saveConfig } from '../config/store';
-import { log, readRecentLogs, reportMetric, sanitizeLogsForDoctor } from '../core/logger';
+import { log, reportMetric } from '../core/logger';
 import { renderCard } from '../card/run-renderer';
 import {
   finalizeIfRunning,
@@ -34,18 +50,36 @@ import {
   reduce,
   type RunState,
 } from '../card/run-state';
-import { formatRelTime, listRecentSessions } from '../session/history';
+import { formatRelTime, listRecentSessions, type SessionSummary } from '../session/history';
+import {
+  listCodexThreadHistory,
+  type CodexThreadHistoryEntry,
+  type ListCodexThreadHistoryOptions,
+} from '../session/codex-history';
+import type { SessionCatalog, SessionCatalogIdentity } from '../session/catalog';
 import { isAlive, readAndPrune, resolveTarget } from '../runtime/registry';
 import type { SessionStore } from '../session/store';
+import { resolveWorkingDirectory } from '../policy/workspace';
+import { evaluateRunPolicy } from '../policy/run-policy';
+import type { ProcessPool } from '../bot/process-pool';
+import type { RunExecutor } from '../runtime/run-executor';
+import { RunRejected } from '../runtime/errors';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import type { WorkspaceStore } from '../workspace/store';
 import { createBoundChat, defaultChatName } from '../bot/group';
-import { fetchAppOwnerId, fetchKnownChats, type KnownChat } from '../bot/lark-info';
+import { fetchKnownChats, type KnownChat } from '../bot/lark-info';
 
 export interface Controls {
+  profile: string;
+  profileConfig: ProfileConfig;
+  botOwnerId?: string;
+  ownerRefreshState: OwnerRefreshState;
+  ownerRefreshedAt?: number;
+  ownerRefreshError?: string;
+  refreshOwner(channel?: LarkChannel): Promise<void>;
   /** Restart the bridge in-process: disconnect WS, kill claude runs, reload
    * config, reconnect with the new credentials. */
-  restart(): Promise<void>;
+  restart(opts?: { wait?: boolean }): Promise<void>;
   /** Stop this whole process gracefully (disconnect + exit). Used by /exit
    * when the user targets the receiving process itself. */
   exit(): Promise<void>;
@@ -56,26 +90,8 @@ export interface Controls {
   /** This process's short id in the registry. Used by /ps to highlight the
    * receiving process and by /exit to detect self-target. */
   processId: string;
-  /**
-   * Current Lark app owner's open_id. Populated by channel.ts on connect
-   * via the `application/v6/applications` API; refreshed on reconnect and
-   * every 30 minutes. `undefined` when the fetch failed — caller treats
-   * that as "no creator", letting access control fall through to the
-   * explicit whitelists (fail-secure).
-   *
-   * The owner is the only identity that bypasses every whitelist (DM /
-   * group / admin), so this field IS the access-control "creator" concept
-   * — there is no parallel config-file list.
-   */
-  botOwnerId?: string;
-  /**
-   * Chats (groups + topic groups) the bot is currently a member of.
-   * Populated by channel.ts on connect via `im/v1/chats`. Used by
-   * `/config` to render the group whitelist dropdown — operators can
-   * still hand-paste chat_ids via the sibling text input for chats not in
-   * this cache (e.g. when the cache was truncated at 500).
-   */
-  knownChats: KnownChat[];
+  /** Groups the bot currently belongs to, used to render and bulk-manage access. */
+  knownChats?: KnownChat[];
 }
 
 export interface CommandContext {
@@ -93,10 +109,18 @@ export interface CommandContext {
    * scope semantic to the user (`topic` shows "话题独立 session"). */
   chatMode: 'p2p' | 'group' | 'topic';
   sessions: SessionStore;
+  sessionCatalog?: SessionCatalog;
+  sessionCatalogIdentity?: SessionCatalogIdentity;
   workspaces: WorkspaceStore;
   agent: AgentAdapter;
   activeRuns: ActiveRuns;
+  processPool?: ProcessPool;
+  runExecutor?: RunExecutor;
   controls: Controls;
+  codexHistoryProvider?: (
+    options: ListCodexThreadHistoryOptions,
+  ) => Promise<CodexThreadHistoryEntry[]>;
+  claudeHistoryProvider?: (cwd: string, limit: number) => Promise<SessionSummary[]>;
   /** Set when invoked from a CardKit 2.0 form submit. Keys are input `name`s. */
   formValue?: Record<string, unknown>;
   /** True when this invocation came from a card button click rather than a
@@ -106,6 +130,21 @@ export interface CommandContext {
 }
 
 type Handler = (args: string, ctx: CommandContext) => Promise<void>;
+
+interface ResumeCandidate {
+  scopeId: string;
+  agentId: 'claude' | 'codex';
+  cwdRealpath: string;
+  policyFingerprint: string;
+  sessionId?: string;
+  threadId?: string;
+  expiresAt: number;
+}
+
+const RESUME_CANDIDATE_TTL_MS = 10 * 60 * 1000;
+const resumeCandidates = new Map<string, ResumeCandidate>();
+const AUDIT_SAFE_COMMAND_REPLY = '命令已处理。';
+const RESUME_APPLIED_REPLY = '已完成，请继续发送下一条消息。';
 
 const handlers: Record<string, Handler> = {
   '/new': handleNew,
@@ -123,19 +162,20 @@ const handlers: Record<string, Handler> = {
   '/exit': handleExit,
   '/doctor': handleDoctor,
   '/reconnect': handleReconnect,
+  '/doc': handleDoc,
   '/invite': handleInvite,
   '/remove': handleRemove,
 };
 
 /**
  * Commands that can mutate credentials, lifecycle, filesystem reach, or
- * surface sensitive runtime state. Gated on the admin allowlist + creator:
- * empty admin list = only the bot creator (current Lark app owner) can
- * run them. See `isAdmin` in config/schema.
+ * surface sensitive runtime state. Gated by unified access policy; runtime
+ * owner is always allowed, while empty admin list means no listed admins.
  */
 const ADMIN_COMMANDS = new Set([
   '/account',
   '/config',
+  '/ps',
   '/exit',
   '/reconnect',
   '/doctor',
@@ -157,7 +197,10 @@ export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
   const args = parts.slice(1).join(' ');
   const h = handlers[cmd];
   if (!h) return false;
-  if (isAdminCommand(cmd) && !isAdmin(ctx.controls, ctx.msg.senderId)) {
+  if (
+    isAdminCommand(cmd) &&
+    !canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok
+  ) {
     log.info('command', 'admin-deny', {
       cmd,
       sender: ctx.msg.senderId.slice(-6),
@@ -182,7 +225,10 @@ export async function runCommandHandler(
 ): Promise<boolean> {
   const h = handlers[`/${name}`];
   if (!h) return false;
-  if (isAdminCommand(name) && !isAdmin(ctx.controls, ctx.msg.senderId)) {
+  if (
+    isAdminCommand(name) &&
+    !canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok
+  ) {
     log.info('command', 'admin-deny', {
       cmd: name,
       sender: ctx.msg.senderId.slice(-6),
@@ -213,13 +259,36 @@ async function reply(ctx: CommandContext, markdown: string): Promise<void> {
   } catch (err) {
     log.fail('command', err, { step: 'reply' });
     reportMetric('command_fail', 1, { step: 'reply' });
+    if (!isMessageAuditReject(err) || markdown === AUDIT_SAFE_COMMAND_REPLY) return;
+    try {
+      await ctx.channel.send(
+        ctx.msg.chatId,
+        { markdown: AUDIT_SAFE_COMMAND_REPLY },
+        { replyTo: ctx.msg.messageId },
+      );
+    } catch (fallbackErr) {
+      log.fail('command', fallbackErr, { step: 'reply-audit-fallback' });
+      reportMetric('command_fail', 1, { step: 'reply-audit-fallback' });
+    }
   }
+}
+
+function isMessageAuditReject(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const record = err as Record<string, unknown>;
+  if (record.code === 230028) return true;
+  const message = String(record.message ?? record.msg ?? '');
+  return /not pass the audit/i.test(message);
 }
 
 function expandTilde(p: string): string {
   if (p === '~') return homedir();
   if (p.startsWith('~/')) return `${homedir()}${p.slice(1)}`;
   return p;
+}
+
+function isAbsoluteOrTilde(p: string): boolean {
+  return isAbsolute(p) || p === '~' || p.startsWith('~/');
 }
 
 async function handleNew(args: string, ctx: CommandContext): Promise<void> {
@@ -232,13 +301,19 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
   }
 
   const wasRunning = ctx.activeRuns.interrupt(ctx.scope);
+  if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
+    ctx.sessionCatalog.archiveActive({
+      ...ctx.sessionCatalogIdentity,
+      now: Date.now(),
+    });
+  }
   ctx.sessions.clear(ctx.scope);
   await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
 }
 
 async function handleNewChat(rawName: string, ctx: CommandContext): Promise<void> {
-  const sourceCwd = ctx.workspaces.cwdFor(ctx.scope);
-  const name = rawName || defaultChatName();
+  const sourceCwd = effectiveWorkspaceCwd(ctx);
+  const name = rawName || defaultChatName(ctx.agent.displayName);
 
   let created;
   try {
@@ -281,25 +356,20 @@ async function handleCd(args: string, ctx: CommandContext): Promise<void> {
     await reply(ctx, '用法：`/cd <绝对路径>` 或 `/cd ~/xxx`');
     return;
   }
-  if (!input.startsWith('/') && !input.startsWith('~')) {
+  if (!isAbsoluteOrTilde(input)) {
     await reply(ctx, '请使用绝对路径，或 `~/xxx` 表示 home 下的子路径。');
     return;
   }
   const absolute = expandTilde(input);
-  try {
-    const st = await stat(absolute);
-    if (!st.isDirectory()) {
-      await reply(ctx, `路径不是目录：\`${absolute}\``);
-      return;
-    }
-  } catch {
-    await reply(ctx, `路径不存在：\`${absolute}\``);
+  const workspace = await resolveWorkingDirectory(absolute);
+  if (!workspace.ok) {
+    await reply(ctx, workspace.userVisible);
     return;
   }
   ctx.activeRuns.interrupt(ctx.scope);
-  ctx.workspaces.setCwd(ctx.scope, absolute);
+  ctx.workspaces.setCwd(ctx.scope, workspace.cwdRealpath);
   ctx.sessions.clear(ctx.scope);
-  await reply(ctx, `✓ 已切换 cwd 到 \`${absolute}\`\n（session 已重置）`);
+  await reply(ctx, `✓ 已切换 cwd 到 \`${workspace.cwdRealpath}\`\n（session 已重置）`);
 }
 
 async function handleWs(args: string, ctx: CommandContext): Promise<void> {
@@ -323,9 +393,12 @@ async function handleWs(args: string, ctx: CommandContext): Promise<void> {
 }
 
 async function handleWsList(ctx: CommandContext): Promise<void> {
-  const named = ctx.workspaces.listNamed();
-  const currentCwd = ctx.workspaces.cwdFor(ctx.scope);
-  const card = workspacesCard(currentCwd, named);
+  const named = listScopedWorkspaces(ctx);
+  const currentCwd = effectiveWorkspaceCwd(ctx);
+  const card = workspacesCard(
+    currentCwd,
+    named,
+  );
   await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
 }
 
@@ -334,13 +407,13 @@ async function handleWsSave(name: string, ctx: CommandContext): Promise<void> {
     await reply(ctx, '用法：`/ws save <name>`');
     return;
   }
-  const cwd = ctx.workspaces.cwdFor(ctx.scope);
+  const cwd = effectiveWorkspaceCwd(ctx);
   if (!cwd) {
     await reply(ctx, '当前 chat 未设置 cwd，先用 `/cd` 设置再保存。');
     return;
   }
-  ctx.workspaces.saveNamed(name, cwd);
-  await reply(ctx, `✓ 工作空间已保存：\`${name}\` → ${cwd}`);
+  ctx.workspaces.saveNamed(scopedWorkspaceName(ctx, name), cwd);
+  await reply(ctx, `✓ 工作目录别名已保存：\`${name}\` → ${cwd}`);
 }
 
 async function handleWsUse(name: string, ctx: CommandContext): Promise<void> {
@@ -348,15 +421,20 @@ async function handleWsUse(name: string, ctx: CommandContext): Promise<void> {
     await reply(ctx, '用法：`/ws use <name>`');
     return;
   }
-  const cwd = ctx.workspaces.getNamed(name);
+  const cwd = getWorkspaceAlias(ctx, name);
   if (!cwd) {
-    await reply(ctx, `未找到工作空间：\`${name}\``);
+    await reply(ctx, `未找到工作目录别名：\`${name}\``);
+    return;
+  }
+  const workspace = await resolveWorkingDirectory(cwd);
+  if (!workspace.ok) {
+    await reply(ctx, workspace.userVisible);
     return;
   }
   ctx.activeRuns.interrupt(ctx.scope);
-  ctx.workspaces.setCwd(ctx.scope, cwd);
+  ctx.workspaces.setCwd(ctx.scope, workspace.cwdRealpath);
   ctx.sessions.clear(ctx.scope);
-  await reply(ctx, `✓ 已切换到 \`${name}\` (${cwd})\n（session 已重置）`);
+  await reply(ctx, `✓ 已切换到 \`${name}\` (${workspace.cwdRealpath})\n（session 已重置）`);
 }
 
 async function handleWsRemove(name: string, ctx: CommandContext): Promise<void> {
@@ -364,11 +442,64 @@ async function handleWsRemove(name: string, ctx: CommandContext): Promise<void> 
     await reply(ctx, '用法：`/ws remove <name>`');
     return;
   }
-  if (!ctx.workspaces.removeNamed(name)) {
-    await reply(ctx, `未找到工作空间：\`${name}\``);
+  if (!removeWorkspaceAlias(ctx, name)) {
+    await reply(ctx, `未找到工作目录别名：\`${name}\``);
     return;
   }
-  await reply(ctx, `✓ 已删除工作空间：\`${name}\``);
+  await reply(ctx, `✓ 已删除工作目录别名：\`${name}\``);
+}
+
+async function handleDoc(args: string, ctx: CommandContext): Promise<void> {
+  void args;
+  await reply(ctx, '云文档评论现在不需要绑定工作区；在支持的文档评论里 @bot 即可触发回复。');
+}
+
+const WORKSPACE_NAME_SEPARATOR = '\u001f';
+
+function scopedWorkspaceName(ctx: CommandContext, name: string): string {
+  return [
+    ctx.controls.profile,
+    ctx.controls.botOwnerId ?? 'owner-unknown',
+    ctx.scope,
+    name,
+  ].join(WORKSPACE_NAME_SEPARATOR);
+}
+
+function workspaceAliasKeys(ctx: CommandContext, name: string): string[] {
+  return [scopedWorkspaceName(ctx, name), name];
+}
+
+function getWorkspaceAlias(ctx: CommandContext, name: string): string | undefined {
+  for (const key of workspaceAliasKeys(ctx, name)) {
+    const cwd = ctx.workspaces.getNamed(key);
+    if (cwd) return cwd;
+  }
+  return undefined;
+}
+
+function removeWorkspaceAlias(ctx: CommandContext, name: string): boolean {
+  const scopedKey = scopedWorkspaceName(ctx, name);
+  if (ctx.workspaces.removeNamed(scopedKey)) return true;
+  return ctx.workspaces.removeNamed(name);
+}
+
+function isLegacyWorkspaceAlias(key: string): boolean {
+  return key !== '' && !key.includes(WORKSPACE_NAME_SEPARATOR);
+}
+
+function listScopedWorkspaces(ctx: CommandContext): Record<string, string> {
+  const prefix = scopedWorkspaceName(ctx, '');
+  const named = ctx.workspaces.listNamed();
+  const scoped: Record<string, string> = {};
+  for (const [key, cwd] of Object.entries(named)) {
+    if (!key.startsWith(prefix)) continue;
+    const displayName = key.slice(prefix.length);
+    if (displayName) scoped[displayName] = cwd;
+  }
+  for (const [key, cwd] of Object.entries(named)) {
+    if (isLegacyWorkspaceAlias(key) && scoped[key] === undefined) scoped[key] = cwd;
+  }
+  return scoped;
 }
 
 async function handleResume(args: string, ctx: CommandContext): Promise<void> {
@@ -384,11 +515,60 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
   const n = Number.parseInt(sub, 10);
   const limit = Number.isFinite(n) && n > 0 && n <= 20 ? n : 5;
 
-  const cwd = ctx.workspaces.cwdFor(ctx.scope) ?? homedir();
-  const sessions = await listRecentSessions(cwd, limit);
+  const cwd = selectedResumeCwd(ctx);
+  if (!cwd) {
+    await reply(ctx, '请先使用 /cd <path> 选择工作目录，再查看或恢复会话。');
+    return;
+  }
+
+  if (ctx.chatMode !== 'p2p') {
+    await reply(ctx, '群聊中不展示历史会话详情。请私聊 bot 使用 `/resume` 查看和选择历史会话。');
+    return;
+  }
+
+  if (ctx.controls.profileConfig.agentKind === 'codex') {
+    const identity = ctx.sessionCatalogIdentity;
+    const entry =
+      ctx.sessionCatalog && identity
+        ? ctx.sessionCatalog.activeFor(identity)
+        : undefined;
+    const history = identity ? await listCodexResumeHistory(ctx, cwd, limit) : [];
+    if (history.length > 0 && identity) {
+      const entries = history.map((thread) => {
+        const nonce = issueResumeCandidate(identity, { threadId: thread.threadId });
+        return {
+          sessionId: nonce,
+          preview: thread.name || thread.preview,
+          relTime: formatRelTime(thread.updatedAtMs),
+          detail: `Codex · ${thread.source}`,
+          current: thread.threadId === entry?.threadId,
+        };
+      });
+      const card = resumeCard(cwd, entries);
+      await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+      return;
+    }
+    if (entry?.threadId && identity) {
+      const nonce = issueResumeCandidate(identity, { threadId: entry.threadId });
+      await reply(
+        ctx,
+        `当前 Codex thread 可恢复。\n使用 \`/resume use ${nonce}\` 恢复（10 分钟内有效）。`,
+      );
+      return;
+    }
+    const card = resumeCard(cwd, []);
+    await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+    return;
+  }
+
+  const sessions = await listClaudeResumeHistory(ctx, cwd, limit);
   const currentSession = ctx.sessions.getRaw(ctx.scope);
+  const identity = ctx.sessionCatalogIdentity;
   const entries = sessions.map((s) => ({
-    sessionId: s.sessionId,
+    sessionId: identity
+      ? issueResumeCandidate(identity, { sessionId: s.sessionId })
+      : s.sessionId,
+    displayId: s.sessionId,
     preview: s.preview,
     relTime: formatRelTime(s.mtime),
     lineCount: s.lineCount,
@@ -399,61 +579,269 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
 }
 
 async function applyResume(sessionId: string, ctx: CommandContext): Promise<void> {
-  const cwd = ctx.workspaces.cwdFor(ctx.scope) ?? homedir();
+  if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
+    const entry = ctx.sessionCatalog.activeFor(ctx.sessionCatalogIdentity);
+    const resolved = consumeResumeCandidate(sessionId, ctx.sessionCatalogIdentity);
+    if (resolved) {
+      ctx.activeRuns.interrupt(ctx.scope);
+      if (ctx.sessionCatalogIdentity.agentId === 'codex') {
+        ctx.sessionCatalog.upsertActive({
+          scopeId: ctx.sessionCatalogIdentity.scopeId,
+          agentId: 'codex',
+          cwdRealpath: ctx.sessionCatalogIdentity.cwdRealpath,
+          policyFingerprint: ctx.sessionCatalogIdentity.policyFingerprint,
+          threadId: resolved.threadId!,
+        });
+      } else {
+        ctx.sessionCatalog.upsertActive({
+          scopeId: ctx.sessionCatalogIdentity.scopeId,
+          agentId: 'claude',
+          cwdRealpath: ctx.sessionCatalogIdentity.cwdRealpath,
+          policyFingerprint: ctx.sessionCatalogIdentity.policyFingerprint,
+          sessionId: resolved.sessionId!,
+        });
+        ctx.sessions.set(ctx.scope, resolved.sessionId!, ctx.sessionCatalogIdentity.cwdRealpath);
+      }
+      await reply(ctx, RESUME_APPLIED_REPLY);
+      return;
+    }
+    if (ctx.sessionCatalogIdentity.agentId === 'codex') {
+      await reply(ctx, '当前上下文不可恢复这个会话，请先用 `/resume` 重新生成恢复候选。');
+      return;
+    }
+    const expected = entry?.sessionId;
+    if (expected !== sessionId) {
+      await reply(ctx, '当前上下文不可恢复这个会话，请重新选择当前工作区和权限策略下的会话。');
+      return;
+    }
+    ctx.activeRuns.interrupt(ctx.scope);
+    if (ctx.sessionCatalogIdentity.agentId === 'claude') {
+      ctx.sessions.set(ctx.scope, sessionId, ctx.sessionCatalogIdentity.cwdRealpath);
+    }
+    await reply(ctx, RESUME_APPLIED_REPLY);
+    return;
+  }
+
+  if (ctx.controls.profileConfig.agentKind === 'codex') {
+    await reply(ctx, '当前上下文没有可恢复的 Codex thread，请先在当前工作区完成一次运行。');
+    return;
+  }
+
+  const cwd = selectedResumeCwd(ctx);
+  if (!cwd) {
+    await reply(ctx, '请先使用 /cd <path> 选择工作目录，再查看或恢复会话。');
+    return;
+  }
   ctx.activeRuns.interrupt(ctx.scope);
   ctx.sessions.set(ctx.scope, sessionId, cwd);
-  await reply(
-    ctx,
-    `✓ 已恢复会话 \`${sessionId.slice(0, 8)}…\`。接着发消息就行。`,
-  );
+  await reply(ctx, RESUME_APPLIED_REPLY);
+}
+
+function issueResumeCandidate(
+  identity: SessionCatalogIdentity,
+  target: { sessionId: string } | { threadId: string },
+): string {
+  pruneResumeCandidates();
+  let nonce = randomUUID().slice(0, 12);
+  while (resumeCandidates.has(nonce)) nonce = randomUUID().slice(0, 12);
+  resumeCandidates.set(nonce, {
+    scopeId: identity.scopeId,
+    agentId: identity.agentId,
+    cwdRealpath: identity.cwdRealpath,
+    policyFingerprint: identity.policyFingerprint,
+    ...target,
+    expiresAt: Date.now() + RESUME_CANDIDATE_TTL_MS,
+  });
+  return nonce;
+}
+
+function consumeResumeCandidate(
+  nonce: string,
+  identity: SessionCatalogIdentity,
+): ResumeCandidate | undefined {
+  pruneResumeCandidates();
+  const candidate = resumeCandidates.get(nonce);
+  if (!candidate) return undefined;
+  resumeCandidates.delete(nonce);
+  if (
+    candidate.scopeId !== identity.scopeId ||
+    candidate.agentId !== identity.agentId ||
+    candidate.cwdRealpath !== identity.cwdRealpath ||
+    candidate.policyFingerprint !== identity.policyFingerprint ||
+    (identity.agentId === 'claude' && !candidate.sessionId) ||
+    (identity.agentId === 'codex' && !candidate.threadId)
+  ) {
+    return undefined;
+  }
+  return candidate;
+}
+
+function pruneResumeCandidates(now = Date.now()): void {
+  for (const [nonce, candidate] of resumeCandidates.entries()) {
+    if (candidate.expiresAt <= now) resumeCandidates.delete(nonce);
+  }
+}
+
+async function listClaudeResumeHistory(
+  ctx: CommandContext,
+  cwd: string,
+  limit: number,
+): Promise<SessionSummary[]> {
+  const provider = ctx.claudeHistoryProvider ?? listRecentSessions;
+  return provider(cwd, limit);
+}
+
+async function listCodexResumeHistory(
+  ctx: CommandContext,
+  cwd: string,
+  limit: number,
+): Promise<CodexThreadHistoryEntry[]> {
+  const codex = ctx.controls.profileConfig.codex;
+  const binary = codex?.binaryPath;
+  if (!binary) return [];
+
+  const provider = ctx.codexHistoryProvider ?? listCodexThreadHistory;
+  try {
+    return await provider({
+      binary,
+      cwd,
+      limit,
+      profileStateDir: commandProfilePaths(ctx).profileDir,
+      ...(codex.codexHome ? { codexHome: codex.codexHome } : {}),
+      ...(codex.inheritCodexHome !== undefined
+        ? { inheritCodexHome: codex.inheritCodexHome }
+        : {}),
+    });
+  } catch (err) {
+    log.warn('session', 'codex-history-failed', {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
+function effectiveWorkspaceCwd(ctx: CommandContext): string | undefined {
+  return ctx.workspaces.cwdFor(ctx.scope) ?? ctx.controls.profileConfig.workspaces.default;
+}
+
+function selectedResumeCwd(ctx: CommandContext): string | undefined {
+  return effectiveWorkspaceCwd(ctx);
+}
+
+function runtimeAccessStatus(
+  profileConfig: ProfileConfig,
+): { label: string; value: string } {
+  if (profileConfig.agentKind === 'claude') {
+    return {
+      label: 'permission',
+      value: accessToClaudePermissionMode(
+        profileConfig.permissions.defaultAccess,
+        profileConfig.permissions,
+      ),
+    };
+  }
+  return {
+    label: 'sandbox',
+    value: `${profileConfig.sandbox.defaultMode}/${profileConfig.sandbox.maxMode}`,
+  };
 }
 
 async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
-  const cwd = ctx.workspaces.cwdFor(ctx.scope) ?? homedir();
+  const cwd = effectiveWorkspaceCwd(ctx);
   const sess = ctx.sessions.getRaw(ctx.scope);
+  const isCodex = ctx.controls.profileConfig.agentKind === 'codex';
+  const catalogEntry =
+    isCodex && ctx.sessionCatalog && ctx.sessionCatalogIdentity
+      ? ctx.sessionCatalog.activeFor(ctx.sessionCatalogIdentity)
+      : undefined;
   const card = statusCard({
+    profileName: ctx.controls.profile,
     cwd,
-    sessionId: sess?.sessionId,
-    sessionStale: Boolean(sess && sess.cwd !== cwd),
+    sessionId: isCodex ? catalogEntry?.threadId : sess?.sessionId,
+    emptySessionText: isCodex ? '(未建立)' : undefined,
+    sessionStale: !isCodex && Boolean(cwd && sess && sess.cwd !== cwd),
     agentName: ctx.agent.displayName,
+    runtimeAccess: runtimeAccessStatus(ctx.controls.profileConfig),
+    activeRun: Boolean(ctx.activeRuns.get(ctx.scope)),
+    activeCommentScopes: ctx.activeRuns.scopes().filter((scope) => scope.startsWith('comment:')),
+    queue: ctx.processPool?.snapshot(),
+    ownerState: formatOwnerState(ctx),
     scope: ctx.scope,
     chatMode: ctx.chatMode,
   });
   await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
 }
 
-async function handleStop(_args: string, ctx: CommandContext): Promise<void> {
-  const ok = ctx.activeRuns.interrupt(ctx.scope);
-  log.info('command', 'stop', { interrupted: ok });
-  // No reply: if there was a run, its in-flight render loop will mark the
-  // card as 'interrupted' and re-render (`_⏹ 已被中断_`).
+function formatOwnerState(ctx: CommandContext): string {
+  const state = ctx.controls.ownerRefreshState;
+  const owner = ctx.controls.botOwnerId ? 'present' : 'missing';
+  const refreshed = ctx.controls.ownerRefreshedAt
+    ? ` refreshed=${new Date(ctx.controls.ownerRefreshedAt).toISOString()}`
+    : '';
+  return `${state} owner=${owner}${refreshed}`;
+}
+
+async function handleStop(args: string, ctx: CommandContext): Promise<void> {
+  const targetScope = args.trim();
+  if (targetScope && !canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok) {
+    await reply(ctx, '❌ 指定 scope 停止任务仅管理员可用。');
+    return;
+  }
+  const scope = targetScope || ctx.scope;
+  const ok = ctx.activeRuns.interrupt(scope);
+  log.info('command', 'stop', {
+    scope,
+    targeted: Boolean(targetScope),
+    interrupted: ok,
+  });
+  if (targetScope) {
+    await reply(
+      ctx,
+      ok
+        ? `已请求停止 \`${scope}\`。`
+        : `未找到正在运行的任务：\`${scope}\`。`,
+    );
+  }
+  // No reply for the current IM scope: if there was a run, its in-flight
+  // render loop will mark the card as interrupted and re-render.
 }
 
 async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
   const trimmed = args.trim().toLowerCase();
+  const parsed = parseTimeoutTarget(trimmed, ctx.scope);
+  if (
+    parsed.targeted &&
+    !canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok
+  ) {
+    await reply(ctx, '❌ 指定 scope 设置 timeout 仅管理员可用。');
+    return;
+  }
+  const scope = parsed.scope;
+  const value = parsed.value;
   const globalMs = getRunIdleTimeoutMs(ctx.controls.cfg);
   const globalMinutes = globalMs ? Math.round(globalMs / 60_000) : 0;
   const formatGlobal = (): string =>
     globalMinutes > 0 ? `${globalMinutes} 分钟` : '未启用';
 
   // /timeout — show effective value + source
-  if (!trimmed) {
-    const scopeMinutes = ctx.sessions.getIdleTimeoutMinutes(ctx.scope);
+  if (!value) {
+    const scopeMinutes = ctx.sessions.getIdleTimeoutMinutes(scope);
     const usage =
-      '\n\n用法:\n- `/timeout 15` 当前 session 设 15 分钟\n- `/timeout off` 当前 session 关闭探活\n- `/timeout default` 清除 session 覆盖,回退全局\n\n_注:`/new` 会清掉当前 session 的覆盖,回到全局_';
+      '\n\n用法:\n- `/timeout 15` 当前 session 设 15 分钟\n- `/timeout off` 当前 session 关闭探活\n- `/timeout default` 清除 session 覆盖,回退全局\n- `/timeout comment:<scopeHash> 15` 管理员设置 comment scope\n\n_注:`/new` 会清掉当前 session 的覆盖,回到全局_';
+    const scopeLabel = parsed.targeted ? ` (${scope})` : '';
     if (scopeMinutes !== undefined) {
       const effective =
         scopeMinutes > 0 ? `${scopeMinutes} 分钟` : '已关闭（当前 session）';
-      await reply(ctx, `⏱ 当前 session 探活:${effective}\n全局默认:${formatGlobal()}${usage}`);
+      await reply(ctx, `⏱ 当前 session${scopeLabel} 探活:${effective}\n全局默认:${formatGlobal()}${usage}`);
       return;
     }
-    await reply(ctx, `⏱ 当前 session 探活:跟随全局(${formatGlobal()})${usage}`);
+    await reply(ctx, `⏱ 当前 session${scopeLabel} 探活:跟随全局(${formatGlobal()})${usage}`);
     return;
   }
 
-  if (trimmed === 'default') {
-    const cleared = ctx.sessions.clearIdleTimeoutOverride(ctx.scope);
-    log.info('command', 'timeout-clear', { scope: ctx.scope, cleared });
+  if (value === 'default') {
+    const cleared = ctx.sessions.clearIdleTimeoutOverride(scope);
+    log.info('command', 'timeout-clear', { scope, cleared, targeted: parsed.targeted });
     await reply(
       ctx,
       cleared
@@ -463,21 +851,42 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
     return;
   }
 
-  if (trimmed === 'off' || trimmed === '0') {
-    ctx.sessions.setIdleTimeoutMinutes(ctx.scope, 0);
-    log.info('command', 'timeout-off', { scope: ctx.scope });
+  if (value === 'off' || value === '0') {
+    ctx.sessions.setIdleTimeoutMinutes(scope, 0);
+    log.info('command', 'timeout-off', { scope, targeted: parsed.targeted });
     await reply(ctx, '✅ 已关闭当前 session 的探活。');
     return;
   }
 
-  const n = Number.parseInt(trimmed, 10);
+  const n = Number.parseInt(value, 10);
   if (!Number.isFinite(n) || n < 1 || n > 120) {
     await reply(ctx, '❌ 用法:`/timeout <1-120>` / `/timeout off` / `/timeout default`');
     return;
   }
-  ctx.sessions.setIdleTimeoutMinutes(ctx.scope, n);
-  log.info('command', 'timeout-set', { scope: ctx.scope, minutes: n });
+  ctx.sessions.setIdleTimeoutMinutes(scope, n);
+  log.info('command', 'timeout-set', { scope, minutes: n, targeted: parsed.targeted });
   await reply(ctx, `✅ 当前 session 探活已设为 ${n} 分钟。`);
+}
+
+function parseTimeoutTarget(input: string, currentScope: string): {
+  scope: string;
+  value: string;
+  targeted: boolean;
+} {
+  const parts = input.split(/\s+/).filter(Boolean);
+  const first = parts[0] ?? '';
+  if (first.startsWith('comment:')) {
+    return {
+      scope: first,
+      value: parts.slice(1).join(' '),
+      targeted: true,
+    };
+  }
+  return {
+    scope: currentScope,
+    value: input,
+    targeted: false,
+  };
 }
 
 async function handlePs(_args: string, ctx: CommandContext): Promise<void> {
@@ -567,80 +976,133 @@ function formatAgo(ms: number): string {
   return `${Math.floor(ms / 86_400_000)}d 前`;
 }
 
-async function handleReconnect(_args: string, ctx: CommandContext): Promise<void> {
-  log.info('command', 'reconnect');
-  await reply(ctx, '⏳ 正在重连…');
+async function handleReconnect(args: string, ctx: CommandContext): Promise<void> {
+  const wait = args.trim().split(/\s+/).filter(Boolean).includes('--wait');
+  log.info('command', 'reconnect', { wait });
+  await reply(ctx, wait ? '⏳ 将在当前运行结束后重连…' : '⏳ 正在停止当前运行并重连…');
+  let resumeNewRuns: (() => void) | undefined;
   try {
-    await ctx.controls.restart();
+    resumeNewRuns = ctx.activeRuns.pauseNewRuns('reconnect-in-progress');
+    if (wait) {
+      await ctx.activeRuns.waitForAll();
+    } else {
+      await ctx.activeRuns.stopAll();
+    }
+    await ctx.controls.restart({ wait });
     log.info('command', 'reconnect-ok');
   } catch (err) {
     log.fail('command', err, { step: 'reconnect' });
     reportMetric('command_fail', 1, { step: 'reconnect' });
     await reply(ctx, `❌ 重连失败:${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    resumeNewRuns?.();
   }
 }
 
-const DOCTOR_INSTRUCTIONS = `你是 lark-channel-bridge 的诊断助理。下面会给你两段输入:
-1. 用户的故障描述
-2. 最近的运行日志(JSON line 格式,旧→新)
-
-日志字段含义:
-- ts: ISO 时间戳
-- level: info | warn | error
-- phase: 模块阶段。常见值: ws(WebSocket), intake(消息入站), queue(去抖队列), flush(批处理), media(附件下载), prompt(prompt 组装), session(会话), agent(claude 子进程), card(卡片渲染), comment(文档评论), cardAction(卡片回调), command(斜杠命令), sdk(飞书 SDK 内部)
-- event: enter | exit | transition | fail | 各 phase 自定义事件
-- traceId: 同一逻辑操作的串联 ID(同一条消息的多个日志会共享)
-- chatId: 飞书聊天 ID(用 chatId 反查相关日志)
-
-回复严格三段,markdown 标题用二级:
-
-## 可能原因
-1-3 条最有可能的原因,每条带具体日志的时间戳或 traceId 引用。
-
-## 关键日志片段
-3-5 条最重要的日志,直接贴 JSON 行原文,后跟一行说明为什么重要。
-
-## 建议下一步
-1-3 条具体可执行的动作(检查 X / 重启 Y / 等待 Z 之类)。
-
-如果日志里没有任何相关线索,直接说"日志不足以判断,建议:"再列动作。回复要直接,不寒暄。`;
-
-function buildDoctorPrompt(description: string, logs: string): string {
-  const desc = description.trim() || '(用户没写描述,自行从日志找最显眼的异常。)';
-  return `${DOCTOR_INSTRUCTIONS}
-
----
-
-用户故障描述:
-${desc}
-
-最近的运行日志:
-\`\`\`
-${logs}
-\`\`\``;
-}
+const DOCTOR_ECHO_PROMPT =
+  'Bridge doctor agent echo check. Do not inspect files, do not use history, and reply exactly: OK';
+const DOCTOR_RATE_LIMIT_MS = 30_000;
+const doctorInFlightProfiles = new Set<string>();
+const doctorLastByOperator = new Map<string, number>();
 
 async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
   log.info('command', 'doctor', {
     hasDescription: args.trim().length > 0,
     chatMode: ctx.chatMode,
   });
-  // Killing any in-flight run on this chat — /doctor is a "I'm stuck" call.
-  ctx.activeRuns.interrupt(ctx.scope);
 
-  const rawLogs = await readRecentLogs({ maxBytes: 60_000 });
-  if (!rawLogs.trim()) {
-    await ctx.channel.send(
-      ctx.msg.chatId,
-      { text: '没有找到日志文件 — bridge 可能刚启动或日志目录不可写。' },
-      { replyTo: ctx.msg.messageId },
+  const rateKey = `${ctx.controls.profile}:${ctx.controls.configPath}:${ctx.msg.senderId}`;
+  const now = Date.now();
+  const last = doctorLastByOperator.get(rateKey);
+  if (last !== undefined && now - last < DOCTOR_RATE_LIMIT_MS) {
+    await reply(ctx, 'doctor rate limited: 同一用户 30 秒内只能触发一次。');
+    return;
+  }
+
+  const requestedCwd = effectiveWorkspaceCwd(ctx);
+  if (!requestedCwd) {
+    await reply(
+      ctx,
+      buildDoctorReport(ctx, {
+        workspaceCheck:
+          '未设置工作目录。先用 `/cd <path>` 或 `/ws use <name>` 选择工作目录后再运行 agent echo check。',
+        echoCheck: 'skipped',
+      }),
     );
     return;
   }
-  // Scrub identifying / credential material before the logs (a) reach
-  // Anthropic via the agent prompt, and (b) end up in any card payload
-  // Lark may cache server-side.
-  const logs = sanitizeLogsForDoctor(rawLogs);
+
+  const workspace = await resolveWorkingDirectory(requestedCwd);
+  if (!workspace.ok) {
+    await reply(
+      ctx,
+      buildDoctorReport(ctx, {
+        workspaceCheck: `${workspace.userVisible} 工作目录不可用时只执行 self-check，不启动 agent。`,
+        echoCheck: 'skipped',
+      }),
+    );
+    return;
+  }
+
+  if (!ctx.runExecutor) {
+    await reply(
+      ctx,
+      buildDoctorReport(ctx, {
+        workspaceCheck: `ok (${workspace.cwdRealpath})`,
+        echoCheck: 'run executor unavailable',
+      }),
+    );
+    return;
+  }
+
+  const profileKey = ctx.controls.profile;
+  if (doctorInFlightProfiles.has(profileKey)) {
+    await reply(ctx, 'doctor in-flight: 当前 profile 已有诊断运行中。');
+    return;
+  }
+  doctorLastByOperator.set(rateKey, now);
+
+  const capability =
+    ctx.controls.profileConfig.agentKind === 'codex'
+      ? codexCapability(ctx.controls.profileConfig)
+      : claudeCapability(ctx.controls.profileConfig);
+  const policy = evaluateRunPolicy({
+    scope: {
+      source: 'im',
+      chatId: ctx.msg.chatId,
+      actorId: ctx.msg.senderId,
+      ...(ctx.msg.threadId ? { threadId: ctx.msg.threadId } : {}),
+    },
+    attachments: [],
+    prompt: DOCTOR_ECHO_PROMPT,
+    requestedCwd,
+    cwdRealpath: workspace.cwdRealpath,
+    access: canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId),
+    capability,
+    profileConfig: ctx.controls.profileConfig,
+    now,
+    ttlMs: 60_000,
+  });
+  if (!policy.ok) {
+    await reply(
+      ctx,
+      buildDoctorReport(ctx, {
+        workspaceCheck: `ok (${workspace.cwdRealpath})`,
+        echoCheck: policy.rejectReason.userVisible,
+      }),
+    );
+    return;
+  }
+  const runtimeAccess = runtimeAccessStatus(ctx.controls.profileConfig);
+  const doctorReport = (echoCheck: string): string =>
+    buildDoctorReport(ctx, {
+      workspaceCheck: `ok (${workspace.cwdRealpath})`,
+      policyCheck:
+        runtimeAccess.label === 'sandbox'
+          ? `ok sandbox=${policy.sandbox}`
+          : `ok ${runtimeAccess.label}=${policy.permissionMode}`,
+      echoCheck,
+    });
 
   // In group / topic chats other members would see the result card. Ack
   // in-channel, deliver the actual analysis privately to the operator's
@@ -650,13 +1112,32 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
     await reply(ctx, '🔍 已收到诊断请求，分析结果将私信发给你。');
   }
 
-  const prompt = buildDoctorPrompt(args, logs);
-  const run = ctx.agent.run({
-    prompt,
-    cwd: homedir(),
-    stopGraceMs: getAgentStopGraceMs(ctx.controls.cfg),
-  });
-  const handle = ctx.activeRuns.register(ctx.scope, run);
+  doctorInFlightProfiles.add(profileKey);
+  let execution: Awaited<ReturnType<RunExecutor['submit']>>;
+  try {
+    execution = await ctx.runExecutor.submit({
+      scopeId: `${ctx.scope}:doctor`,
+      policy,
+      nowait: true,
+      stopGraceMs: getAgentStopGraceMs(ctx.controls.cfg),
+      observability: {
+        profile: ctx.controls.profile,
+        agent: capability.agentId,
+        source: 'doctor',
+        stage: 'agent-probe',
+      },
+    });
+  } catch (err) {
+    doctorInFlightProfiles.delete(profileKey);
+    if (err instanceof RunRejected && err.code === 'pool-full') {
+      await reply(ctx, doctorReport('pool-full'));
+      return;
+    }
+    log.fail('command', err, { step: 'doctor.submit' });
+    reportMetric('command_fail', 1, { step: 'doctor.submit' });
+    await reply(ctx, doctorReport('failed'));
+    return;
+  }
 
   try {
     if (isP2p) {
@@ -665,30 +1146,30 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
         ctx.msg.chatId,
         {
           card: {
-            initial: renderCard(initialState),
+            initial: renderCard(withDoctorReport(initialState, doctorReport('pending'))),
             producer: async (ctrl) => {
               let state: RunState = initialState;
-              const flush = (): Promise<void> => ctrl.update(renderCard(state));
-              for await (const evt of handle.run.events) {
-                if (handle.interrupted) break;
+              let echoText = '';
+              const echoStatus = (): string => formatDoctorEchoStatus(echoText, state);
+              const flush = (): Promise<void> =>
+                ctrl.update(renderCard(withDoctorReport(state, doctorReport(echoStatus()))));
+              for await (const evt of execution.subscribe()) {
+                if (execution.handle.interrupted) break;
                 // /doctor runs are session-less: skip 'system' so we don't
                 // persist a doctor's sessionId over the user's real session.
                 if (evt.type === 'system') continue;
                 if (evt.type === 'usage') {
-                  if (evt.costUsd !== undefined) {
-                    log.info('agent', 'usage', { step: 'doctor', costUsd: Number(evt.costUsd.toFixed(4)) });
-                  }
                   continue;
                 }
+                if (evt.type === 'text') echoText += evt.delta;
                 state = reduce(state, evt);
                 await flush();
                 // Don't wait for stdout to close — some claude versions hang
                 // briefly post-result, which would leave the for-await stuck.
                 if (state.terminal !== 'running') break;
               }
-              state = handle.interrupted ? markInterrupted(state) : finalizeIfRunning(state);
+              state = execution.handle.interrupted ? markInterrupted(state) : finalizeIfRunning(state);
               await flush();
-              await handle.run.stop();
             },
           },
         },
@@ -699,20 +1180,18 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
       // operator. No live streaming — the group should see nothing past the
       // ack reply above.
       let state: RunState = initialState;
-      for await (const evt of handle.run.events) {
-        if (handle.interrupted) break;
+      let echoText = '';
+      for await (const evt of execution.subscribe()) {
+        if (execution.handle.interrupted) break;
         if (evt.type === 'system') continue;
         if (evt.type === 'usage') {
-          if (evt.costUsd !== undefined) {
-            log.info('agent', 'usage', { step: 'doctor', costUsd: Number(evt.costUsd.toFixed(4)) });
-          }
           continue;
         }
+        if (evt.type === 'text') echoText += evt.delta;
         state = reduce(state, evt);
         if (state.terminal !== 'running') break;
       }
-      state = handle.interrupted ? markInterrupted(state) : finalizeIfRunning(state);
-      await handle.run.stop();
+      state = execution.handle.interrupted ? markInterrupted(state) : finalizeIfRunning(state);
       // Send a one-shot interactive card by open_id. Lark routes it to the
       // user's p2p chat with the bot (auto-creates it if needed); other
       // group members never see this payload.
@@ -721,7 +1200,11 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
         data: {
           receive_id: ctx.msg.senderId,
           msg_type: 'interactive',
-          content: JSON.stringify(renderCard(state)),
+          content: JSON.stringify(
+            renderCard(
+              withDoctorReport(state, doctorReport(formatDoctorEchoStatus(echoText, state))),
+            ),
+          ),
         },
       });
     }
@@ -729,12 +1212,67 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
     log.fail('command', err, { step: 'doctor' });
     reportMetric('command_fail', 1, { step: 'doctor' });
   } finally {
-    ctx.activeRuns.unregister(ctx.scope, run);
+    doctorInFlightProfiles.delete(profileKey);
   }
 }
 
+function buildDoctorReport(
+  ctx: CommandContext,
+  opts: {
+    workspaceCheck?: string;
+    policyCheck?: string;
+    echoCheck?: string;
+  } = {},
+): string {
+  const queue = ctx.processPool?.snapshot();
+  const queueLine = queue
+    ? `${queue.active}/${queue.cap} active, ${queue.waiting} waiting`
+    : 'unknown';
+  const cwd = effectiveWorkspaceCwd(ctx);
+  const runtimeAccess = runtimeAccessStatus(ctx.controls.profileConfig);
+  const access =
+    ctx.msg.chatType === 'p2p'
+      ? canUseDm(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId)
+      : canUseGroup(
+          ctx.controls.profileConfig,
+          ctx.controls,
+          ctx.msg.chatId,
+          ctx.msg.senderId,
+        );
+  return [
+    'self-check: ok',
+    `profile: ${ctx.controls.profile}`,
+    `agent: ${ctx.agent.displayName} (${ctx.controls.profileConfig.agentKind})`,
+    `workspace: ${cwd ?? '(未设置)'}`,
+    `workspace default: ${ctx.controls.profileConfig.workspaces.default ? 'set' : 'missing'}`,
+    `${runtimeAccess.label}: ${runtimeAccess.value}`,
+    `access: ${access.ok ? 'ok' : 'denied'} (${access.reason})`,
+    `owner API: ${formatOwnerState(ctx)}`,
+    `queue: ${queueLine}`,
+    `run executor: ${ctx.runExecutor ? 'available' : 'unavailable'}`,
+    ...(opts.workspaceCheck ? [`workspace check: ${opts.workspaceCheck}`] : []),
+    ...(opts.policyCheck ? [`policy check: ${opts.policyCheck}`] : []),
+    ...(opts.echoCheck ? [`agent echo check: ${opts.echoCheck}`] : []),
+  ].join('\n');
+}
+
+function withDoctorReport(state: RunState, report: string): RunState {
+  return {
+    ...state,
+    blocks: [{ kind: 'text', content: report, streaming: false }, ...state.blocks],
+  };
+}
+
+function formatDoctorEchoStatus(echoText: string, state: RunState): string {
+  const trimmed = echoText.trim();
+  if (trimmed) return trimmed.length > 80 ? `${trimmed.slice(0, 80)}…` : trimmed;
+  if (state.terminal === 'running') return 'pending';
+  if (state.terminal === 'done') return 'empty';
+  return state.terminal;
+}
+
 async function handleHelp(_args: string, ctx: CommandContext): Promise<void> {
-  const card = helpCard();
+  const card = helpCard(ctx.agent.displayName);
   await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
 }
 
@@ -796,7 +1334,6 @@ async function submitAccount(ctx: CommandContext): Promise<void> {
 
   const formMsgId = ctx.msg.messageId;
   const channel = ctx.channel;
-  const configPath = ctx.controls.configPath;
   const restart = ctx.controls.restart;
 
   // CRITICAL: detach the work from the cardAction handler. Lark's client
@@ -864,15 +1401,15 @@ async function submitAccount(ctx: CommandContext): Promise<void> {
     // raw secret. lark-cli's `config bind --source lark-channel` reads the
     // same SecretRef and goes through the exec protocol to retrieve the
     // plaintext into its own OS keychain — no plaintext on disk.
-    let newCfg: AppConfig;
     try {
-      newCfg = await buildEncryptedAccountConfig(
+      const appPaths = commandProfilePaths(ctx);
+      const newCfg = await buildEncryptedAccountConfig(
         appId,
         tenant,
         ctx.controls.cfg.preferences,
+        appPaths,
       );
-      await setSecret(secretKeyForApp(appId), appSecret);
-      await saveConfig(newCfg, configPath);
+      await saveAccountConfig(ctx, newCfg, appSecret);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await finishFailure(`保存凭据失败：${msg}`);
@@ -902,48 +1439,45 @@ async function recallMessage(ctx: CommandContext, messageId: string): Promise<vo
   }
 }
 
-// ────────────── /invite — add to access whitelists ──────────────
+// ────────────── /invite and /remove — access lists ──────────────
 
-/**
- * /invite manages access whitelists via slash commands. Replaces the in-form
- * picker that didn't reliably search the Lark directory.
- *
- *   /invite user @user     → add the mentioned non-bot users to allowedUsers
- *   /invite admin @user    → add them to admins
- *   /invite group          → add the current chat_id to allowedChats
- *
- * Token order is flexible (the parser scans for the keyword anywhere),
- * but the canonical form is keyword-first to match the way humans read
- * the command aloud ("invite user @周杰").
- *
- * Admin-gated so a stranger who manages to reach the bot can't escalate
- * themselves. Removals are done via the per-row buttons in /config.
- */
 async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
-  const tokens = args.trim().split(/\s+/).filter(Boolean).map((t) => t.toLowerCase());
+  const tokens = args.trim().split(/\s+/).filter(Boolean).map((token) => token.toLowerCase());
 
-  // `all group` — add every chat the bot is in, directly (no confirmation).
   if (tokens.includes('all') && tokens.includes('group')) {
-    const access = { ...(ctx.controls.cfg.preferences?.access ?? {}) };
-    const list = new Set(access.allowedChats ?? []);
-    let added = 0;
-    for (const c of ctx.controls.knownChats) {
-      if (!list.has(c.id)) {
-        list.add(c.id);
-        added += 1;
-      }
+    const list = new Set(ctx.controls.profileConfig.access.allowedChats);
+    let knownChats = ctx.controls.knownChats ?? [];
+    if (knownChats.length === 0) {
+      knownChats = await fetchKnownChats(ctx.channel);
+      ctx.controls.knownChats = knownChats;
     }
-    access.allowedChats = [...list];
-    await persistAccess(ctx, access);
-    if (ctx.controls.knownChats.length === 0) {
+    let added = 0;
+    let total = list.size;
+    await saveAccessConfig(ctx, (current) => {
+      list.clear();
+      for (const chatId of current.allowedChats) list.add(chatId);
+      added = 0;
+      for (const chat of knownChats) {
+        if (!list.has(chat.id)) {
+          list.add(chat.id);
+          added += 1;
+        }
+      }
+      total = list.size;
+      return {
+        ...current,
+        allowedChats: [...list],
+      };
+    });
+    if (knownChats.length === 0) {
       await reply(ctx, '当前 bot 还不在任何群里，没有可加入的群。');
     } else {
-      await reply(ctx, `✅ 已把 bot 所在的 ${added} 个群加入响应群名单（共 ${list.size} 个）。`);
+      await reply(ctx, `✅ 已把 bot 所在的 ${added} 个群加入响应群名单（共 ${total} 个）。`);
     }
     return;
   }
 
-  const kind = tokens.find((t) => /^(user|admin|group)$/.test(t)) as
+  const kind = tokens.find((token) => /^(user|admin|group)$/.test(token)) as
     | 'user'
     | 'admin'
     | 'group'
@@ -960,31 +1494,31 @@ async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
     return;
   }
 
-  const cfg = ctx.controls.cfg;
-  const access = { ...(cfg.preferences?.access ?? {}) };
-
   if (kind === 'group') {
     if (ctx.chatMode === 'p2p') {
-      await reply(ctx, '❌ `/invite group` 只能在群里发——在私聊里没有 chat_id 可以加。');
+      await reply(ctx, '❌ `/invite group` 只能在群里发，在私聊里没有 chat_id 可以加。');
       return;
     }
     const chatId = ctx.msg.chatId;
-    const list = new Set(access.allowedChats ?? []);
-    if (list.has(chatId)) {
+    let already = false;
+    await saveAccessConfig(ctx, (current) => {
+      const list = new Set(current.allowedChats);
+      already = list.has(chatId);
+      if (!already) list.add(chatId);
+      return {
+        ...current,
+        allowedChats: [...list],
+      };
+    });
+    if (already) {
       await reply(ctx, '✅ 当前群已在白名单里，无需重复添加。');
       return;
     }
-    list.add(chatId);
-    access.allowedChats = [...list];
-    await persistAccess(ctx, access);
     await reply(ctx, `✅ 已把当前群（\`${chatId}\`）加入响应群名单。`);
     return;
   }
 
-  // kind === 'user' or 'admin' — pull non-bot mentions
-  const targets = ctx.msg.mentions
-    .filter((m) => !m.isBot && typeof m.openId === 'string' && m.openId.length > 0)
-    .map((m) => ({ openId: m.openId as string, name: m.name }));
+  const targets = mentionTargets(ctx);
   if (targets.length === 0) {
     await reply(
       ctx,
@@ -992,19 +1526,27 @@ async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
     );
     return;
   }
+
   const listKey = kind === 'user' ? 'allowedUsers' : 'admins';
-  const list = new Set(access[listKey] ?? []);
   const added: string[] = [];
   const already: string[] = [];
-  for (const t of targets) {
-    if (list.has(t.openId)) already.push(t.name ?? t.openId);
-    else {
-      list.add(t.openId);
-      added.push(t.name ?? t.openId);
+  await saveAccessConfig(ctx, (current) => {
+    const list = new Set(current[listKey]);
+    added.length = 0;
+    already.length = 0;
+    for (const target of targets) {
+      if (list.has(target.openId)) {
+        already.push(target.name ?? target.openId);
+      } else {
+        list.add(target.openId);
+        added.push(target.name ?? target.openId);
+      }
     }
-  }
-  access[listKey] = [...list];
-  await persistAccess(ctx, access);
+    return {
+      ...current,
+      [listKey]: [...list],
+    };
+  });
   const label = kind === 'user' ? '用户白名单' : '管理员';
   const parts: string[] = [];
   if (added.length > 0) parts.push(`✅ 已把 ${added.join('、')} 加入${label}。`);
@@ -1012,19 +1554,9 @@ async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
   await reply(ctx, parts.join('\n'));
 }
 
-/**
- * `/remove` is the symmetrical counterpart of `/invite`:
- *
- *   /remove user  @某人   → drop from allowedUsers
- *   /remove admin @某人   → drop from admins
- *   /remove group         → drop the current chat from allowedChats
- *
- * Same admin gate as /invite. Targets that aren't on the list get a
- * friendly "本来就不在名单里" note rather than an error.
- */
 async function handleRemove(args: string, ctx: CommandContext): Promise<void> {
-  const tokens = args.trim().split(/\s+/).filter(Boolean).map((t) => t.toLowerCase());
-  const kind = tokens.find((t) => /^(user|admin|group)$/.test(t)) as
+  const tokens = args.trim().split(/\s+/).filter(Boolean).map((token) => token.toLowerCase());
+  const kind = tokens.find((token) => /^(user|admin|group)$/.test(token)) as
     | 'user'
     | 'admin'
     | 'group'
@@ -1040,77 +1572,119 @@ async function handleRemove(args: string, ctx: CommandContext): Promise<void> {
     return;
   }
 
-  const access = { ...(ctx.controls.cfg.preferences?.access ?? {}) };
-
   if (kind === 'group') {
     if (ctx.chatMode === 'p2p') {
-      await reply(ctx, '`/remove group` 请在要移除的群里发——私聊里没有可移除的群。');
+      await reply(ctx, '`/remove group` 请在要移除的群里发，私聊里没有可移除的群。');
       return;
     }
     const chatId = ctx.msg.chatId;
-    const list = new Set(access.allowedChats ?? []);
-    if (!list.has(chatId)) {
+    let missing = false;
+    await saveAccessConfig(ctx, (current) => {
+      const list = new Set(current.allowedChats);
+      missing = !list.has(chatId);
+      list.delete(chatId);
+      return {
+        ...current,
+        allowedChats: [...list],
+      };
+    });
+    if (missing) {
       await reply(ctx, '✅ 当前群本来就不在响应名单里，无需移除。');
       return;
     }
-    list.delete(chatId);
-    access.allowedChats = [...list];
-    await persistAccess(ctx, access);
-    await reply(ctx, `✅ 已把当前群移出响应群名单。`);
+    await reply(ctx, '✅ 已把当前群移出响应群名单。');
     return;
   }
 
-  const targets = ctx.msg.mentions
-    .filter((m) => !m.isBot && typeof m.openId === 'string' && m.openId.length > 0)
-    .map((m) => ({ openId: m.openId as string, name: m.name }));
+  const targets = mentionTargets(ctx);
   if (targets.length === 0) {
     await reply(ctx, `请 @ 上要移除的人，例如：\`/remove ${kind} @某人\`。`);
     return;
   }
+
   const listKey = kind === 'user' ? 'allowedUsers' : 'admins';
-  const list = new Set(access[listKey] ?? []);
   const removed: string[] = [];
   const notThere: string[] = [];
-  for (const t of targets) {
-    if (list.has(t.openId)) {
-      list.delete(t.openId);
-      removed.push(t.name ?? t.openId);
-    } else {
-      notThere.push(t.name ?? t.openId);
+  await saveAccessConfig(ctx, (current) => {
+    const list = new Set(current[listKey]);
+    removed.length = 0;
+    notThere.length = 0;
+    for (const target of targets) {
+      if (list.has(target.openId)) {
+        list.delete(target.openId);
+        removed.push(target.name ?? target.openId);
+      } else {
+        notThere.push(target.name ?? target.openId);
+      }
     }
-  }
-  access[listKey] = [...list];
-  await persistAccess(ctx, access);
+    return {
+      ...current,
+      [listKey]: [...list],
+    };
+  });
   const label = kind === 'user' ? '用户白名单' : '管理员';
   const parts: string[] = [];
   if (removed.length > 0) parts.push(`✅ 已把 ${removed.join('、')} 移出${label}。`);
-  if (notThere.length > 0) parts.push(`👌 ${notThere.join('、')} 本来就不在${label}里，无需移除。`);
+  if (notThere.length > 0) parts.push(`${notThere.join('、')} 本来就不在${label}里，无需移除。`);
   await reply(ctx, parts.join('\n'));
 }
 
-/**
- * Mutate cfg.preferences.access in place + persist to disk. Shared by
- * /invite and /remove.
- */
-async function persistAccess(
+function mentionTargets(ctx: CommandContext): Array<{ openId: string; name?: string }> {
+  return (ctx.msg.mentions ?? [])
+    .filter((mention) => !mention.isBot && typeof mention.openId === 'string' && mention.openId)
+    .map((mention) => ({
+      openId: mention.openId as string,
+      ...(mention.name ? { name: mention.name } : {}),
+    }));
+}
+
+async function saveAccessConfig(
   ctx: CommandContext,
-  newAccess: AppAccess,
-): Promise<void> {
-  ctx.controls.cfg.preferences = {
-    ...(ctx.controls.cfg.preferences ?? {}),
-    access: newAccess,
-  };
+  mutate: (access: ProfileAccess) => ProfileAccess,
+): Promise<ProfileAccess> {
   try {
-    await saveConfig(ctx.controls.cfg, ctx.controls.configPath);
+    return await withConfigFileLock(ctx.controls.configPath, async () => {
+      const root = await loadRootConfig(ctx.controls.configPath);
+      if (!root) {
+        const access = mutate(ctx.controls.profileConfig.access);
+        ctx.controls.profileConfig = {
+          ...ctx.controls.profileConfig,
+          access,
+        };
+        ctx.controls.cfg.preferences = {
+          ...(ctx.controls.cfg.preferences ?? {}),
+          access: {
+            allowedUsers: access.allowedUsers,
+            allowedChats: access.allowedChats,
+            admins: access.admins,
+          },
+          requireMentionInGroup: access.requireMentionInGroup,
+        };
+        await saveConfig(ctx.controls.cfg, ctx.controls.configPath);
+        return access;
+      }
+
+      const profile = root.profiles[ctx.controls.profile];
+      if (!profile) throw new Error(`profile not found: ${ctx.controls.profile}`);
+      const access = mutate(profile.access);
+      root.profiles[ctx.controls.profile] = {
+        ...profile,
+        access,
+      };
+      await saveRootConfig(root, ctx.controls.configPath);
+      ctx.controls.profileConfig = root.profiles[ctx.controls.profile]!;
+      ctx.controls.cfg = runtimeProfileConfig(root, ctx.controls.profile);
+      log.info('command', 'access-mutated', {
+        allowedUsers: access.allowedUsers.length,
+        allowedChats: access.allowedChats.length,
+        admins: access.admins.length,
+      });
+      return access;
+    });
   } catch (err) {
-    log.fail('command', err, { step: 'invite.save' });
-    reportMetric('command_fail', 1, { step: 'invite.save' });
+    reportMetric('command_fail', 1, { step: 'access.save' });
+    throw err;
   }
-  log.info('command', 'access-mutated', {
-    allowedUsers: newAccess.allowedUsers?.length ?? 0,
-    allowedChats: newAccess.allowedChats?.length ?? 0,
-    admins: newAccess.admins?.length ?? 0,
-  });
 }
 
 // ────────────── /config — preferences form ──────────────
@@ -1130,20 +1704,8 @@ async function handleConfig(args: string, ctx: CommandContext): Promise<void> {
 }
 
 async function showConfigForm(ctx: CommandContext): Promise<void> {
-  // Refresh the cached owner AND chat list on demand. The startup /
-  // 30-min refresh timer occasionally fails fetchKnownChats with a
-  // transient SDK token error ("Cannot destructure tenant_access_token"),
-  // leaving controls.knownChats empty — which makes the group whitelist
-  // render as "(未知群)" because the names can't be resolved. /config is a
-  // stable, user-triggered moment (these fetches succeed reliably here),
-  // so re-pull both and refresh the cache. Each fetch is independently
-  // guarded so one failing doesn't blank the other.
   await Promise.all([
-    fetchAppOwnerId(ctx.channel, ctx.controls.cfg.accounts.app.id)
-      .then((ownerId) => {
-        if (ownerId) ctx.controls.botOwnerId = ownerId;
-      })
-      .catch(() => {}),
+    ctx.controls.refreshOwner(ctx.channel).catch(() => {}),
     fetchKnownChats(ctx.channel)
       .then((chats) => {
         if (chats.length > 0) ctx.controls.knownChats = chats;
@@ -1152,31 +1714,22 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
   ]);
 
   const ms = getRunIdleTimeoutMs(ctx.controls.cfg);
-  const access = ctx.controls.cfg.preferences?.access ?? {};
+  const access = ctx.controls.profileConfig.access;
   const card = configFormCard({
     messageReply: getMessageReplyMode(ctx.controls.cfg),
     showToolCalls: getShowToolCalls(ctx.controls.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
     requireMentionInGroup: getRequireMentionInGroup(ctx.controls.cfg),
-    allowedUsers: access.allowedUsers ?? [],
-    allowedChats: access.allowedChats ?? [],
-    admins: access.admins ?? [],
-    knownChats: ctx.controls.knownChats,
+    allowedUsers: access.allowedUsers,
+    allowedChats: access.allowedChats,
+    admins: access.admins,
+    knownChats: ctx.controls.knownChats ?? [],
   });
   if (ctx.fromCardAction) await recallMessage(ctx, ctx.msg.messageId);
   await sendManagedCard(ctx.channel, ctx.msg.chatId, card);
 }
 
-/**
- * Replace the form card in place with a result card. The managed-card map
- * is per-process and wiped on restart (and after the card is forgotten),
- * so `updateManagedCard` can throw "no managed card registered" for a card
- * rendered by a previous process — which used to silently swallow the
- * confirmation and make the user think their submit didn't take (they'd
- * click again). On any update failure we fall back to posting a fresh
- * card to the chat so there's always visible feedback after one submit.
- */
 async function showResultCardInPlace(
   ctx: CommandContext,
   formMsgId: string,
@@ -1186,8 +1739,10 @@ async function showResultCardInPlace(
     await updateManagedCard(ctx.channel, formMsgId, card);
   } catch (err) {
     log.warn('command', 'config-card-update-fallback', { err: String(err) });
-    await sendManagedCard(ctx.channel, ctx.msg.chatId, card).catch((e) =>
-      log.warn('command', 'config-card-fallback-send-failed', { err: String(e) }),
+    await sendManagedCard(ctx.channel, ctx.msg.chatId, card).catch((fallbackErr) =>
+      log.warn('command', 'config-card-fallback-send-failed', {
+        err: String(fallbackErr),
+      }),
     );
   }
   forgetManagedCard(formMsgId);
@@ -1244,16 +1799,8 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
   else if (rawRequireMention === 'no') requireMentionInGroup = false;
   else requireMentionInGroup = getRequireMentionInGroup(ctx.controls.cfg);
 
-  // Whitelists are managed entirely by /invite and /remove now — the
-  // /config form is read-only for access control. Pass the current values
-  // through unchanged so saving preferences doesn't clobber them.
-  const access = ctx.controls.cfg.preferences?.access ?? {};
-  const allowedUsers = access.allowedUsers ?? [];
-  const allowedChats = access.allowedChats ?? [];
-  const admins = access.admins ?? [];
-
   const formMsgId = ctx.msg.messageId;
-  const configPath = ctx.controls.configPath;
+  const access = ctx.controls.profileConfig.access;
 
   // Detach: same reason as account submit — Lark's client locks the form
   // while the cardAction handler is running. Wait out FORM_SETTLE_MS *after*
@@ -1267,9 +1814,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       }
     };
 
-    // In-place mutation — the cfg object is shared by reference with
-    // runAgentBatch's reads, so this takes effect on the next message.
-    ctx.controls.cfg.preferences = {
+    const nextPreferences: AppPreferences = {
       ...(ctx.controls.cfg.preferences ?? {}),
       messageReply,
       // Mark the messageReply value as living in the new (post-0.1.27)
@@ -1281,14 +1826,10 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
-      // Empty arrays serialize fine. Under the post-2026-05 semantics
-      // empty list = nobody (DM / group whitelists) or only-creator (admins),
-      // so empty is meaningful, not a stand-in for "unrestricted".
-      access: { allowedUsers, allowedChats, admins },
     };
 
     try {
-      await saveConfig(ctx.controls.cfg, configPath);
+      await savePreferencesConfig(ctx, nextPreferences, requireMentionInGroup);
     } catch (err) {
       log.fail('command', err, { step: 'config.save' });
       reportMetric('command_fail', 1, { step: 'config.save' });
@@ -1303,9 +1844,9 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
-      allowedUsersCount: allowedUsers.length,
-      allowedChatsCount: allowedChats.length,
-      adminsCount: admins.length,
+      allowedUsersCount: access.allowedUsers.length,
+      allowedChatsCount: access.allowedChats.length,
+      adminsCount: access.admins.length,
     });
     await waitForSettle();
     await showResultCardInPlace(
@@ -1317,11 +1858,78 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         maxConcurrentRuns,
         runIdleTimeoutMinutes,
         requireMentionInGroup,
-        allowedUsers,
-        allowedChats,
-        admins,
-        knownChats: ctx.controls.knownChats,
+        allowedUsers: access.allowedUsers,
+        allowedChats: access.allowedChats,
+        admins: access.admins,
+        knownChats: ctx.controls.knownChats ?? [],
       }),
     );
   })();
+}
+
+function commandProfilePaths(ctx: CommandContext) {
+  return resolveAppPaths({
+    rootDir: dirname(ctx.controls.configPath),
+    profile: ctx.controls.profile,
+  });
+}
+
+async function saveAccountConfig(
+  ctx: CommandContext,
+  newCfg: AppConfig,
+  plaintextSecret: string,
+): Promise<void> {
+  const appPaths = commandProfilePaths(ctx);
+  await setSecret(secretKeyForApp(newCfg.accounts.app.id), plaintextSecret, appPaths);
+
+  const root = await loadRootConfig(ctx.controls.configPath);
+  if (!root) {
+    await saveConfig(newCfg, ctx.controls.configPath);
+    ctx.controls.cfg = newCfg;
+    return;
+  }
+
+  const profile = root.profiles[ctx.controls.profile];
+  if (!profile) throw new Error(`profile not found: ${ctx.controls.profile}`);
+  root.profiles[ctx.controls.profile] = {
+    ...profile,
+    accounts: newCfg.accounts,
+  };
+  if (newCfg.secrets) root.secrets = newCfg.secrets;
+  await saveRootConfig(root, ctx.controls.configPath);
+  ctx.controls.profileConfig = root.profiles[ctx.controls.profile]!;
+  ctx.controls.cfg = runtimeProfileConfig(root, ctx.controls.profile);
+}
+
+async function savePreferencesConfig(
+  ctx: CommandContext,
+  preferences: AppPreferences,
+  requireMentionInGroup: boolean,
+): Promise<void> {
+  await withConfigFileLock(ctx.controls.configPath, async () => {
+    const root = await loadRootConfig(ctx.controls.configPath);
+    if (!root) {
+      ctx.controls.cfg.preferences = preferences;
+      await saveConfig(ctx.controls.cfg, ctx.controls.configPath);
+      return;
+    }
+
+    const profile = root.profiles[ctx.controls.profile];
+    if (!profile) throw new Error(`profile not found: ${ctx.controls.profile}`);
+    const { requireMentionInGroup: _requireMention, access: _access, ...profilePreferences } = preferences;
+    root.profiles[ctx.controls.profile] = {
+      ...profile,
+      preferences: {
+        ...profile.preferences,
+        ...profilePreferences,
+      },
+      access: {
+        ...profile.access,
+        requireMentionInGroup,
+      },
+    };
+    await saveRootConfig(root, ctx.controls.configPath);
+    ctx.controls.profileConfig = root.profiles[ctx.controls.profile]!;
+    ctx.controls.cfg = runtimeProfileConfig(root, ctx.controls.profile);
+  });
 }

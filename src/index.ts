@@ -1,5 +1,4 @@
-// Public exports — useful for smoke tests / debugging tools that want
-// to reuse the same rendering logic the bot itself uses.
+// Public exports for consumers that need the same rendering logic the bot uses.
 export { renderCard } from './card/run-renderer';
 export { renderText } from './card/text-renderer';
 export {

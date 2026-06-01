@@ -1,7 +1,7 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
+import { writeFileAtomic } from '../platform/atomic-write';
 
 export interface SessionEntry {
   /** May be absent if the entry was created by /timeout before any run
@@ -11,8 +11,8 @@ export interface SessionEntry {
   cwd?: string;
   updatedAt: number;
   /** Per-scope idle-timeout override (minutes). 0 = explicitly off for this
-   * scope, undefined = follow global default. /new clears the whole entry,
-   * so this resets to "follow global" when the user starts a new session. */
+   * scope, undefined = follow global default. Session resets preserve this
+   * scope preference while removing the resumable session id/cwd. */
   idleTimeoutMinutes?: number;
 }
 
@@ -90,8 +90,16 @@ export class SessionStore {
   }
 
   clear(chatId: string): void {
-    if (!(chatId in this.data)) return;
-    delete this.data[chatId];
+    const prev = this.data[chatId];
+    if (!prev) return;
+    if (prev.idleTimeoutMinutes !== undefined) {
+      this.data[chatId] = {
+        idleTimeoutMinutes: prev.idleTimeoutMinutes,
+        updatedAt: Date.now(),
+      };
+    } else {
+      delete this.data[chatId];
+    }
     this.schedulePersist();
   }
 
@@ -129,8 +137,9 @@ export class SessionStore {
   private schedulePersist(): void {
     this.saving = this.saving
       .then(async () => {
-        await mkdir(dirname(this.path), { recursive: true });
-        await writeFile(this.path, `${JSON.stringify(this.data, null, 2)}\n`, 'utf8');
+        await writeFileAtomic(this.path, `${JSON.stringify(this.data, null, 2)}\n`, {
+          mode: 0o600,
+        });
       })
       .catch((err: unknown) => {
         log.fail('session', err, { step: 'persist' });
