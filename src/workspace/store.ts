@@ -1,7 +1,7 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
+import { writeFileAtomic } from '../platform/atomic-write';
 
 interface WorkspaceData {
   chats: Record<string, { cwd: string }>;
@@ -40,6 +40,22 @@ export class WorkspaceStore {
     this.schedulePersist();
   }
 
+  removeCwd(chatId: string): boolean {
+    if (!(chatId in this.data.chats)) return false;
+    delete this.data.chats[chatId];
+    this.schedulePersist();
+    return true;
+  }
+
+  listCwds(prefix?: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(this.data.chats)) {
+      if (prefix && !key.startsWith(prefix)) continue;
+      out[key] = value.cwd;
+    }
+    return out;
+  }
+
   listNamed(): Record<string, string> {
     return { ...this.data.named };
   }
@@ -67,8 +83,9 @@ export class WorkspaceStore {
   private schedulePersist(): void {
     this.saving = this.saving
       .then(async () => {
-        await mkdir(dirname(this.path), { recursive: true });
-        await writeFile(this.path, `${JSON.stringify(this.data, null, 2)}\n`, 'utf8');
+        await writeFileAtomic(this.path, `${JSON.stringify(this.data, null, 2)}\n`, {
+          mode: 0o600,
+        });
       })
       .catch((err: unknown) => {
         log.fail('workspace', err, { step: 'persist' });

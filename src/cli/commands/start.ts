@@ -3,32 +3,48 @@ import os from 'node:os';
 import { createInterface } from 'node:readline';
 import pkg from '../../../package.json';
 import { ClaudeAdapter } from '../../agent/claude/adapter';
-import { startChannel, type BridgeChannel } from '../../bot/channel';
-import { runRegistrationWizard } from '../../bot/wizard';
-import type { Controls } from '../../commands';
-import { setSecret } from '../../config/keystore';
-import { paths } from '../../config/paths';
-import type { AppConfig } from '../../config/schema';
-import { isComplete, secretKeyForApp } from '../../config/schema';
+import { CodexAdapter } from '../../agent/codex/adapter';
 import {
-  buildEncryptedAccountConfig,
-  ensureSecretsGetterWrapper,
-  loadConfig,
-  saveConfig,
-} from '../../config/store';
-import { gcOldLogs, log } from '../../core/logger';
+  AgentPreflightError,
+  formatAgentPreflightDiagnostic,
+  type AgentAvailability,
+} from '../../agent/preflight';
+import type { AgentAdapter } from '../../agent/types';
+import { startChannel, type BridgeChannel } from '../../bot/channel';
+import type { Controls } from '../../commands';
+import type { AppPaths } from '../../config/app-paths';
+import {
+  type AgentKind,
+  type CodexConfig,
+  type ProfileConfig,
+} from '../../config/profile-schema';
+import type { AppConfig } from '../../config/schema';
+import { isComplete } from '../../config/schema';
+import { configureLogger, gcOldLogs, log, reportError } from '../../core/logger';
 import { loadTelemetryAdapter, telemetry } from '../../core/telemetry';
 import { gcMediaCache } from '../../media/cache';
 import { preFlightChecks } from '../preflight';
+import { promptAndStopActiveBridgeMigrationConflict } from './migrate';
+import { stopProcessEntry, type StopProcessEntryResult } from './ps';
 import {
   cleanupTmpFiles,
   register,
-  sameAppOthers,
+  sameAppLiveOthers,
   unregisterSync,
   updateEntry,
   type ProcessEntry,
 } from '../../runtime/registry';
+import {
+  acquireAppRuntimeLock,
+  RuntimeLockConflictError,
+  withProfileAndAppLocks,
+  type AcquiredRuntimeLock,
+  type RuntimeLockMeta,
+} from '../../runtime/locks';
+import { resolveProfileRuntime } from '../../runtime/profile-runtime';
+import { refreshOwnerControls } from '../../policy/owner';
 import { SessionStore } from '../../session/store';
+import { SessionCatalog } from '../../session/catalog';
 import { WorkspaceStore } from '../../workspace/store';
 
 // Prefer IPv4 — Node 20+ defaults to "verbatim" which respects whatever
@@ -44,45 +60,59 @@ dns.setDefaultResultOrder('ipv4first');
 // keep the bot alive — losing a single reply is better than crashing.
 process.on('unhandledRejection', (reason) => {
   log.fail('process', reason, { kind: 'unhandledRejection' });
-  telemetry().recordError(reason, { kind: 'unhandledRejection' });
+  reportError(reason, { kind: 'unhandledRejection' });
 });
 process.on('uncaughtException', (err) => {
   log.fail('process', err, { kind: 'uncaughtException' });
-  telemetry().recordError(err, { kind: 'uncaughtException' });
+  reportError(err, { kind: 'uncaughtException' });
 });
 
 const MEDIA_GC_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export interface StartOptions {
   config?: string;
+  profile?: string;
+  agent?: string;
+  workspace?: string;
+  appId?: string;
+  appSecret?: string;
+  tenant?: string;
   skipCheckLarkCli?: boolean;
+  confirmStopRuntimeLockProcess?: (err: RuntimeLockConflictError) => boolean | Promise<boolean>;
+  stopRuntimeLockProcess?: (meta: RuntimeLockMeta) => StopProcessEntryResult | Promise<StopProcessEntryResult>;
 }
 
 export async function runStart(opts: StartOptions): Promise<void> {
-  const configPath = opts.config ?? paths.configFile;
-  const existing = await loadConfig(configPath);
+  const runtime = await resolveProfileRuntime({
+    ...opts,
+    allowBootstrap: true,
+    handleActiveBridgeMigrationConflict: async (err) => {
+      const handled = await promptAndStopActiveBridgeMigrationConflict(err, {
+        cancelMessage: '已取消启动。',
+      });
+      if (!handled) process.exit(0);
+      return true;
+    },
+  });
+  let cfg = runtime.cfg;
+  const configPath = runtime.configPath;
+  const appPaths = runtime.appPaths;
+  let profileConfig = runtime.profileConfig;
+  configureLogger({ logsDir: appPaths.logsDir });
 
-  let cfg: AppConfig;
-  if (isComplete(existing)) {
-    cfg = existing;
-    // Migrate legacy plaintext configs: any time we see a raw string in
-    // accounts.app.secret that isn't a "${VAR}" template, move it into
-    // the encrypted keystore and rewrite config.json with an exec ref.
-    // Idempotent — already-encrypted configs (SecretRef) pass through.
-    cfg = await maybeMigratePlaintextSecret(cfg, configPath);
-  } else {
-    const fresh = await runRegistrationWizard();
-    // Fresh credentials from the wizard arrive as a plaintext secret;
-    // immediately encrypt before persisting so disk never holds the raw value.
-    cfg = await persistEncrypted(fresh, configPath);
-    console.log(`配置已保存到 ${configPath}\n`);
-  }
+  await preFlightChecks({
+    skipCheckLarkCli: opts.skipCheckLarkCli,
+    bridgeConfig: cfg,
+    appPaths,
+    larkChannel: {
+      profile: appPaths.profile,
+      rootDir: appPaths.rootDir,
+      configPath,
+      larkCliConfigDir: appPaths.larkCliConfigDir,
+      larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile,
+    },
+  });
 
-  await preFlightChecks({ skipCheckLarkCli: opts.skipCheckLarkCli });
-
-  // Optional telemetry: noop unless LARK_CHANNEL_TELEMETRY_MODULE is set.
-  // Loaded after pre-flight (so config is known) and before the channel comes
-  // up (so startup events are captured). Never throws.
   await loadTelemetryAdapter({
     version: pkg.version,
     appId: cfg.accounts.app.id,
@@ -90,160 +120,345 @@ export async function runStart(opts: StartOptions): Promise<void> {
     hostname: os.hostname(),
   });
 
-  const agent = new ClaudeAdapter();
-  if (!(await agent.isAvailable())) {
-    console.error('✗ 未找到 claude CLI。请先安装 Claude Code：');
-    console.error('  https://docs.anthropic.com/en/docs/claude-code/quickstart');
+  let agent = createRuntimeAgent(profileConfig, { ...appPaths, configPath });
+  const availability = await checkRuntimeAgentAvailability(agent);
+  if (!availability.ok) {
+    console.error(formatAgentPreflightDiagnostic(availability.diagnostic));
+    log.warn('agent', 'preflight-failed', { diagnostic: availability.diagnostic });
     process.exit(1);
   }
 
-  const sessions = new SessionStore();
-  await sessions.load();
-  const workspaces = new WorkspaceStore();
-  await workspaces.load();
-
-  await gcMediaCache(MEDIA_GC_MAX_AGE_MS);
-  await gcOldLogs();
-
-  // Same-app conflict detection. Open-platform routes events to one of the
-  // long-connections at random, so two `start` of the same app makes "who
-  // answered me" unpredictable. Warn + interactive triage before connecting.
-  const conflicts = sameAppOthers(cfg.accounts.app.id);
-  if (conflicts.length > 0) {
-    const proceed = await resolveConflict(cfg, conflicts);
-    if (!proceed) {
-      console.log('已取消启动。');
-      process.exit(0);
-    }
-  }
-
-  // Register self in the process registry. Cleanup is wired via stop() and
-  // 'exit' below — both paths run unregisterSync so stale entries don't
-  // poison the next start.
-  const entry = await register({
-    appId: cfg.accounts.app.id,
-    tenant: cfg.accounts.app.tenant,
-    configPath,
-    version: pkg.version,
-  });
-  log.info('registry', 'registered', { id: entry.id, pid: process.pid });
-
-  // `bridge` is mutable so /account can swap it on restart. `controls` carries
-  // restart() and a snapshot of the current cfg so command handlers can read
-  // and replace credentials without plumbing through the whole runStart scope.
-  let bridge: BridgeChannel;
-  let restarting = false;
-
-  let stopping = false;
-  const stop = async (sig: string): Promise<void> => {
-    if (stopping) return;
-    stopping = true;
-    console.log(`\n收到 ${sig}，正在关闭...`);
+  for (;;) {
     try {
-      await bridge.disconnect();
-    } catch (err) {
-      console.error('[disconnect-failed]', err);
-    }
-    // Give the telemetry sink a bounded window to ship buffered events before
-    // the process goes away. Best-effort: a slow/failed flush must not block exit.
-    try {
-      await telemetry().flush?.(2000);
-    } catch {
-      /* ignore — exiting anyway */
-    }
-    // unregister is best-effort sync — we're about to exit anyway.
-    unregisterSync(entry.id);
-    process.exit(0);
-  };
+      let runtimeLocks: AcquiredRuntimeLock[] = [];
+      await withProfileAndAppLocks(
+        appPaths,
+        cfg.accounts.app.id,
+        cfg.agentKind ?? 'claude',
+        async (locks) => {
+          runtimeLocks = locks;
+          const sessions = new SessionStore(appPaths.sessionsFile);
+          await sessions.load();
+          const sessionCatalog = new SessionCatalog(`${appPaths.sessionsFile}.catalog.json`);
+          await sessionCatalog.load();
+          const workspaces = new WorkspaceStore(appPaths.workspacesFile);
+          await workspaces.load();
 
-  const controls: Controls = {
-    configPath,
-    cfg,
-    processId: entry.id,
-    knownChats: [],
-    // botOwnerId is filled in by channel.ts once the WS handshake + the
-    // application/v6 API call complete. Until then it stays undefined and
-    // access control behaves fail-secure (no creator bypass).
-    async exit() {
-      await stop('exit-command');
-    },
-    async restart() {
-      if (restarting) return;
-      restarting = true;
-      try {
-        const next = await loadConfig(configPath);
-        if (!isComplete(next)) throw new Error('config incomplete after change');
-        console.log(
-          `[restart] connecting new bridge with appId=${next.accounts.app.id} tenant=${next.accounts.app.tenant}...`,
+        await gcMediaCache(MEDIA_GC_MAX_AGE_MS, appPaths.mediaDir);
+        await gcOldLogs();
+
+        // Same-app conflict detection. Open-platform routes events to one of the
+        // long-connections at random, so two `start` of the same app makes "who
+        // answered me" unpredictable. Warn + interactive triage before connecting.
+        const conflicts = await sameAppLiveOthers(
+          cfg.accounts.app.id,
+          process.pid,
+          appPaths.userRegistryFile,
         );
-        // Connect-before-disconnect: if the new bridge fails to come up
-        // (e.g. network outage during a force-reconnect), throwing here
-        // leaves the old bridge — and its keepalive timer — untouched, so
-        // the next keepalive tick (~15s later) can retry restart. Without
-        // this ordering, a failed restart would tear down the only
-        // keepalive in the process and the bot would never recover until
-        // someone manually restarts it.
-        const next_bridge = await startChannel({
-          cfg: next,
+        if (conflicts.length > 0) {
+          const proceed = await resolveConflict(conflicts);
+          if (!proceed) {
+            console.log('已取消启动。');
+            process.exit(0);
+          }
+        }
+
+        // Register self in the process registry. Cleanup is wired via stop() and
+        // 'exit' below — both paths run unregisterSync so stale entries don't
+        // poison the next start.
+        const entry = await register({
+          appId: cfg.accounts.app.id,
+          tenant: cfg.accounts.app.tenant,
+          profileName: appPaths.profile,
+          agentKind: cfg.agentKind ?? 'claude',
+          configPath,
+          version: pkg.version,
+          registryFile: appPaths.userRegistryFile,
+        });
+        log.info('registry', 'registered', { id: entry.id, pid: process.pid });
+
+        // `bridge` is mutable so /account can swap it on restart. `controls` carries
+        // restart() and a snapshot of the current cfg so command handlers can read
+        // and replace credentials without plumbing through the whole runStart scope.
+        let bridge: BridgeChannel;
+        let restarting = false;
+
+        let stopping = false;
+        const stop = async (sig: string): Promise<void> => {
+          if (stopping) return;
+          stopping = true;
+          console.log(`\n收到 ${sig}，正在关闭...`);
+          try {
+            await bridge.disconnect();
+          } catch (err) {
+            console.error('[disconnect-failed]', err);
+          }
+          // unregister is best-effort sync — we're about to exit anyway.
+          unregisterSync(entry.id, appPaths.userRegistryFile);
+          await releaseRuntimeLocks(runtimeLocks);
+          await flushTelemetry();
+          process.exit(0);
+        };
+
+        let controls: Controls;
+        const makeControls = (
+          currentPaths: AppPaths,
+          currentCfg: AppConfig,
+          currentProfileConfig: ProfileConfig,
+        ): Controls => {
+          const currentControls: Controls = {
+            profile: currentPaths.profile,
+            profileConfig: currentProfileConfig,
+            ownerRefreshState: 'unknown',
+            knownChats: [],
+            async refreshOwner(channelOverride) {
+              const target = channelOverride ?? bridge?.channel;
+              if (!target) return;
+              await refreshOwnerControls(
+                currentControls,
+                target.rawClient,
+                currentControls.cfg.accounts.app.id,
+              );
+            },
+            configPath,
+            cfg: currentCfg,
+            processId: entry.id,
+            async exit() {
+              await stop('exit-command');
+            },
+            async restart() {
+              if (restarting) return;
+              restarting = true;
+              let nextAppLock: AcquiredRuntimeLock | undefined;
+              try {
+                const nextRuntime = await resolveProfileRuntime({
+                  config: configPath,
+                  profile: appPaths.profile,
+                  allowBootstrap: false,
+                });
+                const next = nextRuntime.cfg;
+                if (!isComplete(next)) throw new Error('config incomplete after change');
+                assertReconnectAgentKindUnchanged(cfg.agentKind, next.agentKind);
+                const nextAgent = createRuntimeAgent(nextRuntime.profileConfig, {
+                  ...nextRuntime.appPaths,
+                  configPath: nextRuntime.configPath,
+                });
+                const nextAvailability = await checkRuntimeAgentAvailability(nextAgent);
+                if (!nextAvailability.ok) {
+                  throw nextAvailability.error;
+                }
+                const appChanged = next.accounts.app.id !== cfg.accounts.app.id;
+                if (appChanged) {
+                  nextAppLock = await acquireAppRuntimeLock(
+                    nextRuntime.appPaths,
+                    next.accounts.app.id,
+                    next.agentKind ?? 'claude',
+                  );
+                }
+                console.log(
+                  `[restart] connecting new bridge with appId=${next.accounts.app.id} tenant=${next.accounts.app.tenant}...`,
+                );
+                const nextControls = makeControls(nextRuntime.appPaths, next, nextRuntime.profileConfig);
+                // Connect-before-disconnect: if the new bridge fails to come up
+                // (e.g. network outage during a force-reconnect), throwing here
+                // leaves the old bridge — and its keepalive timer — untouched, so
+                // the next keepalive tick (~15s later) can retry restart. Without
+                // this ordering, a failed restart would tear down the only
+                // keepalive in the process and the bot would never recover until
+                // someone manually restarts it.
+                const next_bridge = await startChannel({
+                  cfg: next,
+                  agent: nextAgent,
+                  sessions,
+                  sessionCatalog,
+                  workspaces,
+                  controls: nextControls,
+                  appPaths: nextRuntime.appPaths,
+                });
+                console.log('[restart] disconnecting old bridge...');
+                try {
+                  await bridge.disconnect();
+                } catch (err) {
+                  console.warn('[restart] old disconnect failed:', err);
+                }
+                bridge = next_bridge;
+                // Update while the old app lock is still held. Registry write paths
+                // prune stale entries by matching the currently persisted app lock.
+                await updateEntry(entry.id, {
+                  appId: next.accounts.app.id,
+                  tenant: next.accounts.app.tenant,
+                  configPath,
+                  botName: bridge.channel.botIdentity?.name,
+                }, appPaths.userRegistryFile).catch((err) =>
+                  log.warn('registry', 'update-failed', { err: String(err) }),
+                );
+                if (nextAppLock) {
+                  const oldAppLock = runtimeLocks.find((lock) => lock.kind === 'app');
+                  runtimeLocks = [
+                    ...runtimeLocks.filter((lock) => lock.kind !== 'app'),
+                    nextAppLock,
+                  ];
+                  nextAppLock = undefined;
+                  await oldAppLock?.release().catch((err) =>
+                    log.warn('runtime-lock', 'old-app-release-failed', { err: String(err) }),
+                  );
+                }
+                cfg = next;
+                profileConfig = nextRuntime.profileConfig;
+                agent = nextAgent;
+                controls = nextControls;
+                console.log('✓ 已用新凭据重连');
+              } finally {
+                if (nextAppLock) {
+                  await nextAppLock.release().catch((err) =>
+                    log.warn('runtime-lock', 'new-app-release-failed', { err: String(err) }),
+                  );
+                }
+                restarting = false;
+              }
+            },
+          };
+          return currentControls;
+        };
+        controls = makeControls(appPaths, cfg, profileConfig);
+
+        bridge = await startChannel({
+          cfg,
           agent,
           sessions,
+          sessionCatalog,
           workspaces,
           controls,
+          appPaths,
         });
-        console.log('[restart] disconnecting old bridge...');
-        try {
-          await bridge.disconnect();
-        } catch (err) {
-          console.warn('[restart] old disconnect failed:', err);
+
+        // Backfill the bot's display name into the registry once WS handshake is
+        // done — future starts conflicting on this app can show it in the prompt
+        // ("bot 尼莫 (cli_xxx)") instead of just a short id.
+        const botName = bridge.channel.botIdentity?.name;
+        if (botName) {
+          await updateEntry(entry.id, { botName }, appPaths.userRegistryFile).catch((err) =>
+            log.warn('registry', 'update-failed', { step: 'botName', err: String(err) }),
+          );
         }
-        bridge = next_bridge;
-        controls.cfg = next;
-        // Keep the registry in sync so /ps reflects the new app after an
-        // /account change. Same process id, new app fields.
-        await updateEntry(entry.id, {
-          appId: next.accounts.app.id,
-          tenant: next.accounts.app.tenant,
-          configPath,
-          botName: bridge.channel.botIdentity?.name,
-        }).catch((err) =>
-          log.warn('registry', 'update-failed', { err: String(err) }),
-        );
-        console.log('✓ 已用新凭据重连');
-      } finally {
-        restarting = false;
-      }
-    },
+
+        process.on('SIGINT', () => void stop('SIGINT'));
+        process.on('SIGTERM', () => void stop('SIGTERM'));
+        process.on('beforeExit', () => {
+          void flushTelemetry();
+        });
+        // Last-ditch sync unregister in case something exits without going through
+        // stop() (e.g. uncaughtException with process.exit(1)).
+        process.on('exit', () => {
+          unregisterSync(entry.id, appPaths.userRegistryFile);
+          cleanupTmpFiles(appPaths.userRegistryFile);
+        });
+
+        // keep the event loop alive until a signal arrives
+          await new Promise<void>(() => {});
+        },
+      );
+      return;
+    } catch (err) {
+      const action = await handleRuntimeLockConflict(err, opts);
+      if (action === 'retry') continue;
+      if (action === 'cancel') return;
+      throw err;
+    }
+  }
+}
+
+async function checkRuntimeAgentAvailability(agent: AgentAdapter): Promise<AgentAvailability> {
+  if (agent.checkAvailability) return agent.checkAvailability();
+  const ok = await agent.isAvailable();
+  if (ok) return { ok: true };
+  const diagnostic = {
+    code: 'agent-binary-not-found' as const,
+    agentId: agent.id === 'codex' ? 'codex' as const : 'claude' as const,
+    agentName: agent.displayName,
+    command: agent.id === 'codex' ? 'codex' : 'claude',
   };
+  return {
+    ok: false,
+    diagnostic,
+    error: new AgentPreflightError(diagnostic),
+  };
+}
 
-  bridge = await startChannel({ cfg, agent, sessions, workspaces, controls });
-
-  // Backfill the bot's display name into the registry once WS handshake is
-  // done — future starts conflicting on this app can show it in the prompt
-  // ("bot 尼莫 (cli_xxx)") instead of just a short id.
-  const botName = bridge.channel.botIdentity?.name;
-  if (botName) {
-    await updateEntry(entry.id, { botName }).catch((err) =>
-      log.warn('registry', 'update-failed', { step: 'botName', err: String(err) }),
+export function assertReconnectAgentKindUnchanged(
+  current: AgentKind | undefined,
+  next: AgentKind | undefined,
+): void {
+  const currentKind = current ?? 'claude';
+  const nextKind = next ?? 'claude';
+  if (nextKind !== currentKind) {
+    throw new Error(
+      `agent kind cannot change during reconnect (${currentKind} -> ${nextKind}); stop/start is required`,
     );
   }
+}
 
-  process.on('SIGINT', () => void stop('SIGINT'));
-  process.on('SIGTERM', () => void stop('SIGTERM'));
-  // If the event loop ever drains without a signal, give telemetry one last
-  // bounded flush. `beforeExit` doesn't fire on explicit process.exit(), which
-  // is why stop() flushes too.
-  process.on('beforeExit', () => {
-    void Promise.resolve(telemetry().flush?.(2000)).catch(() => {});
-  });
-  // Last-ditch sync unregister in case something exits without going through
-  // stop() (e.g. uncaughtException with process.exit(1)).
-  process.on('exit', () => {
-    unregisterSync(entry.id);
-    cleanupTmpFiles();
-  });
+export function createRuntimeAgent(
+  profileConfig: ProfileConfig,
+  appPaths: Pick<AppPaths, 'profileDir'> &
+    Partial<Pick<AppPaths, 'rootDir' | 'profile' | 'configFile' | 'larkCliConfigDir' | 'larkCliSourceConfigFile'>> & {
+      configPath?: string;
+    },
+): AgentAdapter {
+  const larkChannelConfigPath = appPaths.configPath ?? appPaths.configFile;
+  const larkChannel =
+    appPaths.rootDir && appPaths.profile
+      ? {
+          profile: appPaths.profile,
+          rootDir: appPaths.rootDir,
+          ...(larkChannelConfigPath ? { configPath: larkChannelConfigPath } : {}),
+          ...(appPaths.larkCliConfigDir ? { larkCliConfigDir: appPaths.larkCliConfigDir } : {}),
+          ...(appPaths.larkCliSourceConfigFile
+            ? { larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile }
+            : {}),
+        }
+      : undefined;
+  if (profileConfig.agentKind === 'codex') {
+    const codex = profileConfig.codex;
+    if (!codex?.binaryPath) {
+      throw new Error('codex profile requires codex.binaryPath');
+    }
+    return new CodexAdapter({
+      binary: codex.binaryPath,
+      binaryPin: codexBinaryPin(codex),
+      profileStateDir: appPaths.profileDir,
+      ...(codex.codexHome ? { codexHome: codex.codexHome } : {}),
+      inheritCodexHome: codex.inheritCodexHome === true,
+      ignoreUserConfig: codex.ignoreUserConfig === true,
+      ignoreRules: codex.ignoreRules !== false,
+      sandbox: profileConfig.sandbox.defaultMode,
+      larkChannel,
+    });
+  }
+  return new ClaudeAdapter({ larkChannel });
+}
 
-  // keep the event loop alive until a signal arrives
-  await new Promise<void>(() => {});
+function codexBinaryPin(codex: CodexConfig) {
+  if (!codex.realpath || !codex.version || !codex.sha256) {
+    throw new AgentPreflightError(
+      {
+        code: 'agent-binary-pin-missing',
+        agentId: 'codex',
+        agentName: 'Codex CLI',
+        command: codex.binaryPath,
+        binaryPath: codex.binaryPath,
+      },
+      'codex profile requires binary pin fields: realpath, version, sha256',
+    );
+  }
+  return {
+    binaryPath: codex.binaryPath,
+    realpath: codex.realpath,
+    version: codex.version,
+    sha256: codex.sha256,
+    ...(codex.owner !== undefined ? { owner: codex.owner } : {}),
+    ...(codex.mode !== undefined ? { mode: codex.mode } : {}),
+  };
 }
 
 /**
@@ -254,10 +469,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
  * manager can't answer questions, and erroring out by default would surprise
  * users running a daemon.
  */
-async function resolveConflict(
-  cfg: AppConfig,
-  conflicts: ProcessEntry[],
-): Promise<boolean> {
+async function resolveConflict(conflicts: ProcessEntry[]): Promise<boolean> {
   console.log(
     `⚠️  检测到这个飞书应用已经有 ${conflicts.length} 个 bot 正在运行:`,
   );
@@ -302,101 +514,86 @@ async function resolveConflict(
   }
 }
 
+type RuntimeLockConflictAction = 'retry' | 'cancel' | 'unhandled';
+
+async function handleRuntimeLockConflict(
+  err: unknown,
+  opts: StartOptions,
+): Promise<RuntimeLockConflictAction> {
+  if (!(err instanceof RuntimeLockConflictError)) return 'unhandled';
+  console.error(`✗ 当前 ${err.kind === 'profile' ? 'profile' : 'app'} 已有 bridge 进程占用。`);
+  if (err.meta) {
+    const app = err.meta.appId ? ` app=${err.meta.appId}` : '';
+    console.error(
+      `  holder: profile=${err.meta.profile}${app} agent=${err.meta.agentKind} pid=${err.meta.pid} startedAt=${err.meta.startedAt}`,
+    );
+  } else {
+    console.error(`  lock: ${err.target}`);
+    return 'unhandled';
+  }
+
+  const confirmed = opts.confirmStopRuntimeLockProcess
+    ? await opts.confirmStopRuntimeLockProcess(err)
+    : await confirmStopRuntimeLockProcess(err);
+  if (!confirmed) {
+    console.log('已取消启动。');
+    return 'cancel';
+  }
+
+  const result = opts.stopRuntimeLockProcess
+    ? await opts.stopRuntimeLockProcess(err.meta)
+    : await stopProcessEntry({ pid: err.meta.pid });
+  if (result === 'killed') {
+    console.log(`✓ 已强制停止 pid ${err.meta.pid}`);
+  } else {
+    console.log(`✓ 已停止 pid ${err.meta.pid}`);
+  }
+  return 'retry';
+}
+
+async function confirmStopRuntimeLockProcess(err: RuntimeLockConflictError): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(
+      `当前 ${err.kind === 'profile' ? 'profile' : 'app'} 已有 bridge 进程占用；` +
+        '非交互模式无法确认停止，请先用 `lark-channel-bridge ps` 查看并用 `lark-channel-bridge kill <bot id>` 停止后重试',
+    );
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await new Promise<string>((resolve) =>
+      rl.question('是否停止旧进程并重新启动? [y/N]: ', resolve),
+    ))
+      .trim()
+      .toLowerCase();
+    return answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+async function releaseRuntimeLocks(locks: AcquiredRuntimeLock[]): Promise<void> {
+  for (const lock of [...locks].reverse()) {
+    await lock.release().catch((err) =>
+      log.warn('runtime-lock', 'release-failed', {
+        kind: lock.kind,
+        err: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
+}
+
+async function flushTelemetry(timeoutMs = 2000): Promise<void> {
+  try {
+    await telemetry().flush?.(timeoutMs);
+  } catch {
+    /* best effort during shutdown */
+  }
+}
+
 function formatAgo(ms: number): string {
   if (ms < 60_000) return `${Math.floor(ms / 1000)} 秒前`;
   if (ms < 3_600_000) return `${Math.floor(ms / 60_000)} 分钟前`;
   if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)} 小时前`;
   return `${Math.floor(ms / 86_400_000)} 天前`;
 }
-
-/**
- * If `cfg.accounts.app.secret` is a literal plaintext string (not a
- * "${VAR}" template, not a SecretRef), move it into the encrypted keystore
- * and rewrite `config.json` with an exec-provider SecretRef pointing at
- * the bridge. Returns the (possibly rewritten) cfg.
- *
- * Idempotent: configs already in the encrypted form return unchanged.
- */
-async function maybeMigratePlaintextSecret(
-  cfg: AppConfig,
-  configPath: string,
-): Promise<AppConfig> {
-  const s = cfg.accounts.app.secret;
-
-  // Path A: still plaintext → encrypt + rewrite config.
-  if (typeof s === 'string' && !/^\$\{[A-Z][A-Z0-9_]*\}$/.test(s)) {
-    try {
-      const next = await buildEncryptedAccountConfig(
-        cfg.accounts.app.id,
-        cfg.accounts.app.tenant,
-        cfg.preferences,
-      );
-      await setSecret(secretKeyForApp(cfg.accounts.app.id), s);
-      await saveConfig(next, configPath);
-      console.log('🔒 已把 App Secret 加密迁移到 ~/.lark-channel/secrets.enc');
-      return next;
-    } catch (err) {
-      log.warn('config', 'migrate-encrypted-failed', {
-        err: err instanceof Error ? err.message : String(err),
-      });
-      // Migration failure isn't fatal — runtime resolver still handles
-      // the plaintext path.
-      return cfg;
-    }
-  }
-
-  // Path B: env-template — leave entirely alone.
-  if (typeof s === 'string') return cfg;
-
-  // Path C: already a SecretRef. Two things to keep fresh:
-  //   1. The wrapper script content (node / bridge paths may have moved).
-  //   2. The config's `secrets.providers.bridge` block — older bridge
-  //      versions wrote `command: <node path>`; the new format points
-  //      at the wrapper. Rewrite if out of date so lark-cli's audit
-  //      sees a user-owned, non-symlinked command path.
-  try {
-    const wrapperPath = await ensureSecretsGetterWrapper();
-    if (needsProviderRewrite(cfg, wrapperPath)) {
-      const next = await buildEncryptedAccountConfig(
-        cfg.accounts.app.id,
-        cfg.accounts.app.tenant,
-        cfg.preferences,
-      );
-      await saveConfig(next, configPath);
-      console.log('🔒 已把 secrets provider 切到 wrapper 形态');
-      return next;
-    }
-  } catch (err) {
-    log.warn('config', 'wrapper-refresh-failed', {
-      err: err instanceof Error ? err.message : String(err),
-    });
-  }
-  return cfg;
-}
-
-function needsProviderRewrite(cfg: AppConfig, wrapperPath: string): boolean {
-  const provider = cfg.secrets?.providers?.bridge;
-  if (!provider) return true;
-  if (provider.command !== wrapperPath) return true;
-  if (!Array.isArray(provider.args) || provider.args.length !== 0) return true;
-  return false;
-}
-
-/** Encrypt the (plaintext) secret from a freshly-wizard'd cfg and persist. */
-async function persistEncrypted(cfg: AppConfig, configPath: string): Promise<AppConfig> {
-  const s = cfg.accounts.app.secret;
-  if (typeof s !== 'string') {
-    // Wizard returns plaintext today; if that ever changes, just save as-is.
-    await saveConfig(cfg, configPath);
-    return cfg;
-  }
-  const next = await buildEncryptedAccountConfig(
-    cfg.accounts.app.id,
-    cfg.accounts.app.tenant,
-    cfg.preferences,
-  );
-  await setSecret(secretKeyForApp(cfg.accounts.app.id), s);
-  await saveConfig(next, configPath);
-  return next;
-}
-

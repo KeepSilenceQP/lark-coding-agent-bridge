@@ -1,15 +1,15 @@
-import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { getSecret } from './keystore';
+import type { Readable, Writable } from 'node:stream';
+import { spawnProcess, type SpawnedProcessByStdio } from '../platform/spawn';
+import { getSecret, type KeystorePaths } from './keystore';
 import { paths } from './paths';
 import type { AppConfig, ProviderConfig, SecretInput, SecretRef } from './schema';
 import { isSecretRef, secretKeyForApp } from './schema';
 
 /**
- * Bridge runtime secret resolver. Mirrors the openclaw / lark-cli
- * `ResolveSecretInput` contract so users can keep their App Secret out of
- * `config.json` via:
+ * Bridge runtime secret resolver. Mirrors the lark-cli `ResolveSecretInput`
+ * contract so users can keep their App Secret out of `config.json` via:
  *
  *   - plain string                              → as-is
  *   - "${VAR_NAME}" template                    → process.env[VAR_NAME]
@@ -30,16 +30,20 @@ const DEFAULT_PROVIDER = 'default';
 const DEFAULT_EXEC_TIMEOUT_MS = 5_000;
 const DEFAULT_EXEC_MAX_OUTPUT = 64 * 1024;
 
-export async function resolveAppSecret(cfg: AppConfig): Promise<string> {
+export async function resolveAppSecret(
+  cfg: AppConfig,
+  secretPaths: KeystorePaths = paths,
+): Promise<string> {
   const appId = cfg.accounts.app.id;
   const secret = cfg.accounts.app.secret;
-  return resolveSecretInput(secret, cfg.secrets, appId);
+  return resolveSecretInput(secret, cfg.secrets, appId, secretPaths);
 }
 
 async function resolveSecretInput(
   input: SecretInput,
   secretsCfg: AppConfig['secrets'],
   appId: string,
+  secretPaths: KeystorePaths,
 ): Promise<string> {
   if (!input) {
     throw new Error('app secret is missing');
@@ -56,7 +60,7 @@ async function resolveSecretInput(
     case 'file':
       return resolveFileRef(input, lookupProvider(secretsCfg, input));
     case 'exec':
-      return resolveExecRef(input, lookupProvider(secretsCfg, input), appId);
+      return resolveExecRef(input, lookupProvider(secretsCfg, input), appId, secretPaths);
     default:
       throw new Error(`unknown secret source: ${(input as { source?: string }).source}`);
   }
@@ -102,9 +106,8 @@ async function resolveFileRef(ref: SecretRef, pc: ProviderConfig | undefined): P
 /**
  * Spawn the configured provider command, send the JSON-RPC request on
  * stdin, parse the JSON-RPC response from stdout, return the secret for
- * `ref.id`. Implements the same protocol openclaw / lark-cli's
- * `resolveExecRef` uses, so users can write a script once and point either
- * tool at it.
+ * `ref.id`. Implements the same exec-provider protocol lark-cli uses, so
+ * users can write one resolver script and reuse it.
  *
  * If the configured command IS this same bridge binary (a.k.a. bridge is
  * self-hosting via `lark-channel-bridge secrets get`), short-circuit and
@@ -116,6 +119,7 @@ async function resolveExecRef(
   ref: SecretRef,
   pc: ProviderConfig | undefined,
   appId: string,
+  secretPaths: KeystorePaths,
 ): Promise<string> {
   if (!pc?.command) {
     throw new Error('exec provider missing `command`');
@@ -125,10 +129,10 @@ async function resolveExecRef(
     // Short-circuit: read keystore directly. The expected id under the
     // bridge convention is `app-<appId>`; if the user wired something
     // else, fall back to ref.id verbatim.
-    const candidate = await getSecret(ref.id);
+    const candidate = await getSecret(ref.id, secretPaths);
     if (candidate !== undefined) return candidate;
     const conventional = secretKeyForApp(appId);
-    const fallback = await getSecret(conventional);
+    const fallback = await getSecret(conventional, secretPaths);
     if (fallback !== undefined) return fallback;
     throw new Error(`keystore has no entry for "${ref.id}" or "${conventional}"`);
   }
@@ -140,6 +144,7 @@ function isSelfBridgeCommand(command: string, args: string[] | undefined): boole
   // Canonical form (post-wrapper): command is our own secrets-getter
   // script and args is empty. Match path exactly.
   if (command === paths.secretsGetterScript) return true;
+  if (command === `${paths.secretsGetterScript}.cmd`) return true;
   // Legacy / hand-edited form: command is node and args end with
   // ['secrets', 'get']. Keep this branch so configs written by older
   // bridge versions, or by power-users editing config.json directly,
@@ -167,10 +172,10 @@ async function spawnExecProvider(pc: ProviderConfig, ref: SecretRef): Promise<st
     }
     if (pc.env) Object.assign(env, pc.env);
 
-    const child = spawn(pc.command!, pc.args ?? [], {
+    const child = spawnProcess(pc.command!, pc.args ?? [], {
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    }) as SpawnedProcessByStdio<Writable, Readable, Readable>;
 
     let stdout = '';
     let stderr = '';

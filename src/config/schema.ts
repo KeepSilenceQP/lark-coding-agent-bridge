@@ -3,9 +3,9 @@ export type TenantBrand = 'feishu' | 'lark';
 /**
  * SecretRef points at a secret stored outside this file — keeps secrets out
  * of `config.json` so backups / accidental git commits / log dumps don't
- * leak the bot's App Secret. Mirrors openclaw / lark-cli's `SecretRef`
- * shape so lark-cli's `--source lark-channel` reads it through the same
- * generic `ResolveSecretInput` pipeline as openclaw.
+ * leak the bot's App Secret. Matches lark-cli's `SecretRef` shape so
+ * `--source lark-channel` reads it through the same generic
+ * `ResolveSecretInput` pipeline.
  *
  *   - `env`:  value is in process env at `id` (optionally allowlisted via provider)
  *   - `file`: value is at the path `id` (or `provider.path` if provider config)
@@ -28,10 +28,10 @@ export interface AppCredentials {
 }
 
 /**
- * `secrets.providers` is openclaw-compatible: each named provider declares
- * how SecretRefs resolve to plaintext (env allowlist, file path, exec
- * command). Only the fields actually consumed by bridge's resolver are
- * typed here; lark-cli reads the same JSON via its richer Go types.
+ * `secrets.providers` declares how SecretRefs resolve to plaintext (env
+ * allowlist, file path, exec command). Only the fields actually consumed by
+ * bridge's resolver are typed here; lark-cli reads the same JSON via its
+ * richer Go types.
  */
 export interface ProviderConfig {
   source: 'env' | 'file' | 'exec';
@@ -69,41 +69,19 @@ export interface SecretsConfig {
 export type MessageReplyMode = 'card' | 'markdown' | 'text';
 
 /**
- * Access control settings.
- *
- * Semantics (post-2026-05 redesign, see wiki/T7EswTtVsiF1hMkCYNxc51ASnZc):
- *
- *   - `allowedUsers`: open_id allowlist for DM senders. Empty = nobody can
- *     DM the bot (except creators / admins, which also pass the DM gate).
- *     Group senders are NOT gated by this list — group gating is chat-level.
- *   - `allowedChats`: chat_id allowlist for groups the bot responds in.
- *     Empty = bot doesn't respond in any group (except when the sender is
- *     the creator or an admin, who bypass the chat whitelist). Doesn't
- *     apply to p2p.
- *   - `admins`: open_id list with admin privileges (sensitive commands
- *     `/account` `/config` `/exit` `/reconnect` `/doctor` `/cd` `/ws`).
- *     Empty = only the creator can run admin commands. Non-empty = list +
- *     creator. Admins also bypass the group chat whitelist, so the bot
- *     responds to them in any group regardless of `allowedChats`.
- *
- * There is no `creator` field — the creator identity is the Lark app's
- * current owner, fetched at runtime via `application/v6/applications` and
- * cached on `Controls.botOwnerId`. See `bot/lark-info.ts`. This lets a
- * developer-console ownership transfer take effect without a config edit.
- *
- * Default-secure: all three lists empty + no resolved owner = the bot
- * silently drops every incoming message. Operators tighten via `/config`.
+ * Access control settings. Empty lists are fail-closed in the v2 policy:
+ * no DM senders, no group chats, and only the runtime owner can administer
+ * the bot. Runtime owner/admin bypass is applied by the policy layer because
+ * owner identity is refreshed from Lark rather than stored in config.json.
  */
 export interface AppAccess {
-  /** open_id allowlist for DM senders. Empty = no DM (except creator /
-   * admin). Group senders are gated by `allowedChats`, not this list. */
+  /** open_id allowlist for DM senders. Group senders are gated by chat. */
   allowedUsers?: string[];
-  /** chat_id allowlist for groups the bot responds in. Empty = no group
-   * response (except creator / admins, who bypass it). Doesn't apply to
-   * p2p. */
+  /** chat_id allowlist for groups the bot responds in. Does not apply to p2p. */
   allowedChats?: string[];
-  /** open_id list with admin privileges (sensitive commands). Empty = only
-   * the creator can run admin commands. */
+  /** open_id list with admin privileges. Gates sensitive commands
+   * (/account, /config, /exit, /reconnect, /doctor, /cd, /ws, /doc,
+   * /invite, /remove). */
   admins?: string[];
 }
 
@@ -238,7 +216,16 @@ export function getMaxConcurrentRuns(cfg: AppConfig): number {
  * field) inherit the new safer default automatically.
  */
 export function getRequireMentionInGroup(cfg: AppConfig): boolean {
-  return cfg.preferences?.requireMentionInGroup !== false;
+  if (cfg.preferences?.requireMentionInGroup !== undefined) {
+    return cfg.preferences.requireMentionInGroup !== false;
+  }
+  const profileAccess = (cfg as AppConfig & {
+    access?: { requireMentionInGroup?: boolean };
+  }).access;
+  if (profileAccess?.requireMentionInGroup !== undefined) {
+    return profileAccess.requireMentionInGroup;
+  }
+  return true;
 }
 
 /**
@@ -257,88 +244,6 @@ export function getAgentStopGraceMs(cfg: AppConfig): number {
   const raw = cfg.preferences?.agentStopGraceMs;
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return 5000;
   return Math.min(30_000, Math.max(100, Math.floor(raw)));
-}
-
-/**
- * Minimal shape carrying the inputs every access check needs:
- *   - `cfg`: the on-disk config (whitelists + admin list)
- *   - `botOwnerId`: the runtime-resolved Lark app owner (the "creator")
- *
- * `Controls` already satisfies this structurally, so callers can pass
- * `controls` directly without rebuilding a wrapper object.
- */
-export interface AccessContext {
-  cfg: AppConfig;
-  botOwnerId?: string;
-}
-
-/**
- * Whether `senderId` is the bot's creator (= current Lark app owner). The
- * creator unconditionally bypasses every whitelist. When `botOwnerId` is
- * `undefined` (initial fetch hasn't returned yet, or it failed), this
- * returns false — fail-secure.
- */
-export function isCreator(ctx: AccessContext, senderId: string): boolean {
-  return Boolean(ctx.botOwnerId) && ctx.botOwnerId === senderId;
-}
-
-/**
- * Whether the bot should respond to a message from `senderId`, given the
- * chat type. Used at intake.
- *
- *   - Creator always passes.
- *   - For p2p (DM): `senderId` must be in `allowedUsers ∪ admins`. Empty
- *     intersection = silent drop.
- *   - For groups: returns true unconditionally (chat-level gating happens
- *     in `isChatAllowed`). Keeps intake's two-step pattern: run this first
- *     to drop DM strangers, then run `isChatAllowed` for groups.
- */
-export function isUserAllowed(
-  ctx: AccessContext,
-  senderId: string,
-  isP2p: boolean = true,
-): boolean {
-  if (isCreator(ctx, senderId)) return true;
-  if (!isP2p) return true;
-  const users = ctx.cfg.preferences?.access?.allowedUsers ?? [];
-  const admins = ctx.cfg.preferences?.access?.admins ?? [];
-  return users.includes(senderId) || admins.includes(senderId);
-}
-
-/**
- * Whether the bot should respond in group `chatId`. Only meaningful for
- * non-p2p chats — DM gating is in `isUserAllowed`.
- *
- *   - If `senderId` is the creator or an admin, always allow — they bypass
- *     the chat whitelist so they can drive the bot in any group (e.g. to
- *     run `/invite group` and add the group from inside it).
- *   - Otherwise: `chatId` must be in `allowedChats`. Empty = silent drop.
- */
-export function isChatAllowed(
-  ctx: AccessContext,
-  chatId: string,
-  senderId?: string,
-): boolean {
-  // isAdmin already returns true for the creator, so this one check covers
-  // both bypass identities.
-  if (senderId && isAdmin(ctx, senderId)) return true;
-  const list = ctx.cfg.preferences?.access?.allowedChats ?? [];
-  return list.includes(chatId);
-}
-
-/**
- * Whether `senderId` may run admin-gated commands (`/account`, `/config`,
- * `/exit`, `/reconnect`, `/doctor`, `/cd`, `/ws`).
- *
- *   - Creator always passes.
- *   - Else: must be in the `admins` list. Empty list = only the creator —
- *     a tightening from the prior "empty = all allowed users" semantics,
- *     aligned with the fail-secure direction of the redesign.
- */
-export function isAdmin(ctx: AccessContext, senderId: string): boolean {
-  if (isCreator(ctx, senderId)) return true;
-  const list = ctx.cfg.preferences?.access?.admins ?? [];
-  return list.includes(senderId);
 }
 
 export function getRunIdleTimeoutMs(cfg: AppConfig): number | undefined {

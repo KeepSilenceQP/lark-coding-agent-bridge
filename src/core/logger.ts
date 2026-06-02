@@ -2,14 +2,23 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { open, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { paths } from '../config/paths';
 import { telemetry } from './telemetry';
 
-/** Days of `YYYY-MM-DD.log` history to keep. Override via env. */
-const LOG_RETENTION_DAYS = Math.max(
+export interface LoggerOptions {
+  logsDir?: string;
+  retentionDays: number;
+  now: () => Date;
+}
+
+const DEFAULT_RETENTION_DAYS = Math.max(
   1,
-  Number(process.env.LARK_CHANNEL_LOG_DAYS ?? 7) || 7,
+  Number(process.env.LARK_CHANNEL_LOG_DAYS ?? 30) || 30,
 );
+
+let loggerOptions: LoggerOptions = {
+  retentionDays: DEFAULT_RETENTION_DAYS,
+  now: () => new Date(),
+};
 
 /**
  * Stdout is for humans tailing the terminal. Only these noisy-but-meaningful
@@ -30,7 +39,7 @@ const STDOUT_INFO_ALLOWLIST = new Set<string>([
  * Structured logger.
  *
  * Two destinations on every call:
- *  1. JSON line into `~/.lark-channel/logs/YYYY-MM-DD.log` — the durable
+ *  1. JSON line into the active profile logs directory — the durable
  *     record `/doctor` greps over.
  *  2. Compact human-readable line on stdout/stderr — for live tailing in dev.
  *
@@ -51,14 +60,20 @@ let stream: WriteStream | null = null;
 let currentDate = '';
 
 function todayKey(): string {
-  return new Date().toISOString().slice(0, 10);
+  return loggerOptions.now().toISOString().slice(0, 10).replace(/-/g, '');
 }
 
-function logsDir(): string {
-  return join(paths.appDir, 'logs');
+function logsDir(): string | undefined {
+  return loggerOptions.logsDir;
+}
+
+function logFileName(dateKey: string): string {
+  return `bridge-${dateKey}.jsonl`;
 }
 
 function getStream(): WriteStream | null {
+  const dir = logsDir();
+  if (!dir) return null;
   const today = todayKey();
   if (stream && currentDate === today) return stream;
   if (stream) {
@@ -69,8 +84,8 @@ function getStream(): WriteStream | null {
     }
   }
   try {
-    mkdirSync(logsDir(), { recursive: true });
-    stream = createWriteStream(join(logsDir(), `${today}.log`), { flags: 'a' });
+    mkdirSync(dir, { recursive: true });
+    stream = createWriteStream(join(dir, logFileName(today)), { flags: 'a' });
     currentDate = today;
     return stream;
   } catch {
@@ -97,22 +112,138 @@ const RESERVED_KEYS = new Set([
   'msgId',
 ]);
 
+const TELEMETRY_ENVELOPE_KEYS = new Set([
+  'ts',
+  'level',
+  'phase',
+  'event',
+  'traceId',
+  'chatId',
+  'msgId',
+]);
+
+const RAW_PAYLOAD_KEYS = new Set([
+  'prompt',
+  'stdout',
+  'stderr',
+  'env',
+  'environment',
+  'proxy',
+]);
+
+const RESOURCE_ID_KEYS = new Set(['fileKey', 'sourceFileKey']);
+
+const ID_KEYS = new Set([
+  'chatId',
+  'senderId',
+  'sender',
+  'openId',
+  'operatorId',
+  'userId',
+  'msgId',
+  'messageId',
+  'sourceMessageId',
+  'sessionId',
+  'threadId',
+  'docToken',
+  'fileToken',
+  'fileKey',
+  'sourceFileKey',
+  'commentId',
+  'rootCommentId',
+  'replyId',
+  'reactionId',
+  'scope',
+  'appId',
+]);
+
+const MAX_LOG_STRING_CHARS = 4096;
+const CREDENTIAL_JSON_FIELD_RE =
+  /("(?:secret|app_secret|appSecret|token|access_token|tenant_access_token|app_access_token|authorization)"\s*:\s*")[^"]*(")/gi;
+const ESCAPED_CREDENTIAL_JSON_FIELD_RE =
+  /(\\\"(?:secret|app_secret|appSecret|token|access_token|tenant_access_token|app_access_token|authorization)\\\"\s*:\s*\\\")[^\\]*(\\\")/gi;
+const RESOURCE_JSON_FIELD_RE =
+  /("(?:fileKey|sourceFileKey|file_key|source_file_key|imageKey|image_key|mediaKey|media_key)"\s*:\s*")[^"]*(")/gi;
+const ESCAPED_RESOURCE_JSON_FIELD_RE =
+  /(\\\"(?:fileKey|sourceFileKey|file_key|source_file_key|imageKey|image_key|mediaKey|media_key)\\\"\s*:\s*\\\")[^\\]*(\\\")/gi;
+
+interface SanitizeOptions {
+  redactIds: boolean;
+}
+
+const LOCAL_LOG_SANITIZE: SanitizeOptions = { redactIds: false };
+const EXTERNAL_SANITIZE: SanitizeOptions = { redactIds: true };
+
+function sanitizeLogEntry(
+  entry: Record<string, unknown>,
+  options: SanitizeOptions = EXTERNAL_SANITIZE,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(entry)) {
+    out[key] = sanitizeLogValue(key, value, options);
+  }
+  return out;
+}
+
+function sanitizeLogValue(
+  key: string,
+  value: unknown,
+  options: SanitizeOptions = EXTERNAL_SANITIZE,
+): unknown {
+  const normalizedKey = key.startsWith('_') ? key.slice(1) : key;
+  if (value === undefined) return undefined;
+  if (RAW_PAYLOAD_KEYS.has(normalizedKey)) return '[REDACTED]';
+  if (/token|secret|authorization/i.test(normalizedKey)) return '[REDACTED]';
+  if (/attachment.*path|media.*path|^(cwd|cwdRealpath|path|absPath)$/i.test(normalizedKey)) {
+    return '[REDACTED_PATH]';
+  }
+  if (RESOURCE_ID_KEYS.has(normalizedKey)) return '[REDACTED_RESOURCE]';
+  if (options.redactIds && ID_KEYS.has(normalizedKey)) return redactId(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeLogValue(key, item, options));
+  }
+  if (value && typeof value === 'object') {
+    const nested: Record<string, unknown> = {};
+    for (const [nestedKey, nestedValue] of Object.entries(value)) {
+      nested[nestedKey] = sanitizeLogValue(nestedKey, nestedValue, options);
+    }
+    return nested;
+  }
+  if (typeof value === 'string') {
+    const redacted = redactDiagnosticText(value);
+    if (redacted.length > MAX_LOG_STRING_CHARS) {
+      return `${redacted.slice(0, MAX_LOG_STRING_CHARS)}...[truncated]`;
+    }
+    return redacted;
+  }
+  return value;
+}
+
+function redactId(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  if (value.length <= 6) return value;
+  return `...${value.slice(-6)}`;
+}
+
 function emit(level: Level, phase: string, event: string, fields: LogFields = {}): void {
   const ctx = als.getStore() ?? {};
-  const entry: Record<string, unknown> = {
-    ts: new Date().toISOString(),
+  const entry = sanitizeLogEntry({
+    ts: loggerOptions.now().toISOString(),
     level,
     phase,
     event,
     ...ctx,
-  };
+  }, LOCAL_LOG_SANITIZE);
   for (const [k, v] of Object.entries(fields)) {
     if (RESERVED_KEYS.has(k)) {
-      entry[`_${k}`] = v;
+      entry[`_${k}`] = sanitizeLogValue(`_${k}`, v, LOCAL_LOG_SANITIZE);
     } else {
-      entry[k] = v;
+      entry[k] = sanitizeLogValue(k, v, LOCAL_LOG_SANITIZE);
     }
   }
+
+  const externalEntry = sanitizeLogEntry(entry, EXTERNAL_SANITIZE);
+  const telemetrySafe = telemetryPayloadFromEntry(externalEntry);
   const s = getStream();
   if (s) {
     try {
@@ -122,21 +253,26 @@ function emit(level: Level, phase: string, event: string, fields: LogFields = {}
     }
   }
 
-  // Fan out the raw event to the optional telemetry sink (noop unless an
-  // adapter is loaded). Done before the stdout early-return so the sink sees
-  // *every* event, not just the curated stdout subset. Never break logging.
   try {
-    telemetry().emit({ level, phase, event, fields, ctx, ts: entry.ts as string });
+    telemetry().emit({
+      level,
+      phase,
+      event,
+      fields: telemetrySafe.fields,
+      ctx: telemetrySafe.ctx,
+      ts: String(entry.ts),
+    });
   } catch {
     /* never break logging */
   }
-  // Errors additionally fire recordError so Slardar's exception list (separate
-  // from the Custom Log list) also picks them up. `log.fail` puts the original
-  // error in `fields.err`; fall back to `phase.event` when not present.
   if (level === 'error') {
     try {
-      const errLike = fields.err ?? `${phase}.${event}`;
-      telemetry().recordError(errLike, { phase, event, ...ctx, ...fields });
+      telemetry().recordError(telemetrySafe.fields.err ?? `${phase}.${event}`, {
+        phase,
+        event,
+        ...telemetrySafe.ctx,
+        ...telemetrySafe.fields,
+      });
     } catch {
       /* never break logging */
     }
@@ -150,7 +286,24 @@ function emit(level: Level, phase: string, event: string, fields: LogFields = {}
   if (!showOnStdout) return;
 
   const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
-  fn(formatStdout(level, phase, event, ctx, fields));
+  fn(formatStdout(level, phase, event, telemetrySafe.ctx, telemetrySafe.fields));
+}
+
+function telemetryPayloadFromEntry(entry: Record<string, unknown>): {
+  ctx: LogContext;
+  fields: LogFields;
+} {
+  const ctx: LogContext = {};
+  if (typeof entry.traceId === 'string') ctx.traceId = entry.traceId;
+  if (typeof entry.chatId === 'string') ctx.chatId = entry.chatId;
+  if (typeof entry.msgId === 'string') ctx.msgId = entry.msgId;
+
+  const fields: LogFields = {};
+  for (const [key, value] of Object.entries(entry)) {
+    if (TELEMETRY_ENVELOPE_KEYS.has(key) || value === undefined) continue;
+    fields[key] = value;
+  }
+  return { ctx, fields };
 }
 
 function formatStdout(
@@ -245,6 +398,56 @@ export const log = {
   },
 };
 
+export function configureLogger(opts: Partial<LoggerOptions>): void {
+  if (stream) {
+    try {
+      stream.end();
+    } catch {
+      /* noop */
+    }
+  }
+  stream = null;
+  currentDate = '';
+  loggerOptions = {
+    ...(opts.logsDir !== undefined ? { logsDir: opts.logsDir } : { logsDir: loggerOptions.logsDir }),
+    retentionDays: Math.max(1, opts.retentionDays ?? loggerOptions.retentionDays),
+    now: opts.now ?? loggerOptions.now,
+  };
+}
+
+export async function closeLogger(): Promise<void> {
+  const s = stream;
+  if (!s) return;
+  stream = null;
+  currentDate = '';
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    s.once('error', done);
+    if (s.closed || s.destroyed) {
+      done();
+      return;
+    }
+    s.end(done);
+  });
+}
+
+export function getLoggerConfig(): LoggerOptions {
+  return { ...loggerOptions };
+}
+
+export async function flushLogger(): Promise<void> {
+  const s = stream;
+  if (!s) return;
+  await new Promise<void>((resolve) => {
+    s.write('', () => resolve());
+  });
+}
+
 /**
  * Run `fn` inside a logging context. All `log.*` calls inside (including
  * across awaits) pick up `traceId` / `chatId` / `msgId` automatically.
@@ -285,6 +488,7 @@ export function sanitizeLogsForDoctor(logs: string): string {
     /"(secret|app_secret|appSecret|token|access_token|tenant_access_token|app_access_token|authorization)":"[^"]*"/gi,
     (_, key: string) => `"${key}":"[REDACTED]"`,
   );
+  out = redactJsonCredentialText(out);
   // URL-style tokens in error messages: `?access_token=t-xxx`.
   out = out.replace(
     /\b(access_token|tenant_access_token|app_access_token)=[A-Za-z0-9._\-+/=]+/g,
@@ -293,7 +497,53 @@ export function sanitizeLogsForDoctor(logs: string): string {
   // HTTP Authorization headers embedded in stringified errors.
   out = out.replace(/\bBearer\s+[A-Za-z0-9._\-+/=]+/g, 'Bearer [REDACTED]');
   out = out.replace(/\bAuthorization\s*[:=]\s*\S+/gi, 'Authorization=[REDACTED]');
+  out = out.replace(
+    /"(prompt|stdout|stderr|env|proxy|attachmentPath|mediaPath|path|cwd|cwdRealpath|absPath)":[^,\n}]*/gi,
+    (_, key: string) => `"${key}":"[REDACTED]"`,
+  );
+  return redactDiagnosticText(out);
+}
+
+export function redactDiagnosticText(text: string): string {
+  let out = redactJsonCredentialText(text);
+  out = redactResourceText(out);
+  out = out.replace(
+    /\b(Authorization\s*[:=]\s*Bearer\s+)[A-Za-z0-9._\-+/=]+/gi,
+    '$1[REDACTED]',
+  );
+  out = out.replace(/\b(Bearer\s+)[A-Za-z0-9._\-+/=]+/g, '$1[REDACTED]');
+  out = out.replace(
+    /\b(access_token|tenant_access_token|app_access_token|app_secret|appSecret|secret|token|doc_token|file_token|authorization)=([^&\s"',}]+)/gi,
+    '$1=[REDACTED]',
+  );
+  out = out.replace(
+    /(^|[\s"'=])((?:\/(?:Users|home|tmp|var|private|Volumes|opt|workspace|workspaces|mnt|app|srv|root|data)\/[^\s"',)]+))/g,
+    '$1[REDACTED_PATH]',
+  );
+  out = out.replace(/(^|[\s"'=])(~\/[^\s"',)]+)/g, '$1[REDACTED_PATH]');
+  out = out.replace(/[A-Za-z]:\\[^\s"',)]+/g, '[REDACTED_PATH]');
   return out;
+}
+
+function redactJsonCredentialText(text: string): string {
+  return text
+    .replace(CREDENTIAL_JSON_FIELD_RE, '$1[REDACTED]$2')
+    .replace(ESCAPED_CREDENTIAL_JSON_FIELD_RE, '$1[REDACTED]$2');
+}
+
+function redactResourceText(text: string): string {
+  return text
+    .replace(RESOURCE_JSON_FIELD_RE, '$1[REDACTED_RESOURCE]$2')
+    .replace(ESCAPED_RESOURCE_JSON_FIELD_RE, '$1[REDACTED_RESOURCE]$2')
+    .replace(
+      /<\s*(?:file|image|img|audio|video|media|folder)\b[^>]*\bkey\s*=\s*["'][^"']+["'][^>]*>/gi,
+      '[REDACTED_RESOURCE]',
+    )
+    .replace(/!?\[[^\]]*]\((?:file|img|image|media)_[^)]+\)/gi, '[REDACTED_RESOURCE]')
+    .replace(
+      /\b(?:file|img|image|media)_(?:v\d+_)?[A-Za-z0-9][A-Za-z0-9._-]{8,}\b/g,
+      '[REDACTED_RESOURCE]',
+    );
 }
 
 /**
@@ -303,10 +553,15 @@ export function sanitizeLogsForDoctor(logs: string): string {
  * tail starts mid-line we drop the partial leader.
  */
 export async function readRecentLogs(opts: { maxBytes: number }): Promise<string> {
+  const dir = logsDir();
+  if (!dir) return '';
   const today = todayKey();
-  const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-  const todayPath = join(logsDir(), `${today}.log`);
-  const yesterdayPath = join(logsDir(), `${yesterday}.log`);
+  const yesterday = new Date(loggerOptions.now().getTime() - 86_400_000)
+    .toISOString()
+    .slice(0, 10)
+    .replace(/-/g, '');
+  const todayPath = join(dir, logFileName(today));
+  const yesterdayPath = join(dir, logFileName(yesterday));
 
   const tail = await readTail(todayPath, opts.maxBytes);
   if (tail.length >= opts.maxBytes / 2) return tail;
@@ -323,18 +578,19 @@ export async function readRecentLogs(opts: { maxBytes: number }): Promise<string
  */
 export async function gcOldLogs(): Promise<number> {
   const dir = logsDir();
+  if (!dir) return 0;
   let entries: string[];
   try {
     entries = await readdir(dir);
   } catch {
     return 0;
   }
-  const cutoff = Date.now() - LOG_RETENTION_DAYS * 86_400_000;
+  const cutoff = loggerOptions.now().getTime() - loggerOptions.retentionDays * 86_400_000;
   let removed = 0;
   for (const name of entries) {
-    const m = name.match(/^(\d{4}-\d{2}-\d{2})\.log$/);
+    const m = name.match(/^bridge-(\d{4})(\d{2})(\d{2})\.jsonl$/);
     if (!m) continue;
-    const fileMs = Date.parse(`${m[1]}T00:00:00Z`);
+    const fileMs = Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`);
     if (Number.isNaN(fileMs) || fileMs >= cutoff) continue;
     try {
       await rm(join(dir, name));
@@ -344,7 +600,7 @@ export async function gcOldLogs(): Promise<number> {
     }
   }
   if (removed > 0) {
-    log.info('logger', 'gc', { removed, retentionDays: LOG_RETENTION_DAYS });
+    log.info('logger', 'gc', { removed, retentionDays: loggerOptions.retentionDays });
   }
   return removed;
 }
@@ -372,22 +628,54 @@ async function readTail(path: string, maxBytes: number): Promise<string> {
   }
 }
 
-/**
- * Record a numeric metric to the telemetry sink. Noop unless an adapter is
- * loaded (see {@link import('./telemetry')}). Crash-safe.
- */
 export function reportMetric(
   name: string,
   value: number,
   tags?: Record<string, string>,
 ): void {
-  telemetry().recordMetric(name, value, tags);
+  try {
+    telemetry().recordMetric(name, value, sanitizeMetricTags(tags));
+  } catch {
+    /* never break runtime behavior */
+  }
 }
 
-/**
- * Record an error/exception to the telemetry sink. Noop unless an adapter is
- * loaded. Crash-safe.
- */
 export function reportError(err: unknown, ctx?: Record<string, unknown>): void {
-  telemetry().recordError(err, ctx);
+  try {
+    telemetry().recordError(sanitizeTelemetryError(err), sanitizeTelemetryContext(ctx));
+  } catch {
+    /* never break runtime behavior */
+  }
+}
+
+function sanitizeMetricTags(tags?: Record<string, string>): Record<string, string> | undefined {
+  if (!tags) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(tags)) {
+    const sanitized = sanitizeLogValue(key, value);
+    out[key] = typeof sanitized === 'string' ? sanitized : JSON.stringify(sanitized);
+  }
+  return out;
+}
+
+function sanitizeTelemetryContext(
+  ctx?: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (!ctx) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(ctx)) {
+    out[key] = sanitizeLogValue(key, value);
+  }
+  return out;
+}
+
+function sanitizeTelemetryError(err: unknown): unknown {
+  if (err instanceof Error) {
+    return {
+      name: err.name,
+      message: sanitizeLogValue('err', err.message),
+      ...(err.stack ? { stack: sanitizeLogValue('stack', err.stack) } : {}),
+    };
+  }
+  return sanitizeLogValue('err', err);
 }

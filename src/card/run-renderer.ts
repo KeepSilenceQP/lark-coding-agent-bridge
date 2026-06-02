@@ -14,7 +14,11 @@ interface TextGroup {
 }
 type Group = ToolGroup | TextGroup;
 
-export function renderCard(state: RunState): object {
+export interface RunCardRenderOptions {
+  signCallback?: (action: string) => string;
+}
+
+export function renderCard(state: RunState, options: RunCardRenderOptions = {}): object {
   const elements: object[] = [];
 
   if (state.reasoning.content) {
@@ -44,7 +48,7 @@ export function renderCard(state: RunState): object {
 
   if (state.terminal === 'running') {
     if (state.footer) elements.push(footerStatus(state.footer));
-    elements.push(stopButton());
+    elements.push(stopButton(options));
   }
 
   return {
@@ -173,12 +177,17 @@ function noteMd(content: string): object {
   return { tag: 'markdown', content, text_size: 'notation' };
 }
 
-function stopButton(): object {
+function stopButton(options: RunCardRenderOptions): object {
+  const value: Record<string, unknown> = { cmd: 'stop' };
+  if (options.signCallback) {
+    value.__bridge_cb = true;
+    value.bridge_token = options.signCallback('stop');
+  }
   return {
     tag: 'button',
     text: { tag: 'plain_text', content: '⏹ 终止' },
     type: 'danger',
-    behaviors: [{ type: 'callback', value: { cmd: 'stop' } }],
+    behaviors: [{ type: 'callback', value }],
   };
 }
 

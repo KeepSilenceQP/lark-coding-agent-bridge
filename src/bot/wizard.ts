@@ -29,6 +29,11 @@ export async function runRegistrationWizard(): Promise<AppConfig> {
   console.log('\n✓ 应用创建成功');
   console.log(`  App ID:  ${result.client_id}`);
   console.log(`  Tenant:  ${tenant}`);
+  if (operatorOpenId) {
+    console.log(`  Creator: ${operatorOpenId} (Lark 应用 owner，自动豁免访问控制)`);
+  } else {
+    console.log('  ⚠️ 未拿到扫码用户的 open_id；启动后会通过应用 owner API 解析创建者。');
+  }
 
   // No access fields are seeded here. The bot creator is resolved at
   // runtime from the Lark application API (`application/v6/applications`),

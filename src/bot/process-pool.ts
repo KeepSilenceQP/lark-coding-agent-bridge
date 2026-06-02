@@ -40,6 +40,16 @@ export class ProcessPool {
     return () => this.release();
   }
 
+  tryAcquire(): (() => void) | undefined {
+    if (this.active >= this.cap()) {
+      log.info('pool', 'full', { active: this.active, cap: this.cap() });
+      return undefined;
+    }
+    this.active++;
+    log.info('pool', 'acquired', { active: this.active, cap: this.cap() });
+    return () => this.release();
+  }
+
   private release(): void {
     this.active = Math.max(0, this.active - 1);
     log.info('pool', 'released', { active: this.active });

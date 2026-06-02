@@ -1,11 +1,12 @@
 import { readAndPrune, resolveTarget, isAlive } from '../../runtime/registry';
+import type { ProcessEntry } from '../../runtime/registry';
 
 /**
  * Pretty-print the list of running lark-channel-bridge processes.
  *
- * `readAndPrune` drops dead entries but does not persist the pruned state —
- * fine for a read-only view. Persistence happens on the next `register` /
- * `unregister` / `updateEntry` call.
+ * `readAndPrune` is a legacy name; read-only views never rewrite registry
+ * state. Persistence happens on the next `register` / `unregister` /
+ * `updateEntry` call.
  */
 export function runPs(): void {
   const live = readAndPrune();
@@ -42,29 +43,46 @@ export async function runKillCli(target: string | undefined): Promise<void> {
     process.exit(1);
   }
   console.log(`正在关闭 bot ${entry.id}…`);
+  let result: StopProcessEntryResult;
   try {
-    process.kill(entry.pid, 'SIGTERM');
+    result = await stopProcessEntry(entry);
   } catch (err) {
     console.error(`✗ 关闭失败:${(err as Error).message}`);
     process.exit(1);
   }
-  // Poll for up to 2s; SIGKILL as last resort. 100ms poll keeps the wait
-  // tight on quick exits without spamming kill(0).
-  const deadline = Date.now() + 2000;
+
+  if (result === 'killed') {
+    console.log(`✓ 已强制关闭 bot ${entry.id}。`);
+    return;
+  }
+  console.log(`✓ 已关闭 bot ${entry.id}。`);
+}
+
+export type StopProcessEntryResult = 'terminated' | 'killed';
+
+export async function stopProcessEntry(
+  entry: Pick<ProcessEntry, 'pid'> & { id?: string },
+  timeoutMs = 2000,
+): Promise<StopProcessEntryResult> {
+  process.kill(entry.pid, 'SIGTERM');
+
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!isAlive(entry.pid)) {
-      console.log(`✓ 已关闭 bot ${entry.id}。`);
-      return;
+      return 'terminated';
     }
     await new Promise((r) => setTimeout(r, 100));
   }
-  console.warn('⚠️ 2 秒内没退出,强制关闭。');
-  try {
-    process.kill(entry.pid, 'SIGKILL');
-  } catch (err) {
-    console.error(`✗ 强制关闭失败:${(err as Error).message}`);
-    process.exit(1);
+
+  process.kill(entry.pid, 'SIGKILL');
+  const forceDeadline = Date.now() + timeoutMs;
+  while (Date.now() < forceDeadline) {
+    if (!isAlive(entry.pid)) {
+      return 'killed';
+    }
+    await new Promise((r) => setTimeout(r, 100));
   }
+  throw new Error(`process ${entry.pid} did not exit after SIGKILL`);
 }
 
 function formatAgo(ms: number): string {
