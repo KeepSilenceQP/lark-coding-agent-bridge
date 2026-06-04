@@ -506,13 +506,12 @@ describe('profile runtime resolver', () => {
       });
 
       expect(runtime.profileConfig.agentKind).toBe('codex');
-      const codexRealpath = await realpath(codex);
       expect(runtime.profileConfig.codex).toMatchObject({
         binaryPath: codex,
-        realpath: codexRealpath,
       });
-      expect(runtime.profileConfig.codex?.version).toBeTruthy();
-      expect(runtime.profileConfig.codex?.sha256).toBeTruthy();
+      expect(runtime.profileConfig.codex?.realpath).toBeUndefined();
+      expect(runtime.profileConfig.codex?.version).toBeUndefined();
+      expect(runtime.profileConfig.codex?.sha256).toBeUndefined();
       await expect(readFile(join(root, 'profiles', 'codex', 'sessions.json'), 'utf8')).resolves
         .toContain('thread-1');
       await expect(readFile(join(root, 'sessions.json'), 'utf8')).rejects.toMatchObject({

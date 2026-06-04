@@ -11,13 +11,7 @@ export type AgentPreflightErrorCode =
   | 'agent-version-check-timeout'
   | 'agent-version-check-signaled'
   | 'agent-version-check-nonzero-exit'
-  | 'agent-version-check-empty-output'
-  | 'agent-binary-pin-missing'
-  | 'agent-binary-pin-realpath-mismatch'
-  | 'agent-binary-pin-version-mismatch'
-  | 'agent-binary-pin-hash-mismatch'
-  | 'agent-binary-pin-owner-mismatch'
-  | 'agent-binary-pin-mode-mismatch';
+  | 'agent-version-check-empty-output';
 
 export interface AgentPreflightDiagnostic {
   code: AgentPreflightErrorCode;
@@ -266,24 +260,6 @@ export function formatAgentPreflightDiagnostic(diagnostic: AgentPreflightDiagnos
         `✗ 本地 ${diagnostic.agentName} 不可用：\`${command}\` 没有返回版本信息。`,
         '',
         `请确认安装的是受支持的 ${diagnostic.agentName}。`,
-        `错误码：${diagnostic.code}`,
-      ].join('\n');
-    case 'agent-binary-pin-missing':
-      return [
-        `✗ 当前 ${diagnostic.agentName} profile 缺少二进制校验信息。`,
-        '',
-        '请刷新或重新创建该 profile。',
-        `错误码：${diagnostic.code}`,
-      ].join('\n');
-    case 'agent-binary-pin-realpath-mismatch':
-    case 'agent-binary-pin-version-mismatch':
-    case 'agent-binary-pin-hash-mismatch':
-    case 'agent-binary-pin-owner-mismatch':
-    case 'agent-binary-pin-mode-mismatch':
-      return [
-        `✗ 本地 ${diagnostic.agentName} 与当前 profile 记录的二进制不一致。`,
-        '',
-        `如果你刚升级或重装过 ${diagnostic.agentName}，请刷新当前 profile 的 binary pin。`,
         `错误码：${diagnostic.code}`,
       ].join('\n');
   }

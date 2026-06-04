@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { realpath } from 'node:fs/promises';
+import { mkdir, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { tryHandleCommand, type CommandContext, type Controls } from '../../../src/commands/index.js';
@@ -132,15 +133,103 @@ describe('Claude slash command visible behavior', () => {
 
   it('handles /status and /help with cards', async () => {
     const h = await createHarness();
+    await writeLarkCliTarget(h, {
+      defaultAs: 'auto',
+      strictMode: 'off',
+      users: [{ openId: 'ou-user' }],
+    });
 
     await expect(h.run('/status')).resolves.toBe(true);
     expect(lastContent(h.channel)).toHaveProperty('card');
+    expect(JSON.stringify(lastContent(h.channel))).toContain('lark-cli');
+    expect(JSON.stringify(lastContent(h.channel))).toContain('user-ready');
 
     await expect(h.run('/help')).resolves.toBe(true);
     expect(lastContent(h.channel)).toHaveProperty('card');
     const help = JSON.stringify(lastContent(h.channel));
     expect(help).toContain('Fake Agent');
+    expect(help).toContain('lark-cli 身份策略');
+    expect(help).not.toContain('/lark');
     expect(help).not.toContain('交给 Claude');
+  });
+
+  it('reports lark-cli user-ready for structured user records', async () => {
+    const h = await createHarness();
+    await writeLarkCliTarget(h, {
+      defaultAs: 'auto',
+      strictMode: 'off',
+      users: { current: { userOpenId: 'ou-user', userName: 'User Name' } },
+    });
+
+    await expect(h.run('/status')).resolves.toBe(true);
+
+    const status = JSON.stringify(lastContent(h.channel));
+    expect(status).toContain('lark-cli');
+    expect(status).toContain('user-ready');
+    expect(status).not.toContain('user-missing');
+  });
+
+  it('does not report lark-cli user-ready for display-only target user strings', async () => {
+    const h = await createHarness();
+    h.controls.profileConfig.larkCli = { identityPreset: 'user-default' };
+    await writeLarkCliTarget(h, {
+      defaultAs: 'auto',
+      strictMode: 'off',
+      users: 'User Name (ou-user)',
+    });
+
+    await expect(h.run('/status')).resolves.toBe(true);
+
+    const status = JSON.stringify(lastContent(h.channel));
+    expect(status).toContain('lark-cli');
+    expect(status).toContain('user-missing');
+    expect(status).not.toContain('user-ready');
+  });
+
+  it('does not report lark-cli user-ready for damaged structured user entries', async () => {
+    const h = await createHarness();
+    h.controls.profileConfig.larkCli = { identityPreset: 'user-default' };
+    await writeLarkCliTarget(h, {
+      defaultAs: 'auto',
+      strictMode: 'off',
+      users: [{ userName: 'User Name' }],
+    });
+
+    await expect(h.run('/status')).resolves.toBe(true);
+
+    const status = JSON.stringify(lastContent(h.channel));
+    expect(status).toContain('lark-cli');
+    expect(status).toContain('user-missing');
+    expect(status).not.toContain('user-ready');
+  });
+
+  it('does not report lark-cli user-ready when the profile is user-default but no user is authorized', async () => {
+    const h = await createHarness();
+    h.controls.profileConfig.larkCli = { identityPreset: 'user-default' };
+
+    await expect(h.run('/status')).resolves.toBe(true);
+
+    const status = JSON.stringify(lastContent(h.channel));
+    expect(status).toContain('lark-cli');
+    expect(status).toContain('user-missing');
+    expect(status).not.toContain('user-ready');
+  });
+
+  it('does not treat lark-cli display-only no-user text as authorized user state', async () => {
+    const h = await createHarness();
+    h.controls.profileConfig.larkCli = { identityPreset: 'user-default' };
+    await writeLarkCliTarget(h, {
+      defaultAs: 'auto',
+      strictMode: 'off',
+      users: '(no logged-in users)',
+    });
+
+    await expect(h.run('/status')).resolves.toBe(true);
+
+    const status = JSON.stringify(lastContent(h.channel));
+    expect(status).toContain('lark-cli');
+    expect(status).toContain('user-missing');
+    expect(status).not.toContain('user-ready');
   });
 
   it('handles /timeout display, set, off, default, and invalid values', async () => {
@@ -299,4 +388,38 @@ function lastMarkdown(channel: FakeChannel): string {
   const content = lastContent(channel);
   expect(content.markdown).toBeTypeOf('string');
   return content.markdown as string;
+}
+
+async function writeLarkCliTarget(
+  h: Harness,
+  app: {
+    defaultAs: string;
+    strictMode: string;
+    users: unknown;
+  },
+): Promise<void> {
+  const target = join(
+    h.tmp.profile,
+    'profiles',
+    h.controls.profile,
+    'lark-cli',
+    'lark-channel',
+    'config.json',
+  );
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(
+    target,
+    JSON.stringify({
+      apps: [
+        {
+          appId: h.controls.profileConfig.accounts.app.id,
+          brand: h.controls.profileConfig.accounts.app.tenant,
+          defaultAs: app.defaultAs,
+          strictMode: app.strictMode,
+          users: app.users,
+        },
+      ],
+    }),
+    'utf8',
+  );
 }

@@ -110,6 +110,25 @@ describe('agent prompt builder', () => {
     expect(source).toContain('LARKSUITE_CLI_CONFIG_DIR');
     expect(source).not.toContain('lark-cli config bind --source lark-channel');
   });
+
+  it('keeps lark-cli OAuth inside the current profile and enables user identity after login', () => {
+    const source = readFileSync(join(process.cwd(), 'src/agent/bridge-system-prompt.ts'), 'utf8');
+
+    expect(source).toContain('LARKSUITE_CLI_CONFIG_DIR');
+    expect(source).toContain('lark-cli auth login --device-code');
+    expect(source).toContain('lark-cli config strict-mode off');
+    expect(source).toContain('lark-cli config default-as auto');
+    expect(source).not.toContain('env -u LARK_CHANNEL lark-cli auth login');
+  });
+
+  it('keeps lark-cli user identity policy details out of user-facing OAuth replies', () => {
+    const source = readFileSync(join(process.cwd(), 'src/agent/bridge-system-prompt.ts'), 'utf8');
+
+    expect(source).toContain('不要把 strict-mode/default-as 这类内部配置命令展示给用户');
+    expect(source).toContain('当前 profile 还没有可用的用户身份授权');
+    expect(source).toContain('如果当前 profile 已经有用户授权');
+    expect(source).toContain('内部顺序执行身份策略收敛');
+  });
 });
 
 function readSection(prompt: string, tag: string): unknown {

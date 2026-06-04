@@ -46,37 +46,18 @@ describe('start runtime agent factory', () => {
     });
   });
 
-  it('fails closed when a Codex runtime profile is missing binary pin fields', () => {
-    expect.assertions(2);
-    expect(() =>
-      createRuntimeAgent(
-        createDefaultProfileConfig({
-          agentKind: 'codex',
-          accounts: appAccount(),
-          codex: { binaryPath: '/usr/local/bin/codex' },
-        }),
-        { profileDir: '/tmp/lark-channel-bridge/profiles/codex-e2e' },
-      ),
-    ).toThrow(/binary pin/i);
-    try {
-      createRuntimeAgent(
-        createDefaultProfileConfig({
-          agentKind: 'codex',
-          accounts: appAccount(),
-          codex: { binaryPath: '/usr/local/bin/codex' },
-        }),
-        { profileDir: '/tmp/lark-channel-bridge/profiles/codex-e2e' },
-      );
-    } catch (err) {
-      expect(err).toMatchObject({
-        diagnostic: {
-          code: 'agent-binary-pin-missing',
-          agentId: 'codex',
-          agentName: 'Codex CLI',
-          command: '/usr/local/bin/codex',
-        },
-      });
-    }
+  it('creates a Codex runtime agent when an older profile has only a binary path', () => {
+    const agent = createRuntimeAgent(
+      createDefaultProfileConfig({
+        agentKind: 'codex',
+        accounts: appAccount(),
+        codex: { binaryPath: '/usr/local/bin/codex' },
+      }),
+      { profileDir: '/tmp/lark-channel-bridge/profiles/codex-e2e' },
+    );
+
+    expect(agent.id).toBe('codex');
+    expect(agent.displayName).toBe('Codex CLI');
   });
 
   it('seeds a default Codex binary when bootstrapping a new Codex profile', () => {

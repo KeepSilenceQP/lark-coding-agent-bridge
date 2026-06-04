@@ -1,4 +1,5 @@
 import type { KnownChat } from '../bot/lark-info';
+import type { LarkCliIdentityPreset } from '../config/profile-schema';
 import type { MessageReplyMode } from '../config/schema';
 
 export interface ConfigFormOpts {
@@ -8,6 +9,7 @@ export interface ConfigFormOpts {
   /** 0 means "disabled". */
   runIdleTimeoutMinutes: number;
   requireMentionInGroup: boolean;
+  larkCliIdentity: LarkCliIdentityPreset;
   allowedUsers: string[];
   allowedChats: string[];
   admins: string[];
@@ -93,7 +95,7 @@ export function configFormCard(opts: ConfigFormOpts): object {
           tag: 'markdown',
           content:
             '⚙️ **偏好设置**\n\n' +
-            '调整 bot 的行为偏好。改完点提交,**立即生效**(无需重启)并写入 `~/.lark-channel/config.json`。',
+            '调整 bot 的行为偏好。改完点提交后写入当前 profile 配置；消息和访问控制设置立即生效。',
         },
         { tag: 'hr' },
         {
@@ -181,6 +183,22 @@ export function configFormCard(opts: ConfigFormOpts): object {
                 { text: { tag: 'plain_text', content: '否' }, value: 'no' },
               ],
             },
+            {
+              tag: 'markdown',
+              content:
+                '\n**lark-cli 身份策略**\n' +
+                '_只允许应用身份:使用 bot/app 能力,不访问个人资源_\n' +
+                '_允许用户身份:保留应用身份,并允许已授权用户访问个人日历、邮箱、云盘等资源_',
+            },
+            {
+              tag: 'select_static',
+              name: 'lark_cli_identity',
+              initial_option: opts.larkCliIdentity,
+              options: [
+                { text: { tag: 'plain_text', content: '只允许应用身份' }, value: 'bot-only' },
+                { text: { tag: 'plain_text', content: '允许用户身份' }, value: 'user-default' },
+              ],
+            },
             { tag: 'hr' },
             collapsedAccessPanel('🔒 **访问控制**（点击展开）', accessElements),
             {
@@ -246,6 +264,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
             `**并发上限**:\`${opts.maxConcurrentRuns}\`\n` +
             `**run 探活**:\`${opts.runIdleTimeoutMinutes > 0 ? `${opts.runIdleTimeoutMinutes} 分钟` : '关闭'}\`\n` +
             `**群里需要 @ bot**:\`${opts.requireMentionInGroup ? '是' : '否'}\`\n\n` +
+            `**lark-cli 身份策略**:\`${opts.larkCliIdentity === 'user-default' ? '允许用户身份' : '只允许应用身份'}\`\n\n` +
             '🔒 **访问控制**\n' +
             `**允许私聊的用户**:${summarize(opts.allowedUsers)}\n` +
             `**允许响应的群**:${summarize(opts.allowedChats)}\n` +
@@ -263,6 +282,16 @@ export function configCancelledCard(): object {
     config: { summary: { content: '已取消' } },
     body: {
       elements: [{ tag: 'markdown', content: '已取消,未做任何修改。' }],
+    },
+  };
+}
+
+export function configFailedCard(reason: string): object {
+  return {
+    schema: '2.0',
+    config: { summary: { content: '保存失败' } },
+    body: {
+      elements: [{ tag: 'markdown', content: `保存失败：${reason}` }],
     },
   };
 }

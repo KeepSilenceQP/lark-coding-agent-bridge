@@ -31,7 +31,7 @@ describe('RunExecutor prepareRun preflight', () => {
   it('releases pool slots and does not register active runs when prepareRun fails', async () => {
     const h = await createHarness({
       agent: new PreparingAgent(
-        new SpawnFailed('codex binary verification failed', new Error('hash'), 'binary-hash-mismatch'),
+        new SpawnFailed('codex binary check failed', new Error('missing'), 'agent-prepare-failed'),
       ),
     });
 
@@ -40,7 +40,7 @@ describe('RunExecutor prepareRun preflight', () => {
         scopeId: 'scope-1',
         policy: policy(h.tmp.workspace),
       }),
-    ).rejects.toMatchObject({ code: 'binary-hash-mismatch' });
+    ).rejects.toMatchObject({ code: 'agent-prepare-failed' });
     expect(h.agent.order).toEqual(['prepare:run-1']);
     expect(h.pool.snapshot()).toMatchObject({ active: 0, waiting: 0 });
     expect(h.activeRuns.get('scope-1')).toBeUndefined();

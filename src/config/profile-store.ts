@@ -58,6 +58,7 @@ type StoredProfileConfig = Pick<
   | 'codex'
   | 'attachments'
   | 'comments'
+  | 'larkCli'
 >;
 
 type StoredRootConfig = Omit<RootConfig, 'preferences' | 'profiles'> & {
@@ -94,6 +95,7 @@ function serializeProfileConfig(profile: ProfileConfig): StoredProfileConfig {
     ...(profile.codex ? { codex: profile.codex } : {}),
     attachments: profile.attachments,
     comments: {},
+    larkCli: profile.larkCli,
   };
 }
 

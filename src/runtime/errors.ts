@@ -8,12 +8,7 @@ export type RunRejectedCode =
 export type SpawnFailedCode =
   | 'agent-spawn-failed'
   | 'agent-prepare-failed'
-  | AgentPreflightErrorCode
-  | 'binary-realpath-mismatch'
-  | 'binary-version-mismatch'
-  | 'binary-hash-mismatch'
-  | 'binary-owner-mismatch'
-  | 'binary-mode-mismatch';
+  | AgentPreflightErrorCode;
 
 export class RunRejected extends Error {
   readonly code: RunRejectedCode;

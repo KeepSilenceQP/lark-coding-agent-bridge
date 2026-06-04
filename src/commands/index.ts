@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
@@ -11,7 +12,7 @@ import {
   accountFormCard,
   accountSuccessCard,
 } from '../card/account-cards';
-import { configCancelledCard, configFormCard, configSavedCard } from '../card/config-card';
+import { configCancelledCard, configFailedCard, configFormCard, configSavedCard } from '../card/config-card';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
 import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
@@ -68,6 +69,7 @@ import { validateAppCredentials } from '../utils/feishu-auth';
 import type { WorkspaceStore } from '../workspace/store';
 import { createBoundChat, defaultChatName } from '../bot/group';
 import { fetchKnownChats, type KnownChat } from '../bot/lark-info';
+import { applyLarkCliIdentityPolicy, hasStructuredLarkCliUserAuth } from '../lark-cli/identity-policy';
 
 export interface Controls {
   profile: string;
@@ -746,6 +748,38 @@ function runtimeAccessStatus(
   };
 }
 
+async function larkCliStatus(ctx: CommandContext): Promise<'app' | 'user-ready' | 'user-missing' | 'check-failed'> {
+  const appPaths = commandProfilePaths(ctx);
+  try {
+    const raw = JSON.parse(await readFile(appPaths.larkCliTargetConfigFile, 'utf8')) as {
+      apps?: Array<{
+        appId?: string;
+        brand?: string;
+        defaultAs?: string;
+        strictMode?: string;
+        users?: unknown;
+      }>;
+    };
+    const app = raw.apps?.find(
+      (candidate) =>
+        candidate.appId === ctx.controls.profileConfig.accounts.app.id &&
+        candidate.brand === ctx.controls.profileConfig.accounts.app.tenant,
+    );
+    if (app?.defaultAs === 'auto' && app.strictMode === 'off' && hasStructuredLarkCliUserAuth(app.users)) {
+      return 'user-ready';
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return 'check-failed';
+  }
+  if (
+    ctx.controls.profileConfig.larkCli.identityPreset === 'user-default' &&
+    canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok
+  ) {
+    return 'user-missing';
+  }
+  return 'app';
+}
+
 async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
   const cwd = effectiveWorkspaceCwd(ctx);
   const sess = ctx.sessions.getRaw(ctx.scope);
@@ -762,6 +796,7 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     sessionStale: !isCodex && Boolean(cwd && sess && sess.cwd !== cwd),
     agentName: ctx.agent.displayName,
     runtimeAccess: runtimeAccessStatus(ctx.controls.profileConfig),
+    larkCliStatus: await larkCliStatus(ctx),
     activeRun: Boolean(ctx.activeRuns.get(ctx.scope)),
     activeCommentScopes: ctx.activeRuns.scopes().filter((scope) => scope.startsWith('comment:')),
     queue: ctx.processPool?.snapshot(),
@@ -1721,6 +1756,7 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
     requireMentionInGroup: getRequireMentionInGroup(ctx.controls.cfg),
+    larkCliIdentity: ctx.controls.profileConfig.larkCli.identityPreset,
     allowedUsers: access.allowedUsers,
     allowedChats: access.allowedChats,
     admins: access.admins,
@@ -1798,6 +1834,13 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
   if (rawRequireMention === 'yes') requireMentionInGroup = true;
   else if (rawRequireMention === 'no') requireMentionInGroup = false;
   else requireMentionInGroup = getRequireMentionInGroup(ctx.controls.cfg);
+  const rawLarkCliIdentity = String(fv.lark_cli_identity ?? '').trim();
+  const larkCliIdentity =
+    rawLarkCliIdentity === 'user-default' || rawLarkCliIdentity === 'bot-only'
+      ? rawLarkCliIdentity
+      : ctx.controls.profileConfig.larkCli.identityPreset;
+  const previousLarkCliIdentity = ctx.controls.profileConfig.larkCli.identityPreset;
+  const larkCliIdentityChanged = larkCliIdentity !== previousLarkCliIdentity;
 
   const formMsgId = ctx.msg.messageId;
   const access = ctx.controls.profileConfig.access;
@@ -1828,13 +1871,39 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       requireMentionInGroup,
     };
 
+    let failureStep = 'config.save';
+    let larkCliPolicyApplied = false;
     try {
-      await savePreferencesConfig(ctx, nextPreferences, requireMentionInGroup);
+      if (larkCliIdentityChanged) {
+        failureStep = 'config.lark-cli-policy';
+        const applied = await applyConfigLarkCliIdentityPolicy(ctx, larkCliIdentity);
+        if (!applied) {
+          throw new Error('lark-cli identity policy apply failed');
+        }
+        larkCliPolicyApplied = true;
+        failureStep = 'config.save';
+      }
+      await savePreferencesConfig(ctx, nextPreferences, requireMentionInGroup, larkCliIdentity);
     } catch (err) {
-      log.fail('command', err, { step: 'config.save' });
-      reportMetric('command_fail', 1, { step: 'config.save' });
+      let rollbackFailed = false;
+      if (larkCliIdentityChanged) {
+        const rolledBack = await applyConfigLarkCliIdentityPolicy(ctx, previousLarkCliIdentity);
+        if (!rolledBack) {
+          rollbackFailed = true;
+          log.warn('command', 'lark-cli-identity-policy-rollback-failed', {
+            profile: ctx.controls.profile,
+            identity: previousLarkCliIdentity,
+          });
+        }
+      }
+      log.fail('command', err, { step: failureStep });
+      reportMetric('command_fail', 1, { step: failureStep });
       await waitForSettle();
-      await showResultCardInPlace(ctx, formMsgId, configCancelledCard());
+      await showResultCardInPlace(
+        ctx,
+        formMsgId,
+        configFailedCard(configFailureMessage(failureStep, rollbackFailed, larkCliPolicyApplied)),
+      );
       return;
     }
 
@@ -1844,6 +1913,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
+      larkCliIdentity,
       allowedUsersCount: access.allowedUsers.length,
       allowedChatsCount: access.allowedChats.length,
       adminsCount: access.admins.length,
@@ -1858,6 +1928,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         maxConcurrentRuns,
         runIdleTimeoutMinutes,
         requireMentionInGroup,
+        larkCliIdentity,
         allowedUsers: access.allowedUsers,
         allowedChats: access.allowedChats,
         admins: access.admins,
@@ -1867,11 +1938,45 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
   })();
 }
 
+function configFailureMessage(step: string, rollbackFailed: boolean, larkCliPolicyApplied: boolean): string {
+  if (rollbackFailed) {
+    return '保存失败，且 lark-cli 身份策略回滚失败。请执行 /status 检查当前状态。';
+  }
+  if (larkCliPolicyApplied && step === 'config.save') {
+    return '保存失败，lark-cli 身份策略已回滚。请重新打开 /config 确认当前状态。';
+  }
+  if (step === 'config.lark-cli-policy') {
+    return 'lark-cli 身份策略未生效，未做任何修改。';
+  }
+  return '配置未写入，未做任何修改。';
+}
+
 function commandProfilePaths(ctx: CommandContext) {
   return resolveAppPaths({
     rootDir: dirname(ctx.controls.configPath),
     profile: ctx.controls.profile,
   });
+}
+
+async function applyConfigLarkCliIdentityPolicy(
+  ctx: CommandContext,
+  larkCliIdentity: ProfileConfig['larkCli']['identityPreset'],
+): Promise<boolean> {
+  const appPaths = commandProfilePaths(ctx);
+  const ok = await applyLarkCliIdentityPolicy({
+    profile: appPaths.profile,
+    rootDir: appPaths.rootDir,
+    configPath: ctx.controls.configPath,
+    larkCliConfigDir: appPaths.larkCliConfigDir,
+    larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile,
+  }, larkCliIdentity).catch(() => false);
+  if (!ok) {
+    log.warn('command', 'lark-cli-identity-policy-apply-failed', {
+      profile: appPaths.profile,
+      identity: larkCliIdentity,
+    });
+  }
+  return ok;
 }
 
 async function saveAccountConfig(
@@ -1905,11 +2010,21 @@ async function savePreferencesConfig(
   ctx: CommandContext,
   preferences: AppPreferences,
   requireMentionInGroup: boolean,
+  larkCliIdentity: ProfileConfig['larkCli']['identityPreset'],
 ): Promise<void> {
+  const larkCli = {
+    identityPreset: larkCliIdentity,
+    localUserImport: {
+      status: 'not-needed' as const,
+      attemptedAt: new Date().toISOString(),
+      reason: larkCliIdentity === 'user-default' ? 'manual-user-default' : 'manual-bot-only',
+    },
+  };
   await withConfigFileLock(ctx.controls.configPath, async () => {
     const root = await loadRootConfig(ctx.controls.configPath);
     if (!root) {
       ctx.controls.cfg.preferences = preferences;
+      ctx.controls.profileConfig.larkCli = larkCli;
       await saveConfig(ctx.controls.cfg, ctx.controls.configPath);
       return;
     }
@@ -1927,6 +2042,7 @@ async function savePreferencesConfig(
         ...profile.access,
         requireMentionInGroup,
       },
+      larkCli,
     };
     await saveRootConfig(root, ctx.controls.configPath);
     ctx.controls.profileConfig = root.profiles[ctx.controls.profile]!;

@@ -65,6 +65,8 @@ import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 
 const DEBOUNCE_MS = 600;
+const STREAM_TERMINAL_GRACE_MS = 3000;
+const REACTION_CLEANUP_GRACE_MS = 1000;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
   '你在 bridge 进程中运行，普通 lark-cli 会继承 LARK_CHANNEL=1 并进入 bridge-bound 模式。',
@@ -798,68 +800,111 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   // For non-card modes Claude's output doesn't surface visually until either
   // a first streamed token (markdown mode) or the whole run ends (text mode).
-  // Add a "Typing" reaction to the triggering message as an instant ack;
-  // remove it in finally. Card mode has a visible "正在思考…" footer the
-  // moment the initial card lands, so the extra reaction would be redundant.
-  const reactionId =
-    replyMode === 'card' ? undefined : await addWorkingReaction(channel, lastMsg.messageId);
+  // Add a "Typing" reaction to the triggering message as an instant ack, but
+  // never let that outbound API call block agent event draining.
+  const reactionPromise =
+    replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
 
   try {
     if (replyMode === 'card') {
-      await channel.stream(
-        chatId,
-        {
-          card: {
-            initial: renderCard(initialState, cardRenderOptions),
-            producer: async (ctrl) => {
-              await processAgentStream(
-                handle,
-                eventStream,
-                scope,
-                idleTimeoutMs,
-                recordSession,
-                async (state) => {
-                  await ctrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
-                },
-              );
-            },
-          },
-        },
-        sendOpts,
-      );
-    } else if (replyMode === 'markdown') {
-      await channel.stream(
-        chatId,
-        {
-          markdown: async (ctrl) => {
-            await processAgentStream(
-              handle,
-              eventStream,
-              scope,
-              idleTimeoutMs,
-              recordSession,
-              async (state) => {
-                await ctrl.setContent(renderText(filterForPrefs(state)));
-              },
-            );
-          },
-        },
-        sendOpts,
-      );
-    } else {
-      // text mode: drain the agent stream without sending anything during
-      // the run, then post the final rendered text once as a plain markdown
-      // (msg_type=post) message — no card, no streaming, no typewriter.
-      let finalState: RunState = initialState;
-      await processAgentStream(
+      let latestState: RunState = initialState;
+      let producerStarted = false;
+      let cardCtrl:
+        | { update(next: object | ((current: object) => object)): Promise<void> }
+        | undefined;
+      const renderDone = processAgentStream(
         handle,
         eventStream,
         scope,
         idleTimeoutMs,
         recordSession,
         async (state) => {
-          finalState = state;
+          latestState = state;
+          if (cardCtrl) {
+            await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
+          }
         },
+      );
+      const streamDone = channel.stream(
+        chatId,
+        {
+          card: {
+            initial: renderCard(initialState, cardRenderOptions),
+            producer: async (ctrl) => {
+              producerStarted = true;
+              cardCtrl = ctrl;
+              await ctrl.update(renderCard(filterForPrefs(latestState), cardRenderOptions));
+              await renderDone;
+            },
+          },
+        },
+        sendOpts,
+      );
+      await awaitRenderAwareStream({
+        mode: replyMode,
+        streamDone,
+        renderDone,
+        producerStarted: () => producerStarted,
+        fallback: async (state) => {
+          await channel.send(
+            chatId,
+            { card: renderCard(filterForPrefs(state), cardRenderOptions) },
+            sendOpts,
+          );
+        },
+      });
+    } else if (replyMode === 'markdown') {
+      let latestState: RunState = initialState;
+      let producerStarted = false;
+      let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
+      const renderDone = processAgentStream(
+        handle,
+        eventStream,
+        scope,
+        idleTimeoutMs,
+        recordSession,
+        async (state) => {
+          latestState = state;
+          if (markdownCtrl) {
+            await markdownCtrl.setContent(renderText(filterForPrefs(state)));
+          }
+        },
+      );
+      const streamDone = channel.stream(
+        chatId,
+        {
+          markdown: async (ctrl) => {
+            producerStarted = true;
+            markdownCtrl = ctrl;
+            await ctrl.setContent(renderText(filterForPrefs(latestState)));
+            await renderDone;
+          },
+        },
+        sendOpts,
+      );
+      await awaitRenderAwareStream({
+        mode: replyMode,
+        streamDone,
+        renderDone,
+        producerStarted: () => producerStarted,
+        fallback: async (state) => {
+          const body = renderText(filterForPrefs(state));
+          if (body.trim()) {
+            await channel.send(chatId, { markdown: body }, sendOpts);
+          }
+        },
+      });
+    } else {
+      // text mode: drain the agent stream without sending anything during
+      // the run, then post the final rendered text once as a plain markdown
+      // (msg_type=post) message — no card, no streaming, no typewriter.
+      const finalState = await processAgentStream(
+        handle,
+        eventStream,
+        scope,
+        idleTimeoutMs,
+        recordSession,
+        async () => {},
       );
       const body = renderText(filterForPrefs(finalState));
       if (body.trim()) {
@@ -870,9 +915,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     log.fail('stream', err);
   } finally {
     activePolicyFingerprints.delete(scope);
-    if (reactionId) {
-      await removeReaction(channel, lastMsg.messageId, reactionId);
-    }
+    scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
 }
 
@@ -888,7 +931,7 @@ async function processAgentStream(
   idleTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
   flush: (state: RunState) => Promise<void>,
-): Promise<void> {
+): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = initialState;
 
@@ -998,6 +1041,115 @@ async function processAgentStream(
   if (handle.interrupted) {
     await handle.run.stop();
   }
+  return state;
+}
+
+async function awaitRenderAwareStream(input: {
+  mode: 'card' | 'markdown';
+  streamDone: Promise<unknown>;
+  renderDone: Promise<RunState>;
+  producerStarted: () => boolean;
+  fallback: (state: RunState) => Promise<void>;
+}): Promise<void> {
+  const streamResult = input.streamDone.then(
+    () => ({ kind: 'stream' as const, ok: true as const }),
+    (err) => ({ kind: 'stream' as const, ok: false as const, err }),
+  );
+  const renderResult = input.renderDone.then(
+    (state) => ({ kind: 'render' as const, ok: true as const, state }),
+    (err) => ({ kind: 'render' as const, ok: false as const, err }),
+  );
+  const first = await Promise.race([streamResult, renderResult]);
+  if (!first.ok) {
+    if (first.kind === 'stream') {
+      log.fail('stream', first.err, { mode: input.mode, step: 'stream' });
+      const rendered = await renderResult;
+      if (!rendered.ok) throw rendered.err;
+      await runFallbackReply(input.mode, rendered.state, input.fallback);
+      return;
+    }
+    throw first.err;
+  }
+
+  if (first.kind === 'stream') {
+    const rendered = await renderResult;
+    if (!rendered.ok) throw rendered.err;
+    return;
+  }
+
+  if (!input.producerStarted()) {
+    log.warn('stream', 'producer-not-started-before-agent-terminal', { mode: input.mode });
+    await runFallbackReply(input.mode, first.state, input.fallback);
+    return;
+  }
+
+  const terminal = await Promise.race([
+    streamResult,
+    delay(STREAM_TERMINAL_GRACE_MS).then(() => undefined),
+  ]);
+  if (!terminal) {
+    log.warn('stream', 'terminal-grace-expired', {
+      mode: input.mode,
+      graceMs: STREAM_TERMINAL_GRACE_MS,
+    });
+    void streamResult.then((result) => {
+      if (!result.ok) {
+        log.fail('stream', result.err, { mode: input.mode, step: 'stream-terminal-late' });
+      }
+    });
+    return;
+  }
+  if (!terminal.ok) throw terminal.err;
+}
+
+async function runFallbackReply(
+  mode: 'card' | 'markdown',
+  state: RunState,
+  fallback: (state: RunState) => Promise<void>,
+): Promise<void> {
+  try {
+    await fallback(state);
+  } catch (err) {
+    log.fail('stream', err, { mode, step: 'fallback' });
+  }
+}
+
+function scheduleWorkingReactionCleanup(
+  channel: LarkChannel,
+  messageId: string,
+  reactionPromise: Promise<string | undefined> | undefined,
+): void {
+  if (!reactionPromise) return;
+
+  void (async () => {
+    const reactionResult = reactionPromise.then(
+      (reactionId) => ({ ok: true as const, reactionId }),
+      (err) => ({ ok: false as const, err }),
+    );
+    const settled = await Promise.race([
+      reactionResult,
+      delay(REACTION_CLEANUP_GRACE_MS).then(() => undefined),
+    ]);
+
+    if (!settled) {
+      log.warn('reaction', 'cleanup-deferred', {
+        messageId,
+        graceMs: REACTION_CLEANUP_GRACE_MS,
+      });
+      void reactionResult.then((result) => {
+        if (!result.ok || !result.reactionId) return;
+        void removeReaction(channel, messageId, result.reactionId);
+      });
+      return;
+    }
+
+    if (!settled.ok || !settled.reactionId) return;
+    await removeReaction(channel, messageId, settled.reactionId);
+  })();
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildPrompt(
