@@ -74,6 +74,15 @@ describe('profile store canonical serialization', () => {
         cacheMaxBytes: 2048,
       },
       comments: {},
+      larkCli: {
+        identityPreset: 'user-default' as const,
+        localUserImport: {
+          status: 'imported' as const,
+          attemptedAt: '2026-06-04T01:02:03.000Z',
+          importedAt: '2026-06-04T01:03:03.000Z',
+          reason: 'same-app-local-user',
+        },
+      },
       runtimeOnlyFutureField: true,
     };
 
@@ -114,6 +123,7 @@ describe('profile store canonical serialization', () => {
     expect(savedProfile.codex).toEqual(profile.codex);
     expect(savedProfile.attachments).toEqual(profile.attachments);
     expect(savedProfile.comments).toEqual(profile.comments);
+    expect(savedProfile.larkCli).toEqual(profile.larkCli);
     expect(savedProfile.permissions).toEqual({
       defaultAccess: 'workspace',
       maxAccess: 'full',

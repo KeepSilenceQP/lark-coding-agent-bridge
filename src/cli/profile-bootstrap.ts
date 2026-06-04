@@ -1,6 +1,5 @@
 import { mkdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
-import { createCodexBinaryPin } from '../agent/codex/binary';
 import { AgentPreflightError } from '../agent/preflight';
 import { createDefaultProfileConfig, type AgentKind, type ProfileConfig } from '../config/profile-schema';
 import type { AppConfig } from '../config/schema';
@@ -76,7 +75,7 @@ export async function createBootstrapCodexConfig(binaryPath: string | undefined)
       errno,
     });
   }
-  return createCodexBinaryPin(resolvedBinary, { command });
+  return { binaryPath: resolvedBinary };
 }
 
 function codexBootstrapBinaryErrorCode(errno: string | undefined) {

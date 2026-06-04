@@ -95,9 +95,9 @@ function printServiceFailure(verb: 'started' | 'restarted', stderr: string): voi
 async function ensureBridgeConfigured(
   opts: ServiceStartOptions,
 ): Promise<
-  Pick<Awaited<ReturnType<typeof resolveProfileRuntime>>, 'profile' | 'cfg' | 'appPaths' | 'configPath'>
+  Pick<Awaited<ReturnType<typeof resolveProfileRuntime>>, 'profile' | 'cfg' | 'profileConfig' | 'appPaths' | 'configPath'>
 > {
-  const { cfg, profile, appPaths, configPath } = await resolveProfileRuntime({
+  const { cfg, profile, profileConfig, appPaths, configPath } = await resolveProfileRuntime({
     profile: opts.profile,
     agent: opts.agent,
     workspace: opts.workspace,
@@ -118,7 +118,7 @@ async function ensureBridgeConfigured(
     console.error('请重新运行 `start` 完成首次扫码向导或传入已有应用信息。');
     process.exit(1);
   }
-  return { profile, cfg, appPaths, configPath };
+  return { profile, cfg, profileConfig, appPaths, configPath };
 }
 
 async function assertLockNotHeldByAnotherRuntime(
@@ -267,7 +267,7 @@ async function reportConnectAfter(
  * they've switched runtime versions or updated their PATH since last install.
  */
 export async function runServiceStart(opts: ServiceStartOptions = {}): Promise<void> {
-  const { profile, cfg, appPaths, configPath } = await ensureBridgeConfigured(opts);
+  const { profile, cfg, profileConfig, appPaths, configPath } = await ensureBridgeConfigured(opts);
   const adapter = requireAdapter('start', profile);
   await assertLockNotHeldByAnotherRuntime('profile', appPaths.profileLockFile, adapter, opts);
   await assertLockNotHeldByAnotherRuntime('app', appPaths.appLockFile(cfg.accounts.app.id), adapter, opts);
@@ -282,6 +282,7 @@ export async function runServiceStart(opts: ServiceStartOptions = {}): Promise<v
   await preFlightChecks({
     skipCheckLarkCli: opts.skipCheckLarkCli,
     bridgeConfig,
+    profileConfig,
     appPaths,
     larkChannel: {
       profile: appPaths.profile,

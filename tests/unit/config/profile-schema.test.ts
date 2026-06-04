@@ -124,6 +124,50 @@ describe('profile schema', () => {
     expect(cfg.workspaces).toEqual({});
   });
 
+  it('defaults lark-cli identity to app-only without legacy global source fields', () => {
+    const cfg = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app },
+    });
+
+    expect(cfg.larkCli).toEqual({ identityPreset: 'bot-only' });
+    expect(cfg.larkCli).not.toHaveProperty('configSource');
+    expect(cfg.larkCli).not.toHaveProperty('workspaceMode');
+  });
+
+  it('normalizes lark-cli user identity import state without preserving invalid fields', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      larkCli: {
+        identityPreset: 'user-default',
+        configSource: 'legacy-global',
+        workspaceMode: 'shared',
+        localUserImport: {
+          status: 'imported',
+          attemptedAt: '2026-06-04T01:02:03.000Z',
+          importedAt: '2026-06-04T01:03:03.000Z',
+          reason: 'same-app-local-user',
+          token: 'must-not-survive',
+        },
+      },
+    });
+
+    expect(cfg.larkCli).toEqual({
+      identityPreset: 'user-default',
+      localUserImport: {
+        status: 'imported',
+        attemptedAt: '2026-06-04T01:02:03.000Z',
+        importedAt: '2026-06-04T01:03:03.000Z',
+        reason: 'same-app-local-user',
+      },
+    });
+    expect(JSON.stringify(cfg.larkCli)).not.toContain('legacy-global');
+    expect(JSON.stringify(cfg.larkCli)).not.toContain('workspaceMode');
+    expect(JSON.stringify(cfg.larkCli)).not.toContain('token');
+  });
+
   it('tolerates legacy workspace root fields without preserving them', () => {
     const cfg = normalizeProfileConfig({
       schemaVersion: 2,
@@ -200,7 +244,7 @@ describe('profile schema', () => {
     });
   });
 
-  it('normalizes Codex pin and user-home defaults without keeping public flags', () => {
+  it('keeps legacy Codex binary metadata and user-home defaults without keeping public flags', () => {
     const cfg = normalizeProfileConfig({
       schemaVersion: 2,
       agentKind: 'codex',

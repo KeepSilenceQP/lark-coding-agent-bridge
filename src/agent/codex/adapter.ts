@@ -7,12 +7,7 @@ import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../..
 import { SpawnFailed } from '../../runtime/errors';
 import { prefixBridgeSystemPrompt } from '../bridge-system-prompt';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
-import {
-  AgentPreflightError,
-  checkAgentAvailability,
-  type AgentAvailability,
-  type AgentPreflightDiagnostic,
-} from '../preflight';
+import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import type {
   AgentAdapter,
   AgentBotIdentity,
@@ -21,16 +16,10 @@ import type {
   AgentRunOptions,
 } from '../types';
 import { buildCodexArgs } from './argv';
-import {
-  CodexBinaryPinDriftError,
-  verifyCodexBinaryPin,
-  type CodexBinaryPin,
-} from './binary';
 import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
 
 export interface CodexAdapterOptions {
   binary: string;
-  binaryPin?: CodexBinaryPin;
   profileStateDir: string;
   codexHome?: string;
   inheritCodexHome?: boolean;
@@ -48,7 +37,6 @@ export class CodexAdapter implements AgentAdapter {
   readonly displayName = 'Codex CLI';
 
   private readonly binary: string;
-  private readonly binaryPin: CodexBinaryPin | undefined;
   private readonly profileStateDir: string;
   private readonly codexHome: string | undefined;
   private readonly inheritCodexHome: boolean;
@@ -61,7 +49,6 @@ export class CodexAdapter implements AgentAdapter {
 
   constructor(opts: CodexAdapterOptions) {
     this.binary = opts.binary;
-    this.binaryPin = opts.binaryPin;
     this.profileStateDir = opts.profileStateDir;
     this.codexHome = opts.codexHome;
     this.inheritCodexHome = opts.inheritCodexHome !== false;
@@ -90,36 +77,14 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async prepareRun(): Promise<void> {
-    if (!this.binaryPin) {
-      const err = new AgentPreflightError({
-        code: 'agent-binary-pin-missing',
-        agentId: 'codex',
-        agentName: 'Codex CLI',
-        command: this.binary,
-        binaryPath: this.binary,
-      });
-      throw new SpawnFailed('codex binary pin is missing', err, 'agent-prepare-failed', err.diagnostic);
-    }
-    try {
-      await verifyCodexBinaryPin(this.binaryPin, this.binary);
-    } catch (err) {
-      if (err instanceof CodexBinaryPinDriftError) {
-        throw new SpawnFailed(
-          'codex binary verification failed',
-          err,
-          err.code,
-          codexPinDiagnostic(this.binary, err),
-        );
-      }
-      if (err instanceof AgentPreflightError) {
-        throw new SpawnFailed(
-          'codex binary verification failed',
-          err,
-          err.diagnostic.code,
-          err.diagnostic,
-        );
-      }
-      throw new SpawnFailed('codex binary verification failed', err, 'agent-prepare-failed');
+    const availability = await this.checkAvailability();
+    if (!availability.ok) {
+      throw new SpawnFailed(
+        'codex binary check failed',
+        availability.error,
+        availability.diagnostic.code,
+        availability.diagnostic,
+      );
     }
   }
 
@@ -326,33 +291,6 @@ async function waitForExitCode(child: CodexChild): Promise<number | null> {
   return new Promise<number | null>((resolve) => {
     child.once('exit', (code) => resolve(code));
   });
-}
-
-function codexPinDiagnostic(
-  binary: string,
-  err: CodexBinaryPinDriftError,
-): AgentPreflightDiagnostic {
-  const cause = err.cause as { field?: string; actual?: string | number; expected?: string | number };
-  return {
-    code: codexPinDiagnosticCode(err.code),
-    agentId: 'codex',
-    agentName: 'Codex CLI',
-    command: binary,
-    binaryPath: binary,
-    field: cause.field,
-    actual: cause.actual,
-    expected: cause.expected,
-  };
-}
-
-function codexPinDiagnosticCode(
-  code: CodexBinaryPinDriftError['code'],
-): AgentPreflightDiagnostic['code'] {
-  if (code === 'binary-realpath-mismatch') return 'agent-binary-pin-realpath-mismatch';
-  if (code === 'binary-version-mismatch') return 'agent-binary-pin-version-mismatch';
-  if (code === 'binary-hash-mismatch') return 'agent-binary-pin-hash-mismatch';
-  if (code === 'binary-owner-mismatch') return 'agent-binary-pin-owner-mismatch';
-  return 'agent-binary-pin-mode-mismatch';
 }
 
 function isWindowsCommandNotFoundLine(line: string): boolean {

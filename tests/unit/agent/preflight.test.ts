@@ -128,12 +128,6 @@ describe('agent preflight diagnostics', () => {
       ['agent-version-check-timeout', '✗ 本地 Codex CLI 不可用：`codex --version` 超时未返回。'],
       ['agent-version-check-nonzero-exit', '✗ 本地 Codex CLI 不可用：`codex --version` 退出码为 42。'],
       ['agent-version-check-empty-output', '✗ 本地 Codex CLI 不可用：`codex --version` 没有返回版本信息。'],
-      ['agent-binary-pin-missing', '✗ 当前 Codex CLI profile 缺少二进制校验信息。'],
-      ['agent-binary-pin-realpath-mismatch', '✗ 本地 Codex CLI 与当前 profile 记录的二进制不一致。'],
-      ['agent-binary-pin-version-mismatch', '✗ 本地 Codex CLI 与当前 profile 记录的二进制不一致。'],
-      ['agent-binary-pin-hash-mismatch', '✗ 本地 Codex CLI 与当前 profile 记录的二进制不一致。'],
-      ['agent-binary-pin-owner-mismatch', '✗ 本地 Codex CLI 与当前 profile 记录的二进制不一致。'],
-      ['agent-binary-pin-mode-mismatch', '✗ 本地 Codex CLI 与当前 profile 记录的二进制不一致。'],
     ] as const;
 
     for (const [code, firstLine] of cases) {

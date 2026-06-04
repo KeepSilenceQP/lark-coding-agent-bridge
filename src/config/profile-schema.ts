@@ -55,6 +55,25 @@ export interface AttachmentConfig {
 
 export type CommentConfig = Record<string, never>;
 
+export type LarkCliIdentityPreset = 'bot-only' | 'user-default';
+
+export type LarkCliUserImportStatus =
+  | 'not-needed'
+  | 'imported'
+  | 'skipped-existing-private-user'
+  | 'skipped-no-local-user'
+  | 'failed';
+
+export interface LarkCliConfig {
+  identityPreset: LarkCliIdentityPreset;
+  localUserImport?: {
+    status: LarkCliUserImportStatus;
+    attemptedAt?: string;
+    importedAt?: string;
+    reason?: string;
+  };
+}
+
 export interface ProfileConfig {
   schemaVersion: 2;
   agentKind: AgentKind;
@@ -73,6 +92,7 @@ export interface ProfileConfig {
   codex?: CodexConfig;
   attachments: AttachmentConfig;
   comments: CommentConfig;
+  larkCli: LarkCliConfig;
 }
 
 export interface RootConfig {
@@ -132,6 +152,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     codex?: CodexConfig & { flags?: unknown };
     attachments?: Partial<AttachmentConfig>;
     comments?: unknown;
+    larkCli?: unknown;
   };
 
   if (raw.schemaVersion !== 2) {
@@ -157,6 +178,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
   const sandbox = permissionsToLegacySandbox(permissions);
   const workspaces = normalizeWorkspaces(raw.workspaces);
   const comments = normalizeComments(raw.comments);
+  const larkCli = normalizeLarkCli(raw.larkCli);
 
   return {
     schemaVersion: 2,
@@ -179,6 +201,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
       cacheMaxBytes: numberOr(raw.attachments?.cacheMaxBytes, 512 * 1024 * 1024),
     },
     comments,
+    larkCli,
   };
 }
 
@@ -264,6 +287,50 @@ function normalizeCodex(input: CodexConfig & { flags?: unknown }): CodexConfig {
 
 function normalizeComments(_input: unknown): CommentConfig {
   return {};
+}
+
+function normalizeLarkCli(input: unknown): LarkCliConfig {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return { identityPreset: 'bot-only' };
+  }
+  const raw = input as {
+    identityPreset?: unknown;
+    localUserImport?: unknown;
+  };
+  const identityPreset: LarkCliIdentityPreset =
+    raw.identityPreset === 'user-default' ? 'user-default' : 'bot-only';
+  const localUserImport = normalizeLarkCliUserImport(raw.localUserImport);
+  return {
+    identityPreset,
+    ...(localUserImport ? { localUserImport } : {}),
+  };
+}
+
+function normalizeLarkCliUserImport(input: unknown): LarkCliConfig['localUserImport'] | undefined {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const raw = input as {
+    status?: unknown;
+    attemptedAt?: unknown;
+    importedAt?: unknown;
+    reason?: unknown;
+  };
+  if (!isLarkCliUserImportStatus(raw.status)) return undefined;
+  return {
+    status: raw.status,
+    ...(typeof raw.attemptedAt === 'string' ? { attemptedAt: raw.attemptedAt } : {}),
+    ...(typeof raw.importedAt === 'string' ? { importedAt: raw.importedAt } : {}),
+    ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
+  };
+}
+
+function isLarkCliUserImportStatus(value: unknown): value is LarkCliUserImportStatus {
+  return (
+    value === 'not-needed' ||
+    value === 'imported' ||
+    value === 'skipped-existing-private-user' ||
+    value === 'skipped-no-local-user' ||
+    value === 'failed'
+  );
 }
 
 function stringArray(value: unknown): string[] {

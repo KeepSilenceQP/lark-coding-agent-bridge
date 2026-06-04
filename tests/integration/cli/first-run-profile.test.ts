@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 describe('first-run profile bootstrap', () => {
-  it('creates a Codex profile with a default workspace, binary pin, and inherited user Codex home', async () => {
+  it('creates a Codex profile with a default workspace and inherited user Codex home', async () => {
     const root = await makeRoot();
     const workspace = join(root, 'workspace');
     const profileDir = join(root, 'profiles', 'codex-dev');
@@ -39,11 +39,11 @@ describe('first-run profile bootstrap', () => {
     expect(profile.workspaces).toEqual({ default: workspaceRealpath });
     expect(profile.codex).toMatchObject({
       binaryPath: codex,
-      realpath: await realpath(codex),
-      version: 'codex 1.2.3',
       inheritCodexHome: true,
     });
-    expect(profile.codex?.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(profile.codex?.realpath).toBeUndefined();
+    expect(profile.codex?.version).toBeUndefined();
+    expect(profile.codex?.sha256).toBeUndefined();
     expect(profile.sandbox).toMatchObject({
       defaultMode: 'danger-full-access',
       maxMode: 'danger-full-access',

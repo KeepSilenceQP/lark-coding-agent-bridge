@@ -403,14 +403,14 @@ describe('profile v2 migration', () => {
     }
 
     const next = (await readJson(join(root, 'config.json'))) as RootConfig;
-    const codexRealpath = await realpath(codex);
     expect(next.activeProfile).toBe('codex');
     expect(next.profiles.codex?.agentKind).toBe('codex');
     expect(next.profiles.codex?.codex).toMatchObject({
       binaryPath: codex,
-      realpath: codexRealpath,
     });
-    expect(next.profiles.codex?.codex?.sha256).toBeTruthy();
+    expect(next.profiles.codex?.codex?.realpath).toBeUndefined();
+    expect(next.profiles.codex?.codex?.version).toBeUndefined();
+    expect(next.profiles.codex?.codex?.sha256).toBeUndefined();
     expect(next.profiles.codex?.permissions).toEqual({
       defaultAccess: 'full',
       maxAccess: 'full',

@@ -15,7 +15,6 @@ import type { Controls } from '../../commands';
 import type { AppPaths } from '../../config/app-paths';
 import {
   type AgentKind,
-  type CodexConfig,
   type ProfileConfig,
 } from '../../config/profile-schema';
 import type { AppConfig } from '../../config/schema';
@@ -103,6 +102,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
   await preFlightChecks({
     skipCheckLarkCli: opts.skipCheckLarkCli,
     bridgeConfig: cfg,
+    profileConfig,
     appPaths,
     larkChannel: {
       profile: appPaths.profile,
@@ -425,7 +425,6 @@ export function createRuntimeAgent(
     }
     return new CodexAdapter({
       binary: codex.binaryPath,
-      binaryPin: codexBinaryPin(codex),
       profileStateDir: appPaths.profileDir,
       ...(codex.codexHome ? { codexHome: codex.codexHome } : {}),
       inheritCodexHome: codex.inheritCodexHome === true,
@@ -436,29 +435,6 @@ export function createRuntimeAgent(
     });
   }
   return new ClaudeAdapter({ larkChannel });
-}
-
-function codexBinaryPin(codex: CodexConfig) {
-  if (!codex.realpath || !codex.version || !codex.sha256) {
-    throw new AgentPreflightError(
-      {
-        code: 'agent-binary-pin-missing',
-        agentId: 'codex',
-        agentName: 'Codex CLI',
-        command: codex.binaryPath,
-        binaryPath: codex.binaryPath,
-      },
-      'codex profile requires binary pin fields: realpath, version, sha256',
-    );
-  }
-  return {
-    binaryPath: codex.binaryPath,
-    realpath: codex.realpath,
-    version: codex.version,
-    sha256: codex.sha256,
-    ...(codex.owner !== undefined ? { owner: codex.owner } : {}),
-    ...(codex.mode !== undefined ? { mode: codex.mode } : {}),
-  };
 }
 
 /**

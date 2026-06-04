@@ -76,12 +76,6 @@ describe('CodexAdapter system prompt wiring', () => {
   function codexAdapter(): CodexAdapter {
     return new CodexAdapter({
       binary: '/usr/local/bin/codex',
-      binaryPin: {
-        binaryPath: '/usr/local/bin/codex',
-        realpath: '/usr/local/bin/codex',
-        version: '1.0.0',
-        sha256: 'deadbeef',
-      },
       profileStateDir: '/tmp/codex-profile',
     });
   }
