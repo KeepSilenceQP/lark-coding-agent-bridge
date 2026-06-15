@@ -1,10 +1,11 @@
 import type { KnownChat } from '../bot/lark-info';
 import type { LarkCliIdentityPreset } from '../config/profile-schema';
-import type { MessageReplyMode } from '../config/schema';
+import type { CotMessagesMode, MessageReplyMode } from '../config/schema';
 
 export interface ConfigFormOpts {
   messageReply: MessageReplyMode;
   showToolCalls: boolean;
+  cotMessages: CotMessagesMode;
   maxConcurrentRuns: number;
   /** 0 means "disabled". */
   runIdleTimeoutMinutes: number;
@@ -141,6 +142,24 @@ export function configFormCard(opts: ConfigFormOpts): object {
             {
               tag: 'markdown',
               content:
+                '\n**COT 过程消息**\n' +
+                '_关闭:只发送最终回复_\n' +
+                '_简略:展示 agent 过程文本和工具摘要_\n' +
+                '_详细:额外展示工具参数和输出摘要_',
+            },
+            {
+              tag: 'select_static',
+              name: 'cot_messages',
+              initial_option: opts.cotMessages,
+              options: [
+                { text: { tag: 'plain_text', content: '关闭' }, value: 'off' },
+                { text: { tag: 'plain_text', content: '简略' }, value: 'brief' },
+                { text: { tag: 'plain_text', content: '详细' }, value: 'detailed' },
+              ],
+            },
+            {
+              tag: 'markdown',
+              content:
                 '\n**并发上限**\n' +
                 '_全局同时运行的 agent 进程数(主要影响话题群多话题并行场景)_\n' +
                 '_默认 10,范围 1-50。超出的请求会 FIFO 排队_',
@@ -250,6 +269,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
         : '纯文本';
   const summarize = (list: string[]): string =>
     list.length === 0 ? '_(空)_' : `${list.length} 项`;
+  const cotLabel = cotMessagesLabel(opts.cotMessages);
   return {
     schema: '2.0',
     config: { summary: { content: '偏好已保存' } },
@@ -261,6 +281,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
             '✅ **偏好已保存**\n\n' +
             `**消息回复方式**:${replyLabel}\n` +
             `**工具调用显示**:\`${opts.showToolCalls ? 'show' : 'hide'}\`\n` +
+            `**COT 过程消息**:\`${cotLabel}\`\n` +
             `**并发上限**:\`${opts.maxConcurrentRuns}\`\n` +
             `**run 探活**:\`${opts.runIdleTimeoutMinutes > 0 ? `${opts.runIdleTimeoutMinutes} 分钟` : '关闭'}\`\n` +
             `**群里需要 @ bot**:\`${opts.requireMentionInGroup ? '是' : '否'}\`\n\n` +
@@ -274,6 +295,12 @@ export function configSavedCard(opts: ConfigFormOpts): object {
       ],
     },
   };
+}
+
+function cotMessagesLabel(value: CotMessagesMode): string {
+  if (value === 'brief') return '简略';
+  if (value === 'detailed') return '详细';
+  return '关闭';
 }
 
 export function configCancelledCard(): object {

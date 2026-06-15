@@ -30,6 +30,7 @@ import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
   getAgentStopGraceMs,
+  getCotMessages,
   getMaxConcurrentRuns,
   getMessageReplyMode,
   getRequireMentionInGroup,
@@ -62,6 +63,12 @@ import { fetchQuotedContext, type QuotedContext } from './quote';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
+import {
+  consumeCotEvents,
+  CotClient,
+  CotPublisher,
+  finalAnswerOnlyState,
+} from './cot';
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
@@ -196,6 +203,21 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       })
     : undefined;
   const activePolicyFingerprints = new Map<string, string>();
+  const cotClient = new CotClient({
+    tenant: cfg.accounts.app.tenant,
+    appId: cfg.accounts.app.id,
+    appSecret,
+  });
+  const threadModeOverrideWarnedChats = new Set<string>();
+  const logThreadModeOverride: LogThreadModeOverride = ({ chatId, resolvedMode, threadId }) => {
+    const fields = { chatId, cachedMode: resolvedMode, threadId };
+    if (threadModeOverrideWarnedChats.has(chatId)) {
+      log.info('chat', 'mode-overridden-by-thread', fields);
+      return;
+    }
+    threadModeOverrideWarnedChats.add(chatId);
+    log.warn('chat', 'mode-overridden-by-thread', fields);
+  };
 
   const opts: LarkChannelOptions = {
     appId: cfg.accounts.app.id,
@@ -251,9 +273,24 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     if (!firstMsg) return;
     pending.block(scope);
     void withTrace({ chatId: firstMsg.chatId }, async () => {
-      log.info('flush', 'start', { scope, batchSize: batch.length });
+      log.info('flush', 'start', {
+        scope,
+        batchSize: batch.length,
+        chatId: firstMsg.chatId,
+        threadId: firstMsg.threadId,
+        msgId: firstMsg.messageId,
+      });
       try {
-        const mode = await chatModeCache.resolve(channel, firstMsg.chatId);
+        const resolvedMode = await chatModeCache.resolve(channel, firstMsg.chatId);
+        const mode = firstMsg.threadId ? 'topic' : resolvedMode;
+        if (firstMsg.threadId && resolvedMode !== 'topic') {
+          chatModeCache.invalidate(firstMsg.chatId);
+          logThreadModeOverride({
+            chatId: firstMsg.chatId,
+            resolvedMode,
+            threadId: firstMsg.threadId,
+          });
+        }
         await runAgentBatch({
           channel,
           executor,
@@ -263,6 +300,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           media,
           batch,
           controls,
+          cotClient,
           callbackAuth,
           activePolicyFingerprints,
           scope,
@@ -294,6 +332,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           msg,
           controls,
           chatModeCache,
+          logThreadModeOverride,
           executor,
           pool,
         }),
@@ -490,9 +529,16 @@ interface IntakeDeps {
   msg: NormalizedMessage;
   controls: Controls;
   chatModeCache: ChatModeCache;
+  logThreadModeOverride: LogThreadModeOverride;
   executor: RunExecutor;
   pool: ProcessPool;
 }
+
+type LogThreadModeOverride = (input: {
+  chatId: string;
+  resolvedMode: ChatMode;
+  threadId: string;
+}) => void;
 
 async function intakeMessage(deps: IntakeDeps): Promise<void> {
   const {
@@ -506,13 +552,23 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     msg,
     controls,
     chatModeCache,
+    logThreadModeOverride,
     executor,
     pool,
   } = deps;
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
   // downstream consumer keys off these.
-  const chatMode = await chatModeCache.resolve(channel, msg.chatId);
+  const resolvedMode = await chatModeCache.resolve(channel, msg.chatId);
+  const chatMode = msg.threadId ? 'topic' : resolvedMode;
+  if (msg.threadId && resolvedMode !== 'topic') {
+    chatModeCache.invalidate(msg.chatId);
+    logThreadModeOverride({
+      chatId: msg.chatId,
+      resolvedMode,
+      threadId: msg.threadId,
+    });
+  }
   const scope = chatMode === 'topic' && msg.threadId
     ? `${msg.chatId}:${msg.threadId}`
     : msg.chatId;
@@ -520,6 +576,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     scope,
     chatType: msg.chatType,
     chatMode,
+    resolvedMode,
+    threadId: msg.threadId,
+    msgId: msg.messageId,
     sender: msg.senderId,
     preview,
     resources: msg.resources.length,
@@ -599,6 +658,7 @@ interface RunBatchDeps {
   media: MediaCache;
   batch: NormalizedMessage[];
   controls: Controls;
+  cotClient: CotClient;
   callbackAuth?: CallbackAuth;
   activePolicyFingerprints: Map<string, string>;
   scope: string;
@@ -615,6 +675,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     media,
     batch,
     controls,
+    cotClient,
     callbackAuth,
     activePolicyFingerprints,
     scope,
@@ -680,6 +741,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     replyTo: lastMsg.messageId,
     ...(mode === 'topic' && threadId ? { replyInThread: true } : {}),
   };
+  log.info('flush', 'reply-target', {
+    scope,
+    mode,
+    chatId,
+    threadId,
+    replyTo: sendOpts.replyTo,
+    replyInThread: sendOpts.replyInThread === true,
+  });
 
   const accessDecision =
     firstMsg.chatType === 'p2p'
@@ -768,6 +837,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   const replyMode = getMessageReplyMode(controls.cfg);
   log.info('flush', 'reply-mode', { mode: replyMode });
+  const cotMessages = getCotMessages(controls.cfg);
+  const cotEnabled = cotMessages !== 'off';
 
   // Re-read prefs on every flush so toggling /config mid-stream takes
   // effect immediately. Cheap object lookups, no allocation when on.
@@ -795,9 +866,46 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // Add a "Typing" reaction to the triggering message as an instant ack, but
   // never let that outbound API call block agent event draining.
   const reactionPromise =
-    replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
+    cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
 
   try {
+    if (cotEnabled) {
+      const cotPublisher = new CotPublisher({
+        client: cotClient,
+        chatId,
+        originMessageId: lastMsg.messageId,
+        runId: execution.runId,
+        scope,
+        inputPreview: lastMsg.content,
+      });
+      await cotPublisher.start();
+      if (!cotPublisher.disabled) {
+        const cotDone = consumeCotEvents(execution.subscribe(), cotPublisher, {
+          detail: cotMessages,
+        });
+        const finalState = await processAgentStream(
+          handle,
+          eventStream,
+          scope,
+          idleTimeoutMs,
+          recordSession,
+          async () => {},
+        );
+        await cotDone;
+        await sendFinalReply({
+          channel,
+          chatId,
+          scope,
+          state: finalAnswerOnlyState(finalState),
+          replyMode,
+          sendOpts,
+          cardRenderOptions,
+        });
+        return;
+      }
+      log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
+    }
+
     if (replyMode === 'card') {
       let latestState: RunState = initialState;
       let producerStarted = false;
@@ -898,10 +1006,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         recordSession,
         async () => {},
       );
-      const body = renderText(filterForPrefs(finalState));
-      if (body.trim()) {
-        await channel.send(chatId, { markdown: body }, sendOpts);
-      }
+      await sendFinalReply({
+        channel,
+        chatId,
+        scope,
+        state: filterForPrefs(finalState),
+        replyMode,
+        sendOpts,
+        cardRenderOptions,
+      });
     }
   } catch (err) {
     log.fail('stream', err);
@@ -909,6 +1022,80 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
+}
+
+async function sendFinalReply(input: {
+  channel: LarkChannel;
+  chatId: string;
+  scope: string;
+  state: RunState;
+  replyMode: ReturnType<typeof getMessageReplyMode>;
+  sendOpts: { replyTo: string; replyInThread?: boolean };
+  cardRenderOptions: { signCallback?: (action: string) => string };
+}): Promise<void> {
+  const body = renderText(input.state);
+
+  if (input.replyMode === 'card') {
+    const result = await input.channel.send(
+      input.chatId,
+      { card: renderCard(input.state, input.cardRenderOptions) },
+      input.sendOpts,
+    );
+    log.info('outbound', 'sent', outboundLogFields(input, 'card', body, result));
+  } else if (input.replyMode === 'markdown') {
+    if (body.trim()) {
+      try {
+        await input.channel.stream(
+          input.chatId,
+          {
+            markdown: async (ctrl) => {
+              await ctrl.setContent(body);
+            },
+          },
+          input.sendOpts,
+        );
+        log.info('outbound', 'sent', outboundLogFields(input, 'markdown-stream', body));
+      } catch (err) {
+        log.warn('outbound', 'markdown-stream-fallback', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+        const result = await input.channel.send(
+          input.chatId,
+          { markdown: body },
+          input.sendOpts,
+        );
+        log.info('outbound', 'sent', outboundLogFields(input, 'markdown', body, result));
+      }
+    }
+  } else if (body.trim()) {
+    const result = await input.channel.send(
+      input.chatId,
+      { markdown: body },
+      input.sendOpts,
+    );
+    log.info('outbound', 'sent', outboundLogFields(input, 'text', body, result));
+  }
+}
+
+function outboundLogFields(
+  input: {
+    scope?: string;
+    replyMode: ReturnType<typeof getMessageReplyMode>;
+    sendOpts?: { replyTo?: string; replyInThread?: boolean };
+  },
+  type: string,
+  body: string,
+  result?: { messageId?: string },
+): Record<string, unknown> {
+  return {
+    type,
+    scope: input.scope,
+    mode: input.replyMode,
+    chars: body.length,
+    messageId: result?.messageId,
+    replyTo: input.sendOpts?.replyTo,
+    replyInThread: input.sendOpts?.replyInThread === true,
+  };
 }
 
 /**
@@ -1027,7 +1214,7 @@ async function processAgentStream(
       state = finalizeIfRunning(state);
     }
   }
-  log.info('card', 'final', { terminal: state.terminal, interrupted: handle.interrupted });
+  log.info('card', 'final', { scope, terminal: state.terminal, interrupted: handle.interrupted });
   reportMetric('run_e2e_ms', Date.now() - runStart, { terminal: state.terminal });
   await flush(state);
   if (handle.interrupted) {

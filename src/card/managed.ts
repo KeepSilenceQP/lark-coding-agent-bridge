@@ -2,7 +2,8 @@ import type { LarkChannel } from '@larksuite/channel';
 import { log } from '../core/logger';
 
 interface ManagedEntry {
-  cardId: string;
+  kind: 'card-id' | 'raw-card';
+  cardId?: string;
   sequence: number;
 }
 
@@ -29,15 +30,26 @@ export async function sendManagedCard(
   channel: LarkChannel,
   recipientId: string,
   card: object,
-  opts: { replyTo?: string } = {},
+  opts: { replyTo?: string; replyInThread?: boolean } = {},
 ): Promise<ManagedCardSendResult> {
   const { cardId } = await channel.createCard(card);
-  const { messageId } = await channel.send(
-    recipientId,
-    { cardId },
-    opts.replyTo ? { replyTo: opts.replyTo } : undefined,
-  );
-  byMessageId.set(messageId, { cardId, sequence: 0 });
+  const sendOpts = opts.replyTo
+    ? { replyTo: opts.replyTo, ...(opts.replyInThread ? { replyInThread: true } : {}) }
+    : undefined;
+  let messageId: string;
+  try {
+    ({ messageId } = await channel.send(recipientId, { cardId }, sendOpts));
+  } catch (err) {
+    log.warn('card', 'managed-send-raw-fallback', {
+      err: err instanceof Error ? err.message : String(err),
+      replyTo: opts.replyTo,
+      replyInThread: opts.replyInThread === true,
+    });
+    ({ messageId } = await channel.send(recipientId, { card }, sendOpts));
+    byMessageId.set(messageId, { kind: 'raw-card', sequence: 0 });
+    return { messageId, cardId };
+  }
+  byMessageId.set(messageId, { kind: 'card-id', cardId, sequence: 0 });
   return { messageId, cardId };
 }
 
@@ -57,9 +69,18 @@ export async function updateManagedCard(
   }
   entry.sequence += 1;
   try {
-    await channel.updateCardById(entry.cardId, card, entry.sequence);
+    if (entry.kind === 'card-id') {
+      await channel.updateCardById(entry.cardId!, card, entry.sequence);
+    } else {
+      await channel.updateCard(messageId, card);
+    }
   } catch (err) {
-    log.fail('card', err, { step: 'managed-update', cardId: entry.cardId, seq: entry.sequence });
+    log.fail('card', err, {
+      step: 'managed-update',
+      kind: entry.kind,
+      cardId: entry.cardId,
+      seq: entry.sequence,
+    });
     throw err;
   }
 }

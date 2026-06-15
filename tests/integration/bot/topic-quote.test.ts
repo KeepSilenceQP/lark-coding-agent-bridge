@@ -89,6 +89,28 @@ describe('topic message quote handling', () => {
     expect(h.channel.fetchRawMessage).not.toHaveBeenCalled();
   });
 
+  it('treats messages with threadId as topic messages even when chat mode cache says group', async () => {
+    const h = await createHarness({ chatMode: 'group' });
+
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_converted_topic',
+        rootId: 'om_topic_root',
+        parentId: 'om_topic_root',
+        threadId: 'omt_converted_topic',
+        content: '@Bridge 继续说一下',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    const prompt = h.agent.runOptions[0]?.prompt ?? '';
+    expect(prompt).toContain('"threadId":"omt_converted_topic"');
+    expect(prompt).not.toContain('<quoted_messages>');
+    expect(h.channel.fetchRawMessage).not.toHaveBeenCalled();
+  });
+
   it('keeps regular group reply quotes as quoted context', async () => {
     const h = await createHarness({
       chatMode: 'group',
