@@ -282,6 +282,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       });
       try {
         const resolvedMode = await chatModeCache.resolve(channel, firstMsg.chatId);
+        // Feishu/Lark converted topic groups may still resolve as `group` from
+        // the chat info API/cache, while message events already carry threadId.
+        // Treat threadId as authoritative for IM messages so scope and replies
+        // stay isolated per topic.
         const mode = firstMsg.threadId ? 'topic' : resolvedMode;
         if (firstMsg.threadId && resolvedMode !== 'topic') {
           chatModeCache.invalidate(firstMsg.chatId);
@@ -560,6 +564,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // Resolve scope (and underlying chat mode) once at intake — every
   // downstream consumer keys off these.
   const resolvedMode = await chatModeCache.resolve(channel, msg.chatId);
+  // Some groups are converted into topic groups after creation. In that state
+  // getChatMode can lag behind the message event shape, so threadId is the
+  // stronger signal for topic-scoped sessions and reply routing.
   const chatMode = msg.threadId ? 'topic' : resolvedMode;
   if (msg.threadId && resolvedMode !== 'topic') {
     chatModeCache.invalidate(msg.chatId);
@@ -892,6 +899,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           async () => {},
         );
         await cotDone;
+        if (cotPublisher.degradedReason) {
+          await sendCotDegradedNotice({
+            channel,
+            chatId,
+            scope,
+            sendOpts,
+            reason: cotPublisher.degradedReason,
+          });
+        }
         await sendFinalReply({
           channel,
           chatId,
@@ -1074,6 +1090,32 @@ async function sendFinalReply(input: {
       input.sendOpts,
     );
     log.info('outbound', 'sent', outboundLogFields(input, 'text', body, result));
+  }
+}
+
+async function sendCotDegradedNotice(input: {
+  channel: LarkChannel;
+  chatId: string;
+  scope: string;
+  sendOpts: { replyTo: string; replyInThread?: boolean };
+  reason: string;
+}): Promise<void> {
+  log.warn('cot', 'degraded', {
+    scope: input.scope,
+    reason: input.reason,
+    replyInThread: input.sendOpts.replyInThread === true,
+  });
+  try {
+    await input.channel.send(
+      input.chatId,
+      { markdown: 'COT 过程消息更新失败，已停止展示过程；最终答案仍会继续发送。' },
+      input.sendOpts,
+    );
+  } catch (err) {
+    log.warn('cot', 'degraded-notice-failed', {
+      scope: input.scope,
+      err: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 

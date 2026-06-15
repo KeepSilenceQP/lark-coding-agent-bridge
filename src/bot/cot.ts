@@ -117,6 +117,7 @@ export class CotPublisher {
   readonly inputPreview: string;
   ref: CotRef | undefined;
   disabled = false;
+  degradedReason: string | undefined;
   private buffer: CotEvent[] = [];
   private flushing: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
@@ -207,7 +208,8 @@ export class CotPublisher {
     this.flushing = this.client.update(this.ref, events)
       .catch((err) => {
         this.disabled = true;
-        log.warn('cot', 'update-failed', { err: err instanceof Error ? err.message : String(err) });
+        this.degradedReason = err instanceof Error ? err.message : String(err);
+        log.warn('cot', 'update-failed', { err: this.degradedReason });
       })
       .finally(() => {
         this.flushing = undefined;

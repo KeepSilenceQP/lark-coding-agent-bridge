@@ -55,8 +55,9 @@ export async function sendManagedCard(
 
 /**
  * Update a managed card identified by the messageId of the message that
- * carries it. Auto-increments and tracks the per-card sequence so updates
- * can't be reordered or rejected by the cardkit server.
+ * carries it. CardKit card-id sends use the per-card sequence required by the
+ * card server; raw-card fallback sends can only be updated by messageId, so the
+ * local sequence is diagnostic metadata for that path.
  */
 export async function updateManagedCard(
   channel: LarkChannel,

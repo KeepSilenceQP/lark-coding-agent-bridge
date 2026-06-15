@@ -1802,7 +1802,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
   const messageReply: MessageReplyMode =
     rawReply === 'markdown' || rawReply === 'text' || rawReply === 'card'
       ? (rawReply as MessageReplyMode)
-      : 'card';
+      : getMessageReplyMode(ctx.controls.cfg);
   const rawTools = String(fv.show_tool_calls ?? '').trim();
   const showToolCalls = rawTools !== 'hide';
   const rawCotMessages = String(fv.cot_messages ?? '').trim();

@@ -89,17 +89,42 @@ describe('COT event mapping', () => {
     expect(cotBriefToolTitle('command_execution', { command: 'echo hello' }, 'done'))
       .toContain('echo hello');
   });
+
+  it('marks the publisher degraded when COT updates fail', async () => {
+    const client = new FakeCotClient();
+    client.failUpdate = new Error('field validation failed');
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      runId: 'run-degraded',
+      scope: 'oc_chat',
+      inputPreview: 'run',
+    });
+    await publisher.start();
+
+    await consumeCotEvents(iterate([
+      { type: 'text', delta: 'working' },
+      { type: 'done', terminationReason: 'normal' },
+    ]), publisher, { detail: 'brief' });
+
+    expect(publisher.disabled).toBe(true);
+    expect(publisher.degradedReason).toBe('field validation failed');
+    expect(client.completed).toEqual([]);
+  });
 });
 
 class FakeCotClient {
   events: Array<{ event_type: string; content: string; timestamp: number }> = [];
   completed: string[] = [];
+  failUpdate: Error | undefined;
 
   async create(): Promise<Record<string, unknown>> {
     return { cot_id: 'cot_fake', message_id: 'om_cot_fake' };
   }
 
   async update(_ref: unknown, events: readonly { event_type: string; content: string; timestamp: number }[]): Promise<void> {
+    if (this.failUpdate) throw this.failUpdate;
     this.events.push(...events);
   }
 
