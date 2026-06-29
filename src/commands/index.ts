@@ -27,6 +27,7 @@ import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templa
 import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
   getAgentStopGraceMs,
+  getCotMessages,
   getMaxConcurrentRuns,
   getMessageReplyMode,
   getRequireMentionInGroup,
@@ -266,7 +267,7 @@ export async function runCommandHandler(
  */
 async function reply(ctx: CommandContext, markdown: string): Promise<void> {
   try {
-    await ctx.channel.send(ctx.msg.chatId, { markdown }, { replyTo: ctx.msg.messageId });
+    await ctx.channel.send(ctx.msg.chatId, { markdown }, commandReplyOptions(ctx));
   } catch (err) {
     log.fail('command', err, { step: 'reply' });
     reportMetric('command_fail', 1, { step: 'reply' });
@@ -275,13 +276,20 @@ async function reply(ctx: CommandContext, markdown: string): Promise<void> {
       await ctx.channel.send(
         ctx.msg.chatId,
         { markdown: AUDIT_SAFE_COMMAND_REPLY },
-        { replyTo: ctx.msg.messageId },
+        commandReplyOptions(ctx),
       );
     } catch (fallbackErr) {
       log.fail('command', fallbackErr, { step: 'reply-audit-fallback' });
       reportMetric('command_fail', 1, { step: 'reply-audit-fallback' });
     }
   }
+}
+
+function commandReplyOptions(ctx: CommandContext): { replyTo: string; replyInThread?: true } {
+  return {
+    replyTo: ctx.msg.messageId,
+    ...(ctx.chatMode === 'topic' && ctx.msg.threadId ? { replyInThread: true as const } : {}),
+  };
 }
 
 function isMessageAuditReject(err: unknown): boolean {
@@ -410,7 +418,7 @@ async function handleWsList(ctx: CommandContext): Promise<void> {
     currentCwd,
     named,
   );
-  await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+  await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
 }
 
 async function handleWsSave(name: string, ctx: CommandContext): Promise<void> {
@@ -556,7 +564,7 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
         };
       });
       const card = resumeCard(cwd, entries);
-      await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+      await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
       return;
     }
     if (entry?.threadId && identity) {
@@ -568,7 +576,7 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
       return;
     }
     const card = resumeCard(cwd, []);
-    await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+    await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
     return;
   }
 
@@ -586,7 +594,7 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
     current: s.sessionId === currentSession?.sessionId,
   }));
   const card = resumeCard(cwd, entries);
-  await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+  await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
 }
 
 async function applyResume(sessionId: string, ctx: CommandContext): Promise<void> {
@@ -807,13 +815,14 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     runtimeAccess: runtimeAccessStatus(ctx.controls.profileConfig),
     larkCliStatus: await larkCliStatus(ctx),
     activeRun: Boolean(ctx.activeRuns.get(ctx.scope)),
+    activeScopes: ctx.activeRuns.scopes().filter((scope) => !scope.startsWith('comment:')),
     activeCommentScopes: ctx.activeRuns.scopes().filter((scope) => scope.startsWith('comment:')),
     queue: ctx.processPool?.snapshot(),
     ownerState: formatOwnerState(ctx),
     scope: ctx.scope,
     chatMode: ctx.chatMode,
   });
-  await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+  await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
 }
 
 function formatOwnerState(ctx: CommandContext): string {
@@ -1310,7 +1319,7 @@ function formatDoctorEchoStatus(echoText: string, state: RunState): string {
 
 async function handleHelp(_args: string, ctx: CommandContext): Promise<void> {
   const card = helpCard(ctx.agent.displayName);
-  await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+  await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
 }
 
 // ─── /account ─────────────────────────────────────────────────────────────
@@ -1340,7 +1349,7 @@ async function showCurrent(ctx: CommandContext): Promise<void> {
     botName: ctx.channel.botIdentity?.name,
     tenant: ctx.controls.cfg.accounts.app.tenant,
   });
-  await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+  await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
 }
 
 async function showForm(ctx: CommandContext): Promise<void> {
@@ -1348,7 +1357,7 @@ async function showForm(ctx: CommandContext): Promise<void> {
   if (ctx.fromCardAction) {
     await recallMessage(ctx, ctx.msg.messageId);
   }
-  await sendManagedCard(ctx.channel, ctx.msg.chatId, card);
+  await sendManagedCard(ctx.channel, ctx.msg.chatId, card, commandReplyOptions(ctx));
 }
 
 async function cancelAccount(ctx: CommandContext): Promise<void> {
@@ -1372,6 +1381,7 @@ async function submitAccount(ctx: CommandContext): Promise<void> {
   const formMsgId = ctx.msg.messageId;
   const channel = ctx.channel;
   const restart = ctx.controls.restart;
+  const retryReplyOptions = commandReplyOptions(ctx);
 
   // CRITICAL: detach the work from the cardAction handler. Lark's client
   // keeps the form locked while the handler is pending — if we await the
@@ -1417,7 +1427,7 @@ async function submitAccount(ctx: CommandContext): Promise<void> {
         initialTenant: tenant,
         prefillAppId: appId,
       });
-      await sendManagedCard(channel, chatId, retry).catch((err) =>
+      await sendManagedCard(channel, chatId, retry, retryReplyOptions).catch((err) =>
         console.warn('[account] post retry form failed:', err),
       );
     };
@@ -1753,6 +1763,7 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
   const card = configFormCard({
     messageReply: getMessageReplyMode(ctx.controls.cfg),
     showToolCalls: getShowToolCalls(ctx.controls.cfg),
+    cotMessages: getCotMessages(ctx.controls.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
     requireMentionInGroup: getRequireMentionInGroup(ctx.controls.cfg),
@@ -1763,7 +1774,7 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     knownChats: ctx.controls.knownChats ?? [],
   });
   if (ctx.fromCardAction) await recallMessage(ctx, ctx.msg.messageId);
-  await sendManagedCard(ctx.channel, ctx.msg.chatId, card);
+  await sendManagedCard(ctx.channel, ctx.msg.chatId, card, commandReplyOptions(ctx));
 }
 
 async function showResultCardInPlace(
@@ -1775,7 +1786,7 @@ async function showResultCardInPlace(
     await updateManagedCard(ctx.channel, formMsgId, card);
   } catch (err) {
     log.warn('command', 'config-card-update-fallback', { err: String(err) });
-    await sendManagedCard(ctx.channel, ctx.msg.chatId, card).catch((fallbackErr) =>
+    await sendManagedCard(ctx.channel, ctx.msg.chatId, card, commandReplyOptions(ctx)).catch((fallbackErr) =>
       log.warn('command', 'config-card-fallback-send-failed', {
         err: String(fallbackErr),
       }),
@@ -1800,9 +1811,18 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
   const messageReply: MessageReplyMode =
     rawReply === 'markdown' || rawReply === 'text' || rawReply === 'card'
       ? (rawReply as MessageReplyMode)
-      : 'card';
+      : getMessageReplyMode(ctx.controls.cfg);
   const rawTools = String(fv.show_tool_calls ?? '').trim();
   const showToolCalls = rawTools !== 'hide';
+  const rawCotMessages = String(fv.cot_messages ?? '').trim();
+  const cotMessages =
+    rawCotMessages === 'brief'
+      ? 'brief'
+      : rawCotMessages === 'detailed' || rawCotMessages === 'on'
+        ? 'detailed'
+        : rawCotMessages === 'off'
+          ? 'off'
+          : getCotMessages(ctx.controls.cfg);
   // Parse max_concurrent_runs; invalid input falls back to current value.
   const rawMaxCC = String(fv.max_concurrent_runs ?? '').trim();
   const parsedMaxCC = Number(rawMaxCC);
@@ -1866,6 +1886,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       // explicitly picks any option gets out of the legacy-coerce path.
       messageReplyMigrated: true,
       showToolCalls,
+      cotMessages,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
@@ -1910,6 +1931,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
     log.info('command', 'config-saved', {
       messageReply,
       showToolCalls,
+      cotMessages,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
@@ -1925,6 +1947,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       configSavedCard({
         messageReply,
         showToolCalls,
+        cotMessages,
         maxConcurrentRuns,
         runIdleTimeoutMinutes,
         requireMentionInGroup,
