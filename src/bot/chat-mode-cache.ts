@@ -6,10 +6,14 @@ export type ChatMode = 'p2p' | 'group' | 'topic';
 /**
  * In-memory cache for `channel.getChatMode()` results.
  *
- * Why: chat mode (`p2p` / `group` / `topic`) usually doesn't change within a
- * chat's lifetime — but admins can convert a regular group into a topic group.
- * We cache positive p2p/topic answers; regular `group` is intentionally not
- * cached so a later conversion can be detected without a bridge restart.
+ * Why: chat mode (`p2p` / `group` / `topic`) doesn't change within a chat's
+ * lifetime under normal use, and the SDK doesn't expose it on the message
+ * event — so we cache by chatId to avoid an `im.v1.chat.get` round-trip per
+ * message. Admins can still convert a regular group into a topic group: the
+ * channel layer treats a message-level `threadId` as authoritative and calls
+ * `invalidate(chatId)` whenever a cached non-topic answer is contradicted, so
+ * the next resolve re-probes and a stale `group` entry can't outlive one
+ * message.
  *
  * On lookup failure (network / permission / unknown chatId) we **fall back
  * to 'group'** — that's the conservative default since it means "treat as
@@ -23,7 +27,7 @@ export class ChatModeCache {
     if (hit) return hit;
     try {
       const mode = await channel.getChatMode(chatId);
-      if (mode !== 'group') this.cache.set(chatId, mode);
+      this.cache.set(chatId, mode);
       log.info('chat', 'mode-resolved', { chatId, mode });
       return mode;
     } catch (err) {
