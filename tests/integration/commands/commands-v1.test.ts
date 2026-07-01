@@ -647,6 +647,32 @@ describe('Bridge command contracts', () => {
       .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /cd repo-one'));
   });
 
+  it('sets the coordinator cwd during project bootstrap without rewriting dispatched workspace text', async () => {
+    const h = await createHarness();
+    configureSingleBridgeBotBootstrap(h, '小C', 'ou-live-c', 'repo-one');
+    const coordinatorWorkspace = join(h.tmp.root, 'repo-one');
+    await mkdir(coordinatorWorkspace, { recursive: true });
+    h.sessions.set('oc-project', 'stale-session', h.tmp.workspace);
+
+    await expect(
+      h.run('/project bootstrap repo-one 小C', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    await expect(realpath(coordinatorWorkspace)).resolves.toBe(h.workspaces.cwdFor('oc-project'));
+    expect(h.sessions.resumeFor('oc-project', await realpath(coordinatorWorkspace))).toBeUndefined();
+
+    const textMessages = h.channel.sent
+      .map((m) => (m.content as { text?: string }).text)
+      .filter((text): text is string => typeof text === 'string');
+
+    expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-one');
+    expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /cd repo-one');
+  });
+
   it('keeps the original bootstrap workspace instead of expanding tilde paths', async () => {
     const h = await createHarness();
     configureSingleBridgeBotBootstrap(h, '云上小C', 'ou-cloud-c', 'sayToLittleP');
@@ -995,6 +1021,13 @@ function configureSingleBridgeBotBootstrap(
       projectRoot: string;
     }>;
   }).botRegistry = [
+    {
+      canonicalName: '小P',
+      aliases: [],
+      role: 'bridge',
+      machines: [{ kind: 'local', root: h.tmp.root }],
+      projectRoot,
+    },
     {
       canonicalName: name,
       aliases: [],

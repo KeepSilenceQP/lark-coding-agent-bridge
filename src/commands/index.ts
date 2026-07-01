@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import type { AgentAdapter } from '../agent/types';
@@ -678,6 +678,48 @@ function selectBootstrapTargetRegistry(registry: BotRegistryEntry[], targetBot: 
   );
 }
 
+function resolveCoordinatorBootstrapWorkspaceInput(
+  workspacePath: string,
+  registry: BotRegistryEntry[],
+  coordinatorName: string,
+): string {
+  if (isAbsoluteOrTilde(workspacePath)) return expandTilde(workspacePath);
+
+  const normalized = coordinatorName.normalize('NFC');
+  const coordinator = registry.find((entry) =>
+    entry.canonicalName.normalize('NFC') === normalized ||
+    entry.aliases.some((alias) => alias.normalize('NFC') === normalized),
+  );
+  const localRoot = coordinator?.machines.find((machine) => machine.kind === 'local')?.root;
+  return localRoot ? join(localRoot, workspacePath) : workspacePath;
+}
+
+async function maybeSwitchBootstrapCoordinatorWorkspace(
+  ctx: CommandContext,
+  workspacePath: string,
+  registry: BotRegistryEntry[],
+  coordinatorName: string,
+): Promise<void> {
+  const requested = resolveCoordinatorBootstrapWorkspaceInput(workspacePath, registry, coordinatorName);
+  const workspace = await resolveWorkingDirectory(requested);
+  if (!workspace.ok) {
+    log.warn('project', 'bootstrap-coordinator-workspace-unresolved', {
+      workspacePath,
+      requested,
+      reason: workspace.reason,
+    });
+    return;
+  }
+
+  ctx.activeRuns.interrupt(ctx.scope);
+  ctx.workspaces.setCwd(ctx.scope, workspace.cwdRealpath);
+  ctx.sessions.clear(ctx.scope);
+  log.info('project', 'bootstrap-coordinator-workspace-set', {
+    workspacePath,
+    cwdRealpath: workspace.cwdRealpath,
+  });
+}
+
 async function inviteMissingBootstrapBots(
   chatId: string,
   registry: BotRegistryEntry[],
@@ -867,10 +909,11 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
 
     // If discovery itself failed, all bots are blocked(discovery_failed)
     if (discoveryFailed) {
-      const registry = selectBootstrapTargetRegistry(mergeRegistry(
+      const mergedRegistry = mergeRegistry(
         defaultRegistry(),
         (ctx.controls.profileConfig as { botRegistry?: BotRegistryEntry[] }).botRegistry ?? [],
-      ), targetBot);
+      );
+      const registry = selectBootstrapTargetRegistry(mergedRegistry, targetBot);
       if (!registry.length) {
         await reply(ctx, `❌ 未找到实现方：\`${targetBot}\``);
         return;
@@ -883,10 +926,11 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       return;
     }
 
-    const registry = selectBootstrapTargetRegistry(mergeRegistry(
+    const mergedRegistry = mergeRegistry(
       defaultRegistry(),
       (ctx.controls.profileConfig as { botRegistry?: BotRegistryEntry[] }).botRegistry ?? [],
-    ), targetBot);
+    );
+    const registry = selectBootstrapTargetRegistry(mergedRegistry, targetBot);
     if (!registry.length) {
       await reply(ctx, `❌ 未找到实现方：\`${targetBot}\``);
       return;
@@ -894,6 +938,7 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
     const coordinatorName = (ctx.channel as { botIdentity?: { name?: string } }).botIdentity?.name ?? '小P';
     const coordinatorOpenId = (ctx.channel as { botIdentity?: { openId?: string } }).botIdentity?.openId ?? ctx.msg.senderId;
 
+    await maybeSwitchBootstrapCoordinatorWorkspace(ctx, workspacePath, mergedRegistry, coordinatorName);
     await ensureBootstrapCoordinatorAllowedChat(ctx);
 
     const inviteState = await inviteMissingBootstrapBots(
