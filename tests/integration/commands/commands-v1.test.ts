@@ -380,7 +380,21 @@ describe('Bridge command contracts', () => {
     expect(lastMarkdown(h.channel)).toContain('没检测到 add 后面的 Bot 名称');
   });
 
-  it('accepts @-prefixed bot names for /botAdmin remove compatibility', async () => {
+  it('reports bot list discovery failure for named /botAdmin targets', async () => {
+    const h = await createHarness();
+    await installFakeLarkCliDiscoveryFailure(h);
+
+    await expect(
+      h.run('/botAdmin add 小P', { chatMode: 'group' }),
+    ).resolves.toBe(true);
+
+    const root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.botAdmins).not.toContain('ou-self');
+    expect(lastMarkdown(h.channel)).toContain('无法读取当前群内 Bot 列表');
+    expect(lastMarkdown(h.channel)).toContain('小P');
+  });
+
+  it('rejects @-prefixed names as /botAdmin targets', async () => {
     const h = await createHarness();
     await installFakeLarkCliDiscoveryFallback(h);
     h.controls.profileConfig.access.botAdmins = ['ou-self'];
@@ -393,8 +407,8 @@ describe('Bridge command contracts', () => {
     ).resolves.toBe(true);
 
     const root = await loadRootConfig(h.controls.configPath);
-    expect(root?.profiles.claude?.access.botAdmins).toEqual([]);
-    expect(lastMarkdown(h.channel)).toContain('已把 小P 移出 Bot 管理员');
+    expect(root?.profiles.claude?.access.botAdmins).toEqual(['ou-self']);
+    expect(lastMarkdown(h.channel)).toContain('没检测到 remove 后面的 Bot 名称');
   });
 
   it('maps group /botAdmin targets to receiver-view bot ids through live bot discovery', async () => {
@@ -412,7 +426,9 @@ describe('Bridge command contracts', () => {
 
     const root = await loadRootConfig(h.controls.configPath);
     expect(root?.profiles.claude?.access.botAdmins).toEqual([]);
-    expect(await readFile(logFile, 'utf8')).toContain('chat.members bots --chat-id chat-1 --as bot');
+    expect(await readFile(logFile, 'utf8')).toContain(
+      'chat.members bots --params {"chat_id":"chat-1"} --as bot',
+    );
     expect(lastMarkdown(h.channel)).toContain('已把 小P 移出 Bot 管理员');
   });
 
@@ -1052,6 +1068,27 @@ async function installFakeLarkCliDiscoveryFallback(h: Harness, logFile?: string)
     } else {
       process.env.LARK_FAKE_CLI_LOG = oldLog;
     }
+  });
+}
+
+async function installFakeLarkCliDiscoveryFailure(h: Harness): Promise<void> {
+  const bin = join(h.tmp.root, 'bin');
+  await mkdir(bin, { recursive: true });
+  const script = join(bin, 'lark-cli');
+  await writeFile(
+    script,
+    [
+      '#!/bin/sh',
+      'printf \'{"ok":false,"error":{"type":"authorization","message":"missing scope"}}\\n\' >&2',
+      'exit 3',
+    ].join('\n'),
+    'utf8',
+  );
+  await chmod(script, 0o755);
+  const oldPath = process.env.PATH ?? '';
+  process.env.PATH = `${bin}:${oldPath}`;
+  cleanups.push(async () => {
+    process.env.PATH = oldPath;
   });
 }
 

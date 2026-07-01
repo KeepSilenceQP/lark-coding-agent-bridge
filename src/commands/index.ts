@@ -2280,9 +2280,9 @@ async function handleBotAdmin(args: string, ctx: CommandContext): Promise<void> 
 }
 
 async function handleBotAdminAdd(args: string, ctx: CommandContext): Promise<void> {
-  const targets = await botAdminTargets(args, ctx);
-  if (targets.length === 0) {
-    await reply(ctx, '❌ 没检测到 add 后面的 Bot 名称。请写 `/botAdmin add Bot名`。');
+  const resolved = await botAdminTargets(args, ctx);
+  if (resolved.targets.length === 0) {
+    await reply(ctx, botAdminNoTargetsMessage('add', resolved));
     return;
   }
   const added: string[] = [];
@@ -2291,7 +2291,7 @@ async function handleBotAdminAdd(args: string, ctx: CommandContext): Promise<voi
     const list = new Set(current.botAdmins);
     added.length = 0;
     already.length = 0;
-    for (const target of targets) {
+    for (const target of resolved.targets) {
       if (list.has(target.openId)) {
         already.push(target.name ?? target.openId);
       } else {
@@ -2315,9 +2315,9 @@ async function handleBotAdminAdd(args: string, ctx: CommandContext): Promise<voi
 }
 
 async function handleBotAdminRemove(args: string, ctx: CommandContext): Promise<void> {
-  const targets = await botAdminTargets(args, ctx);
-  if (targets.length === 0) {
-    await reply(ctx, '❌ 没检测到 remove 后面的 Bot 名称。请写 `/botAdmin remove Bot名`。');
+  const resolved = await botAdminTargets(args, ctx);
+  if (resolved.targets.length === 0) {
+    await reply(ctx, botAdminNoTargetsMessage('remove', resolved));
     return;
   }
   const removed: string[] = [];
@@ -2326,7 +2326,7 @@ async function handleBotAdminRemove(args: string, ctx: CommandContext): Promise<
     const list = new Set(current.botAdmins);
     removed.length = 0;
     notThere.length = 0;
-    for (const target of targets) {
+    for (const target of resolved.targets) {
       if (list.has(target.openId)) {
         list.delete(target.openId);
         removed.push(target.name ?? target.openId);
@@ -2373,71 +2373,53 @@ function mentionTargets(ctx: CommandContext): Array<{ openId: string; name?: str
 async function botAdminTargets(
   args: string,
   ctx: CommandContext,
-): Promise<Array<{ openId: string; name?: string }>> {
+): Promise<{
+  targets: Array<{ openId: string; name?: string }>;
+  targetNames: string[];
+  discoveryFailed: boolean;
+}> {
   const targetText = args.trim().split(/\s+/).slice(1).join(' ');
-  if (!targetText) return [];
+  if (!targetText) return { targets: [], targetNames: [], discoveryFailed: false };
 
   const targetNames = botAdminTargetNames(targetText);
-  const seen = new Set<string>();
-  const candidates: Array<{
-    openId: string;
-    name?: string;
-    isBot?: boolean;
-  }> = [];
-  for (const mention of ctx.msg.mentions ?? []) {
-    if (typeof mention.openId !== 'string' || !mention.openId) continue;
-    if (!mentionAppearsInText(mention, targetText)) continue;
-    if (seen.has(mention.openId)) continue;
-    seen.add(mention.openId);
-    candidates.push({
-      openId: mention.openId,
-      ...(mention.name ? { name: mention.name } : {}),
-      ...(mention.isBot !== undefined ? { isBot: mention.isBot } : {}),
-    });
-  }
+  if (targetNames.length === 0) return { targets: [], targetNames, discoveryFailed: false };
   const liveBots = await discoverBotAdminLiveMembers(ctx);
-  if (liveBots) {
-    const byOpenId = new Map(liveBots.map((member) => [member.openId, member]));
-    const byName = new Map(liveBots.map((member) => [member.name.normalize('NFC'), member]));
-    const resolved = new Map<string, { openId: string; name?: string }>();
-    for (const name of targetNames) {
-      const live = byName.get(name.normalize('NFC')) ?? byOpenId.get(name);
-      if (!live || resolved.has(live.openId)) continue;
-      resolved.set(live.openId, { openId: live.openId, name: live.name });
-    }
-    for (const mention of candidates) {
-      const live =
-        byOpenId.get(mention.openId) ??
-        (mention.name ? byName.get(mention.name.normalize('NFC')) : undefined);
-      if (!live || resolved.has(live.openId)) continue;
-      resolved.set(live.openId, { openId: live.openId, name: live.name });
-    }
-    return [...resolved.values()];
+  if (!liveBots) {
+    return { targets: [], targetNames, discoveryFailed: ctx.chatMode !== 'p2p' };
   }
 
-  if (candidates.length === 0) return [];
-  return candidates
-    .filter((mention) => mention.isBot !== false)
-    .map(({ openId, name }) => ({ openId, ...(name ? { name } : {}) }));
+  const byOpenId = new Map(liveBots.map((member) => [member.openId, member]));
+  const byName = new Map(liveBots.map((member) => [member.name.normalize('NFC'), member]));
+  const resolved = new Map<string, { openId: string; name?: string }>();
+  for (const name of targetNames) {
+    const live = byName.get(name.normalize('NFC')) ?? byOpenId.get(name);
+    if (!live || resolved.has(live.openId)) continue;
+    resolved.set(live.openId, { openId: live.openId, name: live.name });
+  }
+  return { targets: [...resolved.values()], targetNames, discoveryFailed: false };
+}
+
+function botAdminNoTargetsMessage(
+  action: 'add' | 'remove',
+  resolved: { targetNames: string[]; discoveryFailed: boolean },
+): string {
+  if (resolved.discoveryFailed) {
+    const names = resolved.targetNames.length > 0 ? `：${resolved.targetNames.join('、')}` : '';
+    return `❌ 无法读取当前群内 Bot 列表，无法按名称解析 Bot${names}。请确认当前 Bot 的应用权限包含群成员读取 scope 后重试。`;
+  }
+  return `❌ 没检测到 ${action} 后面的 Bot 名称。请写 \`/botAdmin ${action} Bot名\`。`;
 }
 
 function botAdminTargetNames(text: string): string[] {
   const seen = new Set<string>();
   const names: string[] = [];
   for (const part of text.split(/[\s,，、]+/)) {
-    const name = part.trim().replace(/^@+/, '').normalize('NFC');
+    const name = part.trim().normalize('NFC');
     if (!name || seen.has(name)) continue;
     seen.add(name);
     names.push(name);
   }
   return names;
-}
-
-function mentionAppearsInText(
-  mention: NonNullable<NormalizedMessage['mentions']>[number],
-  text: string,
-): boolean {
-  return mentionTextCandidates(mention).some((candidate) => text.includes(candidate));
 }
 
 async function discoverBotAdminLiveMembers(ctx: CommandContext): Promise<LiveBotMember[] | undefined> {
@@ -2447,8 +2429,8 @@ async function discoverBotAdminLiveMembers(ctx: CommandContext): Promise<LiveBot
       'im',
       'chat.members',
       'bots',
-      '--chat-id',
-      ctx.msg.chatId,
+      '--params',
+      JSON.stringify({ chat_id: ctx.msg.chatId }),
       '--as',
       'bot',
       '--format',
