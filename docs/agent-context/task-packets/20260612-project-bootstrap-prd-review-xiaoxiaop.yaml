@@ -1,0 +1,22 @@
+task_id: project-bootstrap-phase2-prd-review-xiaoxiaop
+flow_level: heavy
+phase: prd_review
+context_pack: /redacted/history/machine-1/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+target_bot: 小HistoryRedactedBot4
+target_open_id: ou_0e58ef3ecdf6401d66c34122bdd1711a
+role: protocol reviewer
+expected_action: Review whether the bootstrap behavior matches the Feishu group project-flow protocol and bot-at-bot handoff rules.
+input:
+  summary: Check protocol fit for HistoryRedactedBot4 project-group bootstrap, native mentions, state machine, and non-bridge bot workspace context.
+  files:
+    - docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+    - /redacted/history/machine-1/sayToLittleP/protocols/feishu-group-project-flow-v1.md
+    - /redacted/history/machine-1/sayToLittleP/protocols/feishu-group-bot-capability-v1.md
+output:
+  required: GO/NO-GO with protocol gaps and handoff corrections.
+next_receiver: HistoryRedactedBot4
+response_format: independent text/post + native mention @HistoryRedactedBot4
+stop_conditions:
+  - missing context
+  - protocol conflict
+  - same task_id loops back
