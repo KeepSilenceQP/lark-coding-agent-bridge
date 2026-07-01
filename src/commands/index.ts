@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute } from 'node:path';
+import { basename, dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import type { AgentAdapter } from '../agent/types';
@@ -44,9 +44,25 @@ import {
   type OwnerRefreshState,
   type RuntimeControls,
 } from '../policy/access';
+import {
+  defaultRegistry,
+  mergeRegistry,
+  pinBinding,
+  validateSlug,
+  type BotRegistryEntry,
+} from '../project/bot-registry';
+import {
+  createSdkLiveDiscovery,
+  planBootstrap,
+  renderBootstrapReceipt,
+  type LiveBotMember,
+} from '../project/dispatch';
+import type { BootstrapResult } from '../project/bot-registry';
+import { formatContextPacket } from '../project/workspace-context';
 import { setSecret } from '../config/keystore';
 import { buildEncryptedAccountConfig, saveConfig } from '../config/store';
 import { log, reportMetric } from '../core/logger';
+import { spawnProcess } from '../platform/spawn';
 import { renderCard } from '../card/run-renderer';
 import {
   finalizeIfRunning,
@@ -536,60 +552,430 @@ async function handleProject(args: string, ctx: CommandContext): Promise<void> {
   const sub = parts[0] ?? '';
   const rest = parts.slice(1).join(' ').trim();
   switch (sub) {
-    case 'start':
-      return handleProjectStart(rest, ctx);
+    case 'bootstrap':
+      return handleProjectBootstrap(rest, ctx);
     default:
-      await reply(ctx, '用法：`/project start <绝对路径>` — 在当前群启动项目工作区');
+      await reply(ctx, '用法：`/project bootstrap <workspace> <小C|云上小C>`');
   }
 }
 
-async function handleProjectStart(args: string, ctx: CommandContext): Promise<void> {
-  // ── Phase 1: validate input ──
-  const input = args.trim();
-  if (!input) {
-    await reply(ctx, '用法：`/project start <绝对路径>` 或 `/project start ~/xxx`');
-    return;
-  }
-  if (!isAbsoluteOrTilde(input)) {
-    await reply(ctx, '请使用绝对路径，或 `~/xxx` 表示 home 下的子路径。');
-    return;
-  }
-  const absolute = expandTilde(input);
+// ────────────── /project bootstrap — multi-bot group startup ──────────────
 
-  // ── Idempotency guard ──
-  const key = projectStartIdempotencyKey(ctx.scope, absolute);
+/** F4: Per-process pin store for pin-on-first-verify. Phase 3 may persist. */
+const bootstrapPins = new Map<string, import('../project/bot-registry').PinnedBinding>();
+
+interface BootstrapSession {
+  slug: string;
+  chatId: string;
+  coordinatorOpenId: string;
+  results: import('../project/bot-registry').BootstrapResult[];
+  registry: import('../project/bot-registry').BotRegistryEntry[];
+  startedAt: number;
+}
+
+/** In-memory bootstrap sessions for B4 receipt ingestion. Phase 3 may persist. */
+const bootstrapSessions = new Map<string, BootstrapSession>();
+
+interface ProjectBootstrapRequest {
+  workspacePath: string;
+  targetBot: string;
+  slug: string;
+}
+
+const IMPLEMENTER_BOTS = new Set(['小C', '云上小C']);
+const BOOTSTRAP_REQUIRED_BOTS = new Set(['云上C总']);
+
+function parseProjectBootstrapRequest(args: string): { ok: true; value: ProjectBootstrapRequest } | { ok: false; reason: string } {
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  if (parts.length !== 2) {
+    return {
+      ok: false,
+      reason: '用法：`/project bootstrap <workspace> <小C|云上小C>`',
+    };
+  }
+
+  const workspaceInput = parts[0]!;
+  const workspacePath = isAbsoluteOrTilde(workspaceInput) ? expandTilde(workspaceInput) : workspaceInput;
+  const targetBot = parts[1]!;
+  if (!IMPLEMENTER_BOTS.has(targetBot)) {
+    return {
+      ok: false,
+      reason: 'targetBot 只能是 `小C` 或 `云上小C`。',
+    };
+  }
+
+  return {
+    ok: true,
+    value: {
+      workspacePath,
+      targetBot,
+      slug: workspaceSlugFromPath(workspacePath),
+    },
+  };
+}
+
+function workspaceSlugFromPath(path: string): string {
+  const raw = basename(path.replace(/\/+$/, '')) || 'workspace';
+  const slug = raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return slug || 'workspace';
+}
+
+function selectBootstrapTargetRegistry(registry: BotRegistryEntry[], targetBot: string): BotRegistryEntry[] {
+  const normalized = targetBot.normalize('NFC');
+  return registry.filter((entry) =>
+    BOOTSTRAP_REQUIRED_BOTS.has(entry.canonicalName) ||
+    entry.canonicalName.normalize('NFC') === normalized ||
+    entry.aliases.some((alias) => alias.normalize('NFC') === normalized),
+  );
+}
+
+/**
+ * Try to ingest a bootstrap receipt from a target bot.
+ * Called from the message-handling path when a bot replies with
+ * structured @ 小P + task_id + status markers.
+ */
+export function tryIngestBootstrapReceipt(
+  senderId: string,
+  content: string,
+  mentions: Array<{ openId?: string; name?: string }>,
+  botOpenId: string,
+): void {
+  for (const [slug, session] of bootstrapSessions) {
+    // Only process messages targeting the coordinator bot
+    const mentionedCoordinator = mentions.some((m) => m.openId === session.coordinatorOpenId);
+    if (!mentionedCoordinator) continue;
+
+    // Match task_id in message content
+    const taskIdMatch = content.match(/project-bootstrap-([\w.-]+)-(.+)/);
+    if (!taskIdMatch) continue;
+    const matchedSlug = taskIdMatch[1];
+    if (matchedSlug !== slug) continue;
+    const matchedBot = taskIdMatch[2];
+
+    // Find the result entry for this bot
+    const result = session.results.find((r) => r.botName === matchedBot);
+    if (!result || result.status === 'blocked' || result.status === 'verified') continue;
+
+    // Check for verified markers
+    const hasCdOk = /\/cd(?:\s+\S+)?\s*→\s*ok/.test(content) || /✅.*\/cd/.test(content);
+    const hasInviteOk = /\/invite\s+group\s*→\s*ok/.test(content) || /✅.*\/invite\s+group/.test(content);
+    const hasContextAdopted = /workspace\s+context\s+adopted/.test(content) || /✅.*workspace/.test(content);
+
+    if (hasCdOk && hasInviteOk) {
+      result.status = 'verified';
+      // F4: pin-on-first-verify — persist live openId for future identity checks
+      if (matchedBot) pinBinding(matchedBot, senderId, 'bootstrap', bootstrapPins);
+      log.info('project', 'bootstrap-verified', { slug, bot: matchedBot, senderId });
+    } else if (hasCdOk || hasInviteOk || hasContextAdopted || content.includes(taskIdMatch[0])) {
+      if (result.status === 'sent') {
+        result.status = 'acknowledged';
+        log.info('project', 'bootstrap-acknowledged', { slug, bot: matchedBot, senderId });
+      }
+    }
+  }
+}
+
+async function inviteMissingBootstrapBots(
+  chatId: string,
+  registry: BotRegistryEntry[],
+  liveMembers: LiveBotMember[],
+  coordinatorName: string,
+): Promise<{ inviteFailed: Map<string, BootstrapResult>; invitedAny: boolean }> {
+  const inviteFailed = new Map<string, BootstrapResult>();
+  let invitedAny = false;
+
+  for (const entry of registry) {
+    if (entry.canonicalName === coordinatorName) continue;
+    if (findBootstrapLiveMember(entry, liveMembers)) continue;
+
+    if (!entry.appId) {
+      inviteFailed.set(entry.canonicalName, {
+        botName: entry.canonicalName,
+        status: 'blocked',
+        blockedReason: 'app_id_unknown',
+      });
+      continue;
+    }
+
+    const invited = await inviteBotAppToChat(chatId, entry.appId);
+    if (invited) {
+      invitedAny = true;
+    } else {
+      inviteFailed.set(entry.canonicalName, {
+        botName: entry.canonicalName,
+        status: 'blocked',
+        blockedReason: 'invite_failed',
+      });
+    }
+  }
+
+  return { inviteFailed, invitedAny };
+}
+
+function findBootstrapLiveMember(
+  entry: BotRegistryEntry,
+  liveMembers: LiveBotMember[],
+): LiveBotMember | undefined {
+  const names = [entry.canonicalName, ...entry.aliases].map((name) => name.normalize('NFC'));
+  return liveMembers.find((member) => names.includes(member.name.normalize('NFC')));
+}
+
+async function inviteBotAppToChat(chatId: string, appId: string): Promise<boolean> {
+  const output = await runBootstrapLarkCliJson([
+    'im',
+    'chat.members',
+    'create',
+    '--params',
+    JSON.stringify({ chat_id: chatId, member_id_type: 'app_id', succeed_type: 1 }),
+    '--data',
+    JSON.stringify({ id_list: [appId] }),
+    '--as',
+    'user',
+    '--format',
+    'json',
+  ]).catch(() => undefined);
+  if (!output) return false;
+
+  try {
+    const parsed = JSON.parse(output) as {
+      ok?: boolean;
+      code?: number;
+      data?: {
+        invalid_id_list?: unknown[];
+        not_existed_id_list?: unknown[];
+        pending_approval_id_list?: unknown[];
+      };
+    };
+    if (parsed.code !== undefined && parsed.code !== 0) return false;
+    if (parsed.ok === false) return false;
+    const failedIds = [
+      ...(parsed.data?.invalid_id_list ?? []),
+      ...(parsed.data?.not_existed_id_list ?? []),
+      ...(parsed.data?.pending_approval_id_list ?? []),
+    ].map(String);
+    return !failedIds.includes(appId);
+  } catch {
+    return false;
+  }
+}
+
+function runBootstrapLarkCliJson(args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawnProcess('lark-cli', args, {
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error('lark-cli chat member invite timed out'));
+    }, 20_000);
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(new Error(stderr.trim() || `lark-cli exited with ${code ?? 'unknown status'}`));
+      }
+    });
+  });
+}
+
+async function handleProjectBootstrap(args: string, ctx: CommandContext): Promise<void> {
+  // /project bootstrap is human-admin gated.
+  if (!canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok) {
+    await reply(ctx, '❌ /project bootstrap 仅管理员可用。');
+    return;
+  }
+
+  const parsed = parseProjectBootstrapRequest(args);
+  if (!parsed.ok) {
+    await reply(ctx, `❌ ${parsed.reason}`);
+    return;
+  }
+  const { workspacePath, targetBot, slug } = parsed.value;
+  const slugResult = validateSlug(slug);
+  if (!slugResult.ok) {
+    await reply(ctx, `❌ ${slugResult.reason}`);
+    return;
+  }
+
+  const key = projectStartIdempotencyKey(ctx.scope, `${workspacePath}::${targetBot}`);
   if (projectStartInFlight.has(key)) {
-    await reply(ctx, '⏳ 该路径的项目启动已在执行中，请等待完成。');
+    await reply(ctx, '⏳ 该项目的 bootstrap 已在执行中，请等待完成。');
     return;
   }
   projectStartInFlight.add(key);
 
   try {
-    // ── Phase 2: validate workspace exists before /cd ──
-    const workspace = await resolveWorkingDirectory(absolute);
-    if (!workspace.ok) {
-      await reply(ctx, `❌ **Phase 1/3 路径校验失败**\n${workspace.userVisible}`);
+    // B1: live discovery via typed seam
+    const discovery = createSdkLiveDiscovery((ctx.channel as { rawClient?: unknown }).rawClient);
+    let liveMembers: LiveBotMember[];
+    let discoveryFailed = false;
+    try {
+      liveMembers = await discovery.discoverBots(ctx.msg.chatId);
+    } catch {
+      discoveryFailed = true;
+      liveMembers = [];
+    }
+
+    // If discovery itself failed, all bots are blocked(discovery_failed)
+    if (discoveryFailed) {
+      const registry = selectBootstrapTargetRegistry(mergeRegistry(
+        defaultRegistry(),
+        (ctx.controls.profileConfig as { botRegistry?: BotRegistryEntry[] }).botRegistry ?? [],
+      ), targetBot);
+      if (!registry.length) {
+        await reply(ctx, `❌ 未找到实现方：\`${targetBot}\``);
+        return;
+      }
+      const allBlocked: BootstrapResult[] = registry.map((e) => ({
+        botName: e.canonicalName,
+        status: 'blocked' as const,
+        blockedReason: 'discovery_failed' as const,
+      }));
+      await reply(ctx, renderBootstrapReceipt(allBlocked, slug));
       return;
     }
 
-    // ── Phase 3: apply cwd + clear session ──
-    ctx.activeRuns.interrupt(ctx.scope);
-    ctx.workspaces.setCwd(ctx.scope, workspace.cwdRealpath);
-    ctx.sessions.clear(ctx.scope);
+    const registry = selectBootstrapTargetRegistry(mergeRegistry(
+      defaultRegistry(),
+      (ctx.controls.profileConfig as { botRegistry?: BotRegistryEntry[] }).botRegistry ?? [],
+    ), targetBot);
+    if (!registry.length) {
+      await reply(ctx, `❌ 未找到实现方：\`${targetBot}\``);
+      return;
+    }
+    const coordinatorName = (ctx.channel as { botIdentity?: { name?: string } }).botIdentity?.name ?? '小P';
+    const coordinatorOpenId = (ctx.channel as { botIdentity?: { openId?: string } }).botIdentity?.openId ?? ctx.msg.senderId;
 
-    // Structured receipt
-    const receipt = [
-      '🚀 **项目工作区启动完成**',
-      '',
-      '| 步骤 | 状态 |',
-      '|------|------|',
-      `| 路径校验 | ✅ \`${workspace.cwdRealpath}\` |`,
-      '| 工作目录切换 | ✅ 已生效 |',
-      '| Session 重置 | ✅ 已清除 |',
-      '',
-      '_下条消息开始使用新工作区。_',
-    ].join('\n');
+    const inviteState = await inviteMissingBootstrapBots(ctx.msg.chatId, registry, liveMembers, coordinatorName);
+    if (inviteState.invitedAny) {
+      try {
+        liveMembers = await discovery.discoverBots(ctx.msg.chatId);
+      } catch {
+        // Keep the original discovery result; remaining missing bots will be
+        // reported as not in group, while explicit invite failures are kept.
+      }
+    }
+
+    const plan = planBootstrap({
+      slug,
+      workspacePath,
+      chatId: ctx.msg.chatId,
+      coordinatorName,
+      coordinatorOpenId,
+      dispatcherProfile: ctx.controls.profile,
+      liveMembers,
+      registry,
+      pinned: bootstrapPins,
+      participants: registry.map((e) => e.canonicalName),
+    });
+
+    // B3: dispatch with proper send tracking — sent only on success
+    const dispatchResults = new Map<string, BootstrapResult>();
+    for (const r of plan.results) dispatchResults.set(r.botName, { ...r });
+
+    for (const instr of plan.instructions) {
+      if (instr.kind === 'cd-and-invite') {
+        // B2: /cd text is path-only (no taskId suffix)
+        // F2: Send task metadata message first with task_id and receipt format
+        const metaMsg = [
+          `**Project Bootstrap Task**`,
+          `task_id: ${instr.taskId}`,
+          `workspace: \`${instr.workspacePath}\``,
+          `target_bot: ${targetBot}`,
+          '',
+          'Please execute the following commands sequentially:',
+          `1. \`/cd ${instr.workspacePath}\``,
+          '2. `/invite group`',
+          '',
+          '**Expected receipt format** — reply with native @小P:',
+          '```',
+          `task_id: ${instr.taskId}`,
+          '/cd → ok',
+          '/invite group → ok',
+          '```',
+        ].join('\n');
+        const metaSent = await ctx.channel.send(ctx.msg.chatId, {
+          text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at>\n${metaMsg}`,
+        }).then(() => true).catch(() => false);
+
+        const cdSent = await ctx.channel.send(ctx.msg.chatId, {
+          text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at> /cd ${instr.workspacePath}`,
+        }).then(() => true).catch(() => false);
+
+        const inviteSent = await ctx.channel.send(ctx.msg.chatId, {
+          text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at> /invite group`,
+        }).then(() => true).catch(() => false);
+
+        if (metaSent && cdSent && inviteSent) {
+          dispatchResults.set(instr.targetName, {
+            botName: instr.targetName,
+            status: 'sent',
+            messageId: instr.taskId,
+          });
+        } else {
+          dispatchResults.set(instr.targetName, {
+            botName: instr.targetName,
+            status: 'blocked',
+            blockedReason: 'dispatch_failed',
+          });
+        }
+      } else if (instr.kind === 'workspace-context' && instr.contextPacket) {
+        const packetJson = formatContextPacket(instr.contextPacket);
+        const sent = await ctx.channel.send(ctx.msg.chatId, {
+          text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at> workspace context (${instr.taskId}):\n\`\`\`json\n${packetJson}\n\`\`\``,
+        }).then(() => true).catch(() => false);
+
+        dispatchResults.set(instr.targetName, {
+          botName: instr.targetName,
+          status: sent ? 'sent' : 'blocked',
+          blockedReason: sent ? undefined : 'dispatch_failed',
+          messageId: sent ? instr.taskId : undefined,
+        });
+      }
+    }
+
+    // Merge dispatch results into plan results
+    const finalResults = plan.results.map((r) => {
+      const inviteFailure = inviteState.inviteFailed.get(r.botName);
+      if (inviteFailure) return inviteFailure;
+      return dispatchResults.get(r.botName) ?? r;
+    });
+
+    // B4: store session for receipt ingestion
+    bootstrapSessions.set(slug, {
+      slug,
+      chatId: ctx.msg.chatId,
+      coordinatorOpenId,
+      results: finalResults,
+      registry,
+      startedAt: Date.now(),
+    });
+
+    const receipt = renderBootstrapReceipt(finalResults, slug);
     await reply(ctx, receipt);
+
+    log.info('project', 'bootstrap-dispatched', {
+      slug,
+      instructions: plan.instructions.length,
+      results: finalResults.length,
+      blocked: finalResults.filter((r) => r.status === 'blocked').length,
+    });
   } finally {
     projectStartInFlight.delete(key);
   }

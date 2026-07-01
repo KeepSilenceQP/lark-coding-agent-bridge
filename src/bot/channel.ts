@@ -26,7 +26,7 @@ import {
   type RunState,
 } from '../card/run-state';
 import { renderText } from '../card/text-renderer';
-import { tryHandleCommand, type Controls } from '../commands';
+import { tryHandleCommand, tryIngestBootstrapReceipt, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -616,6 +616,14 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     log.info('intake', 'skip-no-mention', { scope, chatType: msg.chatType });
     return;
   }
+
+  // F3: Ingest bootstrap receipts before command handling
+  tryIngestBootstrapReceipt(
+    msg.senderId,
+    msg.content,
+    msg.mentions ?? [],
+    channel.botIdentity?.openId ?? '',
+  );
 
   const handled = await tryHandleCommand({
     channel,

@@ -1,0 +1,25 @@
+task_id: project-bootstrap-phase2-spec-xiaoc
+flow_level: heavy
+phase: spec_draft
+context_pack: /Users/bytedance/repo/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+target_bot: 小C
+target_open_id: ou_324e9fce8ef80022821ca29ae594e45c
+role: spec author and likely implementer
+expected_action: Draft a concrete implementation spec for Phase 2 without coding yet.
+input:
+  summary: Convert the PRD into command syntax, internal interfaces, data flow, dispatch strategy, and focused tests.
+  files:
+    - docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+    - docs/specs/20260612-botadmin-project-start.md
+    - src/commands/index.ts
+    - src/agent/bridge-system-prompt.ts
+    - tests/integration/commands/commands-v1.test.ts
+output:
+  required: Spec draft with proposed files to change, test list, risks, and open questions. Do not implement until review.
+next_receiver: 小P
+response_format: independent text/post + native mention @小P
+stop_conditions:
+  - missing repository
+  - missing context
+  - implementation would require unstated lark-cli capability
+  - same task_id loops back

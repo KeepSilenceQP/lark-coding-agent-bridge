@@ -1,0 +1,14 @@
+workspace: /Users/bytedance/repo/lark-channel-bridge-fork
+branch:
+commit:
+working_tree:
+changed_files:
+tests:
+  commands: []
+  result:
+  known_failures: []
+diff_or_key_snippets:
+risks:
+followups:
+next_receiver: 小P
+

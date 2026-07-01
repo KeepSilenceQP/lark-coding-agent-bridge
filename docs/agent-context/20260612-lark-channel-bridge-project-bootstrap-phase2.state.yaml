@@ -1,0 +1,175 @@
+project: lark-channel-bridge-fork
+topic: lark-channel-bridge-project-bootstrap-phase2
+chat_id: oc_c1a30ba2d2692138047f5ea2b5bf8c92
+flow_level: heavy
+phase: code_review_fix
+owner: 小P
+waiting_on: 小C, 小小P
+last_artifact: /Users/bytedance/repo/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+blocked: []
+next_action: run live install and acceptance checklist
+dispatches:
+  - task_id: project-bootstrap-phase2-prd-review-yunshangcz
+    target: 云上C总
+    message_id: om_x100b6d88c68be088c35137737b378a6
+    status: submitted_go_with_followups
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-prd-review-yunshangcz.md
+    blocker: devbox cannot read macOS context path
+    unblock:
+      method: inline_context_and_task_packet
+      message_id: om_x100b6d88c1b0a880c34ed02aa2f923c
+      status: sent_verified
+  - task_id: project-bootstrap-phase2-spec-review-yunshangcz
+    target: 云上C总
+    message_id: om_x100b6d88d87c2490c336b378eb4f4b1
+    status: sent_verified
+  - task_id: project-bootstrap-phase2-spec-review-v2-yunshangcz
+    target: 云上C总
+    message_id: om_x100b6d88e58ac8acc35f8ca6ab57dc9
+    status: go_with_musts_accepted
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-spec-review-v2-yunshangcz.md
+  - task_id: project-bootstrap-phase2-implementation-xiaoc
+    target: 小C
+    message_id: om_x100b6d88fa8b3c98c25868abde7ebdb
+    status: changes_requested
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-implementation-local-review.md
+  - task_id: project-bootstrap-phase2-implementation-fix-xiaoc
+    target: 小C
+    message_id: om_x100b6d88810fc08cc2a96472898136c
+    status: fixed_passed_local_review
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-implementation-fix-local-review.md
+  - task_id: project-bootstrap-phase2-code-review-yunshangcz
+    target: 云上C总
+    message_id: om_x100b6d88ae03851cc1bf166225367bb
+    status: no_go
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-code-review-yunshangcz-nogo.md
+    review_branch: feat/project-bootstrap-phase2
+    review_commit: 77ffc94
+  - task_id: project-bootstrap-phase2-code-review-fix-xiaoc
+    target: 小C
+    message_id: om_x100b6d894a26a4b0c25f5b00945ce1c
+    status: changes_requested_again
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-code-review-fix2-local-review.md
+  - task_id: project-bootstrap-phase2-code-review-fix2-xiaoc
+    target: 小C
+    message_id: om_x100b6d8952bb6c44c3b0ed745d182f7
+    status: fixed_passed_local_review
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-code-review-fix2-local-review.md
+  - task_id: project-bootstrap-phase2-spec-revision-xiaoc
+    target: 小C
+    message_id: om_x100b6d88d06078acc4fe99254d2fea5
+    status: submitted
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-spec-xiaoc-revised.md
+  - task_id: project-bootstrap-phase2-prd-review-xiaoxiaop
+    target: 小小P
+    message_id: om_x100b6d88c696050cc149afa9074e34c
+    status: sent_verified
+  - task_id: project-bootstrap-phase2-spec-xiaoc
+    target: 小C
+    message_id: om_x100b6d88c6a438b8c3a145bd3967d0d
+    status: submitted
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-spec-xiaoc-draft.md
+  - task_id: project-bootstrap-phase2-plan-yunshangxiaoc
+    target: 云上小C
+    message_id: om_x100b6d88c6b5b080c240dccb9b473f1
+    status: submitted_with_correction
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-plan-yunshangxiaoc.md
+    blocker: devbox cannot read macOS context path
+    unblock:
+      method: inline_context_and_task_packet
+      message_id: om_x100b6d88c1aa78b0c4ff84fdbb64674
+      status: sent_verified
+  - task_id: project-bootstrap-phase2-openid-scope-correction
+    target: 云上小C
+    message_id: om_x100b6d88eaee2ca0c32d859ede9d669
+    status: sent_verified
+  - task_id: project-bootstrap-phase2-openid-scope-correction
+    target: 小C
+    message_id: om_x100b6d88eaf794a0c03232694f4dc4c
+    status: acknowledged_in_revised_spec
+  - task_id: project-bootstrap-phase2-workspace-xiaoa
+    target: 小A
+    message_id: om_x100b6d88c6448890c4cfa6901eb495b
+    status: submitted
+    evidence: docs/agent-context/evidence/20260612-project-bootstrap-workspace-xiaoa-review.md
+history:
+  - time: 2026-06-12 16:49:05 +0800
+    phase: draft_prd
+    actor: 小P
+    note: initialized project-flow artifacts
+  - time: 2026-06-12 16:52:00 +0800
+    phase: prd_review
+    actor: 小P
+    note: completed PRD and prepared first task dispatch
+  - time: 2026-06-12 16:51:20 +0800
+    phase: prd_review
+    actor: 小P
+    note: dispatched five native-mention task packets with bot identity
+  - time: 2026-06-12 16:52:30 +0800
+    phase: prd_review
+    actor: 小P
+    note: verified dispatched messages were sent by app identity and contained structured mentions
+  - time: 2026-06-12 16:53:12 +0800
+    phase: prd_review
+    actor: 小P
+    note: resolved devbox context-path blockers by sending inline Context Pack and task packets to 云上小C and 云上C总
+  - time: 2026-06-12 16:56:00 +0800
+    phase: spec_review
+    actor: 小P
+    note: received 小A workspace review and 小C spec draft; escalated spec conflict for review
+  - time: 2026-06-12 16:55:07 +0800
+    phase: spec_review
+    actor: 小P
+    note: dispatched 小C spec and 小A schema review summary to 云上C总 for spec review
+  - time: 2026-06-12 16:57:15 +0800
+    phase: spec_revision
+    actor: 小P
+    note: received 云上C总 PRD GO-with-followups, updated Context Pack, and dispatched D1-D4 spec revision to 小C
+  - time: 2026-06-12 16:58:43 +0800
+    phase: spec_revision
+    actor: 小P
+    note: received 云上小C plan, corrected app-scoped open_id interpretation, and dispatched correction to 云上小C and 小C
+  - time: 2026-06-12 17:00:00 +0800
+    phase: spec_review
+    actor: 小P
+    note: received 小C revised spec covering D1-D4 and open_id scope; prepared for reviewer pass
+  - time: 2026-06-12 17:00:36 +0800
+    phase: spec_review
+    actor: 小P
+    note: dispatched revised spec to 云上C总 for formal spec review, including name-matching risk
+  - time: 2026-06-12 17:03:00 +0800
+    phase: implementing
+    actor: 小P
+    note: accepted 云上C总 GO-with-musts after writing M1/M2 into Context Pack; dispatched implementation to 小C
+  - time: 2026-06-12 17:04:00 +0800
+    phase: implementing
+    actor: 云上C总
+    note: re-sent review mention due cross-app open_id mismatch; Context Pack updated to require sender-profile live identity resolution
+  - time: 2026-06-12 17:10:20 +0800
+    phase: implementation_fix
+    actor: 小P
+    note: local review found B1-B5 blockers; requested 小C fixes before code review
+  - time: 2026-06-12 17:14:53 +0800
+    phase: code_review
+    actor: 小P
+    note: B1-B5 fix passed local review; dispatched code review to 云上C总
+  - time: 2026-06-12 17:18:00 +0800
+    phase: code_review
+    actor: 小P
+    note: pushed branch feat/project-bootstrap-phase2 to KeepSilenceQP/lark-coding-agent-bridge for remote code review
+  - time: 2026-06-12 17:24:30 +0800
+    phase: code_review_fix
+    actor: 小P
+    note: 云上C总 returned NO-GO with B1-B5 integration blockers; requested 小C second fix
+  - time: 2026-06-12 17:31:00 +0800
+    phase: code_review_fix
+    actor: 小P
+    note: local review of 小C返工 found remaining task_id delivery, receipt ingestion, and pin lifecycle gaps; requested fix2
+  - time: 2026-06-12 17:39:00 +0800
+    phase: code_review_fix
+    actor: 小P
+    note: 小C F2-F5 fix passed local review after adding integration tests, fixing /cd receipt parsing, and replacing SDK bot discovery with lark-cli discovery fallback
+  - time: 2026-06-12 17:48:00 +0800
+    phase: live_acceptance
+    actor: 云上C总
+    note: code review returned GO; 小P applied nonblocking S1 self-dispatch exclusion with unit test and moved to live acceptance

@@ -1,9 +1,14 @@
-import { mkdir, realpath, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NormalizedMessage } from '@larksuite/channel';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
-import { tryHandleCommand, type CommandContext, type Controls } from '../../../src/commands/index.js';
+import {
+  tryHandleCommand,
+  tryIngestBootstrapReceipt,
+  type CommandContext,
+  type Controls,
+} from '../../../src/commands/index.js';
 import { createDefaultProfileConfig, type ProfileConfig } from '../../../src/config/profile-schema.js';
 import { createRootConfig, loadRootConfig, saveRootConfig } from '../../../src/config/profile-store.js';
 import { SessionStore } from '../../../src/session/store.js';
@@ -490,31 +495,114 @@ describe('Bridge command contracts', () => {
     expect(lastMarkdown(h.channel)).toContain('没检测到 @ 的用户');
   });
 
-  // ── /project start tests ──
+  // ── /project bootstrap tests ──
 
-  it('starts a project workspace with structured receipt', async () => {
+  it('removes legacy /project start', async () => {
     const h = await createHarness();
-    const target = join(h.tmp.root, 'my-project');
-    await mkdir(target, { recursive: true });
-
-    await expect(h.run(`/project start ${target}`)).resolves.toBe(true);
-    const text = lastMarkdown(h.channel);
-    expect(text).toContain('项目工作区启动完成');
-    expect(text).toContain('路径校验');
-    expect(text).toContain('工作目录切换');
-    expect(text).toContain('Session 重置');
+    await expect(h.run('/project start /tmp/old')).resolves.toBe(true);
+    expect(lastMarkdown(h.channel)).toContain('/project bootstrap <workspace>');
   });
 
-  it('rejects /project start with invalid path', async () => {
+  it('dispatches /project bootstrap bridge commands with metadata and clean slash commands', async () => {
     const h = await createHarness();
-    await expect(h.run('/project start /nonexistent/path')).resolves.toBe(true);
-    expect(lastMarkdown(h.channel)).toContain('路径校验失败');
+    configureSingleBridgeBotBootstrap(h, '小C', 'ou-live-c', 'repo-one');
+
+    await expect(
+      h.run('/project bootstrap repo-one 小C', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    const textMessages = h.channel.sent
+      .map((m) => (m.content as { text?: string }).text)
+      .filter((text): text is string => typeof text === 'string');
+
+    expect(textMessages).toHaveLength(6);
+    const cloudMeta = textMessages.find((text) => text.includes('task_id: project-bootstrap-repo-one-云上C总'));
+    const targetMeta = textMessages.find((text) => text.includes('task_id: project-bootstrap-repo-one-小C'));
+    expect(cloudMeta).toContain('<at user_id="ou-cloud-cz">云上C总</at>');
+    expect(cloudMeta).toContain('target_bot: 小C');
+    expect(cloudMeta).not.toContain('Implementation prompt');
+    expect(targetMeta).toContain('<at user_id="ou-live-c">小C</at>');
+    expect(targetMeta).toContain('/cd → ok');
+    expect(targetMeta).toContain('/invite group → ok');
+    expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-one');
+    expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /invite group');
+    expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /cd repo-one');
+    expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /invite group');
   });
 
-  it('rejects /project start with relative path', async () => {
+  it('invites missing project bootstrap bots by app_id before dispatching', async () => {
     const h = await createHarness();
-    await expect(h.run('/project start relative/path')).resolves.toBe(true);
-    expect(lastMarkdown(h.channel)).toContain('绝对路径');
+    await installFakeLarkCli(h);
+    configureMissingThenPresentBridgeBotBootstrap(h, '小C', 'ou-live-c', 'cli_target_c', 'repo-invite');
+
+    await expect(
+      h.run('/project bootstrap repo-invite 小C', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    const textMessages = h.channel.sent
+      .map((m) => (m.content as { text?: string }).text)
+      .filter((text): text is string => typeof text === 'string');
+
+    expect(textMessages).toHaveLength(6);
+    expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-invite');
+    expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /cd repo-invite');
+    expect(lastMarkdown(h.channel)).toContain('sent');
+    expect(lastMarkdown(h.channel)).not.toContain('invite_failed');
+    expect(lastMarkdown(h.channel)).not.toContain('app_id_unknown');
+  });
+
+  it('keeps /project bootstrap human-admin gated', async () => {
+    const h = await createHarness();
+    h.controls.profileConfig.access.botAdmins = ['ou-bot-admin'];
+
+    await expect(
+      h.run('/project bootstrap repo-two 小C', { senderId: 'ou-bot-admin' }),
+    ).resolves.toBe(true);
+
+    expect(lastMarkdown(h.channel)).toContain('仅管理员可用');
+  });
+
+  it('pins verified bootstrap receipts and blocks changed live identity later', async () => {
+    const h = await createHarness();
+    configureSingleBridgeBotBootstrap(h, '小C', 'ou-live-old', 'repo-pin');
+
+    await expect(
+      h.run('/project bootstrap repo-pin 小C', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    tryIngestBootstrapReceipt(
+      'ou-live-old',
+      [
+        'task_id: project-bootstrap-repo-pin-小C',
+        '/cd → ok',
+        '/invite group → ok',
+      ].join('\n'),
+      [mention('ou-self', '小P')],
+      'ou-self',
+    );
+
+    configureSingleBridgeBotBootstrap(h, '小C', 'ou-live-new', 'repo-pin');
+    await expect(
+      h.run('/project bootstrap repo-pin 小C', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    expect(lastMarkdown(h.channel)).toContain('identity_changed');
   });
 });
 
@@ -620,6 +708,139 @@ function botMention(openId: string, name: string): NonNullable<NormalizedMessage
     name,
     isBot: true,
   } as NonNullable<NormalizedMessage['mentions']>[number];
+}
+
+function configureSingleBridgeBotBootstrap(
+  h: Harness,
+  name: string,
+  openId: string,
+  projectRoot: string,
+): void {
+  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
+    openId: 'ou-self',
+    name: '小P',
+  };
+  (h.channel.rawClient.im.v1 as unknown as {
+    chatMembers: {
+      bots(params: unknown): Promise<unknown>;
+    };
+  }).chatMembers = {
+    async bots(): Promise<unknown> {
+      return {
+        data: {
+          items: [
+            {
+              member_id_type: 'bot',
+              member_id: 'ou-cloud-cz',
+              name: '云上C总',
+            },
+            {
+              member_id_type: 'bot',
+              member_id: openId,
+              name,
+            },
+          ],
+        },
+      };
+    },
+  };
+  (h.controls.profileConfig as unknown as {
+    botRegistry: Array<{
+      canonicalName: string;
+      aliases: string[];
+      role: 'bridge';
+      machines: Array<{ kind: 'local'; root: string }>;
+      projectRoot: string;
+    }>;
+  }).botRegistry = [
+    {
+      canonicalName: name,
+      aliases: [],
+      role: 'bridge',
+      machines: [{ kind: 'local', root: '/Users/bytedance/repo' }],
+      projectRoot,
+    },
+  ];
+}
+
+async function installFakeLarkCli(h: Harness): Promise<void> {
+  const bin = join(h.tmp.root, 'bin');
+  await mkdir(bin, { recursive: true });
+  const script = join(bin, 'lark-cli');
+  await writeFile(
+    script,
+    [
+      '#!/bin/sh',
+      'printf \'{"code":0,"data":{"invalid_id_list":[],"not_existed_id_list":[],"pending_approval_id_list":[]}}\\n\'',
+    ].join('\n'),
+    'utf8',
+  );
+  await chmod(script, 0o755);
+  const oldPath = process.env.PATH ?? '';
+  process.env.PATH = `${bin}:${oldPath}`;
+  cleanups.push(async () => {
+    process.env.PATH = oldPath;
+  });
+}
+
+function configureMissingThenPresentBridgeBotBootstrap(
+  h: Harness,
+  name: string,
+  openId: string,
+  appId: string,
+  projectRoot: string,
+): void {
+  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
+    openId: 'ou-self',
+    name: '小P',
+  };
+  let calls = 0;
+  (h.channel.rawClient.im.v1 as unknown as {
+    chatMembers: {
+      bots(params: unknown): Promise<unknown>;
+    };
+  }).chatMembers = {
+    async bots(): Promise<unknown> {
+      calls += 1;
+      return {
+        data: {
+          items: calls === 1
+            ? []
+            : [
+              {
+                member_id_type: 'bot',
+                member_id: 'ou-cloud-cz',
+                name: '云上C总',
+              },
+              {
+                member_id_type: 'bot',
+                member_id: openId,
+                name,
+              },
+            ],
+        },
+      };
+    },
+  };
+  (h.controls.profileConfig as unknown as {
+    botRegistry: Array<{
+      canonicalName: string;
+      aliases: string[];
+      appId: string;
+      role: 'bridge';
+      machines: Array<{ kind: 'local'; root: string }>;
+      projectRoot: string;
+    }>;
+  }).botRegistry = [
+    {
+      canonicalName: name,
+      aliases: [],
+      appId,
+      role: 'bridge',
+      machines: [{ kind: 'local', root: '/Users/bytedance/repo' }],
+      projectRoot,
+    },
+  ];
 }
 
 function lastContent(channel: FakeChannel): Record<string, unknown> {

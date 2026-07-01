@@ -1,0 +1,24 @@
+task_id: project-bootstrap-phase2-prd-review-yunshangcz
+flow_level: heavy
+phase: prd_review
+context_pack: /Users/bytedance/repo/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+target_bot: 云上C总
+target_open_id: ou_a73add268438eb388b31e559a4fa846f
+role: PRD and architecture reviewer
+expected_action: Review the PRD for scope, security, and missing acceptance criteria before implementation.
+input:
+  summary: Review Phase 2 project-group bootstrap for lark-channel-bridge.
+  files:
+    - docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+    - docs/specs/20260612-botadmin-project-start.md
+    - src/commands/index.ts
+    - src/agent/bridge-system-prompt.ts
+output:
+  required: GO/NO-GO with blocking issues, recommended implementation boundaries, and required tests.
+next_receiver: 小P
+response_format: independent text/post + native mention @小P
+stop_conditions:
+  - missing repository
+  - missing context
+  - security concern that blocks implementation
+  - same task_id loops back
