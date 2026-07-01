@@ -5,7 +5,6 @@ import type { NormalizedMessage } from '@larksuite/channel';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import {
   tryHandleCommand,
-  tryIngestBootstrapReceipt,
   type CommandContext,
   type Controls,
 } from '../../../src/commands/index.js';
@@ -322,34 +321,35 @@ describe('Bridge command contracts', () => {
 
   it('adds and removes bot admins through /botAdmin add/remove', async () => {
     const h = await createHarness();
+    await installFakeLarkCliDiscoveryFallback(h);
 
     // Add bot admin
     await expect(
-      h.run('/botAdmin add @Bot', { mentions: [botMention('ou-bot', 'Bot')] }),
+      h.run('/botAdmin add 小P', { chatMode: 'group' }),
     ).resolves.toBe(true);
-    expect(lastMarkdown(h.channel)).toContain('已把 Bot 加入 Bot 管理员');
+    expect(lastMarkdown(h.channel)).toContain('已把 小P 加入 Bot 管理员');
 
     let root = await loadRootConfig(h.controls.configPath);
-    expect(root?.profiles.claude?.access.botAdmins).toContain('ou-bot');
+    expect(root?.profiles.claude?.access.botAdmins).toContain('ou-self');
 
     // Add same bot again (idempotent)
     await expect(
-      h.run('/botAdmin add @Bot', { mentions: [botMention('ou-bot', 'Bot')] }),
+      h.run('/botAdmin add 小P', { chatMode: 'group' }),
     ).resolves.toBe(true);
     expect(lastMarkdown(h.channel)).toContain('已经在 Bot 管理员里');
 
     // List
     await expect(h.run('/botAdmin list')).resolves.toBe(true);
-    expect(lastMarkdown(h.channel)).toContain('<at user_id="ou-bot">ou-bot</at>');
+    expect(lastMarkdown(h.channel)).toContain('<at user_id="ou-self">ou-self</at>');
 
     // Remove
     await expect(
-      h.run('/botAdmin remove @Bot', { mentions: [botMention('ou-bot', 'Bot')] }),
+      h.run('/botAdmin remove 小P', { chatMode: 'group' }),
     ).resolves.toBe(true);
     expect(lastMarkdown(h.channel)).toContain('移出 Bot 管理员');
 
     root = await loadRootConfig(h.controls.configPath);
-    expect(root?.profiles.claude?.access.botAdmins).not.toContain('ou-bot');
+    expect(root?.profiles.claude?.access.botAdmins).not.toContain('ou-self');
   });
 
   it('shows empty list for /botAdmin list when no bot admins', async () => {
@@ -358,80 +358,113 @@ describe('Bridge command contracts', () => {
     expect(lastMarkdown(h.channel)).toContain('无 Bot 管理员');
   });
 
-  it('requires @-mention for /botAdmin add and /botAdmin remove', async () => {
+  it('requires target name for /botAdmin add and /botAdmin remove', async () => {
     const h = await createHarness();
-    // No mentions at all
     await expect(h.run('/botAdmin add')).resolves.toBe(true);
-    expect(lastMarkdown(h.channel)).toContain('没检测到 add 后面的 @ 对象');
+    expect(lastMarkdown(h.channel)).toContain('没检测到 add 后面的 Bot 名称');
 
     await expect(h.run('/botAdmin remove')).resolves.toBe(true);
-    expect(lastMarkdown(h.channel)).toContain('没检测到 remove 后面的 @ 对象');
+    expect(lastMarkdown(h.channel)).toContain('没检测到 remove 后面的 Bot 名称');
   });
 
-  it('uses only mentions after /botAdmin add as bot admin targets', async () => {
+  it('rejects names that are not current group bots as /botAdmin targets', async () => {
     const h = await createHarness();
-    (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
-      openId: 'ou-xiaoc',
-      name: '小C',
-    };
+    await installFakeLarkCliDiscoveryFallback(h);
 
     await expect(
-      h.run('/botAdmin add @小P', {
-        mentions: [
-          botMention('ou-xiaoc', '小C'),
-          mention('ou-littlep', '小P'),
-        ],
+      h.run('/botAdmin add Human', { chatMode: 'group' }),
+    ).resolves.toBe(true);
+
+    const root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.botAdmins).not.toContain('ou-human');
+    expect(lastMarkdown(h.channel)).toContain('没检测到 add 后面的 Bot 名称');
+  });
+
+  it('accepts @-prefixed bot names for /botAdmin remove compatibility', async () => {
+    const h = await createHarness();
+    await installFakeLarkCliDiscoveryFallback(h);
+    h.controls.profileConfig.access.botAdmins = ['ou-self'];
+    await saveRootConfig(createRootConfig('claude', h.controls.profileConfig), h.controls.configPath);
+
+    await expect(
+      h.run('/botAdmin remove @小P', {
+        chatMode: 'group',
       }),
     ).resolves.toBe(true);
 
     const root = await loadRootConfig(h.controls.configPath);
-    expect(root?.profiles.claude?.access.botAdmins).toEqual(['ou-littlep']);
+    expect(root?.profiles.claude?.access.botAdmins).toEqual([]);
+    expect(lastMarkdown(h.channel)).toContain('已把 小P 移出 Bot 管理员');
+  });
+
+  it('maps group /botAdmin targets to receiver-view bot ids through live bot discovery', async () => {
+    const h = await createHarness();
+    const logFile = join(h.tmp.root, 'lark-cli.log');
+    await installFakeLarkCliDiscoveryFallback(h, logFile);
+    h.controls.profileConfig.access.botAdmins = ['ou-self'];
+    await saveRootConfig(createRootConfig('claude', h.controls.profileConfig), h.controls.configPath);
+
+    await expect(
+      h.run('/botAdmin remove 小P', {
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    const root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.botAdmins).toEqual([]);
+    expect(await readFile(logFile, 'utf8')).toContain('chat.members bots --chat-id chat-1 --as bot');
+    expect(lastMarkdown(h.channel)).toContain('已把 小P 移出 Bot 管理员');
+  });
+
+  it('uses only names after /botAdmin add as bot admin targets', async () => {
+    const h = await createHarness();
+    await installFakeLarkCliDiscoveryFallback(h);
+
+    await expect(
+      h.run('/botAdmin add 小P', { chatMode: 'group' }),
+    ).resolves.toBe(true);
+
+    const root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.botAdmins).toEqual(['ou-self']);
     expect(lastMarkdown(h.channel)).toContain('已把 小P 加入 Bot 管理员');
     expect(lastMarkdown(h.channel)).not.toContain('小C');
   });
 
-  it('uses only mentions after /botAdmin remove as bot admin targets', async () => {
+  it('uses only names after /botAdmin remove as bot admin targets', async () => {
     const h = await createHarness();
-    h.controls.profileConfig.access.botAdmins = ['ou-xiaoc', 'ou-littlep'];
+    await installFakeLarkCliDiscoveryFallback(h);
+    h.controls.profileConfig.access.botAdmins = ['ou-live-c', 'ou-self'];
     await saveRootConfig(createRootConfig('claude', h.controls.profileConfig), h.controls.configPath);
-    (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
-      openId: 'ou-xiaoc',
-      name: '小C',
-    };
 
     await expect(
-      h.run('/botAdmin remove @小P', {
-        mentions: [
-          botMention('ou-xiaoc', '小C'),
-          mention('ou-littlep', '小P'),
-        ],
-      }),
+      h.run('/botAdmin remove 小P', { chatMode: 'group' }),
     ).resolves.toBe(true);
 
     const root = await loadRootConfig(h.controls.configPath);
-    expect(root?.profiles.claude?.access.botAdmins).toEqual(['ou-xiaoc']);
+    expect(root?.profiles.claude?.access.botAdmins).toEqual(['ou-live-c']);
     expect(lastMarkdown(h.channel)).toContain('已把 小P 移出 Bot 管理员');
     expect(lastMarkdown(h.channel)).not.toContain('小C');
   });
 
   it('strips only leading wake mentions when raw command text contains parameter mentions', async () => {
     const h = await createHarness();
-    h.controls.profileConfig.access.botAdmins = ['ou-xiaoc'];
+    await installFakeLarkCliDiscoveryFallback(h);
+    h.controls.profileConfig.access.botAdmins = ['ou-self'];
     await saveRootConfig(createRootConfig('claude', h.controls.profileConfig), h.controls.configPath);
 
     await expect(
       h.run('/botAdmin remove', {
         mentions: [
           { ...botMention('ou-xiaoc', '小C'), key: '@_user_1' },
-          { ...botMention('ou-xiaoc', '小C'), key: '@_user_2' },
         ],
-        rawContent: JSON.stringify({ text: '@小C /botAdmin remove @小C' }),
+        rawContent: JSON.stringify({ text: '@小C /botAdmin remove 小P' }),
+        chatMode: 'group',
       }),
     ).resolves.toBe(true);
 
     const root = await loadRootConfig(h.controls.configPath);
     expect(root?.profiles.claude?.access.botAdmins).toEqual([]);
-    expect(lastMarkdown(h.channel)).toContain('已把 小C 移出 Bot 管理员');
+    expect(lastMarkdown(h.channel)).toContain('已把 小P 移出 Bot 管理员');
   });
 
   // ── botAdmin permission split tests ──
@@ -480,7 +513,7 @@ describe('Bridge command contracts', () => {
 
     // Denied: /botAdmin add (managing botAdmins)
     await expect(
-      botRun('/botAdmin add @Bot2', { mentions: [botMention('ou-bot2', 'Bot2')] }),
+      botRun('/botAdmin add Bot2'),
     ).resolves.toBe(true);
     expect(lastMarkdown(h.channel)).toContain('仅管理员可用');
 
@@ -568,7 +601,7 @@ describe('Bridge command contracts', () => {
     expect(lastMarkdown(h.channel)).toContain('/project bootstrap <workspace>');
   });
 
-  it('dispatches /project bootstrap bridge commands with metadata and clean slash commands', async () => {
+  it('dispatches /project bootstrap bridge commands as invite-before-cd slash commands', async () => {
     const h = await createHarness();
     configureSingleBridgeBotBootstrap(h, '小C', 'ou-live-c', 'repo-one');
 
@@ -584,19 +617,43 @@ describe('Bridge command contracts', () => {
       .map((m) => (m.content as { text?: string }).text)
       .filter((text): text is string => typeof text === 'string');
 
-    expect(textMessages).toHaveLength(6);
-    const cloudMeta = textMessages.find((text) => text.includes('task_id: project-bootstrap-repo-one-云上C总'));
-    const targetMeta = textMessages.find((text) => text.includes('task_id: project-bootstrap-repo-one-小C'));
-    expect(cloudMeta).toContain('<at user_id="ou-cloud-cz">云上C总</at>');
-    expect(cloudMeta).toContain('target_bot: 小C');
-    expect(cloudMeta).not.toContain('Implementation prompt');
-    expect(targetMeta).toContain('<at user_id="ou-live-c">小C</at>');
-    expect(targetMeta).toContain('/cd → ok');
-    expect(targetMeta).toContain('/invite group → ok');
+    expect(textMessages).toHaveLength(4);
+    expect(textMessages.join('\n')).not.toContain('Project Bootstrap Task');
+    expect(textMessages.join('\n')).not.toContain('task_id: project-bootstrap');
+    expect(textMessages.join('\n')).not.toContain('Expected receipt format');
     expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-one');
     expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /invite group');
     expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /cd repo-one');
     expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /invite group');
+    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-one'));
+    expect(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /cd repo-one'));
+  });
+
+  it('adds the project group to coordinator allowedChats before bootstrap dispatch', async () => {
+    const h = await createHarness();
+    configureSingleBridgeBotBootstrap(h, '小C', 'ou-live-c', 'repo-allow');
+
+    await expect(
+      h.run('/project bootstrap repo-allow 小C', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    const root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.allowedChats).toContain('oc-project');
+    expect(h.controls.profileConfig.access.allowedChats).toContain('oc-project');
+  });
+
+  it('rejects /project bootstrap in p2p because it initializes a project group', async () => {
+    const h = await createHarness();
+
+    await expect(h.run('/project bootstrap repo-p2p 小C')).resolves.toBe(true);
+
+    expect(lastMarkdown(h.channel)).toContain('只能在项目群里使用');
   });
 
   it('invites missing project bootstrap bots by app_id before dispatching', async () => {
@@ -617,12 +674,13 @@ describe('Bridge command contracts', () => {
       .map((m) => (m.content as { text?: string }).text)
       .filter((text): text is string => typeof text === 'string');
 
-    expect(textMessages).toHaveLength(6);
+    expect(textMessages).toHaveLength(4);
+    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-invite'));
+    expect(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /cd repo-invite'));
     expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-invite');
     expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /cd repo-invite');
-    expect(lastMarkdown(h.channel)).toContain('sent');
-    expect(lastMarkdown(h.channel)).not.toContain('invite_failed');
-    expect(lastMarkdown(h.channel)).not.toContain('app_id_unknown');
 
     const inviteCalls = await readFile(inviteLog, 'utf8');
     expect(inviteCalls).toContain('chat.members create');
@@ -649,6 +707,10 @@ describe('Bridge command contracts', () => {
       .filter((text): text is string => typeof text === 'string');
 
     expect(await readFile(inviteLog, 'utf8')).toContain('chat.members create');
+    expect(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /cd repo-order'));
+    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-order'));
     expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /cd repo-order');
     expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-order');
   });
@@ -672,8 +734,65 @@ describe('Bridge command contracts', () => {
       .filter((text): text is string => typeof text === 'string');
 
     expect(await readFile(inviteLog, 'utf8')).toContain('chat.members create');
+    expect(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /cd repo-retry'));
+    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-retry'));
     expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /cd repo-retry');
     expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-retry');
+  });
+
+  it('falls back to lark-cli bot discovery when raw SDK discovery fails', async () => {
+    const h = await createHarness();
+    const inviteLog = join(h.tmp.root, 'fake-lark-cli-fallback.log');
+    await installFakeLarkCliDiscoveryFallback(h, inviteLog);
+    configureThrowingRawSdkBootstrap(h, '小C', 'cli_target_c', 'repo-fallback');
+
+    await expect(
+      h.run('/project bootstrap repo-fallback 小C', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    const textMessages = h.channel.sent
+      .map((m) => (m.content as { text?: string }).text)
+      .filter((text): text is string => typeof text === 'string');
+
+    expect(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /cd repo-fallback'));
+    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-fallback'));
+    expect(textMessages).toContain('<at user_id="ou-live-c">小C</at> /cd repo-fallback');
+    expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /cd repo-fallback');
+
+    const calls = await readFile(inviteLog, 'utf8');
+    expect(calls).toContain('chat.members bots');
+    expect(calls).toContain('chat.members create');
+  });
+
+  it('reports bootstrap discovery failure without dispatching or allowlisting the group', async () => {
+    const h = await createHarness();
+    await installFailingLarkCli(h);
+    configureThrowingRawSdkBootstrap(h, '小C', 'cli_target_c', 'repo-fail');
+
+    await expect(
+      h.run('/project bootstrap repo-fail 小C', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    const textMessages = h.channel.sent
+      .map((m) => (m.content as { text?: string }).text)
+      .filter((text): text is string => typeof text === 'string');
+    expect(textMessages).toHaveLength(0);
+    expect(lastMarkdown(h.channel)).toContain('无法读取群内 bot 列表');
+
+    const root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.allowedChats).not.toContain('oc-project');
   });
 
   it('keeps /project bootstrap human-admin gated', async () => {
@@ -687,40 +806,6 @@ describe('Bridge command contracts', () => {
     expect(lastMarkdown(h.channel)).toContain('仅管理员可用');
   });
 
-  it('pins verified bootstrap receipts and blocks changed live identity later', async () => {
-    const h = await createHarness();
-    configureSingleBridgeBotBootstrap(h, '小C', 'ou-live-old', 'repo-pin');
-
-    await expect(
-      h.run('/project bootstrap repo-pin 小C', {
-        chatId: 'oc-project',
-        scope: 'oc-project',
-        chatMode: 'group',
-      }),
-    ).resolves.toBe(true);
-
-    tryIngestBootstrapReceipt(
-      'ou-live-old',
-      [
-        'task_id: project-bootstrap-repo-pin-小C',
-        '/cd → ok',
-        '/invite group → ok',
-      ].join('\n'),
-      [mention('ou-self', '小P')],
-      'ou-self',
-    );
-
-    configureSingleBridgeBotBootstrap(h, '小C', 'ou-live-new', 'repo-pin');
-    await expect(
-      h.run('/project bootstrap repo-pin 小C', {
-        chatId: 'oc-project',
-        scope: 'oc-project',
-        chatMode: 'group',
-      }),
-    ).resolves.toBe(true);
-
-    expect(lastMarkdown(h.channel)).toContain('identity_changed');
-  });
 });
 
 async function createHarness(): Promise<Harness> {
@@ -891,6 +976,10 @@ async function installFakeLarkCli(h: Harness, logFile?: string): Promise<void> {
     script,
     [
       '#!/bin/sh',
+      'if [ -z "$LARK_CHANNEL_PROFILE" ] || [ -z "$LARK_CHANNEL_CONFIG" ] || [ -z "$LARKSUITE_CLI_CONFIG_DIR" ]; then',
+      '  printf \'{"ok":false,"msg":"missing bridge lark-cli env"}\\n\'',
+      '  exit 1',
+      'fi',
       'if [ -n "$LARK_FAKE_CLI_LOG" ]; then',
       '  printf "%s\\n" "$*" >> "$LARK_FAKE_CLI_LOG"',
       'fi',
@@ -914,6 +1003,76 @@ async function installFakeLarkCli(h: Harness, logFile?: string): Promise<void> {
     } else {
       process.env.LARK_FAKE_CLI_LOG = oldLog;
     }
+  });
+}
+
+async function installFakeLarkCliDiscoveryFallback(h: Harness, logFile?: string): Promise<void> {
+  const bin = join(h.tmp.root, 'bin');
+  await mkdir(bin, { recursive: true });
+  const script = join(bin, 'lark-cli');
+  await writeFile(
+    script,
+    [
+      '#!/bin/sh',
+      'if [ -z "$LARK_CHANNEL_PROFILE" ] || [ -z "$LARK_CHANNEL_CONFIG" ] || [ -z "$LARKSUITE_CLI_CONFIG_DIR" ]; then',
+      '  printf \'{"ok":false,"msg":"missing bridge lark-cli env"}\\n\'',
+      '  exit 1',
+      'fi',
+      'if [ -n "$LARK_FAKE_CLI_LOG" ]; then',
+      '  printf "%s\\n" "$*" >> "$LARK_FAKE_CLI_LOG"',
+      'fi',
+      'case "$*" in',
+      '  *"chat.members bots"*)',
+      '    if [ -n "$LARK_FAKE_CLI_LOG" ] && grep -q "chat.members create" "$LARK_FAKE_CLI_LOG"; then',
+      '      printf \'{"ok":true,"data":{"items":[{"bot_id":"ou-self","bot_name":"小P"},{"bot_id":"ou-cloud-cz","bot_name":"云上C总"},{"bot_id":"ou-live-c","bot_name":"小C"}]}}\\n\'',
+      '    else',
+      '      printf \'{"ok":true,"data":{"items":[{"bot_id":"ou-self","bot_name":"小P"}]}}\\n\'',
+      '    fi',
+      '    ;;',
+      '  *)',
+      '    printf \'{"code":0,"data":{"invalid_id_list":[],"not_existed_id_list":[],"pending_approval_id_list":[]}}\\n\'',
+      '    ;;',
+      'esac',
+    ].join('\n'),
+    'utf8',
+  );
+  await chmod(script, 0o755);
+  const oldPath = process.env.PATH ?? '';
+  const oldLog = process.env.LARK_FAKE_CLI_LOG;
+  process.env.PATH = `${bin}:${oldPath}`;
+  if (logFile) {
+    process.env.LARK_FAKE_CLI_LOG = logFile;
+  } else {
+    delete process.env.LARK_FAKE_CLI_LOG;
+  }
+  cleanups.push(async () => {
+    process.env.PATH = oldPath;
+    if (oldLog === undefined) {
+      delete process.env.LARK_FAKE_CLI_LOG;
+    } else {
+      process.env.LARK_FAKE_CLI_LOG = oldLog;
+    }
+  });
+}
+
+async function installFailingLarkCli(h: Harness): Promise<void> {
+  const bin = join(h.tmp.root, 'bin');
+  await mkdir(bin, { recursive: true });
+  const script = join(bin, 'lark-cli');
+  await writeFile(
+    script,
+    [
+      '#!/bin/sh',
+      'printf \'{"ok":false,"msg":"forced failure"}\\n\'',
+      'exit 1',
+    ].join('\n'),
+    'utf8',
+  );
+  await chmod(script, 0o755);
+  const oldPath = process.env.PATH ?? '';
+  process.env.PATH = `${bin}:${oldPath}`;
+  cleanups.push(async () => {
+    process.env.PATH = oldPath;
   });
 }
 
@@ -954,6 +1113,46 @@ function configureMissingThenPresentBridgeBotBootstrap(
             ],
         },
       };
+    },
+  };
+  (h.controls.profileConfig as unknown as {
+    botRegistry: Array<{
+      canonicalName: string;
+      aliases: string[];
+      appId: string;
+      role: 'bridge';
+      machines: Array<{ kind: 'local'; root: string }>;
+      projectRoot: string;
+    }>;
+  }).botRegistry = [
+    {
+      canonicalName: name,
+      aliases: [],
+      appId,
+      role: 'bridge',
+      machines: [{ kind: 'local', root: '/Users/bytedance/repo' }],
+      projectRoot,
+    },
+  ];
+}
+
+function configureThrowingRawSdkBootstrap(
+  h: Harness,
+  name: string,
+  appId: string,
+  projectRoot: string,
+): void {
+  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
+    openId: 'ou-self',
+    name: '小P',
+  };
+  (h.channel.rawClient.im.v1 as unknown as {
+    chatMembers: {
+      bots(params: unknown): Promise<unknown>;
+    };
+  }).chatMembers = {
+    async bots(): Promise<unknown> {
+      throw new Error('raw SDK discovery unavailable');
     },
   };
   (h.controls.profileConfig as unknown as {

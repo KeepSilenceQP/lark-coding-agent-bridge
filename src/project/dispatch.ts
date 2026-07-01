@@ -1,18 +1,14 @@
 /**
  * Phase 2 dispatch strategy — generates per-bot instructions from live
- * discovery results + registry metadata, then produces structured receipt.
+ * discovery results + registry metadata.
  *
- * This module is a pure-data planning layer.  The actual send/monitor
- * loop is driven by the coordinator bot (小P) via its agent prompt —
- * bridge bots run their own `/cd` and `/invite group` through the
- * existing command handler; non-bridge bots receive a workspace-context
- * packet as a structured post message.
+ * This module is a pure-data planning layer. The command handler sends
+ * native mention slash commands to bridge bots: `/invite group`, then `/cd`.
  */
 
 import type {
   BlockedReason,
   BootstrapResult,
-  BootstrapStatus,
   BotRegistryEntry,
 } from './bot-registry';
 import {
@@ -21,11 +17,6 @@ import {
   checkPinnedIdentity,
   type PinnedBinding,
 } from './bot-registry';
-import {
-  buildWorkspaceContext,
-  formatContextPacket,
-  type NonBridgeWorkspaceContext,
-} from './workspace-context';
 import { spawnProcess } from '../platform/spawn';
 
 // ── live discovery seam ──
@@ -44,12 +35,20 @@ export interface LiveDiscovery {
  * endpoint explicitly filters out bots. In bridge-bound runtime we use the
  * lark-cli bot-list wrapper, while keeping an injected raw method for tests.
  */
-export function createSdkLiveDiscovery(rawClient: unknown): LiveDiscovery {
+export function createSdkLiveDiscovery(
+  rawClient: unknown,
+  larkCliEnv: NodeJS.ProcessEnv = process.env,
+): LiveDiscovery {
   return {
     async discoverBots(chatId: string): Promise<LiveBotMember[]> {
-      const injected = await discoverViaInjectedRawClient(rawClient, chatId);
+      let injected: LiveBotMember[] | undefined;
+      try {
+        injected = await discoverViaInjectedRawClient(rawClient, chatId);
+      } catch {
+        injected = undefined;
+      }
       if (injected) return injected;
-      return discoverViaLarkCli(chatId);
+      return discoverViaLarkCli(chatId, larkCliEnv);
     },
   };
 }
@@ -82,7 +81,7 @@ async function discoverViaInjectedRawClient(
     .map((item) => ({ openId: item.member_id!, name: item.name ?? item.member_id! }));
 }
 
-async function discoverViaLarkCli(chatId: string): Promise<LiveBotMember[]> {
+async function discoverViaLarkCli(chatId: string, larkCliEnv: NodeJS.ProcessEnv): Promise<LiveBotMember[]> {
   const output = await runLarkCliJson([
     'im',
     'chat.members',
@@ -93,7 +92,7 @@ async function discoverViaLarkCli(chatId: string): Promise<LiveBotMember[]> {
     'user',
     '--format',
     'json',
-  ]);
+  ], larkCliEnv);
 
   const parsed = JSON.parse(output) as {
     ok?: boolean;
@@ -122,10 +121,10 @@ async function discoverViaLarkCli(chatId: string): Promise<LiveBotMember[]> {
     .filter((item) => item.openId && item.name);
 }
 
-function runLarkCliJson(args: string[]): Promise<string> {
+function runLarkCliJson(args: string[], larkCliEnv: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawnProcess('lark-cli', args, {
-      env: process.env,
+      env: larkCliEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -159,7 +158,7 @@ function runLarkCliJson(args: string[]): Promise<string> {
 
 // ── dispatch instruction ──
 
-export type DispatchKind = 'cd-and-invite' | 'workspace-context';
+export type DispatchKind = 'cd-and-invite';
 
 export interface DispatchInstruction {
   targetName: string;
@@ -167,10 +166,6 @@ export interface DispatchInstruction {
   kind: DispatchKind;
   /** For bridge bots: workspace path for /cd. */
   workspacePath?: string;
-  /** For non-bridge bots: serialised context packet. */
-  contextPacket?: NonBridgeWorkspaceContext;
-  /** Task id for receipt correlation. */
-  taskId: string;
 }
 
 // ── bootstrap planning ──
@@ -203,7 +198,8 @@ export interface BootstrapPlan {
  *  3. If ambiguous → blocked(ambiguous_name).
  *  4. Check pinned identity → blocked(identity_changed) on mismatch.
  *  5. For bridge bots: resolve workspace path → cd-and-invite instruction.
- *  6. For non-bridge bots: build context packet → workspace-context instruction.
+ *  6. Non-bridge entries are blocked; project bootstrap only sends bridge
+ *     slash commands.
  */
 export function planBootstrap(input: BootstrapPlanInput): BootstrapPlan {
   const results: BootstrapResult[] = [];
@@ -313,6 +309,14 @@ function planBot(
     };
   }
 
+  if (entry.role !== 'bridge') {
+    return {
+      botName: entry.canonicalName,
+      status: 'blocked',
+      blockedReason: 'denied',
+    };
+  }
+
   // Resolve workspace path
   const ws = resolveBootstrapWorkspace(input, entry);
   if (!ws) {
@@ -339,8 +343,6 @@ function buildInstruction(
 
   if (!live) return undefined;
 
-  const taskId = `project-bootstrap-${input.slug}-${entry.canonicalName}`;
-
   if (entry.role === 'bridge') {
     const ws = resolveBootstrapWorkspace(input, entry);
     if (!ws) return undefined;
@@ -349,32 +351,9 @@ function buildInstruction(
       targetOpenId: live.openId,
       kind: 'cd-and-invite',
       workspacePath: ws.path,
-      taskId,
     };
   }
-
-  // Non-bridge
-  const ws = resolveBootstrapWorkspace(input, entry);
-  const contextPacket = buildWorkspaceContext({
-    project: input.slug,
-    taskId,
-    coordinator: input.coordinatorName,
-    coordinatorOpenId: input.coordinatorOpenId,
-    chatId: input.chatId,
-    localWorkspace: ws?.path ?? `/Users/bytedance/repo/${input.slug}`,
-    devboxWorkspace: entry.machines.find((m) => m.kind === 'devbox')
-      ? `${entry.machines.find((m) => m.kind === 'devbox')!.root}/${entry.projectRoot}`
-      : undefined,
-    participants: input.participants,
-  });
-
-  return {
-    targetName: entry.canonicalName,
-    targetOpenId: live.openId,
-    kind: 'workspace-context',
-    contextPacket,
-    taskId,
-  };
+  return undefined;
 }
 
 function resolveBootstrapWorkspace(
@@ -392,37 +371,4 @@ function findLiveMember(
     entry.aliases
       .map((a) => liveMap.get(a.normalize('NFC')))
       .find((m): m is LiveBotMember => !!m);
-}
-
-// ── structured receipt rendering ──
-
-export function renderBootstrapReceipt(results: BootstrapResult[], slug: string): string {
-  const lines = [
-    `🚀 **/project bootstrap \`${slug}\`** 启动回执`,
-    '',
-    '| Bot | 状态 | 原因 |',
-    '|-----|------|------|',
-  ];
-
-  for (const r of results) {
-    const statusIcon = statusEmoji(r.status);
-    const reason = r.blockedReason ? `\`${r.blockedReason}\`` : '—';
-    lines.push(`| ${r.botName} | ${statusIcon} ${r.status} | ${reason} |`);
-  }
-
-  const verified = results.filter((r) => r.status === 'verified').length;
-  const blocked = results.filter((r) => r.status === 'blocked').length;
-  lines.push('');
-  lines.push(`**汇总**：已派发 ${results.length} 个 bot，verified ${verified}，blocked ${blocked}`);
-
-  return lines.join('\n');
-}
-
-function statusEmoji(status: BootstrapStatus): string {
-  switch (status) {
-    case 'verified': return '✅';
-    case 'acknowledged': return '📨';
-    case 'sent': return '📤';
-    case 'blocked': return '🚫';
-  }
 }

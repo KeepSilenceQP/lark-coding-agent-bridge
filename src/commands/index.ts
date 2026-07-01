@@ -47,18 +47,15 @@ import {
 import {
   defaultRegistry,
   mergeRegistry,
-  pinBinding,
   validateSlug,
   type BotRegistryEntry,
 } from '../project/bot-registry';
 import {
   createSdkLiveDiscovery,
   planBootstrap,
-  renderBootstrapReceipt,
   type LiveBotMember,
 } from '../project/dispatch';
 import type { BootstrapResult } from '../project/bot-registry';
-import { formatContextPacket } from '../project/workspace-context';
 import { setSecret } from '../config/keystore';
 import { buildEncryptedAccountConfig, saveConfig } from '../config/store';
 import { log, reportMetric } from '../core/logger';
@@ -622,21 +619,6 @@ async function handleProject(args: string, ctx: CommandContext): Promise<void> {
 
 // ────────────── /project bootstrap — multi-bot group startup ──────────────
 
-/** F4: Per-process pin store for pin-on-first-verify. Phase 3 may persist. */
-const bootstrapPins = new Map<string, import('../project/bot-registry').PinnedBinding>();
-
-interface BootstrapSession {
-  slug: string;
-  chatId: string;
-  coordinatorOpenId: string;
-  results: import('../project/bot-registry').BootstrapResult[];
-  registry: import('../project/bot-registry').BotRegistryEntry[];
-  startedAt: number;
-}
-
-/** In-memory bootstrap sessions for B4 receipt ingestion. Phase 3 may persist. */
-const bootstrapSessions = new Map<string, BootstrapSession>();
-
 interface ProjectBootstrapRequest {
   workspacePath: string;
   targetBot: string;
@@ -696,57 +678,12 @@ function selectBootstrapTargetRegistry(registry: BotRegistryEntry[], targetBot: 
   );
 }
 
-/**
- * Try to ingest a bootstrap receipt from a target bot.
- * Called from the message-handling path when a bot replies with
- * structured @ 小P + task_id + status markers.
- */
-export function tryIngestBootstrapReceipt(
-  senderId: string,
-  content: string,
-  mentions: Array<{ openId?: string; name?: string }>,
-  botOpenId: string,
-): void {
-  for (const [slug, session] of bootstrapSessions) {
-    // Only process messages targeting the coordinator bot
-    const mentionedCoordinator = mentions.some((m) => m.openId === session.coordinatorOpenId);
-    if (!mentionedCoordinator) continue;
-
-    // Match task_id in message content
-    const taskIdMatch = content.match(/project-bootstrap-([\w.-]+)-(.+)/);
-    if (!taskIdMatch) continue;
-    const matchedSlug = taskIdMatch[1];
-    if (matchedSlug !== slug) continue;
-    const matchedBot = taskIdMatch[2];
-
-    // Find the result entry for this bot
-    const result = session.results.find((r) => r.botName === matchedBot);
-    if (!result || result.status === 'blocked' || result.status === 'verified') continue;
-
-    // Check for verified markers
-    const hasCdOk = /\/cd(?:\s+\S+)?\s*→\s*ok/.test(content) || /✅.*\/cd/.test(content);
-    const hasInviteOk = /\/invite\s+group\s*→\s*ok/.test(content) || /✅.*\/invite\s+group/.test(content);
-    const hasContextAdopted = /workspace\s+context\s+adopted/.test(content) || /✅.*workspace/.test(content);
-
-    if (hasCdOk && hasInviteOk) {
-      result.status = 'verified';
-      // F4: pin-on-first-verify — persist live openId for future identity checks
-      if (matchedBot) pinBinding(matchedBot, senderId, 'bootstrap', bootstrapPins);
-      log.info('project', 'bootstrap-verified', { slug, bot: matchedBot, senderId });
-    } else if (hasCdOk || hasInviteOk || hasContextAdopted || content.includes(taskIdMatch[0])) {
-      if (result.status === 'sent') {
-        result.status = 'acknowledged';
-        log.info('project', 'bootstrap-acknowledged', { slug, bot: matchedBot, senderId });
-      }
-    }
-  }
-}
-
 async function inviteMissingBootstrapBots(
   chatId: string,
   registry: BotRegistryEntry[],
   liveMembers: LiveBotMember[],
   coordinatorName: string,
+  larkCliEnv: NodeJS.ProcessEnv,
 ): Promise<{ inviteFailed: Map<string, BootstrapResult>; invitedAny: boolean }> {
   const inviteFailed = new Map<string, BootstrapResult>();
   let invitedAny = false;
@@ -764,7 +701,7 @@ async function inviteMissingBootstrapBots(
       continue;
     }
 
-    const invited = await inviteBotAppToChat(chatId, entry.appId);
+    const invited = await inviteBotAppToChat(chatId, entry.appId, larkCliEnv);
     if (invited) {
       invitedAny = true;
     } else {
@@ -787,7 +724,11 @@ function findBootstrapLiveMember(
   return liveMembers.find((member) => names.includes(member.name.normalize('NFC')));
 }
 
-async function inviteBotAppToChat(chatId: string, appId: string): Promise<boolean> {
+async function inviteBotAppToChat(
+  chatId: string,
+  appId: string,
+  larkCliEnv: NodeJS.ProcessEnv,
+): Promise<boolean> {
   const output = await runBootstrapLarkCliJson([
     'im',
     'chat.members',
@@ -804,7 +745,7 @@ async function inviteBotAppToChat(chatId: string, appId: string): Promise<boolea
     'user',
     '--format',
     'json',
-  ]).catch(() => undefined);
+  ], larkCliEnv).catch(() => undefined);
   if (!output) return false;
 
   try {
@@ -830,10 +771,10 @@ async function inviteBotAppToChat(chatId: string, appId: string): Promise<boolea
   }
 }
 
-function runBootstrapLarkCliJson(args: string[]): Promise<string> {
+function runBootstrapLarkCliJson(args: string[], larkCliEnv: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawnProcess('lark-cli', args, {
-      env: process.env,
+      env: larkCliEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -865,6 +806,21 @@ function runBootstrapLarkCliJson(args: string[]): Promise<string> {
   });
 }
 
+function bootstrapLarkCliEnv(ctx: CommandContext): NodeJS.ProcessEnv {
+  const appPaths = resolveAppPaths({
+    rootDir: dirname(ctx.controls.configPath),
+    profile: ctx.controls.profile,
+  });
+  return {
+    ...process.env,
+    LARK_CHANNEL: '1',
+    LARK_CHANNEL_HOME: appPaths.rootDir,
+    LARK_CHANNEL_PROFILE: appPaths.profile,
+    LARK_CHANNEL_CONFIG: appPaths.larkCliSourceConfigFile,
+    LARKSUITE_CLI_CONFIG_DIR: appPaths.larkCliConfigDir,
+  };
+}
+
 async function handleProjectBootstrap(args: string, ctx: CommandContext): Promise<void> {
   // /project bootstrap is human-admin gated.
   if (!canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok) {
@@ -884,6 +840,11 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
     return;
   }
 
+  if (ctx.chatMode === 'p2p') {
+    await reply(ctx, '❌ /project bootstrap 只能在项目群里使用。');
+    return;
+  }
+
   const key = projectStartIdempotencyKey(ctx.scope, `${workspacePath}::${targetBot}`);
   if (projectStartInFlight.has(key)) {
     await reply(ctx, '⏳ 该项目的 bootstrap 已在执行中，请等待完成。');
@@ -893,7 +854,8 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
 
   try {
     // B1: live discovery via typed seam
-    const discovery = createSdkLiveDiscovery((ctx.channel as { rawClient?: unknown }).rawClient);
+    const larkCliEnv = bootstrapLarkCliEnv(ctx);
+    const discovery = createSdkLiveDiscovery((ctx.channel as { rawClient?: unknown }).rawClient, larkCliEnv);
     let liveMembers: LiveBotMember[];
     let discoveryFailed = false;
     try {
@@ -913,12 +875,11 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
         await reply(ctx, `❌ 未找到实现方：\`${targetBot}\``);
         return;
       }
-      const allBlocked: BootstrapResult[] = registry.map((e) => ({
-        botName: e.canonicalName,
-        status: 'blocked' as const,
-        blockedReason: 'discovery_failed' as const,
-      }));
-      await reply(ctx, renderBootstrapReceipt(allBlocked, slug));
+      log.warn('project', 'bootstrap-discovery-failed', {
+        slug,
+        bots: registry.map((e) => e.canonicalName),
+      });
+      await reply(ctx, '❌ /project bootstrap 无法读取群内 bot 列表，未派发任何命令。');
       return;
     }
 
@@ -933,7 +894,15 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
     const coordinatorName = (ctx.channel as { botIdentity?: { name?: string } }).botIdentity?.name ?? '小P';
     const coordinatorOpenId = (ctx.channel as { botIdentity?: { openId?: string } }).botIdentity?.openId ?? ctx.msg.senderId;
 
-    const inviteState = await inviteMissingBootstrapBots(ctx.msg.chatId, registry, liveMembers, coordinatorName);
+    await ensureBootstrapCoordinatorAllowedChat(ctx);
+
+    const inviteState = await inviteMissingBootstrapBots(
+      ctx.msg.chatId,
+      registry,
+      liveMembers,
+      coordinatorName,
+      larkCliEnv,
+    );
     if (inviteState.invitedAny) {
       try {
         liveMembers = await rediscoverBootstrapBotsAfterInvite(
@@ -957,7 +926,7 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       dispatcherProfile: ctx.controls.profile,
       liveMembers,
       registry,
-      pinned: bootstrapPins,
+      pinned: new Map(),
       participants: registry.map((e) => e.canonicalName),
     });
 
@@ -967,42 +936,20 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
 
     for (const instr of plan.instructions) {
       if (instr.kind === 'cd-and-invite') {
-        // B2: /cd text is path-only (no taskId suffix)
-        // F2: Send task metadata message first with task_id and receipt format
-        const metaMsg = [
-          `**Project Bootstrap Task**`,
-          `task_id: ${instr.taskId}`,
-          `workspace: \`${instr.workspacePath}\``,
-          `target_bot: ${targetBot}`,
-          '',
-          'Please execute the following commands sequentially:',
-          `1. \`/cd ${instr.workspacePath}\``,
-          '2. `/invite group`',
-          '',
-          '**Expected receipt format** — reply with native @小P:',
-          '```',
-          `task_id: ${instr.taskId}`,
-          '/cd → ok',
-          '/invite group → ok',
-          '```',
-        ].join('\n');
-        const metaSent = await ctx.channel.send(ctx.msg.chatId, {
-          text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at>\n${metaMsg}`,
+        // The target bot must allowlist this group before later operational
+        // commands in the same bootstrap flow can pass intake.
+        const inviteSent = await ctx.channel.send(ctx.msg.chatId, {
+          text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at> /invite group`,
         }).then(() => true).catch(() => false);
 
         const cdSent = await ctx.channel.send(ctx.msg.chatId, {
           text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at> /cd ${instr.workspacePath}`,
         }).then(() => true).catch(() => false);
 
-        const inviteSent = await ctx.channel.send(ctx.msg.chatId, {
-          text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at> /invite group`,
-        }).then(() => true).catch(() => false);
-
-        if (metaSent && cdSent && inviteSent) {
+        if (inviteSent && cdSent) {
           dispatchResults.set(instr.targetName, {
             botName: instr.targetName,
             status: 'sent',
-            messageId: instr.taskId,
           });
         } else {
           dispatchResults.set(instr.targetName, {
@@ -1011,18 +958,6 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
             blockedReason: 'dispatch_failed',
           });
         }
-      } else if (instr.kind === 'workspace-context' && instr.contextPacket) {
-        const packetJson = formatContextPacket(instr.contextPacket);
-        const sent = await ctx.channel.send(ctx.msg.chatId, {
-          text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at> workspace context (${instr.taskId}):\n\`\`\`json\n${packetJson}\n\`\`\``,
-        }).then(() => true).catch(() => false);
-
-        dispatchResults.set(instr.targetName, {
-          botName: instr.targetName,
-          status: sent ? 'sent' : 'blocked',
-          blockedReason: sent ? undefined : 'dispatch_failed',
-          messageId: sent ? instr.taskId : undefined,
-        });
       }
     }
 
@@ -1033,19 +968,6 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       return dispatchResults.get(r.botName) ?? r;
     });
 
-    // B4: store session for receipt ingestion
-    bootstrapSessions.set(slug, {
-      slug,
-      chatId: ctx.msg.chatId,
-      coordinatorOpenId,
-      results: finalResults,
-      registry,
-      startedAt: Date.now(),
-    });
-
-    const receipt = renderBootstrapReceipt(finalResults, slug);
-    await reply(ctx, receipt);
-
     log.info('project', 'bootstrap-dispatched', {
       slug,
       instructions: plan.instructions.length,
@@ -1055,6 +977,17 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
   } finally {
     projectStartInFlight.delete(key);
   }
+}
+
+async function ensureBootstrapCoordinatorAllowedChat(ctx: CommandContext): Promise<void> {
+  const chatId = ctx.msg.chatId;
+  await saveAccessConfig(ctx, (current) => {
+    if (current.allowedChats.includes(chatId)) return current;
+    return {
+      ...current,
+      allowedChats: [...current.allowedChats, chatId],
+    };
+  });
 }
 
 async function rediscoverBootstrapBotsAfterInvite(
@@ -2339,17 +2272,17 @@ async function handleBotAdmin(args: string, ctx: CommandContext): Promise<void> 
       await reply(
         ctx,
         '用法：\n' +
-          '• `/botAdmin add @Bot名` — 添加 Bot 管理员\n' +
-          '• `/botAdmin remove @Bot名` — 移除 Bot 管理员\n' +
+          '• `/botAdmin add Bot名` — 添加 Bot 管理员\n' +
+          '• `/botAdmin remove Bot名` — 移除 Bot 管理员\n' +
           '• `/botAdmin list` — 查看 Bot 管理员列表',
       );
   }
 }
 
 async function handleBotAdminAdd(args: string, ctx: CommandContext): Promise<void> {
-  const targets = botAdminMentionTargets(args, ctx);
+  const targets = await botAdminTargets(args, ctx);
   if (targets.length === 0) {
-    await reply(ctx, '❌ 没检测到 add 后面的 @ 对象。请写 `/botAdmin add @Bot名`。');
+    await reply(ctx, '❌ 没检测到 add 后面的 Bot 名称。请写 `/botAdmin add Bot名`。');
     return;
   }
   const added: string[] = [];
@@ -2382,9 +2315,9 @@ async function handleBotAdminAdd(args: string, ctx: CommandContext): Promise<voi
 }
 
 async function handleBotAdminRemove(args: string, ctx: CommandContext): Promise<void> {
-  const targets = botAdminMentionTargets(args, ctx);
+  const targets = await botAdminTargets(args, ctx);
   if (targets.length === 0) {
-    await reply(ctx, '❌ 没检测到 remove 后面的 @ 对象。请写 `/botAdmin remove @Bot名`。');
+    await reply(ctx, '❌ 没检测到 remove 后面的 Bot 名称。请写 `/botAdmin remove Bot名`。');
     return;
   }
   const removed: string[] = [];
@@ -2437,26 +2370,67 @@ function mentionTargets(ctx: CommandContext): Array<{ openId: string; name?: str
     }));
 }
 
-function botAdminMentionTargets(
+async function botAdminTargets(
   args: string,
   ctx: CommandContext,
-): Array<{ openId: string; name?: string }> {
+): Promise<Array<{ openId: string; name?: string }>> {
   const targetText = args.trim().split(/\s+/).slice(1).join(' ');
   if (!targetText) return [];
 
+  const targetNames = botAdminTargetNames(targetText);
   const seen = new Set<string>();
-  const targets: Array<{ openId: string; name?: string }> = [];
+  const candidates: Array<{
+    openId: string;
+    name?: string;
+    isBot?: boolean;
+  }> = [];
   for (const mention of ctx.msg.mentions ?? []) {
     if (typeof mention.openId !== 'string' || !mention.openId) continue;
     if (!mentionAppearsInText(mention, targetText)) continue;
     if (seen.has(mention.openId)) continue;
     seen.add(mention.openId);
-    targets.push({
+    candidates.push({
       openId: mention.openId,
       ...(mention.name ? { name: mention.name } : {}),
+      ...(mention.isBot !== undefined ? { isBot: mention.isBot } : {}),
     });
   }
-  return targets;
+  const liveBots = await discoverBotAdminLiveMembers(ctx);
+  if (liveBots) {
+    const byOpenId = new Map(liveBots.map((member) => [member.openId, member]));
+    const byName = new Map(liveBots.map((member) => [member.name.normalize('NFC'), member]));
+    const resolved = new Map<string, { openId: string; name?: string }>();
+    for (const name of targetNames) {
+      const live = byName.get(name.normalize('NFC')) ?? byOpenId.get(name);
+      if (!live || resolved.has(live.openId)) continue;
+      resolved.set(live.openId, { openId: live.openId, name: live.name });
+    }
+    for (const mention of candidates) {
+      const live =
+        byOpenId.get(mention.openId) ??
+        (mention.name ? byName.get(mention.name.normalize('NFC')) : undefined);
+      if (!live || resolved.has(live.openId)) continue;
+      resolved.set(live.openId, { openId: live.openId, name: live.name });
+    }
+    return [...resolved.values()];
+  }
+
+  if (candidates.length === 0) return [];
+  return candidates
+    .filter((mention) => mention.isBot !== false)
+    .map(({ openId, name }) => ({ openId, ...(name ? { name } : {}) }));
+}
+
+function botAdminTargetNames(text: string): string[] {
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const part of text.split(/[\s,，、]+/)) {
+    const name = part.trim().replace(/^@+/, '').normalize('NFC');
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+  }
+  return names;
 }
 
 function mentionAppearsInText(
@@ -2464,6 +2438,46 @@ function mentionAppearsInText(
   text: string,
 ): boolean {
   return mentionTextCandidates(mention).some((candidate) => text.includes(candidate));
+}
+
+async function discoverBotAdminLiveMembers(ctx: CommandContext): Promise<LiveBotMember[] | undefined> {
+  if (ctx.chatMode === 'p2p') return undefined;
+  try {
+    const output = await runBootstrapLarkCliJson([
+      'im',
+      'chat.members',
+      'bots',
+      '--chat-id',
+      ctx.msg.chatId,
+      '--as',
+      'bot',
+      '--format',
+      'json',
+    ], bootstrapLarkCliEnv(ctx));
+    const parsed = JSON.parse(output) as {
+      ok?: boolean;
+      code?: number;
+      msg?: string;
+      data?: {
+        items?: Array<{ bot_id?: string; bot_name?: string; member_id?: string; name?: string }>;
+      };
+    };
+    if (parsed.code !== undefined && parsed.code !== 0) {
+      throw new Error(parsed.msg || `lark-cli bot discovery failed: code ${parsed.code}`);
+    }
+    if (parsed.ok === false) {
+      throw new Error(parsed.msg || 'lark-cli bot discovery failed');
+    }
+    return (parsed.data?.items ?? [])
+      .map((item) => ({
+        openId: item.bot_id ?? item.member_id ?? '',
+        name: item.bot_name ?? item.name ?? item.bot_id ?? item.member_id ?? '',
+      }))
+      .filter((item) => item.openId && item.name);
+  } catch (err) {
+    log.warn('command', 'bot-admin-target-discovery-failed', { err: String(err) });
+    return undefined;
+  }
 }
 
 async function saveAccessConfig(

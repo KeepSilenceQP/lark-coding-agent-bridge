@@ -26,7 +26,7 @@ import {
   type RunState,
 } from '../card/run-state';
 import { renderText } from '../card/text-renderer';
-import { tryHandleCommand, tryIngestBootstrapReceipt, type Controls } from '../commands';
+import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -43,7 +43,7 @@ import {
   toPolicyAttachment,
   toPromptAttachment,
 } from '../media/attachment';
-import { canUseDm, canUseGroup } from '../policy/access';
+import { canRunBotAdminCommand, canUseDm, canUseGroup } from '../policy/access';
 import type { ScopeContext } from '../policy/run-policy';
 import { createOwnerRefreshController } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
@@ -584,22 +584,30 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     resources: msg.resources.length,
   });
 
-  const accessDecision =
+  let accessDecision =
     msg.chatType === 'p2p'
       ? canUseDm(controls.profileConfig, controls, msg.senderId)
       : canUseGroup(controls.profileConfig, controls, msg.chatId, msg.senderId);
   if (!accessDecision.ok) {
-    log.info('intake', 'skip-not-allowed-user', {
-      scope,
-      sender: msg.senderId.slice(-6),
-      reason: accessDecision.reason,
-    });
-    if (msg.chatType !== 'p2p' && accessDecision.reason === 'denied-chat' && msg.mentionedBot) {
-      void sendNonAllowedGroupHint(channel, msg.chatId, msg.messageId).catch((err) =>
-        log.warn('intake', 'non-allowed-hint-failed', { err: String(err) }),
-      );
+    if (shouldBypassDeniedChatForInviteGroup(msg, controls)) {
+      accessDecision = { ok: true, reason: 'allowed-admin' };
+      log.info('intake', 'allow-denied-chat-invite-group', {
+        scope,
+        sender: msg.senderId.slice(-6),
+      });
+    } else {
+      log.info('intake', 'skip-not-allowed-user', {
+        scope,
+        sender: msg.senderId.slice(-6),
+        reason: accessDecision.reason,
+      });
+      if (msg.chatType !== 'p2p' && accessDecision.reason === 'denied-chat' && msg.mentionedBot) {
+        void sendNonAllowedGroupHint(channel, msg.chatId, msg.messageId).catch((err) =>
+          log.warn('intake', 'non-allowed-hint-failed', { err: String(err) }),
+        );
+      }
+      return;
     }
-    return;
   }
 
   // Group-mention policy. p2p is always unrestricted; in groups (regular and
@@ -616,14 +624,6 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     log.info('intake', 'skip-no-mention', { scope, chatType: msg.chatType });
     return;
   }
-
-  // F3: Ingest bootstrap receipts before command handling
-  tryIngestBootstrapReceipt(
-    msg.senderId,
-    msg.content,
-    msg.mentions ?? [],
-    channel.botIdentity?.openId ?? '',
-  );
 
   const handled = await tryHandleCommand({
     channel,
@@ -655,6 +655,17 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
 
   const size = pending.push(scope, msg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
+}
+
+export function shouldBypassDeniedChatForInviteGroup(
+  msg: NormalizedMessage,
+  controls: Controls,
+): boolean {
+  if (msg.chatType === 'p2p') return false;
+  if (!msg.mentionedBot) return false;
+  const content = msg.content.trim();
+  if (!/^(?:@\S+[ \t]+)?\/invite[ \t]+group$/.test(content)) return false;
+  return canRunBotAdminCommand(controls.profileConfig, controls, msg.senderId).ok;
 }
 
 interface RunBatchDeps {

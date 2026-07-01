@@ -69,6 +69,14 @@ describe('registry matching', () => {
       expect(result.entry.canonicalName).toBe('小P');
     }
   });
+
+  it('uses the current fork repository name for local bridge bots', () => {
+    const xiaoC = registry.find((entry) => entry.canonicalName === '小C');
+    const xiaoP = registry.find((entry) => entry.canonicalName === '小P');
+
+    expect(xiaoC?.projectRoot).toBe('lark-coding-agent-bridge');
+    expect(xiaoP?.projectRoot).toBe('lark-coding-agent-bridge');
+  });
 });
 
 describe('workspace path resolution', () => {

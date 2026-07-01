@@ -1,6 +1,6 @@
 /**
  * Phase 2 bot registry — identity matching, workspace metadata, and slug
- * validation for `/project bootstrap` task ids.
+ * validation for `/project bootstrap` dispatches.
  *
  * Key rules (from spec review v2):
  *  - Live discovery first: open_ids come from `chat.members bots`, not the
@@ -8,8 +8,6 @@
  *  - Static registry stores only role, machine, and workspace metadata.
  *  - Matching uses canonical_name + aliases[] with NFC-normalised exact
  *    equality.  No substring or fuzzy matching.
- *  - Pin-on-first-verify: first successful verified receipt persists the
- *    live open_id as a pinned binding (dispatcher-profile scoped).
  *  - Identity-change detection: if a future name match resolves to a
  *    different open_id than the pinned binding, mark blocked(identity_changed).
  *  - Ambiguous names (0 or >1 matches) → blocked(ambiguous_name).
@@ -57,29 +55,28 @@ export type BlockedReason =
   | 'denied'
   | 'invalid_slug';
 
-export type BootstrapStatus = 'sent' | 'acknowledged' | 'verified' | 'blocked';
+export type BootstrapStatus = 'sent' | 'blocked';
 
 export interface BootstrapResult {
   botName: string;
   status: BootstrapStatus;
   blockedReason?: BlockedReason;
-  messageId?: string;
   pinnedOpenId?: string;
 }
 
-// ── task-id slug validation ──
+// ── bootstrap slug validation ──
 
 const SLUG_RE = /^[A-Za-z0-9._-]+$/;
 
-/** Validate a task-id slug against the allowlist. */
+/** Validate a bootstrap slug against the allowlist. */
 export function validateSlug(slug: string): { ok: true; slug: string } | { ok: false; reason: string } {
   const trimmed = slug.trim();
-  if (!trimmed) return { ok: false, reason: 'task-id slug 不能为空。' };
+  if (!trimmed) return { ok: false, reason: 'bootstrap slug 不能为空。' };
   if (!SLUG_RE.test(trimmed)) {
     return {
       ok: false,
       reason:
-        `task-id slug 格式无效："${trimmed}"。只允许 [A-Za-z0-9._-]。`,
+        `bootstrap slug 格式无效："${trimmed}"。只允许 [A-Za-z0-9._-]。`,
     };
   }
   return { ok: true, slug: trimmed };
@@ -147,7 +144,7 @@ export function checkPinnedIdentity(
   return { ok: true, binding: existing };
 }
 
-/** Persist a pinned binding after first verified dispatch. */
+/** Persist a pinned binding for callers that maintain an external trust source. */
 export function pinBinding(
   canonicalName: string,
   openId: string,
@@ -171,7 +168,7 @@ export function defaultRegistry(): BotRegistryEntry[] {
       appId: 'cli_aaae59d6c77c1be1',
       role: 'bridge',
       machines: [{ kind: 'local', root: '/Users/bytedance/repo' }],
-      projectRoot: 'lark-channel-bridge-fork',
+      projectRoot: 'lark-coding-agent-bridge',
     },
     {
       canonicalName: '云上C总',
@@ -195,7 +192,7 @@ export function defaultRegistry(): BotRegistryEntry[] {
       appId: 'cli_aaae59657e781bd8',
       role: 'bridge',
       machines: [{ kind: 'local', root: '/Users/bytedance/repo' }],
-      projectRoot: 'lark-channel-bridge-fork',
+      projectRoot: 'lark-coding-agent-bridge',
     },
   ];
 }

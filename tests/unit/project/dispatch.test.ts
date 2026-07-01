@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   planBootstrap,
-  renderBootstrapReceipt,
   type LiveBotMember,
 } from '../../../src/project/dispatch';
 import {
@@ -56,7 +55,7 @@ describe('bootstrap planning', () => {
     expect(plan.instructions[0]!.workspacePath).toBe('/Users/bytedance/repo/test-project');
   });
 
-  it('generates workspace-context for explicitly configured non-bridge bots', () => {
+  it('blocks non-bridge bots because bootstrap only sends bridge slash commands', () => {
     const liveMembers: LiveBotMember[] = [
       { openId: 'ou_a', name: 'ContextBot' },
     ];
@@ -74,11 +73,9 @@ describe('bootstrap planning', () => {
       liveMembers,
       registry,
     });
-    expect(plan.results[0]!.status).toBe('sent');
-    expect(plan.instructions[0]!.kind).toBe('workspace-context');
-    expect(plan.instructions[0]!.contextPacket).toBeDefined();
-    expect(plan.instructions[0]!.contextPacket!.workspace.primary_workspace_kind).toBe('local');
-    expect(plan.instructions[0]!.contextPacket!.must_not_run).toContain('/cd');
+    expect(plan.results[0]!.status).toBe('blocked');
+    expect(plan.results[0]!.blockedReason).toBe('denied');
+    expect(plan.instructions).toHaveLength(0);
   });
 
   it('blocks bots not found in live members', () => {
@@ -168,20 +165,4 @@ describe('bootstrap planning', () => {
     expect(plan.instructions).toHaveLength(0);
   });
 
-  it('renders receipt with status for each bot', () => {
-    const receipt = renderBootstrapReceipt(
-      [
-        { botName: '小C', status: 'sent' },
-        { botName: '云上C总', status: 'blocked', blockedReason: 'bot_not_in_group' },
-        { botName: 'ContextBot', status: 'verified' },
-      ],
-      'test-slug',
-    );
-    expect(receipt).toContain('test-slug');
-    expect(receipt).toContain('小C');
-    expect(receipt).toContain('sent');
-    expect(receipt).toContain('blocked');
-    expect(receipt).toContain('bot_not_in_group');
-    expect(receipt).toContain('verified');
-  });
 });
