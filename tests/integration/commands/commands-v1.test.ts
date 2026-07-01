@@ -647,6 +647,27 @@ describe('Bridge command contracts', () => {
       .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">小C</at> /cd repo-one'));
   });
 
+  it('keeps the original bootstrap workspace instead of expanding tilde paths', async () => {
+    const h = await createHarness();
+    configureSingleBridgeBotBootstrap(h, '云上小C', 'ou-cloud-c', 'sayToLittleP');
+
+    await expect(
+      h.run('/project bootstrap ~/repo/sayToLittleP 云上小C', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    const textMessages = h.channel.sent
+      .map((m) => (m.content as { text?: string }).text)
+      .filter((text): text is string => typeof text === 'string');
+
+    expect(textMessages).toContain('<at user_id="ou-cloud-cz">云上C总</at> /cd ~/repo/sayToLittleP');
+    expect(textMessages).toContain('<at user_id="ou-cloud-c">云上小C</at> /cd ~/repo/sayToLittleP');
+    expect(textMessages.join('\n')).not.toContain('/Users/bytedance/repo/sayToLittleP');
+  });
+
   it('adds the project group to coordinator allowedChats before bootstrap dispatch', async () => {
     const h = await createHarness();
     configureSingleBridgeBotBootstrap(h, '小C', 'ou-live-c', 'repo-allow');
