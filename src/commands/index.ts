@@ -640,7 +640,7 @@ function parseProjectBootstrapRequest(args: string): { ok: true; value: ProjectB
   }
 
   const workspaceInput = parts[0]!;
-  const workspacePath = isAbsoluteOrTilde(workspaceInput) ? expandTilde(workspaceInput) : workspaceInput;
+  const workspacePath = workspaceInput;
   const targetBot = normalizeBootstrapTarget(parts[1]!);
   if (!IMPLEMENTER_BOTS.has(targetBot)) {
     return {

@@ -647,6 +647,27 @@ describe('Bridge command contracts', () => {
       .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-one'));
   });
 
+  it('keeps the original bootstrap workspace instead of expanding tilde paths', async () => {
+    const h = await createHarness();
+    configureSingleBridgeBotBootstrap(h, '云上HistoryRedactedBot1', 'ou-cloud-c', 'sayToLittleP');
+
+    await expect(
+      h.run('/project bootstrap ~/repo/sayToLittleP 云上HistoryRedactedBot1', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    const textMessages = h.channel.sent
+      .map((m) => (m.content as { text?: string }).text)
+      .filter((text): text is string => typeof text === 'string');
+
+    expect(textMessages).toContain('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd ~/repo/sayToLittleP');
+    expect(textMessages).toContain('<at user_id="ou-cloud-c">云上HistoryRedactedBot1</at> /cd ~/repo/sayToLittleP');
+    expect(textMessages.join('\n')).not.toContain('/redacted/history/machine-1/sayToLittleP');
+  });
+
   it('adds the project group to coordinator allowedChats before bootstrap dispatch', async () => {
     const h = await createHarness();
     configureSingleBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'repo-allow');
