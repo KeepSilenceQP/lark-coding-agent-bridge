@@ -132,7 +132,7 @@ export async function resolveSecretAcrossProfiles(
   id: string,
   rootDir: string = paths.rootDir,
   warn: (message: string) => void = (message) => console.error(message),
-  profile: string | undefined = process.env.LARK_CHANNEL_PROFILE,
+  profile: string | undefined = rootDir === paths.rootDir ? process.env.LARK_CHANNEL_PROFILE : undefined,
 ): Promise<string | undefined> {
   if (profile) {
     const appPaths = resolveAppPaths({ rootDir, profile });

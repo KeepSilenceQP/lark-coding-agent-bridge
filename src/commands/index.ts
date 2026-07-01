@@ -269,7 +269,7 @@ function resolveCommandGate(
 }
 
 export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
-  const trimmed = ctx.msg.content.trim();
+  const trimmed = commandContent(ctx.msg).trim();
   if (!trimmed.startsWith('/')) return false;
   const parts = trimmed.split(/\s+/);
   const cmd = parts[0] ?? '';
@@ -301,6 +301,67 @@ export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
     reportMetric('command_fail', 1, { step: 'dispatch' });
   }
   return true;
+}
+
+function commandContent(msg: NormalizedMessage): string {
+  const rawText = rawMessageText(msg);
+  if (!rawText) return msg.content;
+
+  const commandStart = rawText.search(/\/\S+/);
+  if (commandStart < 0) return msg.content;
+  const prefix = rawText.slice(0, commandStart).trim();
+  if (!prefix) return rawText.slice(commandStart);
+
+  let remaining = prefix;
+  for (const mention of msg.mentions ?? []) {
+    for (const candidate of mentionTextCandidates(mention)) {
+      remaining = remaining.split(candidate).join('');
+    }
+  }
+  return remaining.trim() ? msg.content : rawText.slice(commandStart);
+}
+
+function rawMessageText(msg: NormalizedMessage): string {
+  const rawContent = (msg.raw as { message?: { content?: unknown } } | undefined)?.message?.content;
+  if (typeof rawContent !== 'string' || rawContent.length === 0) return '';
+
+  try {
+    const parsed = JSON.parse(rawContent) as unknown;
+    const text = textFromRawContent(parsed);
+    return text || rawContent;
+  } catch {
+    return rawContent;
+  }
+}
+
+function textFromRawContent(value: unknown): string {
+  if (!value || typeof value !== 'object') return '';
+  if ('text' in value && typeof value.text === 'string') return value.text;
+  if ('content' in value && Array.isArray(value.content)) {
+    return value.content
+      .map((line) => Array.isArray(line) ? line.map(textFromPostElement).join('') : '')
+      .join('\n');
+  }
+  return '';
+}
+
+function textFromPostElement(value: unknown): string {
+  if (!value || typeof value !== 'object') return '';
+  const element = value as { tag?: unknown; text?: unknown; user_name?: unknown };
+  if (typeof element.text === 'string') return element.text;
+  if (element.tag === 'at' && typeof element.user_name === 'string') return `@${element.user_name}`;
+  return '';
+}
+
+function mentionTextCandidates(
+  mention: NonNullable<NormalizedMessage['mentions']>[number],
+): string[] {
+  return [
+    mention.key,
+    mention.name ? `@${mention.name}` : undefined,
+    mention.openId,
+    mention.userId,
+  ].filter((value): value is string => Boolean(value));
 }
 
 /** Invoke a named command handler (e.g. from a card button click). */
@@ -584,6 +645,8 @@ interface ProjectBootstrapRequest {
 
 const IMPLEMENTER_BOTS = new Set(['小C', '云上小C']);
 const BOOTSTRAP_REQUIRED_BOTS = new Set(['云上C总']);
+const BOOTSTRAP_INVITE_DISCOVERY_ATTEMPTS = 4;
+const BOOTSTRAP_INVITE_DISCOVERY_DELAY_MS = 150;
 
 function parseProjectBootstrapRequest(args: string): { ok: true; value: ProjectBootstrapRequest } | { ok: false; reason: string } {
   const parts = args.trim().split(/\s+/).filter(Boolean);
@@ -596,7 +659,7 @@ function parseProjectBootstrapRequest(args: string): { ok: true; value: ProjectB
 
   const workspaceInput = parts[0]!;
   const workspacePath = isAbsoluteOrTilde(workspaceInput) ? expandTilde(workspaceInput) : workspaceInput;
-  const targetBot = parts[1]!;
+  const targetBot = normalizeBootstrapTarget(parts[1]!);
   if (!IMPLEMENTER_BOTS.has(targetBot)) {
     return {
       ok: false,
@@ -612,6 +675,10 @@ function parseProjectBootstrapRequest(args: string): { ok: true; value: ProjectB
       slug: workspaceSlugFromPath(workspacePath),
     },
   };
+}
+
+function normalizeBootstrapTarget(input: string): string {
+  return input.trim().replace(/^@+/, '');
 }
 
 function workspaceSlugFromPath(path: string): string {
@@ -725,8 +792,12 @@ async function inviteBotAppToChat(chatId: string, appId: string): Promise<boolea
     'im',
     'chat.members',
     'create',
-    '--params',
-    JSON.stringify({ chat_id: chatId, member_id_type: 'app_id', succeed_type: 1 }),
+    '--chat-id',
+    chatId,
+    '--member-id-type',
+    'app_id',
+    '--succeed-type',
+    '1',
     '--data',
     JSON.stringify({ id_list: [appId] }),
     '--as',
@@ -865,7 +936,12 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
     const inviteState = await inviteMissingBootstrapBots(ctx.msg.chatId, registry, liveMembers, coordinatorName);
     if (inviteState.invitedAny) {
       try {
-        liveMembers = await discovery.discoverBots(ctx.msg.chatId);
+        liveMembers = await rediscoverBootstrapBotsAfterInvite(
+          discovery,
+          ctx.msg.chatId,
+          registry,
+          coordinatorName,
+        );
       } catch {
         // Keep the original discovery result; remaining missing bots will be
         // reported as not in group, while explicit invite failures are kept.
@@ -979,6 +1055,39 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
   } finally {
     projectStartInFlight.delete(key);
   }
+}
+
+async function rediscoverBootstrapBotsAfterInvite(
+  discovery: ReturnType<typeof createSdkLiveDiscovery>,
+  chatId: string,
+  registry: BotRegistryEntry[],
+  coordinatorName: string,
+): Promise<LiveBotMember[]> {
+  let latest: LiveBotMember[] = [];
+  for (let attempt = 0; attempt < BOOTSTRAP_INVITE_DISCOVERY_ATTEMPTS; attempt += 1) {
+    latest = await discovery.discoverBots(chatId);
+    if (bootstrapRegistryPresent(registry, latest, coordinatorName)) {
+      return latest;
+    }
+    if (attempt < BOOTSTRAP_INVITE_DISCOVERY_ATTEMPTS - 1) {
+      await sleep(BOOTSTRAP_INVITE_DISCOVERY_DELAY_MS);
+    }
+  }
+  return latest;
+}
+
+function bootstrapRegistryPresent(
+  registry: BotRegistryEntry[],
+  liveMembers: LiveBotMember[],
+  coordinatorName: string,
+): boolean {
+  return registry.every((entry) =>
+    entry.canonicalName === coordinatorName || Boolean(findBootstrapLiveMember(entry, liveMembers)),
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function handleDoc(args: string, ctx: CommandContext): Promise<void> {
@@ -2219,10 +2328,10 @@ async function handleBotAdmin(args: string, ctx: CommandContext): Promise<void> 
   const sub = parts[0] ?? '';
   switch (sub) {
     case 'add':
-      return handleBotAdminAdd(ctx);
+      return handleBotAdminAdd(args, ctx);
     case 'remove':
     case 'rm':
-      return handleBotAdminRemove(ctx);
+      return handleBotAdminRemove(args, ctx);
     case 'list':
     case 'ls':
       return handleBotAdminList(ctx);
@@ -2237,10 +2346,10 @@ async function handleBotAdmin(args: string, ctx: CommandContext): Promise<void> 
   }
 }
 
-async function handleBotAdminAdd(ctx: CommandContext): Promise<void> {
-  const targets = botMentionTargets(ctx);
+async function handleBotAdminAdd(args: string, ctx: CommandContext): Promise<void> {
+  const targets = botAdminMentionTargets(args, ctx);
   if (targets.length === 0) {
-    await reply(ctx, '❌ 没检测到 @ 的 Bot。请 @ 要添加的 Bot（注意不是 @ 用户）。');
+    await reply(ctx, '❌ 没检测到 add 后面的 @ 对象。请写 `/botAdmin add @Bot名`。');
     return;
   }
   const added: string[] = [];
@@ -2272,10 +2381,10 @@ async function handleBotAdminAdd(ctx: CommandContext): Promise<void> {
   await reply(ctx, result.join('\n'));
 }
 
-async function handleBotAdminRemove(ctx: CommandContext): Promise<void> {
-  const targets = botMentionTargets(ctx);
+async function handleBotAdminRemove(args: string, ctx: CommandContext): Promise<void> {
+  const targets = botAdminMentionTargets(args, ctx);
   if (targets.length === 0) {
-    await reply(ctx, '❌ 没检测到 @ 的 Bot。请 @ 要移除的 Bot。');
+    await reply(ctx, '❌ 没检测到 remove 后面的 @ 对象。请写 `/botAdmin remove @Bot名`。');
     return;
   }
   const removed: string[] = [];
@@ -2314,7 +2423,7 @@ async function handleBotAdminList(ctx: CommandContext): Promise<void> {
     return;
   }
   const lines = botAdmins.map(
-    (id, i) => `${i + 1}. <at id="${id}"></at>（...${id.slice(-6)}）`,
+    (id, i) => `${i + 1}. <at user_id="${id}">${id}</at>（...${id.slice(-6)}）`,
   );
   await reply(ctx, `**Bot 管理员**（共 ${botAdmins.length} 个）：\n${lines.join('\n')}`);
 }
@@ -2328,13 +2437,33 @@ function mentionTargets(ctx: CommandContext): Array<{ openId: string; name?: str
     }));
 }
 
-function botMentionTargets(ctx: CommandContext): Array<{ openId: string; name?: string }> {
-  return (ctx.msg.mentions ?? [])
-    .filter((mention) => mention.isBot && typeof mention.openId === 'string' && mention.openId)
-    .map((mention) => ({
-      openId: mention.openId as string,
+function botAdminMentionTargets(
+  args: string,
+  ctx: CommandContext,
+): Array<{ openId: string; name?: string }> {
+  const targetText = args.trim().split(/\s+/).slice(1).join(' ');
+  if (!targetText) return [];
+
+  const seen = new Set<string>();
+  const targets: Array<{ openId: string; name?: string }> = [];
+  for (const mention of ctx.msg.mentions ?? []) {
+    if (typeof mention.openId !== 'string' || !mention.openId) continue;
+    if (!mentionAppearsInText(mention, targetText)) continue;
+    if (seen.has(mention.openId)) continue;
+    seen.add(mention.openId);
+    targets.push({
+      openId: mention.openId,
       ...(mention.name ? { name: mention.name } : {}),
-    }));
+    });
+  }
+  return targets;
+}
+
+function mentionAppearsInText(
+  mention: NonNullable<NormalizedMessage['mentions']>[number],
+  text: string,
+): boolean {
+  return mentionTextCandidates(mention).some((candidate) => text.includes(candidate));
 }
 
 async function saveAccessConfig(

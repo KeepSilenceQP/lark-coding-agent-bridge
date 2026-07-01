@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { LarkChannel, ResourceDescriptor } from '@larksuite/channel';
+import type { LarkChannel, ResourceDescriptor, ResourceType } from '@larksuite/channel';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
 import {
@@ -23,6 +23,15 @@ export interface MediaResolveOptions extends Partial<AttachmentPolicyOptions> {
 export interface ResourceRequest {
   messageId: string;
   resource: ResourceDescriptor;
+}
+
+interface ResourceFileDownloader {
+  downloadResourceToFile(
+    messageId: string,
+    fileKey: string,
+    type: ResourceType,
+    destPath: string,
+  ): Promise<{ contentType?: string }>;
 }
 
 export class MediaCache {
@@ -78,18 +87,12 @@ export class MediaCache {
       `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
     );
 
-    // downloadResourceToFile hits im.v1.messageResource.get under the hood —
-    // the endpoint required for resources that arrived in user messages. It
-    // maps image resources to 'image' and everything else (file/audio/video)
-    // to 'file'. We stream straight to disk (not via a full Buffer) because the
-    // size limit is only enforced after download: a large attachment would
-    // otherwise sit entirely in the JS heap before being rejected. It returns
-    // the server content-type so we can pick an accurate extension, falling
-    // back to defaultMime(kind) when absent.
-    const { contentType } = await this.channel.downloadResourceToFile(
+    const resourceType: ResourceType = r.type === 'image' ? 'image' : 'file';
+    const { contentType } = await downloadResourceToFile(
+      this.channel,
       messageId,
       r.fileKey,
-      r.type === 'image' ? 'image' : 'file',
+      resourceType,
       tmpPath,
     );
 
@@ -122,6 +125,23 @@ export class MediaCache {
     });
     return candidate;
   }
+}
+
+async function downloadResourceToFile(
+  channel: LarkChannel,
+  messageId: string,
+  fileKey: string,
+  type: ResourceType,
+  destPath: string,
+): Promise<{ contentType?: string }> {
+  const downloader = channel as LarkChannel & Partial<ResourceFileDownloader>;
+  if (typeof downloader.downloadResourceToFile === 'function') {
+    return downloader.downloadResourceToFile(messageId, fileKey, type, destPath);
+  }
+
+  const { buffer, contentType } = await channel.downloadResourceWithMeta(messageId, fileKey, type);
+  await writeFile(destPath, buffer);
+  return { contentType };
 }
 
 /** Delete files under the media cache whose mtime is older than maxAgeMs. */
