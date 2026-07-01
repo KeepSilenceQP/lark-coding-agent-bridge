@@ -92,7 +92,7 @@ export function configFormCard(opts: ConfigFormOpts): object {
         `**Bot 管理员**（共 ${opts.botAdmins.length} 个）\n` +
         `${atMentionLine(opts.botAdmins)}\n\n` +
         '_其他 Bot 可执行 `/cd` `/ws` `/project` `/invite group` `/remove group` 等运营命令；不能管理用户、人类管理员或配置。_\n\n' +
-        '_加 / 删：_ `/botAdmin add @Bot名`  `/botAdmin remove @Bot名`',
+        '_加 / 删：_ `/botAdmin add Bot名`  `/botAdmin remove Bot名`',
     },
   ];
 
