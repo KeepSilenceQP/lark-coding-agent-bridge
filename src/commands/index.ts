@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
+import { DEFAULT_MODEL, normalizeModelSelection, supportedModels } from '../agent/models';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
@@ -1761,6 +1762,11 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
   const ms = getRunIdleTimeoutMs(ctx.controls.cfg);
   const access = ctx.controls.profileConfig.access;
   const card = configFormCard({
+    agentKind: ctx.controls.profileConfig.agentKind,
+    model: normalizeModelSelection(
+      ctx.controls.profileConfig.agentKind,
+      ctx.controls.cfg.preferences?.model,
+    ),
     messageReply: getMessageReplyMode(ctx.controls.cfg),
     showToolCalls: getShowToolCalls(ctx.controls.cfg),
     cotMessages: getCotMessages(ctx.controls.cfg),
@@ -1814,6 +1820,16 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       : getMessageReplyMode(ctx.controls.cfg);
   const rawTools = String(fv.show_tool_calls ?? '').trim();
   const showToolCalls = rawTools !== 'hide';
+  // Parse the model picker. Unexpected / empty values keep the current
+  // selection. Store `undefined` for the "default" sentinel to keep config
+  // tidy (resolveModelArg treats both the same way).
+  const agentKind = ctx.controls.profileConfig.agentKind;
+  const rawModel = String(fv.model ?? '').trim();
+  const modelValid = rawModel !== '' && supportedModels(agentKind).some((m) => m.value === rawModel);
+  const modelSelection = modelValid
+    ? rawModel
+    : normalizeModelSelection(agentKind, ctx.controls.cfg.preferences?.model);
+  const model = modelSelection === DEFAULT_MODEL ? undefined : modelSelection;
   const rawCotMessages = String(fv.cot_messages ?? '').trim();
   const cotMessages =
     rawCotMessages === 'brief'
@@ -1879,6 +1895,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
 
     const nextPreferences: AppPreferences = {
       ...(ctx.controls.cfg.preferences ?? {}),
+      model,
       messageReply,
       // Mark the messageReply value as living in the new (post-0.1.27)
       // semantic — `text` now means real plain text, not the lightweight
@@ -1945,6 +1962,8 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       ctx,
       formMsgId,
       configSavedCard({
+        agentKind,
+        model: modelSelection,
         messageReply,
         showToolCalls,
         cotMessages,
