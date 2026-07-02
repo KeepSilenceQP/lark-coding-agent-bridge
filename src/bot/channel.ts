@@ -923,6 +923,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       const cotPublisher = new CotPublisher({
         client: cotClient,
         chatId,
+        // Mirror sendOpts.replyInThread: in topic groups the CoT bubble must be
+        // addressed to the thread so it lands inside the topic, not at the
+        // group top level.
+        ...(mode === 'topic' && threadId ? { threadId } : {}),
         originMessageId: lastMsg.messageId,
         runId: execution.runId,
         scope,

@@ -65,8 +65,19 @@ export class CotClient {
     return data.data ?? data;
   }
 
-  async create(receiveId: string, originMessageId?: string): Promise<Record<string, unknown>> {
-    return this.request('/open-apis/im/v1/message_cot?receive_id_type=chat_id', {
+  async create(
+    chatId: string,
+    originMessageId?: string,
+    threadId?: string,
+  ): Promise<Record<string, unknown>> {
+    // In topic groups the CoT bubble must be addressed to the thread, otherwise
+    // it lands at the group top level instead of inside the topic the user is
+    // in. Feishu routes into a thread via receive_id_type=thread_id with the
+    // omt_* thread id as receive_id (same mechanism as sending into a thread);
+    // fall back to chat_id for regular chats.
+    const receiveIdType = threadId ? 'thread_id' : 'chat_id';
+    const receiveId = threadId ?? chatId;
+    return this.request(`/open-apis/im/v1/message_cot?receive_id_type=${receiveIdType}`, {
       method: 'POST',
       body: JSON.stringify({
         receive_id: receiveId,
@@ -111,6 +122,7 @@ interface CotEvent {
 export class CotPublisher {
   private readonly client: Pick<CotClient, 'create' | 'update' | 'complete'>;
   readonly chatId: string;
+  readonly threadId: string | undefined;
   readonly originMessageId: string;
   readonly runId: string;
   readonly scope: string;
@@ -125,6 +137,7 @@ export class CotPublisher {
   constructor(opts: {
     client: Pick<CotClient, 'create' | 'update' | 'complete'>;
     chatId: string;
+    threadId?: string;
     originMessageId: string;
     runId: string;
     scope: string;
@@ -132,6 +145,7 @@ export class CotPublisher {
   }) {
     this.client = opts.client;
     this.chatId = opts.chatId;
+    this.threadId = opts.threadId;
     this.originMessageId = opts.originMessageId;
     this.runId = opts.runId;
     this.scope = opts.scope;
@@ -140,7 +154,7 @@ export class CotPublisher {
 
   async start(): Promise<void> {
     try {
-      const created = await this.client.create(this.chatId, this.originMessageId);
+      const created = await this.client.create(this.chatId, this.originMessageId, this.threadId);
       const cotId = stringValue(created.cot_id ?? created.cotId);
       const messageId = stringValue(created.message_id ?? created.messageId);
       if (!cotId || !messageId) {

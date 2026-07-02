@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { consumeCotEvents, CotPublisher, cotBriefToolTitle, finalAnswerOnlyState } from '../../../src/bot/cot.js';
+import { consumeCotEvents, CotClient, CotPublisher, cotBriefToolTitle, finalAnswerOnlyState } from '../../../src/bot/cot.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 import type { RunState } from '../../../src/card/run-state.js';
 
@@ -90,6 +90,45 @@ describe('COT event mapping', () => {
       .toContain('echo hello');
   });
 
+  it('forwards the topic thread id to CoT create so the bubble lands in the topic', async () => {
+    const client = new FakeCotClient();
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      threadId: 'omt_topic',
+      originMessageId: 'om_origin',
+      runId: 'run-topic',
+      scope: 'oc_chat:omt_topic',
+      inputPreview: 'in a topic',
+    });
+    await publisher.start();
+
+    expect(client.createCalls[0]).toEqual({
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      threadId: 'omt_topic',
+    });
+  });
+
+  it('addresses CoT create to the thread in topics and the chat otherwise', async () => {
+    const client = new CotClient({ tenant: 'feishu', appId: 'app', appSecret: 'secret' });
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    // Intercept the HTTP layer so we assert only how create() shapes the request.
+    (client as unknown as { request: CotClient['request'] }).request = async (path, init) => {
+      calls.push({ path, body: JSON.parse(String(init?.body ?? '{}')) });
+      return { cot_id: 'cot_x', message_id: 'om_x' };
+    };
+
+    await client.create('oc_chat', 'om_origin', 'omt_topic');
+    expect(calls[0]?.path).toContain('receive_id_type=thread_id');
+    expect(calls[0]?.body).toMatchObject({ receive_id: 'omt_topic', origin_message_id: 'om_origin' });
+
+    calls.length = 0;
+    await client.create('oc_chat', 'om_origin');
+    expect(calls[0]?.path).toContain('receive_id_type=chat_id');
+    expect(calls[0]?.body).toMatchObject({ receive_id: 'oc_chat' });
+  });
+
   it('marks the publisher degraded when COT updates fail', async () => {
     const client = new FakeCotClient();
     client.failUpdate = new Error('field validation failed');
@@ -117,9 +156,11 @@ describe('COT event mapping', () => {
 class FakeCotClient {
   events: Array<{ event_type: string; content: string; timestamp: number }> = [];
   completed: string[] = [];
+  createCalls: Array<{ chatId: string; originMessageId?: string; threadId?: string }> = [];
   failUpdate: Error | undefined;
 
-  async create(): Promise<Record<string, unknown>> {
+  async create(chatId: string, originMessageId?: string, threadId?: string): Promise<Record<string, unknown>> {
+    this.createCalls.push({ chatId, originMessageId, threadId });
     return { cot_id: 'cot_fake', message_id: 'om_cot_fake' };
   }
 
