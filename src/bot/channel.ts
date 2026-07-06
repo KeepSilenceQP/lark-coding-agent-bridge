@@ -12,6 +12,7 @@ import {
   type BridgePromptInteractiveCard,
   type BridgePromptMention,
   type BridgePromptQuotedMessage,
+  type BridgePromptTopicMessage,
 } from '../agent/prompt';
 import type { AgentAdapter, AgentEvent } from '../agent/types';
 import { handleCardAction } from '../card/dispatcher';
@@ -60,7 +61,7 @@ import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
 import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
-import { fetchQuotedContext, type QuotedContext } from './quote';
+import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { fetchKnownChats } from './lark-info';
@@ -768,6 +769,28 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
+  // Topic upstream context. When the bot is pulled into a topic for the FIRST
+  // time (no session yet for this scope), the topic's earlier messages — the
+  // root question that may never have @-mentioned the bot, plus prior replies —
+  // live nowhere the agent can see them. Fetch them so it isn't blind to what
+  // the user is pointing at. An already-engaged topic keeps that history in its
+  // resumed session, so we skip the fetch there.
+  let topicContext: QuotedContext[] = [];
+  if (mode === 'topic' && threadId && !sessions.getRaw(scope)) {
+    const exclude = new Set([...batchIds, ...quoteTargets]);
+    topicContext = await fetchTopicContext(channel, threadId, {
+      maxMessages: 40,
+      excludeIds: exclude,
+    });
+    if (topicContext.length > 0) {
+      log.info('topic', 'context-fetched', {
+        scope,
+        threadId,
+        count: topicContext.length,
+      });
+    }
+  }
+
   // Detect a model switch since this scope's last run. When resuming an
   // existing conversation the transcript still claims the old model, so tell
   // the (now-switched) agent its model changed — otherwise it keeps echoing
@@ -789,10 +812,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       ]
     : undefined;
 
-  const prompt = buildPrompt(batch, attachments, quotes, channel.botIdentity, extraInstructions);
+  const prompt = buildPrompt(
+    batch,
+    attachments,
+    quotes,
+    topicContext,
+    channel.botIdentity,
+    extraInstructions,
+  );
   log.info('prompt', 'built', {
     promptChars: prompt.length,
     quotes: quotes.length,
+    topicContext: topicContext.length,
     ...(modelSwitched ? { modelSwitchedTo: modelSelection } : {}),
   });
 
@@ -1446,6 +1477,7 @@ function buildPrompt(
   batch: NormalizedMessage[],
   attachments: LocalAttachment[],
   quotes: QuotedContext[] = [],
+  topicContext: QuotedContext[] = [],
   botIdentity?: { openId: string; name?: string },
   extraInstructions?: string[],
 ): string {
@@ -1492,6 +1524,7 @@ function buildPrompt(
         ? [...BRIDGE_AGENT_INSTRUCTIONS, ...extraInstructions]
         : BRIDGE_AGENT_INSTRUCTIONS,
     userInput: userPart,
+    ...(topicContext.length > 0 ? { topicContext: topicContext.map(toPromptTopicMessage) } : {}),
     quotedMessages: quotes.map(toPromptQuote),
     interactiveCards: batch.map(toPromptInteractiveCard).filter(isDefined),
     attachments: attachments.map(toPromptAttachment),
@@ -1573,6 +1606,18 @@ function toPromptQuote(q: QuotedContext): BridgePromptQuotedMessage {
     messageId: q.messageId,
     senderId: q.senderId,
     ...(q.senderName ? { senderName: q.senderName } : {}),
+    ...(q.createdAt ? { createdAt: q.createdAt } : {}),
+    rawContentType: q.rawContentType,
+    content: q.content,
+  };
+}
+
+function toPromptTopicMessage(q: QuotedContext): BridgePromptTopicMessage {
+  return {
+    messageId: q.messageId,
+    senderId: q.senderId,
+    ...(q.senderName ? { senderName: q.senderName } : {}),
+    ...(q.senderType ? { senderType: q.senderType } : {}),
     ...(q.createdAt ? { createdAt: q.createdAt } : {}),
     rawContentType: q.rawContentType,
     content: q.content,

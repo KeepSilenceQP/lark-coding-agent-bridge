@@ -38,6 +38,9 @@ interface FakeLarkChannel {
     request: ReturnType<typeof vi.fn>;
     im: {
       v1: {
+        message: {
+          list: ReturnType<typeof vi.fn>;
+        };
         messageReaction: {
           create: ReturnType<typeof vi.fn>;
           delete: ReturnType<typeof vi.fn>;
@@ -174,6 +177,100 @@ describe('topic message quote handling', () => {
     expect(h.channel.streams[0]?.options).not.toMatchObject({ replyInThread: true });
   });
 
+  it('pulls in the topic upstream messages when first engaged in a topic', async () => {
+    // The topic root holds the real question and never @-mentioned the bot; the
+    // bot only gets pulled in by a later "@Bridge 看下这个" reply. On a fresh
+    // topic session we fetch the thread so the agent isn't blind to the root.
+    const h = await createHarness({
+      chatMode: 'topic',
+      threadMessages: [
+        {
+          message_id: 'om_topic_root',
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: 'the real upstream question' }) },
+          sender: { id: 'ou_asker', sender_type: 'user' },
+          create_time: '1760000000000',
+          thread_id: 'omt_topic',
+        },
+        {
+          // the triggering message itself — must be excluded, not echoed back
+          message_id: 'om_at_in_topic',
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: '@Bridge 看下这个' }) },
+          sender: { id: 'ou_user', sender_type: 'user' },
+          create_time: '1760000001000',
+          thread_id: 'omt_topic',
+        },
+      ],
+    });
+
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_at_in_topic',
+        rootId: 'om_topic_root',
+        parentId: 'om_topic_root',
+        threadId: 'omt_topic',
+        content: '@Bridge 看下这个',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    expect(h.channel.rawClient.im.v1.message.list).toHaveBeenCalledWith(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          container_id_type: 'thread',
+          container_id: 'omt_topic',
+        }),
+      }),
+    );
+    const prompt = h.agent.runOptions[0]?.prompt ?? '';
+    expect(prompt).toContain('<topic_context>');
+    expect(prompt).toContain('the real upstream question');
+    // The triggering message is in the thread list too — it must be excluded so
+    // it isn't duplicated inside topic_context.
+    const topicBlock = prompt.slice(prompt.indexOf('<topic_context>'), prompt.indexOf('</topic_context>'));
+    expect(topicBlock).not.toContain('om_at_in_topic');
+  });
+
+  it('does not fetch topic context when the topic session already exists', async () => {
+    // A prior session for this topic scope means the history is already in the
+    // resumed conversation — no need to re-fetch and re-inject it every turn.
+    const h = await createHarness({
+      chatMode: 'topic',
+      threadMessages: [
+        {
+          message_id: 'om_topic_root',
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: 'the real upstream question' }) },
+          sender: { id: 'ou_asker', sender_type: 'user' },
+          create_time: '1760000000000',
+          thread_id: 'omt_existing',
+        },
+      ],
+    });
+    // Seed a session for the topic scope so it looks already-engaged.
+    h.sessions.set('oc_topic_chat:omt_existing', 'sess_existing', await realpath(h.tmp.workspace));
+
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_followup',
+        rootId: 'om_topic_root',
+        parentId: 'om_topic_root',
+        threadId: 'omt_existing',
+        content: '@Bridge 接着说',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    expect(h.channel.rawClient.im.v1.message.list).not.toHaveBeenCalled();
+    const prompt = h.agent.runOptions[0]?.prompt ?? '';
+    expect(prompt).not.toContain('<topic_context>');
+  });
+
   it('keeps regular group reply quotes as quoted context', async () => {
     const h = await createHarness({
       chatMode: 'group',
@@ -237,7 +334,8 @@ async function createHarness(options: {
   chatMode?: 'group' | 'topic';
   quotedMessages?: Record<string, string>;
   rawThreadIds?: Record<string, string>;
-} = {}): Promise<{
+  threadMessages?: Array<Record<string, unknown>>;
+} = {}):Promise<{
   tmp: TmpProfile;
   channel: FakeLarkChannel & { handlers: MessageHandlerMap };
   agent: FakeAgentAdapter;
@@ -313,7 +411,8 @@ function createFakeLarkChannel(options: {
   chatMode?: 'group' | 'topic';
   quotedMessages?: Record<string, string>;
   rawThreadIds?: Record<string, string>;
-} = {}): FakeLarkChannel & { handlers: MessageHandlerMap } {
+  threadMessages?: Array<Record<string, unknown>>;
+} = {}):FakeLarkChannel & { handlers: MessageHandlerMap } {
   const handlers: MessageHandlerMap = {};
   const sent: Array<{ chatId: string; content: unknown; options: unknown }> = [];
   const streams: Array<{ chatId: string; options: unknown }> = [];
@@ -322,6 +421,7 @@ function createFakeLarkChannel(options: {
     om_topic_root: 'topic root content',
   };
   const rawThreadIds = options.rawThreadIds ?? {};
+  const threadMessages = options.threadMessages ?? [];
   return {
     handlers,
     sent,
@@ -331,6 +431,9 @@ function createFakeLarkChannel(options: {
       request: vi.fn(async () => ({ data: { items: [] } })),
       im: {
         v1: {
+          message: {
+            list: vi.fn(async () => ({ data: { items: threadMessages, has_more: false } })),
+          },
           messageReaction: {
             create: vi.fn(async () => ({ data: { reaction_id: 'reaction_1' } })),
             delete: vi.fn(async () => ({})),
