@@ -156,6 +156,35 @@ describe('markdown stream startup failures', () => {
       ),
     );
   }, 10_000);
+
+  it('does not persist running footers in markdown stream content', async () => {
+    const contents: string[] = [];
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        if (!producer) return;
+        await producer({
+          setContent: async (markdown: string) => {
+            contents.push(markdown);
+          },
+        });
+      },
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: '处理完成。' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
+
+    expect(contents.length).toBeGreaterThan(0);
+    expect(contents.some((content) => content.includes('正在输出'))).toBe(false);
+    expect(contents.at(-1)).toContain('处理完成。');
+  });
 });
 
 async function createHarness(options: {
