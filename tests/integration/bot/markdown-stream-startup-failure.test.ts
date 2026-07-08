@@ -211,8 +211,116 @@ describe('markdown stream startup failures', () => {
 
     expect(h.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({
       path: { message_id: 'om_stream' },
+      params: { card_msg_content_type: 'user_card_content' },
     });
     expect(lastMarkdown(h.channel)).toContain('最终答案。');
+  });
+
+  it('reads back the tail rollover chunk before deciding final markdown is visible', async () => {
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        if (!producer) return { messageId: 'om_head', chunkIds: ['om_head', 'om_tail'] };
+        await producer({ setContent: async () => {} });
+        return { messageId: 'om_head', chunkIds: ['om_head', 'om_tail'] };
+      },
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: '最终答案。' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    h.channel.rawClient.im.v1.message.get.mockImplementation(async (req) => {
+      const messageId = (req as { path?: { message_id?: string } }).path?.message_id;
+      return {
+        data: {
+          items: [
+            {
+              body: {
+                content:
+                  messageId === 'om_tail'
+                    ? streamingCardContent('最终答案。')
+                    : streamingCardContent('旧的 head 内容'),
+              },
+            },
+          ],
+        },
+      };
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
+
+    expect(h.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({
+      path: { message_id: 'om_tail' },
+      params: { card_msg_content_type: 'user_card_content' },
+    });
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it('does not fallback when interactive readback only returns downgraded card content', async () => {
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        if (!producer) return { messageId: 'om_stream' };
+        await producer({ setContent: async () => {} });
+        return { messageId: 'om_stream' };
+      },
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: '最终答案。' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    h.channel.rawClient.im.v1.message.get.mockResolvedValue({
+      data: {
+        items: [
+          {
+            body: {
+              content: JSON.stringify({
+                title: null,
+                elements: [[{ tag: 'text', text: '请升级至最新版本客户端，以查看内容' }]],
+              }),
+            },
+          },
+        ],
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
+
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it('normalizes readback whitespace before matching final markdown', async () => {
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        if (!producer) return { messageId: 'om_stream' };
+        await producer({ setContent: async () => {} });
+        return { messageId: 'om_stream' };
+      },
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: '第一段\n\n第二段' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    h.channel.rawClient.im.v1.message.get.mockResolvedValue({
+      data: { items: [{ body: { content: streamingCardContent('第一段\n第二段') } }] },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
+
+    expect(h.channel.sent).toHaveLength(0);
   });
 
   it('does not fallback when final markdown stream readback fails', async () => {
@@ -441,6 +549,22 @@ function lastMarkdown(channel: FakeLarkChannel): string {
   const content = channel.sent.at(-1)?.content as { markdown?: string } | undefined;
   expect(content?.markdown).toBeTypeOf('string');
   return content?.markdown ?? '';
+}
+
+function streamingCardContent(markdown: string): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { streaming_mode: true },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          element_id: 'stream_md',
+          content: markdown,
+        },
+      ],
+    },
+  });
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
