@@ -925,6 +925,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       });
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
+      let latestMarkdown = renderMarkdownStreamText(latestState);
+      let markdownFlushes = 0;
       let producerStarted = false;
       let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
       const renderDone = processAgentStream(
@@ -936,22 +938,44 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         async (state) => {
           latestState = state;
           if (markdownCtrl) {
-            await markdownCtrl.setContent(renderMarkdownStreamText(filterForPrefs(state)));
+            const markdown = renderMarkdownStreamText(filterForPrefs(state));
+            latestMarkdown = markdown;
+            markdownFlushes++;
+            await markdownCtrl.setContent(markdown);
           }
         },
       );
-      const streamDone = channel.stream(
-        chatId,
-        {
-          markdown: async (ctrl) => {
-            producerStarted = true;
-            markdownCtrl = ctrl;
-            await ctrl.setContent(renderMarkdownStreamText(filterForPrefs(latestState)));
-            await renderDone;
+      const streamDone = channel
+        .stream(
+          chatId,
+          {
+            markdown: async (ctrl) => {
+              producerStarted = true;
+              markdownCtrl = ctrl;
+              const initialMarkdown = renderMarkdownStreamText(filterForPrefs(latestState));
+              latestMarkdown = initialMarkdown;
+              markdownFlushes++;
+              await ctrl.setContent(initialMarkdown);
+              const finalState = await renderDone;
+              log.info('stream', 'markdown-producer-final', {
+                terminal: finalState.terminal,
+                chars: latestMarkdown.length,
+                flushes: markdownFlushes,
+                hasRunningFooter: hasRunningFooter(latestMarkdown),
+              });
+            },
           },
-        },
-        sendOpts,
-      );
+          sendOpts,
+        )
+        .then((result) => {
+          log.info('stream', 'markdown-terminal-resolved', {
+            chars: latestMarkdown.length,
+            flushes: markdownFlushes,
+            hasRunningFooter: hasRunningFooter(latestMarkdown),
+            ...streamResultLogFields(result),
+          });
+          return result;
+        });
       await awaitRenderAwareStream({
         mode: replyMode,
         streamDone,
@@ -991,6 +1015,24 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
 function renderMarkdownStreamText(state: RunState): string {
   return renderText(state, { includeRunningFooter: false });
+}
+
+function hasRunningFooter(markdown: string): boolean {
+  return (
+    markdown.includes('正在思考') ||
+    markdown.includes('正在调用工具') ||
+    markdown.includes('正在输出')
+  );
+}
+
+function streamResultLogFields(result: unknown): Record<string, unknown> {
+  if (!result || typeof result !== 'object') return {};
+  const messageId = (result as { messageId?: unknown }).messageId;
+  const chunkIds = (result as { chunkIds?: unknown }).chunkIds;
+  return {
+    ...(typeof messageId === 'string' ? { messageId } : {}),
+    ...(Array.isArray(chunkIds) ? { chunkIds } : {}),
+  };
 }
 
 /**
