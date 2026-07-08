@@ -936,7 +936,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         async (state) => {
           latestState = state;
           if (markdownCtrl) {
-            await markdownCtrl.setContent(renderText(filterForPrefs(state)));
+            await markdownCtrl.setContent(renderMarkdownStreamText(filterForPrefs(state)));
           }
         },
       );
@@ -946,7 +946,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           markdown: async (ctrl) => {
             producerStarted = true;
             markdownCtrl = ctrl;
-            await ctrl.setContent(renderText(filterForPrefs(latestState)));
+            await ctrl.setContent(renderMarkdownStreamText(filterForPrefs(latestState)));
             await renderDone;
           },
         },
@@ -987,6 +987,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
+}
+
+function renderMarkdownStreamText(state: RunState): string {
+  return renderText(state, { includeRunningFooter: false });
 }
 
 /**
