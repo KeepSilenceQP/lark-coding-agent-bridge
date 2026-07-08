@@ -1,9 +1,10 @@
 import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../../src/agent/codex/adapter.js';
 import { buildCodexArgs } from '../../src/agent/codex/argv.js';
+import { log } from '../../src/core/logger.js';
 import type { AgentEvent } from '../../src/agent/types.js';
 
 interface FakeBinary {
@@ -408,6 +409,46 @@ describe('CodexAdapter process contract', () => {
     await iterator.return?.();
   });
 
+  it('logs stdout idle while the Codex child stays alive without new lines', async () => {
+    const fake = await createFakeCodex({
+      lines: [],
+      exitDelayMs: 5_000,
+    });
+    cleanup.push(fake.dir);
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const run = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      stdoutIdleProbeMs: 20,
+    }).run({
+      runId: 'run-stdout-idle',
+      prompt: 'idle',
+      cwd: await realpath(fake.dir),
+    });
+    const iterator = run.events[Symbol.asyncIterator]();
+    const next = iterator.next();
+
+    await waitFor(() =>
+      warn.mock.calls.some(
+        (call) =>
+          call[0] === 'agent' &&
+          call[1] === 'stdout-idle' &&
+          (call[2] as { childExitCode?: unknown; childSignalCode?: unknown } | undefined)
+            ?.childExitCode === null &&
+          (call[2] as { childExitCode?: unknown; childSignalCode?: unknown } | undefined)
+            ?.childSignalCode === null,
+      ),
+    );
+
+    await run.stop();
+    expect(await next).toEqual({
+      done: false,
+      value: { type: 'done', terminationReason: 'interrupted' },
+    });
+    await iterator.return?.();
+  });
+
   it('requires cwd to be resolved by policy before spawning', () => {
     expect(() =>
       new CodexAdapter({ binary: 'unused', profileStateDir: tmpdir() }).run({
@@ -499,4 +540,13 @@ async function readRecord(path: string): Promise<{
       PATH?: string;
     };
   };
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('timed out waiting for async work');
 }

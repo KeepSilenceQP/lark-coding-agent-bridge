@@ -62,7 +62,7 @@ interface FakeLarkChannel {
   getChatMode(chatId: string): Promise<'group' | 'topic'>;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
   send(chatId: string, content: unknown, options?: unknown): Promise<void>;
-  stream(chatId: string, input: unknown, options?: unknown): Promise<void>;
+  stream(chatId: string, input: unknown, options?: unknown): Promise<unknown>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
 }
@@ -184,6 +184,59 @@ describe('markdown stream startup failures', () => {
     expect(contents.length).toBeGreaterThan(0);
     expect(contents.some((content) => content.includes('正在输出'))).toBe(false);
     expect(contents.at(-1)).toContain('处理完成。');
+  });
+
+  it('sends a fallback reply when final markdown stream readback mismatches', async () => {
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        if (!producer) return { messageId: 'om_stream' };
+        await producer({ setContent: async () => {} });
+        return { messageId: 'om_stream' };
+      },
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: '最终答案。' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    h.channel.rawClient.im.v1.message.get.mockResolvedValue({
+      data: { items: [{ content: '旧的流式内容' }] },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.sent.length > 0);
+
+    expect(h.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({
+      path: { message_id: 'om_stream' },
+    });
+    expect(lastMarkdown(h.channel)).toContain('最终答案。');
+  });
+
+  it('does not fallback when final markdown stream readback fails', async () => {
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        if (!producer) return { messageId: 'om_stream' };
+        await producer({ setContent: async () => {} });
+        return { messageId: 'om_stream' };
+      },
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: '最终答案。' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    h.channel.rawClient.im.v1.message.get.mockRejectedValue(new Error('readback failed'));
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
+
+    expect(h.channel.sent).toHaveLength(0);
   });
 });
 

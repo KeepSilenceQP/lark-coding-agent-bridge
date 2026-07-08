@@ -65,6 +65,9 @@ import type { AppPaths } from '../config/app-paths';
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
+const FINAL_READBACK_RETRY_MS = 250;
+const FINAL_READBACK_TIMEOUT_MS = 2000;
+const TAIL_COMPARE_CHARS = 500;
 const REACTION_CLEANUP_GRACE_MS = 1000;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
@@ -981,6 +984,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         streamDone,
         renderDone,
         producerStarted: () => producerStarted,
+        verifyFinal: async (streamValue, state) =>
+          verifyMarkdownFinalReadback(
+            channel,
+            streamValue,
+            renderMarkdownStreamText(filterForPrefs(state)),
+          ),
         fallback: async (state) => {
           const body = renderText(filterForPrefs(state));
           if (body.trim()) {
@@ -1165,10 +1174,11 @@ async function awaitRenderAwareStream(input: {
   streamDone: Promise<unknown>;
   renderDone: Promise<RunState>;
   producerStarted: () => boolean;
+  verifyFinal?: (streamValue: unknown, state: RunState) => Promise<boolean | undefined>;
   fallback: (state: RunState) => Promise<void>;
 }): Promise<void> {
   const streamResult = input.streamDone.then(
-    () => ({ kind: 'stream' as const, ok: true as const }),
+    (value) => ({ kind: 'stream' as const, ok: true as const, value }),
     (err) => ({ kind: 'stream' as const, ok: false as const, err }),
   );
   const renderResult = input.renderDone.then(
@@ -1190,6 +1200,7 @@ async function awaitRenderAwareStream(input: {
   if (first.kind === 'stream') {
     const rendered = await renderResult;
     if (!rendered.ok) throw rendered.err;
+    await runFallbackOnFinalMismatch(input, first.value, rendered.state);
     return;
   }
 
@@ -1216,6 +1227,146 @@ async function awaitRenderAwareStream(input: {
     return;
   }
   if (!terminal.ok) throw terminal.err;
+  await runFallbackOnFinalMismatch(input, terminal.value, first.state);
+}
+
+async function runFallbackOnFinalMismatch(
+  input: {
+    mode: 'card' | 'markdown';
+    verifyFinal?: (streamValue: unknown, state: RunState) => Promise<boolean | undefined>;
+    fallback: (state: RunState) => Promise<void>;
+  },
+  streamValue: unknown,
+  state: RunState,
+): Promise<void> {
+  if (!input.verifyFinal) return;
+  const visible = await input.verifyFinal(streamValue, state);
+  if (visible === false) {
+    await runFallbackReply(input.mode, state, input.fallback);
+  }
+}
+
+async function verifyMarkdownFinalReadback(
+  channel: LarkChannel,
+  streamValue: unknown,
+  expected: string,
+): Promise<boolean | undefined> {
+  const messageId = streamMessageId(streamValue);
+  const chunkIds = streamChunkIds(streamValue);
+  if (!messageId) {
+    log.warn('stream', 'markdown-readback-skipped', {
+      reason: 'missing-message-id',
+      didRollover: chunkIds.length > 0,
+      chunkIds,
+    });
+    return undefined;
+  }
+
+  const first = await readMarkdownMessageText(channel, messageId, chunkIds);
+  if (first === undefined) return undefined;
+  if (markdownReadbackMatches(first, expected)) {
+    log.info('stream', 'markdown-readback-match', {
+      messageId,
+      didRollover: chunkIds.length > 0,
+      chunkIds,
+    });
+    return true;
+  }
+
+  await delay(FINAL_READBACK_RETRY_MS);
+  const second = await readMarkdownMessageText(channel, messageId, chunkIds);
+  if (second === undefined) return undefined;
+  const matches = markdownReadbackMatches(second, expected);
+  if (!matches) {
+    log.warn('stream', 'markdown-readback-mismatch', {
+      messageId,
+      didRollover: chunkIds.length > 0,
+      chunkIds,
+      liveTail: tailForLog(second),
+      expectedTail: tailForLog(expected),
+    });
+  }
+  return matches;
+}
+
+async function readMarkdownMessageText(
+  channel: LarkChannel,
+  messageId: string,
+  chunkIds: string[],
+): Promise<string | undefined> {
+  try {
+    const result = await Promise.race([
+      channel.rawClient.im.v1.message.get({ path: { message_id: messageId } }),
+      delay(FINAL_READBACK_TIMEOUT_MS).then(() => READBACK_TIMEOUT),
+    ]);
+    if (result === READBACK_TIMEOUT) {
+      log.warn('stream', 'markdown-readback-timeout', {
+        messageId,
+        timeoutMs: FINAL_READBACK_TIMEOUT_MS,
+        didRollover: chunkIds.length > 0,
+        chunkIds,
+      });
+      return undefined;
+    }
+    return extractMessageText(result);
+  } catch (err) {
+    log.fail('stream', err, {
+      step: 'markdown-readback',
+      messageId,
+      didRollover: chunkIds.length > 0,
+      chunkIds,
+    });
+    return undefined;
+  }
+}
+
+const READBACK_TIMEOUT = Symbol('readback-timeout');
+
+function streamMessageId(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const messageId = (value as { messageId?: unknown }).messageId;
+  return typeof messageId === 'string' ? messageId : undefined;
+}
+
+function streamChunkIds(value: unknown): string[] {
+  if (!value || typeof value !== 'object') return [];
+  const chunkIds = (value as { chunkIds?: unknown }).chunkIds;
+  return Array.isArray(chunkIds)
+    ? chunkIds.filter((chunkId): chunkId is string => typeof chunkId === 'string')
+    : [];
+}
+
+function extractMessageText(value: unknown): string {
+  const item = (value as { data?: { items?: Array<{ content?: unknown }> } } | undefined)?.data
+    ?.items?.[0];
+  const content = item?.content;
+  if (typeof content !== 'string') return '';
+  return `${content}\n${extractJsonText(content)}`.trim();
+}
+
+function extractJsonText(raw: string): string {
+  try {
+    return collectText(JSON.parse(raw)).join('\n');
+  } catch {
+    return '';
+  }
+}
+
+function collectText(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap(collectText);
+  if (!value || typeof value !== 'object') return [];
+  return Object.values(value).flatMap(collectText);
+}
+
+function markdownReadbackMatches(live: string, expected: string): boolean {
+  const expectedTail = tailForLog(expected.trim());
+  if (!expectedTail) return true;
+  return live.includes(expectedTail);
+}
+
+function tailForLog(value: string): string {
+  return value.slice(-TAIL_COMPARE_CHARS);
 }
 
 async function runFallbackReply(
