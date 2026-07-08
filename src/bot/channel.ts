@@ -1253,7 +1253,8 @@ async function verifyMarkdownFinalReadback(
 ): Promise<boolean | undefined> {
   const messageId = streamMessageId(streamValue);
   const chunkIds = streamChunkIds(streamValue);
-  if (!messageId) {
+  const readbackMessageId = streamReadbackMessageId(messageId, chunkIds);
+  if (!readbackMessageId) {
     log.warn('stream', 'markdown-readback-skipped', {
       reason: 'missing-message-id',
       didRollover: chunkIds.length > 0,
@@ -1262,11 +1263,12 @@ async function verifyMarkdownFinalReadback(
     return undefined;
   }
 
-  const first = await readMarkdownMessageText(channel, messageId, chunkIds);
+  const first = await readMarkdownMessageText(channel, readbackMessageId, messageId, chunkIds);
   if (first === undefined) return undefined;
   if (markdownReadbackMatches(first, expected)) {
     log.info('stream', 'markdown-readback-match', {
       messageId,
+      readbackMessageId,
       didRollover: chunkIds.length > 0,
       chunkIds,
     });
@@ -1274,12 +1276,13 @@ async function verifyMarkdownFinalReadback(
   }
 
   await delay(FINAL_READBACK_RETRY_MS);
-  const second = await readMarkdownMessageText(channel, messageId, chunkIds);
+  const second = await readMarkdownMessageText(channel, readbackMessageId, messageId, chunkIds);
   if (second === undefined) return undefined;
   const matches = markdownReadbackMatches(second, expected);
   if (!matches) {
     log.warn('stream', 'markdown-readback-mismatch', {
       messageId,
+      readbackMessageId,
       didRollover: chunkIds.length > 0,
       chunkIds,
       liveTail: tailForLog(second),
@@ -1291,28 +1294,43 @@ async function verifyMarkdownFinalReadback(
 
 async function readMarkdownMessageText(
   channel: LarkChannel,
-  messageId: string,
+  readbackMessageId: string,
+  messageId: string | undefined,
   chunkIds: string[],
 ): Promise<string | undefined> {
   try {
     const result = await Promise.race([
-      channel.rawClient.im.v1.message.get({ path: { message_id: messageId } }),
+      channel.rawClient.im.v1.message.get({
+        path: { message_id: readbackMessageId },
+        params: { card_msg_content_type: 'user_card_content' },
+      }),
       delay(FINAL_READBACK_TIMEOUT_MS).then(() => READBACK_TIMEOUT),
     ]);
     if (result === READBACK_TIMEOUT) {
       log.warn('stream', 'markdown-readback-timeout', {
         messageId,
+        readbackMessageId,
         timeoutMs: FINAL_READBACK_TIMEOUT_MS,
         didRollover: chunkIds.length > 0,
         chunkIds,
       });
       return undefined;
     }
-    return extractMessageText(result);
+    const text = extractMessageText(result);
+    if (text === undefined) {
+      log.warn('stream', 'markdown-readback-unsupported-content', {
+        messageId,
+        readbackMessageId,
+        didRollover: chunkIds.length > 0,
+        chunkIds,
+      });
+    }
+    return text;
   } catch (err) {
     log.fail('stream', err, {
       step: 'markdown-readback',
       messageId,
+      readbackMessageId,
       didRollover: chunkIds.length > 0,
       chunkIds,
     });
@@ -1336,19 +1354,33 @@ function streamChunkIds(value: unknown): string[] {
     : [];
 }
 
-function extractMessageText(value: unknown): string {
-  const item = (value as { data?: { items?: Array<{ content?: unknown }> } } | undefined)?.data
-    ?.items?.[0];
-  const content = item?.content;
-  if (typeof content !== 'string') return '';
-  return `${content}\n${extractJsonText(content)}`.trim();
+function streamReadbackMessageId(
+  messageId: string | undefined,
+  chunkIds: string[],
+): string | undefined {
+  return chunkIds.at(-1) ?? messageId;
 }
 
-function extractJsonText(raw: string): string {
+function extractMessageText(value: unknown): string | undefined {
+  const item = (
+    value as
+      | { data?: { items?: Array<{ content?: unknown; body?: { content?: unknown } }> } }
+      | undefined
+  )?.data?.items?.[0];
+  const content = item?.content ?? item?.body?.content;
+  if (typeof content !== 'string') return undefined;
+  const parsed = parseJson(content);
+  if (isUnsupportedInteractiveCardContent(parsed)) return undefined;
+  const extracted = parsed === undefined ? '' : collectText(parsed).join('\n');
+  const text = `${content}\n${extracted}`.trim();
+  return text || undefined;
+}
+
+function parseJson(raw: string): unknown {
   try {
-    return collectText(JSON.parse(raw)).join('\n');
+    return JSON.parse(raw);
   } catch {
-    return '';
+    return undefined;
   }
 }
 
@@ -1359,14 +1391,38 @@ function collectText(value: unknown): string[] {
   return Object.values(value).flatMap(collectText);
 }
 
+function isUnsupportedInteractiveCardContent(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (record.type === 'card') return true;
+  if (typeof record.card_id === 'string') return true;
+  const data = record.data;
+  if (data && typeof data === 'object' && typeof (data as { card_id?: unknown }).card_id === 'string') {
+    return true;
+  }
+  return isDowngradedInteractiveCard(value);
+}
+
+function isDowngradedInteractiveCard(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (record.schema === '2.0' || record.body !== undefined) return false;
+  if (!('elements' in record)) return false;
+  return collectText(value).some((text) => text.includes('请升级至最新版本客户端，以查看内容'));
+}
+
 function markdownReadbackMatches(live: string, expected: string): boolean {
-  const expectedTail = tailForLog(expected.trim());
+  const expectedTail = tailForLog(normalizeReadbackText(expected));
   if (!expectedTail) return true;
-  return live.includes(expectedTail);
+  return normalizeReadbackText(live).includes(expectedTail);
 }
 
 function tailForLog(value: string): string {
   return value.slice(-TAIL_COMPARE_CHARS);
+}
+
+function normalizeReadbackText(value: string): string {
+  return value.trim().replace(/\s+/g, ' ');
 }
 
 async function runFallbackReply(
