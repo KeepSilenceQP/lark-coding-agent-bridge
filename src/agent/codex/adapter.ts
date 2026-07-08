@@ -27,10 +27,12 @@ export interface CodexAdapterOptions {
   ignoreRules?: boolean;
   sandbox?: SandboxMode;
   stopGraceMs?: number;
+  stdoutIdleProbeMs?: number;
   larkChannel?: LarkChannelEnvContext;
 }
 
 type CodexChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
+const DEFAULT_STDOUT_IDLE_PROBE_MS = 60_000;
 
 export class CodexAdapter implements AgentAdapter {
   readonly id = 'codex';
@@ -44,6 +46,7 @@ export class CodexAdapter implements AgentAdapter {
   private readonly ignoreRules: boolean;
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
+  private readonly stdoutIdleProbeMs: number;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
   private botIdentity: AgentBotIdentity | undefined;
 
@@ -56,6 +59,7 @@ export class CodexAdapter implements AgentAdapter {
     this.ignoreRules = opts.ignoreRules !== false;
     this.sandbox = opts.sandbox ?? 'danger-full-access';
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
+    this.stdoutIdleProbeMs = opts.stdoutIdleProbeMs ?? DEFAULT_STDOUT_IDLE_PROBE_MS;
     this.larkChannel = opts.larkChannel;
   }
 
@@ -157,7 +161,13 @@ export class CodexAdapter implements AgentAdapter {
 
     return {
       runId: opts.runId,
-      events: createEventStream(child, stderrChunks, () => runtimeError, () => stopReason),
+      events: createEventStream(
+        child,
+        stderrChunks,
+        () => runtimeError,
+        () => stopReason,
+        this.stdoutIdleProbeMs,
+      ),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
         stopReason = 'interrupted';
@@ -206,6 +216,7 @@ async function* createEventStream(
   stderrChunks: Buffer[],
   getError: () => Error | null,
   getStopReason: () => CodexFinishReason | undefined,
+  stdoutIdleProbeMs: number,
 ): AsyncGenerator<AgentEvent> {
   const translator = new CodexJsonlTranslator();
   if (!child.pid) {
@@ -220,6 +231,21 @@ async function* createEventStream(
 
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
   let sawStdout = false;
+  let lastStdoutAt = Date.now();
+  const stdoutIdleTimer =
+    stdoutIdleProbeMs > 0
+      ? setInterval(() => {
+          const idleMs = Date.now() - lastStdoutAt;
+          if (idleMs < stdoutIdleProbeMs) return;
+          log.warn('agent', 'stdout-idle', {
+            pid: child.pid ?? null,
+            idleMs,
+            childExitCode: child.exitCode,
+            childSignalCode: child.signalCode,
+          });
+          lastStdoutAt = Date.now();
+        }, stdoutIdleProbeMs)
+      : undefined;
   let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
   const closeSilentStdout = (): void => {
     silentExitTimer = setTimeout(() => {
@@ -230,6 +256,7 @@ async function* createEventStream(
   try {
     for await (const line of rl) {
       sawStdout = true;
+      lastStdoutAt = Date.now();
       const trimmed = line.trim();
       if (!trimmed) continue;
       let parsed: unknown;
@@ -241,6 +268,7 @@ async function* createEventStream(
       yield* translator.translate(parsed);
     }
   } finally {
+    if (stdoutIdleTimer) clearInterval(stdoutIdleTimer);
     if (silentExitTimer) clearTimeout(silentExitTimer);
     child.removeListener('exit', closeSilentStdout);
     rl.close();
