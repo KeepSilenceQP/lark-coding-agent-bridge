@@ -216,47 +216,31 @@ describe('markdown stream startup failures', () => {
     expect(lastMarkdown(h.channel)).toContain('最终答案。');
   });
 
-  it('reads back the tail rollover chunk before deciding final markdown is visible', async () => {
+  it('skips readback for likely markdown rollover when stream returns no chunk ids', async () => {
+    const finalText = '最终答案。'.repeat(9000);
     const h = await createHarness({
       stream: async (_chatId, input) => {
         const producer = (input as {
           markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
         }).markdown;
-        if (!producer) return { messageId: 'om_head', chunkIds: ['om_head', 'om_tail'] };
+        if (!producer) return { messageId: 'om_head' };
         await producer({ setContent: async () => {} });
-        return { messageId: 'om_head', chunkIds: ['om_head', 'om_tail'] };
+        return { messageId: 'om_head' };
       },
     });
     h.agent.setEvents([
-      { type: 'text', delta: '最终答案。' },
+      { type: 'text', delta: finalText },
       { type: 'done', terminationReason: 'normal' },
     ]);
-    h.channel.rawClient.im.v1.message.get.mockImplementation(async (req) => {
-      const messageId = (req as { path?: { message_id?: string } }).path?.message_id;
-      return {
-        data: {
-          items: [
-            {
-              body: {
-                content:
-                  messageId === 'om_tail'
-                    ? streamingCardContent('最终答案。')
-                    : streamingCardContent('旧的 head 内容'),
-              },
-            },
-          ],
-        },
-      };
+    h.channel.rawClient.im.v1.message.get.mockResolvedValue({
+      data: { items: [{ body: { content: streamingCardContent('旧的 head 内容') } }] },
     });
     await startTestBridge(h);
 
     await h.channel.handlers.message?.(message('om_first', 'first'));
     await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
 
-    expect(h.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({
-      path: { message_id: 'om_tail' },
-      params: { card_msg_content_type: 'user_card_content' },
-    });
+    expect(h.channel.rawClient.im.v1.message.get).not.toHaveBeenCalled();
     expect(h.channel.sent).toHaveLength(0);
   });
 
