@@ -68,6 +68,10 @@ const STREAM_TERMINAL_GRACE_MS = 3000;
 const FINAL_READBACK_RETRY_MS = 250;
 const FINAL_READBACK_TIMEOUT_MS = 2000;
 const TAIL_COMPARE_CHARS = 500;
+// Mirrors @larksuite/channel's DEFAULT_MAX_ELEMENT_CHARS for markdown streaming
+// cards. When final markdown exceeds this, the SDK rolls over internally but
+// currently returns only the head messageId from MarkdownStreamController.run().
+const MARKDOWN_STREAM_MAX_ELEMENT_CHARS = 30_000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
@@ -1262,6 +1266,16 @@ async function verifyMarkdownFinalReadback(
     });
     return undefined;
   }
+  if (isLikelyUntrackedMarkdownRollover(expected, chunkIds)) {
+    log.warn('stream', 'markdown-readback-skipped', {
+      reason: 'likely-rollover-without-chunk-ids',
+      messageId,
+      readbackMessageId,
+      chars: expected.length,
+      maxElementChars: MARKDOWN_STREAM_MAX_ELEMENT_CHARS,
+    });
+    return undefined;
+  }
 
   const first = await readMarkdownMessageText(channel, readbackMessageId, messageId, chunkIds);
   if (first === undefined) return undefined;
@@ -1359,6 +1373,10 @@ function streamReadbackMessageId(
   chunkIds: string[],
 ): string | undefined {
   return chunkIds.at(-1) ?? messageId;
+}
+
+function isLikelyUntrackedMarkdownRollover(expected: string, chunkIds: string[]): boolean {
+  return chunkIds.length === 0 && expected.length > MARKDOWN_STREAM_MAX_ELEMENT_CHARS;
 }
 
 function extractMessageText(value: unknown): string | undefined {
