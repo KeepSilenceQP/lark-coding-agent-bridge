@@ -157,7 +157,7 @@ describe('markdown stream startup failures', () => {
     );
   }, 10_000);
 
-  it('does not persist running footers in markdown stream content', async () => {
+  it('preserves running footer in live markdown stream updates', async () => {
     const contents: string[] = [];
     const h = await createHarness({
       stream: async (_chatId, input) => {
@@ -182,11 +182,11 @@ describe('markdown stream startup failures', () => {
     await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
 
     expect(contents.length).toBeGreaterThan(0);
-    expect(contents.some((content) => content.includes('正在输出'))).toBe(false);
+    expect(contents.some((content) => content.includes('正在输出'))).toBe(true);
     expect(contents.at(-1)).toContain('处理完成。');
   });
 
-  it('sends a fallback reply when final markdown stream readback mismatches', async () => {
+  it('does not fallback when CardKit readback rewrites markdown text', async () => {
     const h = await createHarness({
       stream: async (_chatId, input) => {
         const producer = (input as {
@@ -198,22 +198,34 @@ describe('markdown stream startup failures', () => {
       },
     });
     h.agent.setEvents([
+      { type: 'tool_use', id: 'tool_1', name: 'command_execution', input: 'git status' },
+      { type: 'tool_result', id: 'tool_1', output: 'ok', isError: false },
       { type: 'text', delta: '最终答案。' },
       { type: 'done', terminationReason: 'normal' },
     ]);
     h.channel.rawClient.im.v1.message.get.mockResolvedValue({
-      data: { items: [{ content: '旧的流式内容' }] },
+      data: {
+        items: [
+          {
+            body: {
+              content: streamingCardContent(
+                '> ✅ **command_****execution** — git status\n\n最终答案。',
+              ),
+            },
+          },
+        ],
+      },
     });
     await startTestBridge(h);
 
     await h.channel.handlers.message?.(message('om_first', 'first'));
-    await waitFor(() => h.channel.sent.length > 0);
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
 
     expect(h.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({
       path: { message_id: 'om_stream' },
       params: { card_msg_content_type: 'user_card_content' },
     });
-    expect(lastMarkdown(h.channel)).toContain('最终答案。');
+    expect(h.channel.sent).toHaveLength(0);
   });
 
   it('skips readback for likely markdown rollover when stream returns no chunk ids', async () => {

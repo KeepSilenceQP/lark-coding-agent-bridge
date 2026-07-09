@@ -1027,7 +1027,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 }
 
 function renderMarkdownStreamText(state: RunState): string {
-  return renderText(state, { includeRunningFooter: false });
+  return renderText(state);
 }
 
 function hasRunningFooter(markdown: string): boolean {
@@ -1246,7 +1246,7 @@ async function runFallbackOnFinalMismatch(
   if (!input.verifyFinal) return;
   const visible = await input.verifyFinal(streamValue, state);
   if (visible === false) {
-    await runFallbackReply(input.mode, state, input.fallback);
+    log.warn('stream', 'final-readback-mismatch-no-fallback', { mode: input.mode });
   }
 }
 
