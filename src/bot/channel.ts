@@ -4,6 +4,7 @@ import type {
   NormalizedMessage,
 } from '@larksuite/channel';
 import { createLarkChannel } from '@larksuite/channel';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import { modelLabel, normalizeModelSelection, resolveModelArg } from '../agent/models';
@@ -83,6 +84,7 @@ const TAIL_COMPARE_CHARS = 500;
 // currently returns only the head messageId from MarkdownStreamController.run().
 const MARKDOWN_STREAM_MAX_ELEMENT_CHARS = 30_000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
+const STREAM_HASH_HEX_CHARS = 12;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
   '你在 bridge 进程中运行，普通 lark-cli 会继承 LARK_CHANNEL=1 并进入 bridge-bound 模式。',
@@ -169,6 +171,188 @@ function stringifyArgs(args: unknown[]): string {
       }
     })
     .join(' ');
+}
+
+type RawClientCall = (request: unknown) => Promise<unknown>;
+type RawMethodOwner = Record<string, RawClientCall | undefined>;
+
+interface RawClientShape {
+  cardkit?: {
+    v1?: {
+      card?: RawMethodOwner;
+      cardElement?: RawMethodOwner;
+    };
+  };
+  im?: {
+    v1?: {
+      message?: RawMethodOwner;
+    };
+  };
+}
+
+const STREAM_DIAG_WRAPPED = Symbol('streamDiagWrapped');
+
+function installCardkitStreamDiagnostics(channel: LarkChannel): void {
+  const raw = channel.rawClient as RawClientShape;
+  wrapRawClientCall(
+    raw.cardkit?.v1?.card,
+    'create',
+    'cardkit-card-create',
+    summarizeCardCreateRequest,
+  );
+  wrapRawClientCall(
+    raw.cardkit?.v1?.cardElement,
+    'content',
+    'cardkit-card-element-content',
+    summarizeCardElementContentRequest,
+  );
+  wrapRawClientCall(
+    raw.cardkit?.v1?.card,
+    'settings',
+    'cardkit-card-settings',
+    summarizeCardSettingsRequest,
+  );
+  wrapRawClientCall(
+    raw.im?.v1?.message,
+    'create',
+    'im-message-create',
+    summarizeImCreateRequest,
+  );
+  wrapRawClientCall(
+    raw.im?.v1?.message,
+    'reply',
+    'im-message-reply',
+    summarizeImReplyRequest,
+  );
+}
+
+function wrapRawClientCall(
+  owner: RawMethodOwner | undefined,
+  method: string,
+  event: string,
+  summarize: (request: unknown) => Record<string, unknown>,
+): void {
+  const original = owner?.[method] as (RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean }) | undefined;
+  if (!owner || !original || original[STREAM_DIAG_WRAPPED]) return;
+
+  const wrapped = async function wrappedRawClientCall(this: unknown, request: unknown): Promise<unknown> {
+    const fields = summarize(request);
+    const start = Date.now();
+    log.info('stream-diag', `${event}-request`, fields);
+    try {
+      const result = await original.call(this, request);
+      log.info('stream-diag', `${event}-result`, {
+        ...fields,
+        durationMs: Date.now() - start,
+        ...summarizeApiResult(result),
+      });
+      return result;
+    } catch (err) {
+      log.fail('stream-diag', err, {
+        step: event,
+        durationMs: Date.now() - start,
+        ...fields,
+      });
+      throw err;
+    }
+  } as RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean };
+  wrapped[STREAM_DIAG_WRAPPED] = true;
+  owner[method] = wrapped;
+}
+
+function summarizeCardCreateRequest(request: unknown): Record<string, unknown> {
+  const data = recordAt(request, 'data');
+  const rawCard = stringAt(data, 'data');
+  return {
+    cardType: stringAt(data, 'type'),
+    ...textLogFields('cardJson', rawCard),
+  };
+}
+
+function summarizeCardElementContentRequest(request: unknown): Record<string, unknown> {
+  const path = recordAt(request, 'path');
+  const data = recordAt(request, 'data');
+  const content = stringAt(data, 'content');
+  return {
+    cardId: stringAt(path, 'card_id'),
+    elementId: stringAt(path, 'element_id'),
+    sequence: numberAt(data, 'sequence'),
+    uuid: stringAt(data, 'uuid'),
+    ...textLogFields('content', content),
+  };
+}
+
+function summarizeCardSettingsRequest(request: unknown): Record<string, unknown> {
+  const path = recordAt(request, 'path');
+  const data = recordAt(request, 'data');
+  const settings = stringAt(data, 'settings');
+  return {
+    cardId: stringAt(path, 'card_id'),
+    sequence: numberAt(data, 'sequence'),
+    uuid: stringAt(data, 'uuid'),
+    streamingMode: parseStreamingMode(settings),
+    ...textLogFields('settings', settings),
+  };
+}
+
+function summarizeImCreateRequest(request: unknown): Record<string, unknown> {
+  const params = recordAt(request, 'params');
+  const data = recordAt(request, 'data');
+  const content = stringAt(data, 'content');
+  return {
+    receiveIdType: stringAt(params, 'receive_id_type'),
+    receiveId: stringAt(data, 'receive_id'),
+    msgType: stringAt(data, 'msg_type'),
+    ...textLogFields('content', content),
+  };
+}
+
+function summarizeImReplyRequest(request: unknown): Record<string, unknown> {
+  const path = recordAt(request, 'path');
+  const data = recordAt(request, 'data');
+  const content = stringAt(data, 'content');
+  return {
+    replyToMessageId: stringAt(path, 'message_id'),
+    msgType: stringAt(data, 'msg_type'),
+    ...textLogFields('content', content),
+  };
+}
+
+function summarizeApiResult(result: unknown): Record<string, unknown> {
+  const data = recordAt(result, 'data');
+  return {
+    code: numberAt(result, 'code') ?? numberAt(data, 'code'),
+    msg: stringAt(result, 'msg') ?? stringAt(result, 'message') ?? stringAt(data, 'msg'),
+    cardId: stringAt(data, 'card_id'),
+    messageId: stringAt(data, 'message_id'),
+    requestId: stringAt(result, 'request_id') ?? stringAt(data, 'request_id'),
+  };
+}
+
+function recordAt(value: unknown, key: string): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const child = (value as Record<string, unknown>)[key];
+  return child && typeof child === 'object' ? (child as Record<string, unknown>) : undefined;
+}
+
+function stringAt(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === 'string' ? field : undefined;
+}
+
+function numberAt(value: unknown, key: string): number | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === 'number' ? field : undefined;
+}
+
+function parseStreamingMode(settings: string | undefined): boolean | undefined {
+  if (!settings) return undefined;
+  const parsed = parseJson(settings);
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const config = (parsed as { config?: { streaming_mode?: unknown } }).config;
+  return typeof config?.streaming_mode === 'boolean' ? config.streaming_mode : undefined;
 }
 
 export interface BridgeChannel {
@@ -275,6 +459,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   };
 
   const channel = createLarkChannel(opts);
+  installCardkitStreamDiagnostics(channel);
   const media = new MediaCache(channel, deps.appPaths?.mediaDir);
 
   // Pending → run handoff: while a run is active on a chat, block its pending
@@ -1159,7 +1344,40 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       let latestMarkdown = renderMarkdownStreamText(latestState);
       let markdownFlushes = 0;
       let producerStarted = false;
+      let lastSetContent:
+        | ({ flush: number; phase: string; durationMs: number } & ReturnType<typeof textLogFields>)
+        | undefined;
       let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
+      const setMarkdownContent = async (
+        phase: 'initial' | 'update' | 'terminal',
+        markdown: string,
+      ): Promise<void> => {
+        if (!markdownCtrl) return;
+        latestMarkdown = markdown;
+        markdownFlushes++;
+        const flush = markdownFlushes;
+        const start = Date.now();
+        try {
+          await markdownCtrl.setContent(markdown);
+          lastSetContent = {
+            flush,
+            phase,
+            durationMs: Date.now() - start,
+            ...textLogFields('markdown', markdown),
+          };
+          if (phase !== 'update') {
+            log.info('stream', 'markdown-set-content', lastSetContent);
+          }
+        } catch (err) {
+          log.fail('stream', err, {
+            step: 'markdown-set-content',
+            flush,
+            phase,
+            ...textLogFields('markdown', markdown),
+          });
+          throw err;
+        }
+      };
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -1170,9 +1388,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           latestState = state;
           if (markdownCtrl) {
             const markdown = renderMarkdownStreamText(filterForPrefs(state));
-            latestMarkdown = markdown;
-            markdownFlushes++;
-            await markdownCtrl.setContent(markdown);
+            await setMarkdownContent(state.terminal === 'running' ? 'update' : 'terminal', markdown);
           }
         },
       );
@@ -1184,15 +1400,17 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
               producerStarted = true;
               markdownCtrl = ctrl;
               const initialMarkdown = renderMarkdownStreamText(filterForPrefs(latestState));
-              latestMarkdown = initialMarkdown;
-              markdownFlushes++;
-              await ctrl.setContent(initialMarkdown);
+              await setMarkdownContent('initial', initialMarkdown);
               const finalState = await renderDone;
+              const finalMarkdown = renderMarkdownStreamText(filterForPrefs(finalState));
               log.info('stream', 'markdown-producer-final', {
                 terminal: finalState.terminal,
                 chars: latestMarkdown.length,
                 flushes: markdownFlushes,
                 hasRunningFooter: hasRunningFooter(latestMarkdown),
+                finalMatchesLatest: finalMarkdown === latestMarkdown,
+                ...textLogFields('finalMarkdown', finalMarkdown),
+                lastSetContent,
               });
             },
           },
@@ -1203,6 +1421,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             chars: latestMarkdown.length,
             flushes: markdownFlushes,
             hasRunningFooter: hasRunningFooter(latestMarkdown),
+            ...textLogFields('latestMarkdown', latestMarkdown),
+            lastSetContent,
             ...streamResultLogFields(result),
           });
           return result;
@@ -1606,41 +1826,51 @@ async function verifyMarkdownFinalReadback(
     return undefined;
   }
 
-  const first = await readMarkdownMessageText(channel, readbackMessageId, messageId, chunkIds);
+  const first = await readMarkdownMessageSnapshot(channel, readbackMessageId, messageId, chunkIds);
   if (first === undefined) return undefined;
-  if (markdownReadbackMatches(first, expected)) {
+  if (markdownReadbackMatches(first.text, expected)) {
     log.info('stream', 'markdown-readback-match', {
       messageId,
       readbackMessageId,
       didRollover: chunkIds.length > 0,
       chunkIds,
+      ...readbackLogFields(first, expected),
     });
     return true;
   }
 
   await delay(FINAL_READBACK_RETRY_MS);
-  const second = await readMarkdownMessageText(channel, readbackMessageId, messageId, chunkIds);
+  const second = await readMarkdownMessageSnapshot(channel, readbackMessageId, messageId, chunkIds);
   if (second === undefined) return undefined;
-  const matches = markdownReadbackMatches(second, expected);
+  const matches = markdownReadbackMatches(second.text, expected);
   if (!matches) {
     log.warn('stream', 'markdown-readback-mismatch', {
       messageId,
       readbackMessageId,
       didRollover: chunkIds.length > 0,
       chunkIds,
-      liveTail: tailForLog(second),
+      ...readbackLogFields(second, expected),
+      liveTail: tailForLog(second.text),
       expectedTail: tailForLog(expected),
     });
   }
   return matches;
 }
 
-async function readMarkdownMessageText(
+interface MarkdownReadbackSnapshot {
+  text: string;
+  messageType?: string;
+  createTime?: string;
+  updateTime?: string;
+  rawContent?: string;
+}
+
+async function readMarkdownMessageSnapshot(
   channel: LarkChannel,
   readbackMessageId: string,
   messageId: string | undefined,
   chunkIds: string[],
-): Promise<string | undefined> {
+): Promise<MarkdownReadbackSnapshot | undefined> {
   try {
     const result = await Promise.race([
       channel.rawClient.im.v1.message.get({
@@ -1659,6 +1889,7 @@ async function readMarkdownMessageText(
       });
       return undefined;
     }
+    const item = firstMessageItem(result);
     const text = extractMessageText(result);
     if (text === undefined) {
       log.warn('stream', 'markdown-readback-unsupported-content', {
@@ -1666,9 +1897,14 @@ async function readMarkdownMessageText(
         readbackMessageId,
         didRollover: chunkIds.length > 0,
         chunkIds,
+        ...messageItemMetadata(item),
       });
+      return undefined;
     }
-    return text;
+    return {
+      text,
+      ...messageItemMetadata(item),
+    };
   } catch (err) {
     log.fail('stream', err, {
       step: 'markdown-readback',
@@ -1708,19 +1944,60 @@ function isLikelyUntrackedMarkdownRollover(expected: string, chunkIds: string[])
   return chunkIds.length === 0 && expected.length > MARKDOWN_STREAM_MAX_ELEMENT_CHARS;
 }
 
-function extractMessageText(value: unknown): string | undefined {
+function readbackLogFields(
+  snapshot: MarkdownReadbackSnapshot,
+  expected: string,
+): Record<string, unknown> {
+  const expectedTail = tailForLog(normalizeReadbackText(expected));
+  const normalizedLive = normalizeReadbackText(snapshot.text);
+  return {
+    messageType: snapshot.messageType,
+    createTime: snapshot.createTime,
+    updateTime: snapshot.updateTime,
+    expectedTailPresent: expectedTail ? normalizedLive.includes(expectedTail) : true,
+    liveHasRunningFooter: hasRunningFooter(snapshot.text),
+    ...textLogFields('live', snapshot.text),
+    ...textLogFields('expected', expected),
+    ...textLogFields('rawContent', snapshot.rawContent),
+  };
+}
+
+function firstMessageItem(value: unknown): Record<string, unknown> | undefined {
   const item = (
     value as
-      | { data?: { items?: Array<{ content?: unknown; body?: { content?: unknown } }> } }
+      | { data?: { items?: Array<Record<string, unknown>> } }
       | undefined
   )?.data?.items?.[0];
-  const content = item?.content ?? item?.body?.content;
+  return item && typeof item === 'object' ? item : undefined;
+}
+
+function messageItemMetadata(item: Record<string, unknown> | undefined): Omit<MarkdownReadbackSnapshot, 'text'> {
+  if (!item) return {};
+  const content = messageItemRawContent(item);
+  return {
+    messageType: typeof item.message_type === 'string' ? item.message_type : undefined,
+    createTime: typeof item.create_time === 'string' ? item.create_time : undefined,
+    updateTime: typeof item.update_time === 'string' ? item.update_time : undefined,
+    rawContent: typeof content === 'string' ? content : undefined,
+  };
+}
+
+function extractMessageText(value: unknown): string | undefined {
+  const item = firstMessageItem(value);
+  const content = item ? messageItemRawContent(item) : undefined;
   if (typeof content !== 'string') return undefined;
   const parsed = parseJson(content);
   if (isUnsupportedInteractiveCardContent(parsed)) return undefined;
   const extracted = parsed === undefined ? '' : collectText(parsed).join('\n');
   const text = `${content}\n${extracted}`.trim();
   return text || undefined;
+}
+
+function messageItemRawContent(item: Record<string, unknown>): unknown {
+  const body = item.body;
+  return item.content ?? (body && typeof body === 'object'
+    ? (body as { content?: unknown }).content
+    : undefined);
 }
 
 function parseJson(raw: string): unknown {
@@ -1762,6 +2039,20 @@ function markdownReadbackMatches(live: string, expected: string): boolean {
   const expectedTail = tailForLog(normalizeReadbackText(expected));
   if (!expectedTail) return true;
   return normalizeReadbackText(live).includes(expectedTail);
+}
+
+function textLogFields(prefix: string, value: string | undefined): Record<string, unknown> {
+  if (value === undefined) return {};
+  return {
+    [`${prefix}Chars`]: value.length,
+    [`${prefix}Hash`]: textHash(value),
+    [`${prefix}HasRunningFooter`]: hasRunningFooter(value),
+    [`${prefix}Tail`]: tailForLog(value),
+  };
+}
+
+function textHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, STREAM_HASH_HEX_CHARS);
 }
 
 function tailForLog(value: string): string {
