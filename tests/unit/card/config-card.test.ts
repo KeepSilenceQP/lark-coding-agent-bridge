@@ -80,6 +80,7 @@ function options(groupResponseMode: ConfigFormOpts['groupResponseMode']): Config
 function opts(overrides: Partial<ConfigFormOpts> & { groupResponseMode: ConfigFormOpts['groupResponseMode'] }): ConfigFormOpts {
   return {
     agentKind: 'claude',
+    mode: overrides.mode ?? 'personal',
     model: 'default',
     messageReply: 'markdown',
     showToolCalls: true,
