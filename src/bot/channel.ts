@@ -1220,7 +1220,8 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     }
   }
   // Carry the (possibly backfilled) threadId on the message so the batched
-  // flush — which reads `firstMsg.threadId` for reply routing and CoT — sees it.
+  // flush — which reads `firstMsg.threadId` for reply routing and topic scope —
+  // sees it.
   const emsg: NormalizedMessage = threadId === msg.threadId ? msg : { ...msg, threadId };
   // Some groups are converted into topic groups after creation. In that state
   // getChatMode can lag behind the message event shape, so threadId is the
@@ -1758,10 +1759,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       const cotPublisher = new CotPublisher({
         client: cotClient,
         chatId,
-        // Mirror sendOpts.replyInThread: in topic groups the CoT bubble must be
-        // addressed to the thread so it lands inside the topic, not at the
-        // group top level.
-        ...(mode === 'topic' && threadId ? { threadId } : {}),
+        // The CoT bubble follows this origin message's thread. In a topic the
+        // triggering message is itself in-topic, so the bubble lands in the
+        // topic; message_cot has no thread_id receive type, so origin is the
+        // only lever we have (see CotClient.create).
         originMessageId: lastMsg.messageId,
         runId: execution.runId,
         scope,

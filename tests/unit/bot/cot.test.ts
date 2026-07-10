@@ -90,27 +90,64 @@ describe('COT event mapping', () => {
       .toContain('echo hello');
   });
 
-  it('forwards the topic thread id to CoT create so the bubble lands in the topic', async () => {
+  it('creates the CoT bubble once, addressed to the origin message in a topic', async () => {
     const client = new FakeCotClient();
     const publisher = new CotPublisher({
       client,
       chatId: 'oc_chat',
-      threadId: 'omt_topic',
-      originMessageId: 'om_origin',
+      // In a topic the trigger message is itself in-topic, so the bubble
+      // inherits its thread. No thread_id is passed — message_cot rejects it.
+      originMessageId: 'om_in_topic',
       runId: 'run-topic',
       scope: 'oc_chat:omt_topic',
       inputPreview: 'in a topic',
     });
     await publisher.start();
 
-    expect(client.createCalls[0]).toEqual({
-      chatId: 'oc_chat',
-      originMessageId: 'om_origin',
-      threadId: 'omt_topic',
-    });
+    // Exactly one create — never a second (that would render a duplicate).
+    expect(client.createCalls).toEqual([
+      { chatId: 'oc_chat', originMessageId: 'om_in_topic' },
+    ]);
+    expect(publisher.disabled).toBe(false);
   });
 
-  it('addresses CoT create to the thread in topics and the chat otherwise', async () => {
+  it('disables the publisher when the create is rejected and never retries', async () => {
+    const client = new FakeCotClient();
+    client.failCreate = new Error('COT API failed: code=10002 msg=Bot/User can NOT be out of the chat.');
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      runId: 'run-rejected',
+      scope: 'oc_chat:omt_topic',
+      inputPreview: 'in a topic',
+    });
+    await publisher.start();
+
+    expect(client.createCalls).toHaveLength(1);
+    expect(publisher.disabled).toBe(true);
+  });
+
+  it('disables the publisher when the create returns unusable ids and never retries', async () => {
+    const client = new FakeCotClient();
+    // code=0 response missing cot_id/message_id: the bubble may exist
+    // server-side, so a second create would render a duplicate.
+    client.createResult = { unexpected: 'shape' };
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      runId: 'run-missing-ids',
+      scope: 'oc_chat',
+      inputPreview: 'run',
+    });
+    await publisher.start();
+
+    expect(client.createCalls).toHaveLength(1);
+    expect(publisher.disabled).toBe(true);
+  });
+
+  it('addresses CoT create to the chat with the origin message id', async () => {
     const client = new CotClient({ tenant: 'feishu', appId: 'app', appSecret: 'secret' });
     const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
     // Intercept the HTTP layer so we assert only how create() shapes the request.
@@ -119,14 +156,11 @@ describe('COT event mapping', () => {
       return { cot_id: 'cot_x', message_id: 'om_x' };
     };
 
-    await client.create('oc_chat', 'om_origin', 'omt_topic');
-    expect(calls[0]?.path).toContain('receive_id_type=thread_id');
-    expect(calls[0]?.body).toMatchObject({ receive_id: 'omt_topic', origin_message_id: 'om_origin' });
-
-    calls.length = 0;
     await client.create('oc_chat', 'om_origin');
     expect(calls[0]?.path).toContain('receive_id_type=chat_id');
-    expect(calls[0]?.body).toMatchObject({ receive_id: 'oc_chat' });
+    // thread_id is never a valid receive type for message_cot.
+    expect(calls[0]?.path).not.toContain('thread_id');
+    expect(calls[0]?.body).toMatchObject({ receive_id: 'oc_chat', origin_message_id: 'om_origin' });
   });
 
   it('marks the publisher degraded when COT updates fail', async () => {
@@ -156,12 +190,15 @@ describe('COT event mapping', () => {
 class FakeCotClient {
   events: Array<{ event_type: string; content: string; timestamp: number }> = [];
   completed: string[] = [];
-  createCalls: Array<{ chatId: string; originMessageId?: string; threadId?: string }> = [];
+  createCalls: Array<{ chatId: string; originMessageId?: string }> = [];
   failUpdate: Error | undefined;
+  failCreate: Error | undefined;
+  createResult: Record<string, unknown> | undefined;
 
-  async create(chatId: string, originMessageId?: string, threadId?: string): Promise<Record<string, unknown>> {
-    this.createCalls.push({ chatId, originMessageId, threadId });
-    return { cot_id: 'cot_fake', message_id: 'om_cot_fake' };
+  async create(chatId: string, originMessageId?: string): Promise<Record<string, unknown>> {
+    this.createCalls.push({ chatId, originMessageId });
+    if (this.failCreate) throw this.failCreate;
+    return this.createResult ?? { cot_id: 'cot_fake', message_id: 'om_cot_fake' };
   }
 
   async update(_ref: unknown, events: readonly { event_type: string; content: string; timestamp: number }[]): Promise<void> {

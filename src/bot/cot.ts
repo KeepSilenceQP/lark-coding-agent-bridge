@@ -12,6 +12,10 @@ const ENDPOINTS: Record<TenantBrand, string> = {
 const COT_UPDATE_THROTTLE_MS = 600;
 const COT_TOOL_OUTPUT_MAX = 1200;
 const COT_TEXT_MAX = 1200;
+// Bounds every CoT HTTP call. Without it a hung message_cot endpoint pins
+// start() — which runs before any agent event is drained and before the
+// plain-reply fallback — to undici's ~300s default.
+const COT_REQUEST_TIMEOUT_MS = 15_000;
 
 export class CotClient {
   private readonly baseUrl: string;
@@ -33,6 +37,7 @@ export class CotClient {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
+      signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
     });
     if (!resp.ok) throw new Error(`tenant token HTTP ${resp.status}`);
     const data = await resp.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
@@ -48,6 +53,7 @@ export class CotClient {
   async request(path: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
     const token = await this.tenantToken();
     const resp = await fetch(`${this.baseUrl}${path}`, {
+      signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
       ...init,
       headers: {
         'Content-Type': 'application/json;charset=utf-8',
@@ -65,22 +71,23 @@ export class CotClient {
     return data.data ?? data;
   }
 
-  async create(
-    chatId: string,
-    originMessageId?: string,
-    threadId?: string,
-  ): Promise<Record<string, unknown>> {
-    // In topic groups the CoT bubble must be addressed to the thread, otherwise
-    // it lands at the group top level instead of inside the topic the user is
-    // in. Feishu routes into a thread via receive_id_type=thread_id with the
-    // omt_* thread id as receive_id (same mechanism as sending into a thread);
-    // fall back to chat_id for regular chats.
-    const receiveIdType = threadId ? 'thread_id' : 'chat_id';
-    const receiveId = threadId ?? chatId;
-    return this.request(`/open-apis/im/v1/message_cot?receive_id_type=${receiveIdType}`, {
+  async create(chatId: string, originMessageId?: string): Promise<Record<string, unknown>> {
+    // message_cot only accepts receive_id_type=chat_id. thread_id is NOT a
+    // valid receive type for this endpoint (it exists only on the forward
+    // APIs) — addressing the create to an omt_* thread id is rejected with
+    // code=10002 "Bot/User can NOT be out of the chat" (the backend tries to
+    // resolve the omt_* id as a chat the bot belongs to and finds none).
+    //
+    // Placement inside a topic is instead governed by origin_message_id: the
+    // bubble inherits the topic of the message it originates from. Passing an
+    // in-topic message id keeps the bubble in the topic; the topic's root
+    // (首楼) message has no thread of its own, so a bubble originated from it
+    // lands at the group top level. Callers pick origin_message_id
+    // accordingly.
+    return this.request('/open-apis/im/v1/message_cot?receive_id_type=chat_id', {
       method: 'POST',
       body: JSON.stringify({
-        receive_id: receiveId,
+        receive_id: chatId,
         ...(originMessageId ? { origin_message_id: originMessageId } : {}),
       }),
     });
@@ -122,7 +129,6 @@ interface CotEvent {
 export class CotPublisher {
   private readonly client: Pick<CotClient, 'create' | 'update' | 'complete'>;
   readonly chatId: string;
-  readonly threadId: string | undefined;
   readonly originMessageId: string;
   readonly runId: string;
   readonly scope: string;
@@ -137,7 +143,6 @@ export class CotPublisher {
   constructor(opts: {
     client: Pick<CotClient, 'create' | 'update' | 'complete'>;
     chatId: string;
-    threadId?: string;
     originMessageId: string;
     runId: string;
     scope: string;
@@ -145,7 +150,6 @@ export class CotPublisher {
   }) {
     this.client = opts.client;
     this.chatId = opts.chatId;
-    this.threadId = opts.threadId;
     this.originMessageId = opts.originMessageId;
     this.runId = opts.runId;
     this.scope = opts.scope;
@@ -153,28 +157,40 @@ export class CotPublisher {
   }
 
   async start(): Promise<void> {
+    // Single chat_id-addressed create. In topics the bubble follows
+    // originMessageId's thread (see CotClient.create); the caller passes an
+    // in-topic origin so it lands in the topic. On any failure we disable CoT
+    // and let the caller fall back to a plain reply — never retry, since a
+    // create that failed after committing server-side would leave a duplicate
+    // bubble spinning forever.
+    let created: Record<string, unknown>;
     try {
-      const created = await this.client.create(this.chatId, this.originMessageId, this.threadId);
-      const cotId = stringValue(created.cot_id ?? created.cotId);
-      const messageId = stringValue(created.message_id ?? created.messageId);
-      if (!cotId || !messageId) {
-        throw new Error(`CreateCOT missing ids: ${JSON.stringify(created).slice(0, 200)}`);
-      }
-      this.ref = { cotId, messageId };
-      log.info('cot', 'created', { cotId, messageId });
-      this.enqueue('RUN_STARTED', {
-        threadId: this.scope,
-        runId: this.runId,
-        input: { query: this.inputPreview },
-      });
-      this.enqueue('STEP_STARTED', {
-        stepId: `step-understand-${this.runId}`,
-        stepName: '理解用户问题',
-      });
+      created = await this.client.create(this.chatId, this.originMessageId);
     } catch (err) {
       this.disabled = true;
       log.warn('cot', 'create-failed', { err: err instanceof Error ? err.message : String(err) });
+      return;
     }
+    const cotId = stringValue(created.cot_id ?? created.cotId);
+    const messageId = stringValue(created.message_id ?? created.messageId);
+    if (!cotId || !messageId) {
+      this.disabled = true;
+      log.warn('cot', 'create-failed', {
+        err: `CreateCOT missing ids: ${JSON.stringify(created).slice(0, 200)}`,
+      });
+      return;
+    }
+    this.ref = { cotId, messageId };
+    log.info('cot', 'created', { cotId, messageId });
+    this.enqueue('RUN_STARTED', {
+      threadId: this.scope,
+      runId: this.runId,
+      input: { query: this.inputPreview },
+    });
+    this.enqueue('STEP_STARTED', {
+      stepId: `step-understand-${this.runId}`,
+      stepName: '理解用户问题',
+    });
   }
 
   enqueue(eventType: string, content: unknown): void {
