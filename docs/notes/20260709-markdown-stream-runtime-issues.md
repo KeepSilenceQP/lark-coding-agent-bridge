@@ -136,16 +136,13 @@ Current logs are not rich enough to reliably separate these subtypes without ins
 ### 4. Fix Status
 
 - Duplicate fallback risk fixed by no longer sending text fallback.
-- Stale final card not fixed.
+- Real stale final readback is now repaired on the original CardKit entity, without sending a duplicate message.
+- The bridge records the SDK's `message_id -> card_id` correlation and the latest observed sequence. After two supported readbacks confirm that the expected final tail is absent, it performs one full `card.update` with `streaming_mode=false` and `sequence+1`, then reads the same message back again.
+- Canonicalized matches, downgraded/unsupported card content, readback failures, missing card correlation, and likely untracked rollover do not trigger a blind repair.
 
 ### 5. Next Plan
 
-- Split mismatch classification:
-  - "readback canonicalized but final text present"
-  - "readback stale and final text absent"
-  - "readback unsupported/downgraded"
-  - "readback timeout"
-- Add enough runtime fields to classify without guessing.
+- Deploy and verify a real stale-card occurrence produces `markdown-readback-repair-request`, `card.update code=0`, and `markdown-readback-repair-verified visible=true` for the same message.
 
 ## Issue 3: Codex Child Process Alive But No stdout / Card Stays Thinking
 
@@ -198,6 +195,8 @@ Previous attempted fixes were wrong:
 - For a completed turn, the adapter also reads the persisted `final_answer` item and emits it if stdout did not already deliver that exact text, then synthesizes the normal terminal event. The existing post-done cleanup stops the lingering CLI child.
 - A baseline turn, an `inProgress` turn, a failed baseline probe, or a run with no substantive event cannot be treated as completed.
 - Bad hard-timeout and global-serialization fixes remain dropped; the recovery is based on Codex's persisted terminal fact, not elapsed wall time or reduced concurrency.
+- The metadata-only startup subtype is now also recoverable, but under a narrower replay guard. At startup timeout the bridge stops and cleans up the old execution, then checks the latest turn through `thread/read`. It retries the identical prompt once only when the turn is new, has status `interrupted` or `failed`, and has exactly zero persisted items.
+- A turn that is still `inProgress`, contains any user/agent/tool item, matches the baseline, or cannot be probed is never replayed. This prevents duplicating side effects from a run that may actually have started.
 
 ### 5. Next Plan
 
@@ -217,5 +216,5 @@ Previous attempted fixes were wrong:
 | # | 问题 | 现象 | 关键 runtime 信息 | 当前结论 | 修复情况 | 下一步 |
 |---|---|---|---|---|---|---|
 | 1 | 任务完成但卡片没更新最终内容 | Codex 已完成，飞书卡片仍停在旧的工具调用/运行态内容 | `trace=8k2mhyaz` / `clujpjym` / `9csdgepc`；最新现场在卡片创建 605.784 秒后从 sequence 43 起持续返回 `300309` | 根因已确认：CardKit 10 分钟自动关闭 streaming；`@larksuite/channel@0.3.0` 忽略业务响应码，继续伪成功 finish | 已在 bridge CardKit 边界修复：`300309` / `200850` 后同卡全量更新；后续快照直达全量路径；最终恢复仍失败时触发 Markdown fallback | 全量测试、部署；下一次 >10 分钟 run 验证 `expiry -> card.update code=0 -> final readback match` |
-| 2 | 多个正常 run 出现 final readback mismatch | run 正常结束，但 readback 和期望 markdown 不一致，有些可能是真 stale，有些只是 CardKit 改写 | `yp61vkyr`、`2lhybkem`、`94dzimie`、`4wemjyzo`、`8k2mhyaz`，均 `didRollover=false`、`chunkIds=[]` | `markdown-readback-mismatch` 是症状，不是单一根因；需要区分“内容存在但被改写”和“最终内容确实没落地” | 仅避免了后续重复 fallback；消息中断根因未闭环 | 把 mismatch 分类，并补充足够 runtime 字段 |
-| 3 | Codex 子进程活着但 stdout 无终态 | 卡片一直 thinking/running，进程还在但没有 terminal event | `e59vesuq` 的持久化 turn 已 `completed` 且含 final answer，但 `codex exec resume --json` 无 terminal/EOF；`7shw6nug` 是 metadata-only 启动子类 | 根因边界已确认：bridge 只信 stdout，无法处理“持久化已完成、stdout 终态丢失”的 split-brain | 已补 app-server 终态对账：pre-run baseline + substantive-event guard + new terminal turn；缺失 final answer 时一并补发；startup 子类仍由独立 watchdog 处理 | 部署；下一次现场验证 `agent.terminal-recovered`、最终卡片正文和 running footer 均正确 |
+| 2 | 多个正常 run 出现 final readback mismatch | run 正常结束，但 readback 和期望 markdown 不一致，有些可能是真 stale，有些只是 CardKit 改写 | `yp61vkyr`、`2lhybkem`、`94dzimie`、`4wemjyzo`、`8k2mhyaz`，均 `didRollover=false`、`chunkIds=[]` | `markdown-readback-mismatch` 是症状；只有受支持 readback 连续确认 final tail 缺失才属于可修复 stale | 已记录 message/card/sequence 关联并对真实 stale 做同卡 `card.update` + 再回读；不发送重复消息 | 部署并验证真实现场的 same-card repair 日志闭环 |
+| 3 | Codex 子进程活着但 stdout 无终态 | 卡片一直 thinking/running，进程还在但没有 terminal event | `e59vesuq` 的持久化 turn 已 `completed` 且含 final answer；`7shw6nug` 的官方 turn 状态为 `interrupted` 且 `items=[]` | 分为“持久化已完成但 stdout 丢终态”和“metadata-only 空 turn”两个子类 | 前者用 app-server 终态对账；后者仅在新 terminal turn 且 `items=[]` 时停止旧 execution 后单次续跑 | 部署；分别验证 `terminal-recovered` 和 `no-output-retry-check safe=true -> startup-timeout-retry-started` |
