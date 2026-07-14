@@ -38,7 +38,6 @@ import {
   getMaxConcurrentRuns,
   getMessageReplyMode,
   getRequireMentionInGroup,
-  getRunIdleTimeoutMs,
   getShowToolCalls,
 } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
@@ -52,10 +51,16 @@ import { canRunBotAdminCommand, canUseDm, canUseGroup } from '../policy/access';
 import type { ScopeContext } from '../policy/run-policy';
 import { createOwnerRefreshController } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
+import {
+  consumeDeferredServiceRestart,
+  launchDeferredServiceRestart,
+  requestDeferredServiceRestart,
+} from '../runtime/deferred-service-restart';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
+import { resolveRunIdleTimeoutMs, resolveRunStartupTimeoutMs } from './run-idle-timeout';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
@@ -561,7 +566,9 @@ export interface StartChannelDeps {
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   controls: Controls;
-  appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'>;
+  appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'> &
+    Partial<Pick<AppPaths, 'profileDir'>>;
+  launchDeferredRestart?: (profile: string) => void;
 }
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
@@ -574,6 +581,29 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // so /config bumps take effect for the next run.
   const pool = new ProcessPool(() => getMaxConcurrentRuns(controls.cfg));
   const executor = new RunExecutor({ agent, pool, activeRuns });
+  let activeBatchCount = 0;
+  let deferredRestartLaunching = false;
+
+  const maybeLaunchDeferredRestart = async (): Promise<void> => {
+    const profileDir = deps.appPaths?.profileDir;
+    if (!profileDir || activeBatchCount !== 0 || deferredRestartLaunching) return;
+    const requested = await consumeDeferredServiceRestart(profileDir, process.pid);
+    if (!requested) return;
+    // Another scope may have started while the marker read yielded to the
+    // event loop. Put the request back and let the final active batch consume
+    // it, so a restart can never cut across a newly-started reply.
+    if (activeBatchCount !== 0) {
+      await requestDeferredServiceRestart(profileDir, {
+        profile: controls.profile,
+        bridgePid: process.pid,
+        requestedAt: new Date().toISOString(),
+      });
+      return;
+    }
+    deferredRestartLaunching = true;
+    log.info('service', 'deferred-restart-launch', { profile: controls.profile });
+    (deps.launchDeferredRestart ?? launchDeferredServiceRestart)(controls.profile);
+  };
 
   // Resolve the App Secret to plaintext. The config field can be a literal
   // string, a "${VAR}" template, or a {source, id} SecretRef referencing
@@ -665,6 +695,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     const firstMsg = batch[0];
     if (!firstMsg) return;
     pending.block(scope);
+    activeBatchCount += 1;
     void withTrace({ chatId: firstMsg.chatId }, async () => {
       log.info('flush', 'start', {
         scope,
@@ -708,6 +739,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         log.fail('flush', err);
       } finally {
         pending.unblock(scope);
+        activeBatchCount = Math.max(0, activeBatchCount - 1);
+        await maybeLaunchDeferredRestart().catch((err) =>
+          log.fail('service', err, { step: 'deferred-restart' }),
+        );
         log.info('flush', 'end');
       }
     });
@@ -1392,14 +1427,17 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // Resolve idle-timeout for this run: scope override (on SessionEntry) wins
   // over global default (preferences). 0 / undefined = no watchdog.
   const scopeOverride = sessions.getIdleTimeoutMinutes(scope);
-  const idleTimeoutMs =
-    scopeOverride !== undefined
-      ? scopeOverride > 0
-        ? scopeOverride * 60_000
-        : undefined
-      : getRunIdleTimeoutMs(controls.cfg);
+  const idleTimeoutMs = resolveRunIdleTimeoutMs(
+    controls.cfg,
+    scopeOverride,
+    capability.agentId,
+  );
+  const startupTimeoutMs = resolveRunStartupTimeoutMs(capability.agentId);
   if (idleTimeoutMs) {
     log.info('flush', 'idle-watchdog', { idleTimeoutMs });
+  }
+  if (startupTimeoutMs) {
+    log.info('flush', 'startup-watchdog', { startupTimeoutMs });
   }
 
   const replyMode = getMessageReplyMode(controls.cfg);
@@ -1459,6 +1497,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           eventStream,
           scope,
           idleTimeoutMs,
+          startupTimeoutMs,
           recordSession,
           async () => {},
         );
@@ -1497,6 +1536,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         eventStream,
         scope,
         idleTimeoutMs,
+        startupTimeoutMs,
         recordSession,
         async (state) => {
           latestState = state;
@@ -1577,6 +1617,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         eventStream,
         scope,
         idleTimeoutMs,
+        startupTimeoutMs,
         recordSession,
         async (state) => {
           latestState = state;
@@ -1648,6 +1689,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         eventStream,
         scope,
         idleTimeoutMs,
+        startupTimeoutMs,
         recordSession,
         async () => {},
       );
@@ -1796,11 +1838,12 @@ function streamResultLogFields(result: unknown): Record<string, unknown> {
  * on every state transition. Used by both card and markdown reply modes —
  * the only difference between the two is what `flush` does with the state.
  */
-async function processAgentStream(
+export async function processAgentStream(
   handle: RunHandle,
   events: AsyncIterable<AgentEvent>,
   scope: string,
   idleTimeoutMs: number | undefined,
+  startupTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
   flush: (state: RunState) => Promise<void>,
 ): Promise<RunState> {
@@ -1823,26 +1866,46 @@ async function processAgentStream(
   //  - any non-tool event arrives while the set is empty.
   let idleFired = false;
   let timer: NodeJS.Timeout | undefined;
+  let startupFired = false;
+  let startupTimer: NodeJS.Timeout | undefined;
   const inFlightTools = new Set<string>();
+  const stopForTimeout = (kind: 'idle' | 'startup', timeoutMs: number): void => {
+    if (idleFired || startupFired) return;
+    if (kind === 'idle') idleFired = true;
+    else startupFired = true;
+    handle.interrupted = true;
+    log.warn('agent', `${kind}-timeout`, { scope, timeoutMs });
+    void handle.run.stop().catch(() => {
+      /* stop errors are non-fatal */
+    });
+  };
   const armOrPauseIdle = (): void => {
     if (!idleTimeoutMs) return;
     if (timer) clearTimeout(timer);
     timer = undefined;
     if (inFlightTools.size > 0) return;
     timer = setTimeout(() => {
-      idleFired = true;
-      handle.interrupted = true;
-      log.warn('agent', 'idle-timeout', { scope, idleTimeoutMs });
-      void handle.run.stop().catch(() => {
-        /* stop errors are non-fatal */
-      });
+      stopForTimeout('idle', idleTimeoutMs);
     }, idleTimeoutMs);
   };
   armOrPauseIdle();
+  if (startupTimeoutMs) {
+    startupTimer = setTimeout(() => {
+      stopForTimeout('startup', startupTimeoutMs);
+    }, startupTimeoutMs);
+  }
 
   try {
     for await (const evt of events) {
       if (handle.interrupted) break;
+
+      // Codex can emit thread/task metadata and then permanently stop making
+      // progress when a broken resume transcript is loaded. Metadata alone
+      // does not prove startup completed; any substantive event does.
+      if (evt.type !== 'system' && evt.type !== 'usage' && startupTimer) {
+        clearTimeout(startupTimer);
+        startupTimer = undefined;
+      }
 
       // Track tool flight before re-arming the idle timer so the arm step
       // sees the correct set size. tool_use opens a window; tool_result
@@ -1892,6 +1955,7 @@ async function processAgentStream(
     }
   } finally {
     if (timer) clearTimeout(timer);
+    if (startupTimer) clearTimeout(startupTimer);
   }
 
   // If state already reached a terminal event (done/error/etc.) before the
@@ -1899,8 +1963,9 @@ async function processAgentStream(
   // wins. This avoids "claude finished but flush was slow → timer fired
   // mid-flush → user sees 'idle_timeout' on a successful run".
   if (state.terminal === 'running') {
-    if (idleFired) {
-      state = markIdleTimeout(state, Math.round(idleTimeoutMs! / 60_000));
+    if (idleFired || startupFired) {
+      const timeoutMs = startupFired ? startupTimeoutMs! : idleTimeoutMs!;
+      state = markIdleTimeout(state, Math.round(timeoutMs / 60_000));
     } else if (handle.interrupted) {
       state = markInterrupted(state);
     } else {

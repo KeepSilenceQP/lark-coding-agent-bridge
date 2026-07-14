@@ -6,6 +6,7 @@ import { createDefaultProfileConfig } from '../../../src/config/profile-schema.j
 import { log } from '../../../src/core/logger.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
+import { requestDeferredServiceRestart } from '../../../src/runtime/deferred-service-restart.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
 
@@ -96,6 +97,40 @@ describe('markdown stream startup failures', () => {
     );
     expect(lastMarkdown(h.channel)).toContain('agent 失败');
     expect(lastMarkdown(h.channel)).toContain('codex exited with code 1');
+  });
+
+  it('launches a deferred self-restart only after the terminal reply is rendered', async () => {
+    const contents: string[] = [];
+    const launchDeferredRestart = vi.fn();
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        if (!producer) return;
+        await producer({
+          setContent: async (markdown: string) => {
+            contents.push(markdown);
+          },
+        });
+      },
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: '重启前的最终回复。' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    await requestDeferredServiceRestart(h.tmp.profile, {
+      profile: 'codex',
+      bridgePid: process.pid,
+      requestedAt: new Date().toISOString(),
+    });
+    await startTestBridge(h, launchDeferredRestart);
+
+    await h.channel.handlers.message?.(message('om_restart', 'restart'));
+    await waitFor(() => launchDeferredRestart.mock.calls.length === 1);
+
+    expect(contents.at(-1)).toContain('重启前的最终回复。');
+    expect(launchDeferredRestart).toHaveBeenCalledWith('codex');
   });
 
   it('does not wait for the working reaction before draining a failed agent run', async () => {
@@ -445,18 +480,26 @@ async function createHarness(options: {
 }
 
 async function startTestBridge(h: {
+  tmp: TmpProfile;
   profileConfig: ReturnType<typeof createDefaultProfileConfig>;
   agent: FakeAgentAdapter;
   sessions: SessionStore;
   workspaces: WorkspaceStore;
   controls: ReturnType<typeof createControls>;
-}): Promise<void> {
+}, launchDeferredRestart?: (profile: string) => void): Promise<void> {
   const bridge = await startChannel({
     cfg: h.profileConfig,
     agent: h.agent,
     sessions: h.sessions,
     workspaces: h.workspaces,
     controls: h.controls,
+    appPaths: {
+      secretsFile: join(h.tmp.profile, 'secrets.enc'),
+      keystoreSaltFile: join(h.tmp.profile, '.keystore.salt'),
+      mediaDir: join(h.tmp.profile, 'media'),
+      profileDir: h.tmp.profile,
+    },
+    launchDeferredRestart,
   });
   cleanups.push(() => bridge.disconnect());
 }

@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServiceAdapter } from '../../../src/daemon/service-adapter';
 import type { ProcessEntry } from '../../../src/runtime/registry';
@@ -13,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   stopProcessEntry: vi.fn(),
   readActiveProfile: vi.fn(),
   loadRootConfig: vi.fn(),
+  rootDir: '/tmp/lark-channel-home',
 }));
 
 vi.mock('../../../src/daemon/service-adapter', () => ({
@@ -43,7 +47,9 @@ vi.mock('../../../src/config/profile-store', () => ({
 
 vi.mock('../../../src/config/paths', () => ({
   paths: {
-    rootDir: '/tmp/lark-channel-home',
+    get rootDir() {
+      return mocks.rootDir;
+    },
     configFile: '/tmp/lark-channel-home/config.json',
     profile: 'claude',
   },
@@ -58,11 +64,12 @@ vi.mock('../../../src/cli/preflight', () => ({
   preFlightChecks: mocks.preFlightChecks,
 }));
 
-const { runServiceStart, runServiceStatus, runServiceUnregister } = await import('../../../src/cli/commands/service');
+const { runServiceRestart, runServiceStart, runServiceStatus, runServiceUnregister } = await import('../../../src/cli/commands/service');
 
 describe('profile-aware service commands', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.rootDir = '/tmp/lark-channel-home';
     mocks.adapter = {
       platformName: 'mock',
       fileExists: vi.fn(() => true),
@@ -504,7 +511,62 @@ describe('profile-aware service commands', () => {
     expect(lines).toContain('✓ 已清除后台运行注册');
     expect(lines).toContain('  (配置 / 日志 / 会话保留在 /tmp/lark-channel-home)');
   });
+
+  it('defers a same-profile bridge-bound restart instead of killing its active run', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'bridge-service-restart-'));
+    mocks.rootDir = root;
+    (mocks.adapter.isRunning as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    mocks.readAndPrune
+      .mockReturnValueOnce([])
+      .mockReturnValue([
+        processEntry({
+          id: 'p2',
+          pid: 54321,
+          appId: 'cli_codex',
+          profileName: 'codex-dev',
+          agentKind: 'codex',
+          botName: 'Codex Bot',
+        }),
+      ]);
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => lines.push(line));
+    const previous = {
+      channel: process.env.LARK_CHANNEL,
+      profile: process.env.LARK_CHANNEL_PROFILE,
+      home: process.env.LARK_CHANNEL_HOME,
+      bridgePid: process.env.LARK_CHANNEL_BRIDGE_PID,
+    };
+    process.env.LARK_CHANNEL = '1';
+    process.env.LARK_CHANNEL_PROFILE = 'codex-dev';
+    process.env.LARK_CHANNEL_HOME = root;
+    process.env.LARK_CHANNEL_BRIDGE_PID = '1234';
+
+    try {
+      await runServiceRestart({ profile: 'codex-dev' });
+
+      expect(mocks.adapter.restart).not.toHaveBeenCalled();
+      const marker = JSON.parse(
+        await readFile(
+          join(root, 'profiles', 'codex-dev', '.deferred-service-restart.json'),
+          'utf8',
+        ),
+      ) as Record<string, unknown>;
+      expect(marker).toMatchObject({ profile: 'codex-dev', bridgePid: 1234 });
+      expect(lines.join('\n')).toContain('当前任务完成后重启');
+    } finally {
+      restoreEnv('LARK_CHANNEL', previous.channel);
+      restoreEnv('LARK_CHANNEL_PROFILE', previous.profile);
+      restoreEnv('LARK_CHANNEL_HOME', previous.home);
+      restoreEnv('LARK_CHANNEL_BRIDGE_PID', previous.bridgePid);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
+
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}
 
 function processEntry(overrides: Partial<ProcessEntry>): ProcessEntry {
   return {

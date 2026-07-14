@@ -411,6 +411,7 @@ export function createRuntimeAgent(
       ? {
           profile: appPaths.profile,
           rootDir: appPaths.rootDir,
+          bridgePid: process.pid,
           ...(larkChannelConfigPath ? { configPath: larkChannelConfigPath } : {}),
           ...(appPaths.larkCliConfigDir ? { larkCliConfigDir: appPaths.larkCliConfigDir } : {}),
           ...(appPaths.larkCliSourceConfigFile
