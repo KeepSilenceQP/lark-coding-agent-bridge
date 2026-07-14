@@ -256,6 +256,33 @@ export class CodexAdapter implements AgentAdapter {
           child.once('exit', onExit);
         });
       },
+      async canRetryAfterNoOutput(): Promise<boolean> {
+        if (!opts.threadId || !terminalProbe) return false;
+        try {
+          const latest = await terminalProbe(opts.threadId);
+          const safe = Boolean(
+            latest &&
+            latest.id !== preparedProbe?.turnId &&
+            (latest.status === 'interrupted' || latest.status === 'failed') &&
+            latest.itemCount === 0,
+          );
+          log.warn('agent', 'no-output-retry-check', {
+            threadId: opts.threadId,
+            baselineTurnId: preparedProbe?.turnId,
+            turnId: latest?.id,
+            turnStatus: latest?.status,
+            itemCount: latest?.itemCount,
+            safe,
+          });
+          return safe;
+        } catch (error) {
+          log.warn('agent', 'no-output-retry-check-failed', {
+            threadId: opts.threadId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          return false;
+        }
+      },
     };
   }
 }
