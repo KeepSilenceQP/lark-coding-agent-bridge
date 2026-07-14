@@ -164,6 +164,15 @@ Concrete case previously inspected:
 - Logs: repeated `agent.stdout-idle`, `childExitCode=null`, `childSignalCode=null`
 - Manual action taken: killed stale `74358/74359`; bridge then unblocked the queue and removed reaction.
 
+Second confirmed case reconstructed from the historical Codex session:
+
+- Trace: `e59vesuq`
+- Session: `019f40cc-68ef-7551-bead-f0981b0c124d`
+- Run started at `2026-07-08 18:09Z`.
+- Codex persisted a final answer at `18:38:15Z` and marked turn `c69d4615-efa0-458b-8df3-86e07f97fbea` completed at `18:38:16Z`.
+- The bridge-side `codex exec resume --json` process did not deliver a terminal event or close stdout, so the child remained alive until external interruption at `20:18Z`.
+- The same completed turn and its `final_answer` item are readable through the supported Codex app-server API.
+
 Additional possibly related but not yet classified case:
 
 - Trace: `8fs7agd1`
@@ -172,7 +181,9 @@ Additional possibly related but not yet classified case:
 
 ### 3. Current Analysis
 
-This is a separate class from the stale final card issue. It may involve Codex child process/stdout/event stream behavior under bridge, but root cause is not proven.
+This is a separate class from the stale final card issue. Historical case `e59vesuq` proves a split-brain terminal state at the Codex process boundary: the persisted Codex turn was complete while `codex exec resume --json` neither emitted the terminal event nor closed stdout. The bridge previously trusted stdout as its only terminal authority, so it could not finalize the card or release the run.
+
+`7shw6nug` is a different startup subtype: it produced metadata only and no substantive agent event. It is covered by the separate Codex startup watchdog and must not be used to weaken the terminal reconciliation safeguards below.
 
 Previous attempted fixes were wrong:
 
@@ -181,21 +192,18 @@ Previous attempted fixes were wrong:
 
 ### 4. Fix Status
 
-- Not fixed.
-- Bad fixes were dropped from branch history.
-- Manual kill resolved the specific stuck run, but that was operational cleanup, not a root-cause fix.
+- Fixed at the bridge/Codex boundary without parsing Codex rollout JSONL.
+- Before a resumed run starts, the adapter records the latest persisted turn ID through Codex's supported app-server `thread/read` API.
+- After stdout becomes idle, and only after this run has emitted a substantive text/tool event, the adapter checks the same API. It recovers only when the latest turn is new relative to the pre-run baseline and has a terminal status.
+- For a completed turn, the adapter also reads the persisted `final_answer` item and emits it if stdout did not already deliver that exact text, then synthesizes the normal terminal event. The existing post-done cleanup stops the lingering CLI child.
+- A baseline turn, an `inProgress` turn, a failed baseline probe, or a run with no substantive event cannot be treated as completed.
+- Bad hard-timeout and global-serialization fixes remain dropped; the recovery is based on Codex's persisted terminal fact, not elapsed wall time or reduced concurrency.
 
 ### 5. Next Plan
 
-- Gather multiple confirmed stdout-idle traces before proposing code changes.
-- For each confirmed trace, record:
-  - spawn command and cwd
-  - session ID and resume state
-  - whether first assistant/tool/card event was emitted
-  - process tree and open file descriptors while stuck
-  - Codex JSONL session tail
-  - bridge queue state and scope
-- Only propose a fix after the stuck layer is proven.
+- Deploy the adapter recovery and confirm the next real occurrence logs `agent.terminal-recovered` with thread ID, new turn ID, persisted status, and idle duration.
+- Verify the resulting Lark card contains the persisted final answer and no running footer.
+- Keep collecting stdout-idle cases that do not satisfy the recovery guard; those indicate a different producer-side failure and must not be force-completed.
 
 ## Cross-Issue Notes
 
@@ -210,4 +218,4 @@ Previous attempted fixes were wrong:
 |---|---|---|---|---|---|---|
 | 1 | 任务完成但卡片没更新最终内容 | Codex 已完成，飞书卡片仍停在旧的工具调用/运行态内容 | `trace=8k2mhyaz` / `clujpjym` / `9csdgepc`；最新现场在卡片创建 605.784 秒后从 sequence 43 起持续返回 `300309` | 根因已确认：CardKit 10 分钟自动关闭 streaming；`@larksuite/channel@0.3.0` 忽略业务响应码，继续伪成功 finish | 已在 bridge CardKit 边界修复：`300309` / `200850` 后同卡全量更新；后续快照直达全量路径；最终恢复仍失败时触发 Markdown fallback | 全量测试、部署；下一次 >10 分钟 run 验证 `expiry -> card.update code=0 -> final readback match` |
 | 2 | 多个正常 run 出现 final readback mismatch | run 正常结束，但 readback 和期望 markdown 不一致，有些可能是真 stale，有些只是 CardKit 改写 | `yp61vkyr`、`2lhybkem`、`94dzimie`、`4wemjyzo`、`8k2mhyaz`，均 `didRollover=false`、`chunkIds=[]` | `markdown-readback-mismatch` 是症状，不是单一根因；需要区分“内容存在但被改写”和“最终内容确实没落地” | 仅避免了后续重复 fallback；消息中断根因未闭环 | 把 mismatch 分类，并补充足够 runtime 字段 |
-| 3 | Codex 子进程活着但 stdout 无终态 | 卡片一直 thinking/running，进程还在但没有 terminal event | `trace=7shw6nug`，`runId=81c77a0c...`，PID `74358/74359`，多次 `stdout-idle`；另有 `8fs7agd1` 仅疑似 | 和 stale card 是不同类问题；hard timeout 和串行化都不是根因修复 | 未修；当时只手动 kill 释放队列；错误的 hard-timeout/串行化提交已丢弃 | 收集多个确认 trace，记录进程树、session tail、fd、queue/scope 后再判断 |
+| 3 | Codex 子进程活着但 stdout 无终态 | 卡片一直 thinking/running，进程还在但没有 terminal event | `e59vesuq` 的持久化 turn 已 `completed` 且含 final answer，但 `codex exec resume --json` 无 terminal/EOF；`7shw6nug` 是 metadata-only 启动子类 | 根因边界已确认：bridge 只信 stdout，无法处理“持久化已完成、stdout 终态丢失”的 split-brain | 已补 app-server 终态对账：pre-run baseline + substantive-event guard + new terminal turn；缺失 final answer 时一并补发；startup 子类仍由独立 watchdog 处理 | 部署；下一次现场验证 `agent.terminal-recovered`、最终卡片正文和 running footer 均正确 |
