@@ -59,6 +59,37 @@ describe('Codex startup watchdog', () => {
     continueRun.resolve(undefined);
     await expect(resultPromise).resolves.toMatchObject({ terminal: 'done' });
   });
+
+  it('continues with one safe replacement run after a metadata-only startup timeout', async () => {
+    vi.useFakeTimers();
+    const stopped = deferred<void>();
+    const firstEvents = (async function* (): AsyncGenerator<AgentEvent> {
+      yield { type: 'system', threadId: 'thread-stuck' };
+      await stopped.promise;
+    })();
+    const firstHandle = runHandle(firstEvents, vi.fn(async () => stopped.resolve(undefined)));
+    const secondEvents = (async function* (): AsyncGenerator<AgentEvent> {
+      yield { type: 'text', delta: '续跑后的结果。' };
+      yield { type: 'done', terminationReason: 'normal' };
+    })();
+    const secondHandle = runHandle(secondEvents, vi.fn(async () => {}));
+    const recover = vi.fn(async () => ({ handle: secondHandle, events: secondEvents }));
+
+    const resultPromise = processAgentStream(
+      firstHandle,
+      firstEvents,
+      'oc_retry',
+      undefined,
+      5 * 60_000,
+      vi.fn(),
+      vi.fn(async () => {}),
+      recover,
+    );
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+    await expect(resultPromise).resolves.toMatchObject({ terminal: 'done' });
+    expect(recover).toHaveBeenCalledTimes(1);
+  });
 });
 
 function runHandle(events: AsyncIterable<AgentEvent>, stop: () => Promise<void>): RunHandle {
