@@ -63,37 +63,47 @@ Important mismatch details:
 - `expectedTail` was the final answer around `这次补的是 add_to_desktop` and `本地仓库工作区是干净的`.
 - Independent `lark-cli im +messages-mget --message-ids om_x100b6bcc6df0c484c4eca45347d1fc1 --as user --format json` still read the stale card content after the run.
 
+Third confirmed case, captured after the CardKit probes were deployed:
+
+- Source message: `om_x100b6a6b25fd9024c38fcee16b988ac`
+- Trace: `9csdgepc`
+- Run ID: `c3d2cc87-aa0d-49ab-b673-da8559b571c4`
+- Card ID: `7662301595611106587`
+- Reply card message: `om_x100b6a6b25903c88c0b6575f0f9f3e2`
+- Chat: `oc_f89495c27df18efb279272477122c0cc`
+- Card created successfully at `2026-07-14 16:43:33.413 +08:00`.
+- Element updates sequence 1 through 42 returned `code=0`.
+- The first failed update was sequence 43 at `16:53:39.197`, 605.784 seconds after card creation. It returned `code=300309`, `streaming mode is closed`.
+- Every later element update through the final sequence 57 returned the same `300309` response.
+- Codex still completed normally. The bridge rendered final markdown with `chars=5116`, `hash=9085df7d5ac2`, and no running footer.
+- `card.settings` sequence 58 returned `code=0`, but it only finalized card settings; it did not restore the rejected element content.
+- Readback remained on the old running content with `hash=d4bdbeaac704` and a running footer.
+
 ### 3. Current Analysis
 
-This is not Codex execution failure. Codex completed and bridge rendered final markdown. The failure boundary is after bridge final render, in the CardKit streaming update/finalization path or in the readback/display consistency of that path.
+This is not a Codex execution failure or a readback-only inconsistency. The root cause is now confirmed:
 
-The strongest current hypothesis is:
+1. Feishu automatically closes CardKit streaming mode after 10 minutes.
+2. `@larksuite/channel@0.3.0` knows about that limit in its source comments but does not recover the markdown controller when it is reached.
+3. The Lark node SDK resolves CardKit business errors as response objects. `OutboundSender.updateCardElementContent()` ignored the response `code`, so `code=300309` was treated as success instead of an error.
+4. The controller therefore continued sending rejected element updates, called `card.settings`, and returned a successful stream result. `card.settings` cannot restore markdown that the element API rejected.
 
-> CardKit streaming card final element update or streaming finish can fail, be ignored, or remain stale, while `@larksuite/channel` / bridge still resolves the stream path as if it had completed.
-
-This is not proven down to exact API call yet. Missing evidence:
-
-- whether bridge's last `ctrl.setContent` call carried the final markdown
-- whether `@larksuite/channel` sent a final `cardkit.v1.cardElement.content` update with that same content hash
-- whether `@larksuite/channel` then sent `cardkit.v1.card.settings` to close streaming mode
-- raw success/error result of both final CardKit calls
+The exact failure chain is: long run crosses the CardKit 10-minute streaming lifetime -> element updates return `300309` -> channel ignores the business error -> final settings succeeds -> stream falsely resolves -> readback exposes stale running content.
 
 ### 4. Fix Status
 
-- Not fixed.
-- Existing no-fallback behavior prevents duplicate text, but it leaves the stale card visible.
-- Previous hard-timeout and serialized-Codex changes did not address this root cause and were dropped.
-- Diagnostic logging is being added to capture the missing boundary evidence on the next reproduction.
+- Fix implemented in the bridge's CardKit boundary wrapper, because a dependency-local pnpm patch is not inherited by downstream/global installs.
+- When `cardElement.content` returns `300309`, the bridge immediately retries the same content and sequence through `card.update`, replacing the same card with `streaming_mode=false`.
+- Later controller updates continue to receive `300309` and are recovered through the same full-card path, so the terminal update carries the latest markdown without sending another message.
+- Recovery request/result logs include card ID, sequence, content hash, duration, and raw business result.
+- Regression tests cover successful recovery, rejected recovery, and the normal streaming path.
+- Previous hard-timeout and serialized-Codex changes remain excluded; they did not address this root cause.
 
 ### 5. Next Plan
 
-- Add diagnostic-only tracing around CardKit streaming final update path before changing behavior:
-  - bridge-side final `ctrl.setContent` content hash / flush index / terminal state
-  - final `cardElement.content` sequence/card ID/result/error
-  - final `card.settings` sequence/card ID/result/error
-  - final readback content type and whether user-card content is stale
-- Reproduce with a controlled canary message that has long tool-call markdown and final answer.
-- Only after evidence confirms the exact failing API/state transition, propose the minimal fix.
+- Run the full bridge test/typecheck/build suite.
+- Deploy the bridge recovery path to the active Codex profile.
+- On the next run longer than 10 minutes, require direct proof of this sequence: `300309` element response -> full `card.update code=0` -> final readback match.
 
 ## Issue 2: Card/Readback Mismatch Recurs Across Multiple Normal Runs
 
@@ -197,6 +207,6 @@ Previous attempted fixes were wrong:
 
 | # | 问题 | 现象 | 关键 runtime 信息 | 当前结论 | 修复情况 | 下一步 |
 |---|---|---|---|---|---|---|
-| 1 | 任务完成但卡片没更新最终内容 | Codex 已完成，飞书卡片仍停在旧的工具调用/运行态内容 | `trace=8k2mhyaz` / `clujpjym`，同一 `session=019f44a3...`；reply message 分别为 `om_x100b6bc2771800acc39eba9f347d771`、`om_x100b6bcc6df0c484c4eca45347d1fc1` | 不是 Codex 没跑完；失败边界在 bridge final `setContent` 之后、CardKit streaming final update / finish / 持久化读回之间 | 未修；目前只避免重复 fallback；正在补诊断日志 | 记录 final `setContent` hash、`cardElement.content` sequence/result、`card.settings` sequence/result、readback raw meta |
+| 1 | 任务完成但卡片没更新最终内容 | Codex 已完成，飞书卡片仍停在旧的工具调用/运行态内容 | `trace=8k2mhyaz` / `clujpjym` / `9csdgepc`；最新现场在卡片创建 605.784 秒后从 sequence 43 起持续返回 `300309` | 根因已确认：CardKit 10 分钟自动关闭 streaming；`@larksuite/channel@0.3.0` 忽略业务响应码，继续伪成功 finish | 已在 bridge CardKit 边界修复：`300309` 后同卡 `card.update` 全量写入相同内容和 sequence，不新增消息 | 全量测试、部署；下一次 >10 分钟 run 验证 `300309 -> card.update code=0 -> readback match` |
 | 2 | 多个正常 run 出现 final readback mismatch | run 正常结束，但 readback 和期望 markdown 不一致，有些可能是真 stale，有些只是 CardKit 改写 | `yp61vkyr`、`2lhybkem`、`94dzimie`、`4wemjyzo`、`8k2mhyaz`，均 `didRollover=false`、`chunkIds=[]` | `markdown-readback-mismatch` 是症状，不是单一根因；需要区分“内容存在但被改写”和“最终内容确实没落地” | 仅避免了后续重复 fallback；消息中断根因未闭环 | 把 mismatch 分类，并补充足够 runtime 字段 |
 | 3 | Codex 子进程活着但 stdout 无终态 | 卡片一直 thinking/running，进程还在但没有 terminal event | `trace=7shw6nug`，`runId=81c77a0c...`，PID `74358/74359`，多次 `stdout-idle`；另有 `8fs7agd1` 仅疑似 | 和 stale card 是不同类问题；hard timeout 和串行化都不是根因修复 | 未修；当时只手动 kill 释放队列；错误的 hard-timeout/串行化提交已丢弃 | 收集多个确认 trace，记录进程树、session tail、fd、queue/scope 后再判断 |
