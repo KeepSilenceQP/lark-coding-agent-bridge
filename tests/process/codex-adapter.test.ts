@@ -534,6 +534,93 @@ describe('CodexAdapter process contract', () => {
     );
   });
 
+  it('does not synthesize a terminal event from a persisted interrupted turn', async () => {
+    const fake = await createFakeCodex({
+      lines: [
+        { type: 'thread.started', thread_id: 'thread-persisted-interrupted' },
+        { type: 'agent_message', message: 'work had started' },
+      ],
+      exitDelayMs: 180,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed', itemCount: 1 })
+      .mockResolvedValue({ id: 'turn-current', status: 'interrupted', itemCount: 2 });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stdoutIdleProbeMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-persisted-interrupted',
+      prompt: 'keep working despite a stale interrupted status',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-persisted-interrupted',
+    };
+
+    await adapter.prepareRun(options);
+    const events = await collect(adapter.run(options).events);
+
+    expect(events.at(-1)).toEqual({
+      type: 'error',
+      message: 'codex stream ended before a terminal event',
+      terminationReason: 'failed',
+    });
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: 'done', terminationReason: 'interrupted' }),
+    );
+  });
+
+  it('does not probe persisted terminal state while a Codex tool is still in flight', async () => {
+    const fake = await createFakeCodex({
+      lines: [
+        { type: 'thread.started', thread_id: 'thread-long-tool' },
+        {
+          type: 'item.started',
+          item: {
+            id: 'tool-long',
+            type: 'command_execution',
+            command: './gradlew compile',
+          },
+        },
+      ],
+      exitDelayMs: 180,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed', itemCount: 1 })
+      .mockResolvedValue({
+        id: 'turn-current',
+        status: 'completed',
+        itemCount: 3,
+        finalText: 'must not be recovered while the tool is running',
+      });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stdoutIdleProbeMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-long-tool',
+      prompt: 'run a long build',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-long-tool',
+    };
+
+    await adapter.prepareRun(options);
+    const events = await collect(adapter.run(options).events);
+
+    expect(events).toContainEqual(expect.objectContaining({ type: 'tool_use', id: 'tool-long' }));
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: 'text', delta: 'must not be recovered while the tool is running' }),
+    );
+    expect(turnStateProbe).toHaveBeenCalledTimes(1);
+  });
+
   it('does not duplicate a persisted final answer that stdout already delivered', async () => {
     const finalText = 'the complete answer';
     const fake = await createFakeCodex({
