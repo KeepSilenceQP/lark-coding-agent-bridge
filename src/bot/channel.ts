@@ -198,7 +198,14 @@ interface RawClientShape {
 
 const STREAM_DIAG_WRAPPED = Symbol('streamDiagWrapped');
 const STREAM_RECOVERY_WRAPPED = Symbol('streamRecoveryWrapped');
+const CARDKIT_STREAM_TRACKER = Symbol('cardkitStreamTracker');
 const CARDKIT_STREAM_EXPIRED_CODES = new Set([200850, 300309]);
+const CARDKIT_STREAM_TRACKER_LIMIT = 256;
+
+interface CardkitStreamTracker {
+  cardByMessageId: Map<string, string>;
+  sequenceByCardId: Map<string, number>;
+}
 
 interface StreamRecoveryState {
   expiredCardIds: Set<string>;
@@ -208,6 +215,7 @@ interface StreamRecoveryState {
 const streamRecoveryState = new AsyncLocalStorage<StreamRecoveryState>();
 
 export function installCardkitStreamDiagnostics(channel: LarkChannel): void {
+  const tracker = getOrCreateCardkitStreamTracker(channel);
   wrapMarkdownStreamWithRecoveryFailures(channel);
   const raw = channel.rawClient as RawClientShape;
   wrapRawClientCall(
@@ -216,25 +224,40 @@ export function installCardkitStreamDiagnostics(channel: LarkChannel): void {
     'cardkit-card-create',
     summarizeCardCreateRequest,
   );
-  wrapCardElementContentWithExpiryRecovery(raw);
+  wrapCardElementContentWithExpiryRecovery(raw, tracker);
   wrapRawClientCall(
     raw.cardkit?.v1?.card,
     'settings',
     'cardkit-card-settings',
     summarizeCardSettingsRequest,
+    (request) => trackCardSequence(tracker, request),
   );
   wrapRawClientCall(
     raw.im?.v1?.message,
     'create',
     'im-message-create',
     summarizeImCreateRequest,
+    (request, result) => trackCardMessage(tracker, request, result),
   );
   wrapRawClientCall(
     raw.im?.v1?.message,
     'reply',
     'im-message-reply',
     summarizeImReplyRequest,
+    (request, result) => trackCardMessage(tracker, request, result),
   );
+}
+
+function getOrCreateCardkitStreamTracker(channel: LarkChannel): CardkitStreamTracker {
+  const trackedChannel = channel as LarkChannel & { [CARDKIT_STREAM_TRACKER]?: CardkitStreamTracker };
+  const existing = trackedChannel[CARDKIT_STREAM_TRACKER];
+  if (existing) return existing;
+  const tracker: CardkitStreamTracker = {
+    cardByMessageId: new Map(),
+    sequenceByCardId: new Map(),
+  };
+  trackedChannel[CARDKIT_STREAM_TRACKER] = tracker;
+  return tracker;
 }
 
 function wrapMarkdownStreamWithRecoveryFailures(channel: LarkChannel): void {
@@ -262,7 +285,10 @@ function wrapMarkdownStreamWithRecoveryFailures(channel: LarkChannel): void {
   channel.stream = wrapped;
 }
 
-function wrapCardElementContentWithExpiryRecovery(raw: RawClientShape): void {
+function wrapCardElementContentWithExpiryRecovery(
+  raw: RawClientShape,
+  tracker: CardkitStreamTracker,
+): void {
   const owner = raw.cardkit?.v1?.cardElement;
   const cardOwner = raw.cardkit?.v1?.card;
   const original = owner?.content as
@@ -278,6 +304,7 @@ function wrapCardElementContentWithExpiryRecovery(raw: RawClientShape): void {
     const fields = summarizeCardElementContentRequest(request);
     const path = recordAt(request, 'path');
     const cardId = stringAt(path, 'card_id');
+    trackCardSequence(tracker, request);
     const start = Date.now();
     log.info('stream-diag', 'cardkit-card-element-content-request', fields);
     try {
@@ -430,6 +457,7 @@ function wrapRawClientCall(
   method: string,
   event: string,
   summarize: (request: unknown) => Record<string, unknown>,
+  observe?: (request: unknown, result: unknown) => void,
 ): void {
   const original = owner?.[method] as (RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean }) | undefined;
   if (!owner || !original || original[STREAM_DIAG_WRAPPED]) return;
@@ -440,6 +468,7 @@ function wrapRawClientCall(
     log.info('stream-diag', `${event}-request`, fields);
     try {
       const result = await original.call(this, request);
+      observe?.(request, result);
       log.info('stream-diag', `${event}-result`, {
         ...fields,
         durationMs: Date.now() - start,
@@ -457,6 +486,47 @@ function wrapRawClientCall(
   } as RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean };
   wrapped[STREAM_DIAG_WRAPPED] = true;
   owner[method] = wrapped;
+}
+
+function trackCardSequence(tracker: CardkitStreamTracker, request: unknown): void {
+  const path = recordAt(request, 'path');
+  const data = recordAt(request, 'data');
+  const cardId = stringAt(path, 'card_id');
+  const sequence = numberAt(data, 'sequence');
+  if (!cardId || sequence === undefined) return;
+  const current = tracker.sequenceByCardId.get(cardId) ?? 0;
+  if (sequence > current) rememberBounded(tracker.sequenceByCardId, cardId, sequence);
+}
+
+function trackCardMessage(
+  tracker: CardkitStreamTracker,
+  request: unknown,
+  result: unknown,
+): void {
+  const data = recordAt(request, 'data');
+  const content = stringAt(data, 'content');
+  const messageId = stringAt(recordAt(result, 'data'), 'message_id');
+  const cardId = cardIdFromReferenceContent(content);
+  if (!messageId || !cardId) return;
+  rememberBounded(tracker.cardByMessageId, messageId, cardId);
+}
+
+function cardIdFromReferenceContent(content: string | undefined): string | undefined {
+  if (!content) return undefined;
+  const parsed = parseJson(content);
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const root = parsed as Record<string, unknown>;
+  return stringAt(root, 'card_id') ?? stringAt(recordAt(root, 'data'), 'card_id');
+}
+
+function rememberBounded<K, V>(map: Map<K, V>, key: K, value: V): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > CARDKIT_STREAM_TRACKER_LIMIT) {
+    const oldest = map.keys().next().value as K | undefined;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
 }
 
 function summarizeCardCreateRequest(request: unknown): Record<string, unknown> {
@@ -1356,27 +1426,29 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
       : claudeCapability(controls.profileConfig);
-  const flow = await startRunFlow({
-    scopeId: scope,
-    scope: scopeContext,
-    prompt,
-    attachments: attachments.map(toPolicyAttachment),
-    access: accessDecision,
-    capability,
-    profileConfig: controls.profileConfig,
-    sessions,
-    sessionCatalog,
-    workspaces,
-    executor,
-    now: Date.now(),
-    stopGraceMs: getAgentStopGraceMs(controls.cfg),
-    observability: {
-      profile: controls.profile,
-      agent: capability.agentId,
-      source: 'im',
-      stage: 'submit',
-    },
-  });
+  const startFlow = (stage: 'submit' | 'startup-retry') =>
+    startRunFlow({
+      scopeId: scope,
+      scope: scopeContext,
+      prompt,
+      attachments: attachments.map(toPolicyAttachment),
+      access: accessDecision,
+      capability,
+      profileConfig: controls.profileConfig,
+      sessions,
+      sessionCatalog,
+      workspaces,
+      executor,
+      now: Date.now(),
+      stopGraceMs: getAgentStopGraceMs(controls.cfg),
+      observability: {
+        profile: controls.profile,
+        agent: capability.agentId,
+        source: 'im',
+        stage,
+      },
+    });
+  const flow = await startFlow('submit');
   if (!flow.ok) {
     log.info('run-flow', 'rejected', { scope, code: flow.rejectReason.code });
     log.warn('policy', 'denied', {
@@ -1422,6 +1494,42 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (evt.type === 'system' && evt.threadId) {
       log.info('session', 'set-thread', { threadId: evt.threadId });
     }
+  };
+  let startupRetryUsed = false;
+  const recoverStartupTimeout = async (): Promise<
+    { handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined
+  > => {
+    if (capability.agentId !== 'codex' || startupRetryUsed) return undefined;
+    startupRetryUsed = true;
+    await execution.stop();
+    const safe = await execution.run.canRetryAfterNoOutput?.() ?? false;
+    if (!safe) {
+      log.warn('agent', 'startup-timeout-retry-skipped', {
+        scope,
+        reason: execution.run.canRetryAfterNoOutput
+          ? 'turn-not-empty-terminal'
+          : 'agent-does-not-support-verification',
+      });
+      return undefined;
+    }
+    const replacement = await startFlow('startup-retry');
+    if (!replacement.ok) {
+      log.warn('agent', 'startup-timeout-retry-rejected', {
+        scope,
+        code: replacement.rejectReason.code,
+      });
+      return undefined;
+    }
+    log.warn('agent', 'startup-timeout-retry-started', {
+      scope,
+      previousRunId: execution.runId,
+      retryRunId: replacement.execution.runId,
+      threadId: replacement.resumeFrom,
+    });
+    return {
+      handle: replacement.execution.handle,
+      events: replacement.execution.subscribe(),
+    };
   };
 
   // Resolve idle-timeout for this run: scope override (on SessionEntry) wins
@@ -1500,6 +1608,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           startupTimeoutMs,
           recordSession,
           async () => {},
+          recoverStartupTimeout,
         );
         await cotDone;
         if (cotPublisher.degradedReason) {
@@ -1544,6 +1653,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
           }
         },
+        recoverStartupTimeout,
       );
       const streamDone = channel.stream(
         chatId,
@@ -1626,6 +1736,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             await setMarkdownContent(state.terminal === 'running' ? 'update' : 'terminal', markdown);
           }
         },
+        recoverStartupTimeout,
       );
       const streamDone = channel
         .stream(
@@ -1692,6 +1803,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         startupTimeoutMs,
         recordSession,
         async () => {},
+        recoverStartupTimeout,
       );
       await sendFinalReply({
         channel,
@@ -1846,6 +1958,9 @@ export async function processAgentStream(
   startupTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
   flush: (state: RunState) => Promise<void>,
+  recoverStartupTimeout?: () => Promise<
+    { handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined
+  >,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = initialState;
@@ -1956,6 +2071,27 @@ export async function processAgentStream(
   } finally {
     if (timer) clearTimeout(timer);
     if (startupTimer) clearTimeout(startupTimer);
+  }
+
+  if (state.terminal === 'running' && startupFired && recoverStartupTimeout) {
+    await handle.run.stop().catch(() => {});
+    try {
+      const replacement = await recoverStartupTimeout();
+      if (replacement) {
+        log.warn('agent', 'startup-timeout-retrying', { scope });
+        return processAgentStream(
+          replacement.handle,
+          replacement.events,
+          scope,
+          idleTimeoutMs,
+          startupTimeoutMs,
+          recordSession,
+          flush,
+        );
+      }
+    } catch (err) {
+      log.fail('agent', err, { step: 'startup-timeout-recovery', scope });
+    }
   }
 
   // If state already reached a terminal event (done/error/etc.) before the
@@ -2107,6 +2243,7 @@ async function verifyMarkdownFinalReadback(
   if (second === undefined) return undefined;
   const matches = markdownReadbackMatches(second.text, expected);
   if (!matches) {
+    const finalAnchorPresent = markdownFinalAnchorPresent(second.text, expected);
     log.warn('stream', 'markdown-readback-mismatch', {
       messageId,
       readbackMessageId,
@@ -2115,9 +2252,102 @@ async function verifyMarkdownFinalReadback(
       ...readbackLogFields(second, expected),
       liveTail: tailForLog(second.text),
       expectedTail: tailForLog(expected),
+      finalAnchorPresent,
     });
+    if (finalAnchorPresent && !hasRunningFooter(second.text)) return false;
+    const repaired = await repairStaleMarkdownCard(channel, readbackMessageId, expected);
+    if (repaired) {
+      await delay(FINAL_READBACK_RETRY_MS);
+      const repairedSnapshot = await readMarkdownMessageSnapshot(
+        channel,
+        readbackMessageId,
+        messageId,
+        chunkIds,
+      );
+      const repairVisible = repairedSnapshot !== undefined
+        && markdownReadbackMatches(repairedSnapshot.text, expected);
+      log.info('stream', 'markdown-readback-repair-verified', {
+        messageId,
+        readbackMessageId,
+        visible: repairVisible,
+        ...(repairedSnapshot ? readbackLogFields(repairedSnapshot, expected) : {}),
+      });
+      return repairVisible;
+    }
   }
   return matches;
+}
+
+async function repairStaleMarkdownCard(
+  channel: LarkChannel,
+  messageId: string,
+  expected: string,
+): Promise<boolean> {
+  const tracker = getOrCreateCardkitStreamTracker(channel);
+  const cardId = tracker.cardByMessageId.get(messageId);
+  const updateCard = (channel.rawClient as RawClientShape).cardkit?.v1?.card?.update;
+  if (!cardId || !updateCard) {
+    log.warn('stream', 'markdown-readback-repair-skipped', {
+      messageId,
+      reason: cardId ? 'missing-card-update-api' : 'missing-card-correlation',
+    });
+    return false;
+  }
+
+  const sequence = (tracker.sequenceByCardId.get(cardId) ?? 0) + 1;
+  const request = {
+    path: { card_id: cardId },
+    data: {
+      card: {
+        type: 'card_json',
+        data: JSON.stringify(buildClosedMarkdownCard('stream_md', expected)),
+      },
+      sequence,
+      uuid: `u_repair_${cardId}_${sequence}_${Date.now()}`,
+    },
+  };
+  const start = Date.now();
+  log.warn('stream', 'markdown-readback-repair-request', {
+    messageId,
+    cardId,
+    sequence,
+    ...textLogFields('expected', expected),
+  });
+  try {
+    const result = await updateCard.call(
+      (channel.rawClient as RawClientShape).cardkit?.v1?.card,
+      request,
+    );
+    const resultFields = summarizeApiResult(result);
+    if (numberAt(resultFields, 'code') !== 0) {
+      log.warn('stream', 'markdown-readback-repair-rejected', {
+        messageId,
+        cardId,
+        sequence,
+        durationMs: Date.now() - start,
+        ...resultFields,
+      });
+      return false;
+    }
+    rememberBounded(tracker.sequenceByCardId, cardId, sequence);
+    log.info('stream', 'markdown-readback-repair-result', {
+      messageId,
+      cardId,
+      sequence,
+      durationMs: Date.now() - start,
+      ...resultFields,
+    });
+    return true;
+  } catch (err) {
+    log.fail('stream', err, {
+      step: 'markdown-readback-repair',
+      messageId,
+      cardId,
+      sequence,
+      durationMs: Date.now() - start,
+    });
+    return false;
+  }
 }
 
 interface MarkdownReadbackSnapshot {
@@ -2302,6 +2532,18 @@ function markdownReadbackMatches(live: string, expected: string): boolean {
   const expectedTail = tailForLog(normalizeReadbackText(expected));
   if (!expectedTail) return true;
   return normalizeReadbackText(live).includes(expectedTail);
+}
+
+function markdownFinalAnchorPresent(live: string, expected: string): boolean {
+  const paragraphs = expected
+    .trim()
+    .split(/\n\s*\n/)
+    .map(normalizeReadbackText)
+    .filter(Boolean);
+  const finalParagraph = paragraphs.at(-1);
+  if (!finalParagraph) return true;
+  const anchor = finalParagraph.slice(-TAIL_COMPARE_CHARS);
+  return normalizeReadbackText(live).includes(anchor);
 }
 
 function textLogFields(prefix: string, value: string | undefined): Record<string, unknown> {

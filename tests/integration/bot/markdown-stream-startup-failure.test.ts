@@ -49,10 +49,24 @@ interface FakeLarkChannel {
       v1: {
         message: {
           get: ReturnType<typeof vi.fn>;
+          create: ReturnType<typeof vi.fn>;
+          reply: ReturnType<typeof vi.fn>;
         };
         messageReaction: {
           create: ReturnType<typeof vi.fn>;
           delete: ReturnType<typeof vi.fn>;
+        };
+      };
+    };
+    cardkit: {
+      v1: {
+        card: {
+          create: ReturnType<typeof vi.fn>;
+          update: ReturnType<typeof vi.fn>;
+          settings: ReturnType<typeof vi.fn>;
+        };
+        cardElement: {
+          content: ReturnType<typeof vi.fn>;
         };
       };
     };
@@ -289,6 +303,83 @@ describe('markdown stream startup failures', () => {
       path: { message_id: 'om_stream' },
       params: { card_msg_content_type: 'user_card_content' },
     });
+    expect(h.channel.rawClient.cardkit.v1.card.update).not.toHaveBeenCalled();
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it('repairs a confirmed stale final readback by updating the same CardKit card', async () => {
+    let sequence = 0;
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        const raw = sdkMock.channel!.rawClient;
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        const created = await raw.cardkit.v1.card.create({
+          data: { type: 'card_json', data: streamingCardContent('...') },
+        });
+        const cardId = created.data.card_id as string;
+        const sent = await raw.im.v1.message.reply({
+          path: { message_id: 'om_first' },
+          data: {
+            msg_type: 'interactive',
+            content: JSON.stringify({ type: 'card', data: { card_id: cardId } }),
+          },
+        });
+        if (producer) {
+          await producer({
+            setContent: async (markdown: string) => {
+              await raw.cardkit.v1.cardElement.content({
+                path: { card_id: cardId, element_id: 'stream_md' },
+                data: { content: markdown, sequence: ++sequence, uuid: `u_${sequence}` },
+              });
+            },
+          });
+        }
+        await raw.cardkit.v1.card.settings({
+          path: { card_id: cardId },
+          data: {
+            settings: JSON.stringify({ config: { streaming_mode: false } }),
+            sequence: ++sequence,
+            uuid: `u_${sequence}`,
+          },
+        });
+        return { messageId: sent.data.message_id };
+      },
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: '真正的最终答案。' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    h.channel.rawClient.im.v1.message.get.mockImplementation(async () => ({
+      data: {
+        items: [
+          {
+            body: {
+              content: streamingCardContent(
+                h.channel.rawClient.cardkit.v1.card.update.mock.calls.length > 0
+                  ? '真正的最终答案。'
+                  : '旧的执行中内容\n\n---\n\n🧠 正在思考…',
+              ),
+            },
+          },
+        ],
+      },
+    }));
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
+
+    expect(h.channel.rawClient.cardkit.v1.card.update).toHaveBeenCalledTimes(1);
+    expect(h.channel.rawClient.cardkit.v1.card.update).toHaveBeenCalledWith({
+      path: { card_id: 'card_stream' },
+      data: expect.objectContaining({ sequence: sequence + 1 }),
+    });
+    const updateRequest = h.channel.rawClient.cardkit.v1.card.update.mock.calls[0]?.[0] as {
+      data?: { card?: { data?: string } };
+    };
+    expect(updateRequest.data?.card?.data).toContain('真正的最终答案。');
     expect(h.channel.sent).toHaveLength(0);
   });
 
@@ -529,10 +620,24 @@ function createFakeLarkChannel(options: {
         v1: {
           message: {
             get: vi.fn(async () => ({ data: { items: [] } })),
+            create: vi.fn(async () => ({ data: { message_id: 'om_stream' } })),
+            reply: vi.fn(async () => ({ data: { message_id: 'om_stream' } })),
           },
           messageReaction: {
             create: vi.fn(options.reactionCreate ?? (async () => ({ data: { reaction_id: 'reaction_1' } }))),
             delete: vi.fn(async () => ({})),
+          },
+        },
+      },
+      cardkit: {
+        v1: {
+          card: {
+            create: vi.fn(async () => ({ data: { card_id: 'card_stream' } })),
+            update: vi.fn(async () => ({ code: 0, data: {} })),
+            settings: vi.fn(async () => ({ code: 0, data: {} })),
+          },
+          cardElement: {
+            content: vi.fn(async () => ({ code: 0, data: {} })),
           },
         },
       },
