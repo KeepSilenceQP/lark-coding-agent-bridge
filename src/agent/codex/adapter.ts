@@ -19,7 +19,6 @@ import { buildCodexArgs } from './argv';
 import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
 import {
   createCodexTurnStateProbe,
-  type CodexTurnState,
   type CodexTurnStateProbe,
 } from './turn-state-probe';
 
@@ -313,6 +312,7 @@ async function* createEventStream(
   let lastStdoutAt = Date.now();
   let currentThreadId = initialThreadId;
   let sawSubstantiveEvent = false;
+  const inFlightTools = new Set<string>();
   const emittedText = new Set<string>();
   let terminalProbeInFlight = false;
   let recoveredReason: CodexFinishReason | undefined;
@@ -323,6 +323,7 @@ async function* createEventStream(
       !turnStateProbe ||
       !currentThreadId ||
       !sawSubstantiveEvent ||
+      inFlightTools.size > 0 ||
       terminalProbeInFlight ||
       streamClosed ||
       recoveredReason
@@ -336,11 +337,11 @@ async function* createEventStream(
         streamClosed ||
         !latest ||
         latest.id === baselineTurnId ||
-        latest.status === 'inProgress'
+        latest.status !== 'completed'
       ) {
         return;
       }
-      recoveredReason = finishReasonForTurn(latest);
+      recoveredReason = 'normal';
       if (
         latest.status === 'completed' &&
         latest.finalText &&
@@ -416,6 +417,8 @@ async function* createEventStream(
       const translated = translator.translate(parsed);
       for (const event of translated) {
         if (event.type === 'text') emittedText.add(event.delta);
+        if (event.type === 'tool_use') inFlightTools.add(event.id);
+        if (event.type === 'tool_result') inFlightTools.delete(event.id);
       }
       if (translated.some((event) => event.type !== 'system' && event.type !== 'usage')) {
         sawSubstantiveEvent = true;
@@ -464,12 +467,6 @@ async function* createEventStream(
   }
 
   yield* translator.finish();
-}
-
-function finishReasonForTurn(turn: CodexTurnState): CodexFinishReason {
-  if (turn.status === 'completed') return 'normal';
-  if (turn.status === 'interrupted') return 'interrupted';
-  return 'failed';
 }
 
 function terminalError(message: string): AgentEvent {
