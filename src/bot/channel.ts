@@ -192,7 +192,7 @@ interface RawClientShape {
 
 const STREAM_DIAG_WRAPPED = Symbol('streamDiagWrapped');
 
-function installCardkitStreamDiagnostics(channel: LarkChannel): void {
+export function installCardkitStreamDiagnostics(channel: LarkChannel): void {
   const raw = channel.rawClient as RawClientShape;
   wrapRawClientCall(
     raw.cardkit?.v1?.card,
@@ -200,12 +200,7 @@ function installCardkitStreamDiagnostics(channel: LarkChannel): void {
     'cardkit-card-create',
     summarizeCardCreateRequest,
   );
-  wrapRawClientCall(
-    raw.cardkit?.v1?.cardElement,
-    'content',
-    'cardkit-card-element-content',
-    summarizeCardElementContentRequest,
-  );
+  wrapCardElementContentWithExpiryRecovery(raw);
   wrapRawClientCall(
     raw.cardkit?.v1?.card,
     'settings',
@@ -224,6 +219,119 @@ function installCardkitStreamDiagnostics(channel: LarkChannel): void {
     'im-message-reply',
     summarizeImReplyRequest,
   );
+}
+
+function wrapCardElementContentWithExpiryRecovery(raw: RawClientShape): void {
+  const owner = raw.cardkit?.v1?.cardElement;
+  const cardOwner = raw.cardkit?.v1?.card;
+  const original = owner?.content as
+    | (RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean })
+    | undefined;
+  const updateCard = cardOwner?.update;
+  if (!owner || !original || original[STREAM_DIAG_WRAPPED]) return;
+
+  const wrapped = async function wrappedCardElementContent(
+    this: unknown,
+    request: unknown,
+  ): Promise<unknown> {
+    const fields = summarizeCardElementContentRequest(request);
+    const start = Date.now();
+    log.info('stream-diag', 'cardkit-card-element-content-request', fields);
+    try {
+      const result = await original.call(this, request);
+      const resultFields = summarizeApiResult(result);
+      log.info('stream-diag', 'cardkit-card-element-content-result', {
+        ...fields,
+        durationMs: Date.now() - start,
+        ...resultFields,
+      });
+      if (resultFields.code !== 300309 || !updateCard) return result;
+
+      return await recoverExpiredStreamingCard(cardOwner, updateCard, request, fields, result);
+    } catch (err) {
+      log.fail('stream-diag', err, {
+        step: 'cardkit-card-element-content',
+        durationMs: Date.now() - start,
+        ...fields,
+      });
+      throw err;
+    }
+  } as RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean };
+  wrapped[STREAM_DIAG_WRAPPED] = true;
+  owner.content = wrapped;
+}
+
+async function recoverExpiredStreamingCard(
+  cardOwner: RawMethodOwner,
+  updateCard: RawClientCall,
+  elementRequest: unknown,
+  fields: Record<string, unknown>,
+  expiredResult: unknown,
+): Promise<unknown> {
+  const path = recordAt(elementRequest, 'path');
+  const data = recordAt(elementRequest, 'data');
+  const cardId = stringAt(path, 'card_id');
+  const elementId = stringAt(path, 'element_id');
+  const content = stringAt(data, 'content');
+  const sequence = numberAt(data, 'sequence');
+  if (!cardId || !elementId || content === undefined || sequence === undefined) {
+    log.warn('stream-diag', 'cardkit-stream-expired-recovery-skipped', {
+      reason: 'invalid-element-request',
+      ...fields,
+    });
+    return expiredResult;
+  }
+
+  const request = {
+    path: { card_id: cardId },
+    data: {
+      card: {
+        type: 'card_json',
+        data: JSON.stringify(buildClosedMarkdownCard(elementId, content)),
+      },
+      sequence,
+      uuid: `u_${cardId}_${sequence}`,
+    },
+  };
+  const start = Date.now();
+  log.warn('stream-diag', 'cardkit-stream-expired-recovery-request', fields);
+  try {
+    const result = await updateCard.call(cardOwner, request);
+    const resultFields = summarizeApiResult(result);
+    log.info('stream-diag', 'cardkit-stream-expired-recovery-result', {
+      ...fields,
+      durationMs: Date.now() - start,
+      ...resultFields,
+    });
+    return resultFields.code === undefined || resultFields.code === 0 ? result : expiredResult;
+  } catch (err) {
+    log.fail('stream-diag', err, {
+      step: 'cardkit-stream-expired-recovery',
+      durationMs: Date.now() - start,
+      ...fields,
+    });
+    return expiredResult;
+  }
+}
+
+function buildClosedMarkdownCard(elementId: string, content: string): Record<string, unknown> {
+  const summary = content.replace(/\s+/g, ' ').trim();
+  return {
+    schema: '2.0',
+    config: {
+      streaming_mode: false,
+      summary: { content: summary.length <= 50 ? summary : `${summary.slice(0, 49)}…` },
+    },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          element_id: elementId,
+          content,
+        },
+      ],
+    },
+  };
 }
 
 function wrapRawClientCall(
