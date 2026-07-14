@@ -157,6 +157,35 @@ describe('markdown stream startup failures', () => {
     );
   }, 10_000);
 
+  it('falls back when the markdown stream fails after the agent render completes', async () => {
+    const streamFailure = deferred<void>();
+    let producerCompleted = false;
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        if (producer) {
+          await producer({ setContent: vi.fn(async () => {}) });
+          producerCompleted = true;
+        }
+        await streamFailure.promise;
+      },
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: '最终答案。' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => producerCompleted);
+    streamFailure.reject(new Error('CardKit stream recovery failed code=300500'));
+
+    await waitFor(() => h.channel.sent.length > 0);
+    expect(lastMarkdown(h.channel)).toContain('最终答案。');
+  });
+
   it('preserves running footer in live markdown stream updates', async () => {
     const contents: string[] = [];
     const h = await createHarness({

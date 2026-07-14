@@ -4,6 +4,7 @@ import type {
   NormalizedMessage,
 } from '@larksuite/channel';
 import { createLarkChannel } from '@larksuite/channel';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { claudeCapability, codexCapability } from '../agent/capability';
@@ -191,8 +192,18 @@ interface RawClientShape {
 }
 
 const STREAM_DIAG_WRAPPED = Symbol('streamDiagWrapped');
+const STREAM_RECOVERY_WRAPPED = Symbol('streamRecoveryWrapped');
+const CARDKIT_STREAM_EXPIRED_CODES = new Set([200850, 300309]);
+
+interface StreamRecoveryState {
+  expiredCardIds: Set<string>;
+  failures: Map<string, Error>;
+}
+
+const streamRecoveryState = new AsyncLocalStorage<StreamRecoveryState>();
 
 export function installCardkitStreamDiagnostics(channel: LarkChannel): void {
+  wrapMarkdownStreamWithRecoveryFailures(channel);
   const raw = channel.rawClient as RawClientShape;
   wrapRawClientCall(
     raw.cardkit?.v1?.card,
@@ -221,6 +232,31 @@ export function installCardkitStreamDiagnostics(channel: LarkChannel): void {
   );
 }
 
+function wrapMarkdownStreamWithRecoveryFailures(channel: LarkChannel): void {
+  const original = channel.stream as LarkChannel['stream'] & {
+    [STREAM_RECOVERY_WRAPPED]?: boolean;
+  } | undefined;
+  if (!original || original[STREAM_RECOVERY_WRAPPED]) return;
+
+  const wrapped = async function wrappedMarkdownStream(
+    this: LarkChannel,
+    ...args: Parameters<LarkChannel['stream']>
+  ): ReturnType<LarkChannel['stream']> {
+    const state: StreamRecoveryState = {
+      expiredCardIds: new Set<string>(),
+      failures: new Map<string, Error>(),
+    };
+    return streamRecoveryState.run(state, async () => {
+      const result = await original.apply(this, args);
+      const failure = state.failures.values().next().value;
+      if (failure) throw failure;
+      return result;
+    });
+  } as LarkChannel['stream'] & { [STREAM_RECOVERY_WRAPPED]?: boolean };
+  wrapped[STREAM_RECOVERY_WRAPPED] = true;
+  channel.stream = wrapped;
+}
+
 function wrapCardElementContentWithExpiryRecovery(raw: RawClientShape): void {
   const owner = raw.cardkit?.v1?.cardElement;
   const cardOwner = raw.cardkit?.v1?.card;
@@ -235,17 +271,25 @@ function wrapCardElementContentWithExpiryRecovery(raw: RawClientShape): void {
     request: unknown,
   ): Promise<unknown> {
     const fields = summarizeCardElementContentRequest(request);
+    const path = recordAt(request, 'path');
+    const cardId = stringAt(path, 'card_id');
     const start = Date.now();
     log.info('stream-diag', 'cardkit-card-element-content-request', fields);
     try {
+      if (cardId && updateCard && isExpiredCardInCurrentStream(cardId)) {
+        log.info('stream-diag', 'cardkit-card-element-content-bypassed', fields);
+        return await recoverExpiredStreamingCard(cardOwner, updateCard, request, fields, undefined);
+      }
       const result = await original.call(this, request);
       const resultFields = summarizeApiResult(result);
+      const resultCode = numberAt(resultFields, 'code');
       log.info('stream-diag', 'cardkit-card-element-content-result', {
         ...fields,
         durationMs: Date.now() - start,
         ...resultFields,
       });
-      if (resultFields.code !== 300309 || !updateCard) return result;
+      if (!CARDKIT_STREAM_EXPIRED_CODES.has(resultCode ?? -1) || !updateCard) return result;
+      if (cardId) markExpiredCardInCurrentStream(cardId);
 
       return await recoverExpiredStreamingCard(cardOwner, updateCard, request, fields, result);
     } catch (err) {
@@ -279,6 +323,10 @@ async function recoverExpiredStreamingCard(
       reason: 'invalid-element-request',
       ...fields,
     });
+    recordStreamRecoveryFailure(
+      cardId ?? 'unknown-card',
+      new Error('CardKit stream recovery failed: invalid element update request'),
+    );
     return expiredResult;
   }
 
@@ -298,20 +346,58 @@ async function recoverExpiredStreamingCard(
   try {
     const result = await updateCard.call(cardOwner, request);
     const resultFields = summarizeApiResult(result);
+    const resultCode = numberAt(resultFields, 'code');
     log.info('stream-diag', 'cardkit-stream-expired-recovery-result', {
       ...fields,
       durationMs: Date.now() - start,
       ...resultFields,
     });
-    return resultFields.code === undefined || resultFields.code === 0 ? result : expiredResult;
+    if (resultCode === 0) {
+      clearStreamRecoveryFailure(cardId);
+      return result;
+    }
+    recordStreamRecoveryFailure(
+      cardId,
+      new Error(
+        `CardKit stream recovery failed card=${cardId} sequence=${sequence} code=${resultCode ?? 'missing'} msg=${resultFields.msg ?? 'unknown'}`,
+      ),
+    );
+    return expiredResult;
   } catch (err) {
     log.fail('stream-diag', err, {
       step: 'cardkit-stream-expired-recovery',
       durationMs: Date.now() - start,
       ...fields,
     });
+    recordStreamRecoveryFailure(
+      cardId,
+      new Error(
+        `CardKit stream recovery failed card=${cardId} sequence=${sequence}: ${errorMessage(err)}`,
+        { cause: err },
+      ),
+    );
     return expiredResult;
   }
+}
+
+function recordStreamRecoveryFailure(cardId: string, error: Error): void {
+  streamRecoveryState.getStore()?.failures.set(cardId, error);
+}
+
+function clearStreamRecoveryFailure(cardId: string): void {
+  streamRecoveryState.getStore()?.failures.delete(cardId);
+}
+
+function markExpiredCardInCurrentStream(cardId: string): void {
+  streamRecoveryState.getStore()?.expiredCardIds.add(cardId);
+}
+
+function isExpiredCardInCurrentStream(cardId: string): boolean {
+  return streamRecoveryState.getStore()?.expiredCardIds.has(cardId) ?? false;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function buildClosedMarkdownCard(elementId: string, content: string): Record<string, unknown> {
@@ -1887,7 +1973,11 @@ async function awaitRenderAwareStream(input: {
     });
     return;
   }
-  if (!terminal.ok) throw terminal.err;
+  if (!terminal.ok) {
+    log.fail('stream', terminal.err, { mode: input.mode, step: 'stream-terminal' });
+    await runFallbackReply(input.mode, first.state, input.fallback);
+    return;
+  }
   await runFallbackOnFinalMismatch(input, terminal.value, first.state);
 }
 
