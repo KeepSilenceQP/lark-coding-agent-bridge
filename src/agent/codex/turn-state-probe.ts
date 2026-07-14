@@ -14,6 +14,7 @@ export type CodexTurnStatus = 'completed' | 'interrupted' | 'failed' | 'inProgre
 export interface CodexTurnState {
   id: string;
   status: CodexTurnStatus;
+  itemCount: number;
   finalText?: string;
 }
 
@@ -161,8 +162,11 @@ function parseLatestTurn(input: unknown): CodexTurnState | undefined {
   if (!id || !isTurnStatus(status)) {
     throw new Error('codex app-server returned malformed latest turn state');
   }
+  if (!Array.isArray(latest.items)) {
+    throw new Error('codex app-server returned latest turn without items');
+  }
   const finalText = parseFinalAgentText(latest.items);
-  return { id, status, ...(finalText ? { finalText } : {}) };
+  return { id, status, itemCount: latest.items.length, ...(finalText ? { finalText } : {}) };
 }
 
 function parseFinalAgentText(input: unknown): string | undefined {

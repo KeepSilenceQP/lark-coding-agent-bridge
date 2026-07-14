@@ -24,6 +24,7 @@ describe('Codex app-server turn state probe', () => {
       id: 'turn-current',
       status: 'completed',
       finalText: 'persisted final answer',
+      itemCount: 3,
     });
     const requests = JSON.parse(await readFile(fake.recordPath, 'utf8')) as Array<{
       method: string;

@@ -577,6 +577,112 @@ describe('CodexAdapter process contract', () => {
     await run.stop();
   });
 
+  it('allows one replay only when the stopped Codex turn is new, terminal, and has zero items', async () => {
+    const fake = await createFakeCodex({
+      lines: [{ type: 'thread.started', thread_id: 'thread-empty-turn' }],
+      exitDelayMs: 500,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({
+        id: 'turn-before-run',
+        status: 'completed',
+        itemCount: 1,
+      })
+      .mockResolvedValueOnce({
+        id: 'turn-empty-interrupted',
+        status: 'interrupted',
+        itemCount: 0,
+      });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-empty-turn',
+      prompt: 'retry this prompt',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-empty-turn',
+    };
+
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+    await run.stop();
+
+    await expect(run.canRetryAfterNoOutput?.()).resolves.toBe(true);
+  });
+
+  it('fails closed when the interrupted Codex turn contains any persisted item', async () => {
+    const fake = await createFakeCodex({
+      lines: [{ type: 'thread.started', thread_id: 'thread-with-item' }],
+      exitDelayMs: 500,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({
+        id: 'turn-before-run',
+        status: 'completed',
+        itemCount: 1,
+      })
+      .mockResolvedValueOnce({
+        id: 'turn-with-user-message',
+        status: 'interrupted',
+        itemCount: 1,
+      });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-with-item',
+      prompt: 'must not replay',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-with-item',
+    };
+
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+    await run.stop();
+
+    await expect(run.canRetryAfterNoOutput?.()).resolves.toBe(false);
+  });
+
+  it('fails closed while the latest Codex turn is still in progress even with zero items', async () => {
+    const fake = await createFakeCodex({
+      lines: [{ type: 'thread.started', thread_id: 'thread-in-progress' }],
+      exitDelayMs: 500,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed', itemCount: 1 })
+      .mockResolvedValueOnce({ id: 'turn-in-progress', status: 'inProgress', itemCount: 0 });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-in-progress',
+      prompt: 'must not overlap',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-in-progress',
+    };
+
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+    await run.stop();
+
+    await expect(run.canRetryAfterNoOutput?.()).resolves.toBe(false);
+  });
+
   it('requires cwd to be resolved by policy before spawning', () => {
     expect(() =>
       new CodexAdapter({ binary: 'unused', profileStateDir: tmpdir() }).run({
