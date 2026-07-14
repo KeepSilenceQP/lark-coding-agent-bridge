@@ -93,17 +93,18 @@ The exact failure chain is: long run crosses the CardKit 10-minute streaming lif
 ### 4. Fix Status
 
 - Fix implemented in the bridge's CardKit boundary wrapper, because a dependency-local pnpm patch is not inherited by downstream/global installs.
-- When `cardElement.content` returns `300309`, the bridge immediately retries the same content and sequence through `card.update`, replacing the same card with `streaming_mode=false`.
-- Later controller updates continue to receive `300309` and are recovered through the same full-card path, so the terminal update carries the latest markdown without sending another message.
+- When `cardElement.content` returns the documented expiry codes `300309` or `200850`, the bridge immediately retries the same content and sequence through `card.update`, replacing the same card with `streaming_mode=false`.
+- The bridge remembers that card as expired for the lifetime of the current stream. Later controller snapshots go directly through `card.update` instead of first repeating an element request that is guaranteed to fail.
+- Recovery business responses are accepted only when `code=0`. A transient recovery failure can be cleared by a later successful snapshot; if the final recovery state is still failed, `channel.stream()` rejects and the bridge sends its existing final Markdown fallback.
 - Recovery request/result logs include card ID, sequence, content hash, duration, and raw business result.
-- Regression tests cover successful recovery, rejected recovery, and the normal streaming path.
+- Regression tests cover successful recovery, both expiry codes, rejected and malformed recovery responses, transient recovery, the normal streaming path, later full-card snapshots, and the real `channel.stream()` / final fallback path.
 - Previous hard-timeout and serialized-Codex changes remain excluded; they did not address this root cause.
 
 ### 5. Next Plan
 
 - Run the full bridge test/typecheck/build suite.
 - Deploy the bridge recovery path to the active Codex profile.
-- On the next run longer than 10 minutes, require direct proof of this sequence: `300309` element response -> full `card.update code=0` -> final readback match.
+- On the next run longer than 10 minutes, require direct proof of this sequence: expiry element response -> full `card.update code=0` -> later full-card snapshots without repeated element failures -> final readback match.
 
 ## Issue 2: Card/Readback Mismatch Recurs Across Multiple Normal Runs
 
@@ -207,6 +208,6 @@ Previous attempted fixes were wrong:
 
 | # | 问题 | 现象 | 关键 runtime 信息 | 当前结论 | 修复情况 | 下一步 |
 |---|---|---|---|---|---|---|
-| 1 | 任务完成但卡片没更新最终内容 | Codex 已完成，飞书卡片仍停在旧的工具调用/运行态内容 | `trace=8k2mhyaz` / `clujpjym` / `9csdgepc`；最新现场在卡片创建 605.784 秒后从 sequence 43 起持续返回 `300309` | 根因已确认：CardKit 10 分钟自动关闭 streaming；`@larksuite/channel@0.3.0` 忽略业务响应码，继续伪成功 finish | 已在 bridge CardKit 边界修复：`300309` 后同卡 `card.update` 全量写入相同内容和 sequence，不新增消息 | 全量测试、部署；下一次 >10 分钟 run 验证 `300309 -> card.update code=0 -> readback match` |
+| 1 | 任务完成但卡片没更新最终内容 | Codex 已完成，飞书卡片仍停在旧的工具调用/运行态内容 | `trace=8k2mhyaz` / `clujpjym` / `9csdgepc`；最新现场在卡片创建 605.784 秒后从 sequence 43 起持续返回 `300309` | 根因已确认：CardKit 10 分钟自动关闭 streaming；`@larksuite/channel@0.3.0` 忽略业务响应码，继续伪成功 finish | 已在 bridge CardKit 边界修复：`300309` / `200850` 后同卡全量更新；后续快照直达全量路径；最终恢复仍失败时触发 Markdown fallback | 全量测试、部署；下一次 >10 分钟 run 验证 `expiry -> card.update code=0 -> final readback match` |
 | 2 | 多个正常 run 出现 final readback mismatch | run 正常结束，但 readback 和期望 markdown 不一致，有些可能是真 stale，有些只是 CardKit 改写 | `yp61vkyr`、`2lhybkem`、`94dzimie`、`4wemjyzo`、`8k2mhyaz`，均 `didRollover=false`、`chunkIds=[]` | `markdown-readback-mismatch` 是症状，不是单一根因；需要区分“内容存在但被改写”和“最终内容确实没落地” | 仅避免了后续重复 fallback；消息中断根因未闭环 | 把 mismatch 分类，并补充足够 runtime 字段 |
 | 3 | Codex 子进程活着但 stdout 无终态 | 卡片一直 thinking/running，进程还在但没有 terminal event | `trace=7shw6nug`，`runId=81c77a0c...`，PID `74358/74359`，多次 `stdout-idle`；另有 `8fs7agd1` 仅疑似 | 和 stale card 是不同类问题；hard timeout 和串行化都不是根因修复 | 未修；当时只手动 kill 释放队列；错误的 hard-timeout/串行化提交已丢弃 | 收集多个确认 trace，记录进程树、session tail、fd、queue/scope 后再判断 |
