@@ -17,6 +17,11 @@ import type {
 } from '../types';
 import { buildCodexArgs } from './argv';
 import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
+import {
+  createCodexTurnStateProbe,
+  type CodexTurnState,
+  type CodexTurnStateProbe,
+} from './turn-state-probe';
 
 export interface CodexAdapterOptions {
   binary: string;
@@ -28,6 +33,7 @@ export interface CodexAdapterOptions {
   sandbox?: SandboxMode;
   stopGraceMs?: number;
   stdoutIdleProbeMs?: number;
+  turnStateProbe?: CodexTurnStateProbe;
   larkChannel?: LarkChannelEnvContext;
 }
 
@@ -47,6 +53,11 @@ export class CodexAdapter implements AgentAdapter {
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
   private readonly stdoutIdleProbeMs: number;
+  private readonly turnStateProbe: CodexTurnStateProbe;
+  private readonly turnProbeBaselines = new Map<
+    string,
+    { enabled: boolean; turnId?: string }
+  >();
   private readonly larkChannel: LarkChannelEnvContext | undefined;
   private botIdentity: AgentBotIdentity | undefined;
 
@@ -60,6 +71,14 @@ export class CodexAdapter implements AgentAdapter {
     this.sandbox = opts.sandbox ?? 'danger-full-access';
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
     this.stdoutIdleProbeMs = opts.stdoutIdleProbeMs ?? DEFAULT_STDOUT_IDLE_PROBE_MS;
+    this.turnStateProbe =
+      opts.turnStateProbe ??
+      createCodexTurnStateProbe({
+        binary: opts.binary,
+        profileStateDir: opts.profileStateDir,
+        codexHome: opts.codexHome,
+        inheritCodexHome: opts.inheritCodexHome,
+      });
     this.larkChannel = opts.larkChannel;
   }
 
@@ -80,7 +99,7 @@ export class CodexAdapter implements AgentAdapter {
     });
   }
 
-  async prepareRun(): Promise<void> {
+  async prepareRun(opts?: AgentRunOptions): Promise<void> {
     const availability = await this.checkAvailability();
     if (!availability.ok) {
       throw new SpawnFailed(
@@ -90,12 +109,37 @@ export class CodexAdapter implements AgentAdapter {
         availability.diagnostic,
       );
     }
+    if (!opts) return;
+    if (this.stdoutIdleProbeMs <= 0 || !opts.threadId) {
+      this.turnProbeBaselines.set(opts.runId, { enabled: true });
+      return;
+    }
+    try {
+      const latest = await this.turnStateProbe(opts.threadId);
+      this.turnProbeBaselines.set(opts.runId, {
+        enabled: true,
+        ...(latest ? { turnId: latest.id } : {}),
+      });
+    } catch (error) {
+      this.turnProbeBaselines.set(opts.runId, { enabled: false });
+      log.warn('agent', 'terminal-probe-baseline-failed', {
+        threadId: opts.threadId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   run(opts: AgentRunOptions): AgentRun {
     if (!opts.cwd) {
       throw new Error('cwd is required for CodexAdapter.run');
     }
+    const preparedProbe = this.turnProbeBaselines.get(opts.runId);
+    this.turnProbeBaselines.delete(opts.runId);
+    const terminalProbe = opts.threadId
+      ? preparedProbe?.enabled
+        ? this.turnStateProbe
+        : undefined
+      : this.turnStateProbe;
 
     const args = buildCodexArgs({
       cwd: opts.cwd,
@@ -169,6 +213,9 @@ export class CodexAdapter implements AgentAdapter {
         () => runtimeError,
         () => stopReason,
         this.stdoutIdleProbeMs,
+        opts.threadId,
+        preparedProbe?.turnId,
+        terminalProbe,
       ),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
@@ -219,6 +266,9 @@ async function* createEventStream(
   getError: () => Error | null,
   getStopReason: () => CodexFinishReason | undefined,
   stdoutIdleProbeMs: number,
+  initialThreadId: string | undefined,
+  baselineTurnId: string | undefined,
+  turnStateProbe: CodexTurnStateProbe | undefined,
 ): AsyncGenerator<AgentEvent> {
   const translator = new CodexJsonlTranslator();
   if (!child.pid) {
@@ -234,6 +284,64 @@ async function* createEventStream(
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
   let sawStdout = false;
   let lastStdoutAt = Date.now();
+  let currentThreadId = initialThreadId;
+  let sawSubstantiveEvent = false;
+  const emittedText = new Set<string>();
+  let terminalProbeInFlight = false;
+  let recoveredReason: CodexFinishReason | undefined;
+  let recoveredText: string | undefined;
+  let streamClosed = false;
+  const probePersistedTerminal = async (idleMs: number): Promise<void> => {
+    if (
+      !turnStateProbe ||
+      !currentThreadId ||
+      !sawSubstantiveEvent ||
+      terminalProbeInFlight ||
+      streamClosed ||
+      recoveredReason
+    ) {
+      return;
+    }
+    terminalProbeInFlight = true;
+    try {
+      const latest = await turnStateProbe(currentThreadId);
+      if (
+        streamClosed ||
+        !latest ||
+        latest.id === baselineTurnId ||
+        latest.status === 'inProgress'
+      ) {
+        return;
+      }
+      recoveredReason = finishReasonForTurn(latest);
+      if (
+        latest.status === 'completed' &&
+        latest.finalText &&
+        !emittedText.has(latest.finalText)
+      ) {
+        recoveredText = latest.finalText;
+      }
+      log.warn('agent', 'terminal-recovered', {
+        pid: child.pid ?? null,
+        threadId: currentThreadId,
+        turnId: latest.id,
+        turnStatus: latest.status,
+        idleMs,
+      });
+      rl.close();
+      child.stdout.destroy();
+    } catch (error) {
+      if (!streamClosed) {
+        log.warn('agent', 'terminal-probe-failed', {
+          pid: child.pid ?? null,
+          threadId: currentThreadId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } finally {
+      terminalProbeInFlight = false;
+    }
+  };
   const stdoutIdleTimer =
     stdoutIdleProbeMs > 0
       ? setInterval(() => {
@@ -246,6 +354,7 @@ async function* createEventStream(
             childSignalCode: child.signalCode,
           });
           lastStdoutAt = Date.now();
+          void probePersistedTerminal(idleMs);
         }, stdoutIdleProbeMs)
       : undefined;
   let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
@@ -267,13 +376,37 @@ async function* createEventStream(
       } catch {
         continue;
       }
-      yield* translator.translate(parsed);
+      const raw = parsed as { type?: unknown; thread_id?: unknown; threadId?: unknown };
+      if (raw.type === 'thread.started') {
+        const threadId =
+          typeof raw.thread_id === 'string'
+            ? raw.thread_id
+            : typeof raw.threadId === 'string'
+              ? raw.threadId
+              : undefined;
+        if (threadId) currentThreadId = threadId;
+      }
+      const translated = translator.translate(parsed);
+      for (const event of translated) {
+        if (event.type === 'text') emittedText.add(event.delta);
+      }
+      if (translated.some((event) => event.type !== 'system' && event.type !== 'usage')) {
+        sawSubstantiveEvent = true;
+      }
+      yield* translated;
     }
   } finally {
+    streamClosed = true;
     if (stdoutIdleTimer) clearInterval(stdoutIdleTimer);
     if (silentExitTimer) clearTimeout(silentExitTimer);
     child.removeListener('exit', closeSilentStdout);
     rl.close();
+  }
+
+  if (recoveredReason) {
+    if (recoveredText) yield { type: 'text', delta: recoveredText };
+    yield* translator.finish(recoveredReason);
+    return;
   }
 
   const earlyRuntimeError = getError();
@@ -304,6 +437,12 @@ async function* createEventStream(
   }
 
   yield* translator.finish();
+}
+
+function finishReasonForTurn(turn: CodexTurnState): CodexFinishReason {
+  if (turn.status === 'completed') return 'normal';
+  if (turn.status === 'interrupted') return 'interrupted';
+  return 'failed';
 }
 
 function terminalError(message: string): AgentEvent {
