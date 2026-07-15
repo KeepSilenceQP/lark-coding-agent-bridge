@@ -1,4 +1,5 @@
 import { isComplete } from '../../config/schema';
+import { resolveAppPaths } from '../../config/app-paths';
 import { createInterface } from 'node:readline';
 import { paths } from '../../config/paths';
 import { loadRootConfig, readActiveProfile } from '../../config/profile-store';
@@ -17,6 +18,7 @@ import { checkRuntimeLock, type RuntimeLockMeta } from '../../runtime/locks';
 import { preFlightChecks } from '../preflight';
 import { promptAndStopActiveBridgeMigrationConflict } from './migrate';
 import { stopProcessEntry, type StopProcessEntryResult } from './ps';
+import { requestDeferredServiceRestart } from '../../runtime/deferred-service-restart';
 
 export interface ServiceStartOptions {
   profile?: string;
@@ -373,11 +375,30 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
     console.error('bot 还没在后台运行过。请先运行 `start` 启动。');
     process.exit(1);
   }
+  if (
+    process.env.LARK_CHANNEL === '1' &&
+    process.env.LARK_CHANNEL_PROFILE === profile
+  ) {
+    const appPaths = resolveAppPaths({ rootDir: paths.rootDir, profile });
+    const bridgePid = positiveInt(process.env.LARK_CHANNEL_BRIDGE_PID);
+    await requestDeferredServiceRestart(appPaths.profileDir, {
+      profile,
+      ...(bridgePid ? { bridgePid } : {}),
+      requestedAt: new Date().toISOString(),
+    });
+    console.log('✓ 已安排在当前任务完成后重启；本次回复完成前不会中断 bridge。');
+    return;
+  }
   if (adapter.isRunning()) {
     await reportConnectAfter('restarted', profile, adapter.restart);
     return;
   }
   await reportConnectAfter('started', profile, adapter.start);
+}
+
+function positiveInt(value: string | undefined): number | undefined {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 /** `bridge status` — report whether the daemon is running, with pid + log paths. */

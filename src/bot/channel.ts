@@ -4,6 +4,8 @@ import type {
   NormalizedMessage,
 } from '@larksuite/channel';
 import { createLarkChannel } from '@larksuite/channel';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import { modelLabel, normalizeModelSelection, resolveModelArg } from '../agent/models';
@@ -36,7 +38,6 @@ import {
   getMaxConcurrentRuns,
   getMessageReplyMode,
   getRequireMentionInGroup,
-  getRunIdleTimeoutMs,
   getShowToolCalls,
 } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
@@ -50,10 +51,16 @@ import { canRunBotAdminCommand, canUseDm, canUseGroup } from '../policy/access';
 import type { ScopeContext } from '../policy/run-policy';
 import { createOwnerRefreshController } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
+import {
+  consumeDeferredServiceRestart,
+  launchDeferredServiceRestart,
+  requestDeferredServiceRestart,
+} from '../runtime/deferred-service-restart';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
+import { resolveRunIdleTimeoutMs, resolveRunStartupTimeoutMs } from './run-idle-timeout';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
@@ -75,7 +82,15 @@ import {
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
+const FINAL_READBACK_RETRY_MS = 250;
+const FINAL_READBACK_TIMEOUT_MS = 2000;
+const TAIL_COMPARE_CHARS = 500;
+// Mirrors @larksuite/channel's DEFAULT_MAX_ELEMENT_CHARS for markdown streaming
+// cards. When final markdown exceeds this, the SDK rolls over internally but
+// currently returns only the head messageId from MarkdownStreamController.run().
+const MARKDOWN_STREAM_MAX_ELEMENT_CHARS = 30_000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
+const STREAM_HASH_HEX_CHARS = 12;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
   '你在 bridge 进程中运行，普通 lark-cli 会继承 LARK_CHANNEL=1 并进入 bridge-bound 模式。',
@@ -164,6 +179,451 @@ function stringifyArgs(args: unknown[]): string {
     .join(' ');
 }
 
+type RawClientCall = (request: unknown) => Promise<unknown>;
+type RawMethodOwner = Record<string, RawClientCall | undefined>;
+
+interface RawClientShape {
+  cardkit?: {
+    v1?: {
+      card?: RawMethodOwner;
+      cardElement?: RawMethodOwner;
+    };
+  };
+  im?: {
+    v1?: {
+      message?: RawMethodOwner;
+    };
+  };
+}
+
+const STREAM_DIAG_WRAPPED = Symbol('streamDiagWrapped');
+const STREAM_RECOVERY_WRAPPED = Symbol('streamRecoveryWrapped');
+const CARDKIT_STREAM_TRACKER = Symbol('cardkitStreamTracker');
+const CARDKIT_STREAM_EXPIRED_CODES = new Set([200850, 300309]);
+const CARDKIT_STREAM_TRACKER_LIMIT = 256;
+
+interface CardkitStreamTracker {
+  cardByMessageId: Map<string, string>;
+  sequenceByCardId: Map<string, number>;
+}
+
+interface StreamRecoveryState {
+  expiredCardIds: Set<string>;
+  failures: Map<string, Error>;
+}
+
+const streamRecoveryState = new AsyncLocalStorage<StreamRecoveryState>();
+
+export function installCardkitStreamDiagnostics(channel: LarkChannel): void {
+  const tracker = getOrCreateCardkitStreamTracker(channel);
+  wrapMarkdownStreamWithRecoveryFailures(channel);
+  const raw = channel.rawClient as RawClientShape;
+  wrapRawClientCall(
+    raw.cardkit?.v1?.card,
+    'create',
+    'cardkit-card-create',
+    summarizeCardCreateRequest,
+  );
+  wrapCardElementContentWithExpiryRecovery(raw, tracker);
+  wrapRawClientCall(
+    raw.cardkit?.v1?.card,
+    'settings',
+    'cardkit-card-settings',
+    summarizeCardSettingsRequest,
+    (request) => trackCardSequence(tracker, request),
+  );
+  wrapRawClientCall(
+    raw.im?.v1?.message,
+    'create',
+    'im-message-create',
+    summarizeImCreateRequest,
+    (request, result) => trackCardMessage(tracker, request, result),
+  );
+  wrapRawClientCall(
+    raw.im?.v1?.message,
+    'reply',
+    'im-message-reply',
+    summarizeImReplyRequest,
+    (request, result) => trackCardMessage(tracker, request, result),
+  );
+}
+
+function getOrCreateCardkitStreamTracker(channel: LarkChannel): CardkitStreamTracker {
+  const trackedChannel = channel as LarkChannel & { [CARDKIT_STREAM_TRACKER]?: CardkitStreamTracker };
+  const existing = trackedChannel[CARDKIT_STREAM_TRACKER];
+  if (existing) return existing;
+  const tracker: CardkitStreamTracker = {
+    cardByMessageId: new Map(),
+    sequenceByCardId: new Map(),
+  };
+  trackedChannel[CARDKIT_STREAM_TRACKER] = tracker;
+  return tracker;
+}
+
+function wrapMarkdownStreamWithRecoveryFailures(channel: LarkChannel): void {
+  const original = channel.stream as LarkChannel['stream'] & {
+    [STREAM_RECOVERY_WRAPPED]?: boolean;
+  } | undefined;
+  if (!original || original[STREAM_RECOVERY_WRAPPED]) return;
+
+  const wrapped = async function wrappedMarkdownStream(
+    this: LarkChannel,
+    ...args: Parameters<LarkChannel['stream']>
+  ): ReturnType<LarkChannel['stream']> {
+    const state: StreamRecoveryState = {
+      expiredCardIds: new Set<string>(),
+      failures: new Map<string, Error>(),
+    };
+    return streamRecoveryState.run(state, async () => {
+      const result = await original.apply(this, args);
+      const failure = state.failures.values().next().value;
+      if (failure) throw failure;
+      return result;
+    });
+  } as LarkChannel['stream'] & { [STREAM_RECOVERY_WRAPPED]?: boolean };
+  wrapped[STREAM_RECOVERY_WRAPPED] = true;
+  channel.stream = wrapped;
+}
+
+function wrapCardElementContentWithExpiryRecovery(
+  raw: RawClientShape,
+  tracker: CardkitStreamTracker,
+): void {
+  const owner = raw.cardkit?.v1?.cardElement;
+  const cardOwner = raw.cardkit?.v1?.card;
+  const original = owner?.content as
+    | (RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean })
+    | undefined;
+  const updateCard = cardOwner?.update;
+  if (!owner || !original || original[STREAM_DIAG_WRAPPED]) return;
+
+  const wrapped = async function wrappedCardElementContent(
+    this: unknown,
+    request: unknown,
+  ): Promise<unknown> {
+    const fields = summarizeCardElementContentRequest(request);
+    const path = recordAt(request, 'path');
+    const cardId = stringAt(path, 'card_id');
+    trackCardSequence(tracker, request);
+    const start = Date.now();
+    log.info('stream-diag', 'cardkit-card-element-content-request', fields);
+    try {
+      if (cardId && updateCard && isExpiredCardInCurrentStream(cardId)) {
+        log.info('stream-diag', 'cardkit-card-element-content-bypassed', fields);
+        return await recoverExpiredStreamingCard(cardOwner, updateCard, request, fields, undefined);
+      }
+      const result = await original.call(this, request);
+      const resultFields = summarizeApiResult(result);
+      const resultCode = numberAt(resultFields, 'code');
+      log.info('stream-diag', 'cardkit-card-element-content-result', {
+        ...fields,
+        durationMs: Date.now() - start,
+        ...resultFields,
+      });
+      if (!CARDKIT_STREAM_EXPIRED_CODES.has(resultCode ?? -1) || !updateCard) return result;
+      if (cardId) markExpiredCardInCurrentStream(cardId);
+
+      return await recoverExpiredStreamingCard(cardOwner, updateCard, request, fields, result);
+    } catch (err) {
+      log.fail('stream-diag', err, {
+        step: 'cardkit-card-element-content',
+        durationMs: Date.now() - start,
+        ...fields,
+      });
+      throw err;
+    }
+  } as RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean };
+  wrapped[STREAM_DIAG_WRAPPED] = true;
+  owner.content = wrapped;
+}
+
+async function recoverExpiredStreamingCard(
+  cardOwner: RawMethodOwner,
+  updateCard: RawClientCall,
+  elementRequest: unknown,
+  fields: Record<string, unknown>,
+  expiredResult: unknown,
+): Promise<unknown> {
+  const path = recordAt(elementRequest, 'path');
+  const data = recordAt(elementRequest, 'data');
+  const cardId = stringAt(path, 'card_id');
+  const elementId = stringAt(path, 'element_id');
+  const content = stringAt(data, 'content');
+  const sequence = numberAt(data, 'sequence');
+  if (!cardId || !elementId || content === undefined || sequence === undefined) {
+    log.warn('stream-diag', 'cardkit-stream-expired-recovery-skipped', {
+      reason: 'invalid-element-request',
+      ...fields,
+    });
+    recordStreamRecoveryFailure(
+      cardId ?? 'unknown-card',
+      new Error('CardKit stream recovery failed: invalid element update request'),
+    );
+    return expiredResult;
+  }
+
+  const request = {
+    path: { card_id: cardId },
+    data: {
+      card: {
+        type: 'card_json',
+        data: JSON.stringify(buildClosedMarkdownCard(elementId, content)),
+      },
+      sequence,
+      uuid: `u_${cardId}_${sequence}`,
+    },
+  };
+  const start = Date.now();
+  log.warn('stream-diag', 'cardkit-stream-expired-recovery-request', fields);
+  try {
+    const result = await updateCard.call(cardOwner, request);
+    const resultFields = summarizeApiResult(result);
+    const resultCode = numberAt(resultFields, 'code');
+    log.info('stream-diag', 'cardkit-stream-expired-recovery-result', {
+      ...fields,
+      durationMs: Date.now() - start,
+      ...resultFields,
+    });
+    if (resultCode === 0) {
+      clearStreamRecoveryFailure(cardId);
+      return result;
+    }
+    recordStreamRecoveryFailure(
+      cardId,
+      new Error(
+        `CardKit stream recovery failed card=${cardId} sequence=${sequence} code=${resultCode ?? 'missing'} msg=${resultFields.msg ?? 'unknown'}`,
+      ),
+    );
+    return expiredResult;
+  } catch (err) {
+    log.fail('stream-diag', err, {
+      step: 'cardkit-stream-expired-recovery',
+      durationMs: Date.now() - start,
+      ...fields,
+    });
+    recordStreamRecoveryFailure(
+      cardId,
+      new Error(
+        `CardKit stream recovery failed card=${cardId} sequence=${sequence}: ${errorMessage(err)}`,
+        { cause: err },
+      ),
+    );
+    return expiredResult;
+  }
+}
+
+function recordStreamRecoveryFailure(cardId: string, error: Error): void {
+  streamRecoveryState.getStore()?.failures.set(cardId, error);
+}
+
+function clearStreamRecoveryFailure(cardId: string): void {
+  streamRecoveryState.getStore()?.failures.delete(cardId);
+}
+
+function markExpiredCardInCurrentStream(cardId: string): void {
+  streamRecoveryState.getStore()?.expiredCardIds.add(cardId);
+}
+
+function isExpiredCardInCurrentStream(cardId: string): boolean {
+  return streamRecoveryState.getStore()?.expiredCardIds.has(cardId) ?? false;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function buildClosedMarkdownCard(elementId: string, content: string): Record<string, unknown> {
+  const summary = content.replace(/\s+/g, ' ').trim();
+  return {
+    schema: '2.0',
+    config: {
+      streaming_mode: false,
+      summary: { content: summary.length <= 50 ? summary : `${summary.slice(0, 49)}…` },
+    },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          element_id: elementId,
+          content,
+        },
+      ],
+    },
+  };
+}
+
+function wrapRawClientCall(
+  owner: RawMethodOwner | undefined,
+  method: string,
+  event: string,
+  summarize: (request: unknown) => Record<string, unknown>,
+  observe?: (request: unknown, result: unknown) => void,
+): void {
+  const original = owner?.[method] as (RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean }) | undefined;
+  if (!owner || !original || original[STREAM_DIAG_WRAPPED]) return;
+
+  const wrapped = async function wrappedRawClientCall(this: unknown, request: unknown): Promise<unknown> {
+    const fields = summarize(request);
+    const start = Date.now();
+    log.info('stream-diag', `${event}-request`, fields);
+    try {
+      const result = await original.call(this, request);
+      observe?.(request, result);
+      log.info('stream-diag', `${event}-result`, {
+        ...fields,
+        durationMs: Date.now() - start,
+        ...summarizeApiResult(result),
+      });
+      return result;
+    } catch (err) {
+      log.fail('stream-diag', err, {
+        step: event,
+        durationMs: Date.now() - start,
+        ...fields,
+      });
+      throw err;
+    }
+  } as RawClientCall & { [STREAM_DIAG_WRAPPED]?: boolean };
+  wrapped[STREAM_DIAG_WRAPPED] = true;
+  owner[method] = wrapped;
+}
+
+function trackCardSequence(tracker: CardkitStreamTracker, request: unknown): void {
+  const path = recordAt(request, 'path');
+  const data = recordAt(request, 'data');
+  const cardId = stringAt(path, 'card_id');
+  const sequence = numberAt(data, 'sequence');
+  if (!cardId || sequence === undefined) return;
+  const current = tracker.sequenceByCardId.get(cardId) ?? 0;
+  if (sequence > current) rememberBounded(tracker.sequenceByCardId, cardId, sequence);
+}
+
+function trackCardMessage(
+  tracker: CardkitStreamTracker,
+  request: unknown,
+  result: unknown,
+): void {
+  const data = recordAt(request, 'data');
+  const content = stringAt(data, 'content');
+  const messageId = stringAt(recordAt(result, 'data'), 'message_id');
+  const cardId = cardIdFromReferenceContent(content);
+  if (!messageId || !cardId) return;
+  rememberBounded(tracker.cardByMessageId, messageId, cardId);
+}
+
+function cardIdFromReferenceContent(content: string | undefined): string | undefined {
+  if (!content) return undefined;
+  const parsed = parseJson(content);
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const root = parsed as Record<string, unknown>;
+  return stringAt(root, 'card_id') ?? stringAt(recordAt(root, 'data'), 'card_id');
+}
+
+function rememberBounded<K, V>(map: Map<K, V>, key: K, value: V): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > CARDKIT_STREAM_TRACKER_LIMIT) {
+    const oldest = map.keys().next().value as K | undefined;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
+function summarizeCardCreateRequest(request: unknown): Record<string, unknown> {
+  const data = recordAt(request, 'data');
+  const rawCard = stringAt(data, 'data');
+  return {
+    cardType: stringAt(data, 'type'),
+    ...textLogFields('cardJson', rawCard),
+  };
+}
+
+function summarizeCardElementContentRequest(request: unknown): Record<string, unknown> {
+  const path = recordAt(request, 'path');
+  const data = recordAt(request, 'data');
+  const content = stringAt(data, 'content');
+  return {
+    cardId: stringAt(path, 'card_id'),
+    elementId: stringAt(path, 'element_id'),
+    sequence: numberAt(data, 'sequence'),
+    uuid: stringAt(data, 'uuid'),
+    ...textLogFields('content', content),
+  };
+}
+
+function summarizeCardSettingsRequest(request: unknown): Record<string, unknown> {
+  const path = recordAt(request, 'path');
+  const data = recordAt(request, 'data');
+  const settings = stringAt(data, 'settings');
+  return {
+    cardId: stringAt(path, 'card_id'),
+    sequence: numberAt(data, 'sequence'),
+    uuid: stringAt(data, 'uuid'),
+    streamingMode: parseStreamingMode(settings),
+    ...textLogFields('settings', settings),
+  };
+}
+
+function summarizeImCreateRequest(request: unknown): Record<string, unknown> {
+  const params = recordAt(request, 'params');
+  const data = recordAt(request, 'data');
+  const content = stringAt(data, 'content');
+  return {
+    receiveIdType: stringAt(params, 'receive_id_type'),
+    receiveId: stringAt(data, 'receive_id'),
+    msgType: stringAt(data, 'msg_type'),
+    ...textLogFields('content', content),
+  };
+}
+
+function summarizeImReplyRequest(request: unknown): Record<string, unknown> {
+  const path = recordAt(request, 'path');
+  const data = recordAt(request, 'data');
+  const content = stringAt(data, 'content');
+  return {
+    replyToMessageId: stringAt(path, 'message_id'),
+    msgType: stringAt(data, 'msg_type'),
+    ...textLogFields('content', content),
+  };
+}
+
+function summarizeApiResult(result: unknown): Record<string, unknown> {
+  const data = recordAt(result, 'data');
+  return {
+    code: numberAt(result, 'code') ?? numberAt(data, 'code'),
+    msg: stringAt(result, 'msg') ?? stringAt(result, 'message') ?? stringAt(data, 'msg'),
+    cardId: stringAt(data, 'card_id'),
+    messageId: stringAt(data, 'message_id'),
+    requestId: stringAt(result, 'request_id') ?? stringAt(data, 'request_id'),
+  };
+}
+
+function recordAt(value: unknown, key: string): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const child = (value as Record<string, unknown>)[key];
+  return child && typeof child === 'object' ? (child as Record<string, unknown>) : undefined;
+}
+
+function stringAt(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === 'string' ? field : undefined;
+}
+
+function numberAt(value: unknown, key: string): number | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === 'number' ? field : undefined;
+}
+
+function parseStreamingMode(settings: string | undefined): boolean | undefined {
+  if (!settings) return undefined;
+  const parsed = parseJson(settings);
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const config = (parsed as { config?: { streaming_mode?: unknown } }).config;
+  return typeof config?.streaming_mode === 'boolean' ? config.streaming_mode : undefined;
+}
+
 export interface BridgeChannel {
   channel: LarkChannel;
   disconnect(): Promise<void>;
@@ -176,7 +636,9 @@ export interface StartChannelDeps {
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   controls: Controls;
-  appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'>;
+  appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'> &
+    Partial<Pick<AppPaths, 'profileDir'>>;
+  launchDeferredRestart?: (profile: string) => void;
 }
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
@@ -189,6 +651,29 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // so /config bumps take effect for the next run.
   const pool = new ProcessPool(() => getMaxConcurrentRuns(controls.cfg));
   const executor = new RunExecutor({ agent, pool, activeRuns });
+  let activeBatchCount = 0;
+  let deferredRestartLaunching = false;
+
+  const maybeLaunchDeferredRestart = async (): Promise<void> => {
+    const profileDir = deps.appPaths?.profileDir;
+    if (!profileDir || activeBatchCount !== 0 || deferredRestartLaunching) return;
+    const requested = await consumeDeferredServiceRestart(profileDir, process.pid);
+    if (!requested) return;
+    // Another scope may have started while the marker read yielded to the
+    // event loop. Put the request back and let the final active batch consume
+    // it, so a restart can never cut across a newly-started reply.
+    if (activeBatchCount !== 0) {
+      await requestDeferredServiceRestart(profileDir, {
+        profile: controls.profile,
+        bridgePid: process.pid,
+        requestedAt: new Date().toISOString(),
+      });
+      return;
+    }
+    deferredRestartLaunching = true;
+    log.info('service', 'deferred-restart-launch', { profile: controls.profile });
+    (deps.launchDeferredRestart ?? launchDeferredServiceRestart)(controls.profile);
+  };
 
   // Resolve the App Secret to plaintext. The config field can be a literal
   // string, a "${VAR}" template, or a {source, id} SecretRef referencing
@@ -268,6 +753,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   };
 
   const channel = createLarkChannel(opts);
+  installCardkitStreamDiagnostics(channel);
   const media = new MediaCache(channel, deps.appPaths?.mediaDir);
 
   // Pending → run handoff: while a run is active on a chat, block its pending
@@ -279,6 +765,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     const firstMsg = batch[0];
     if (!firstMsg) return;
     pending.block(scope);
+    activeBatchCount += 1;
     void withTrace({ chatId: firstMsg.chatId }, async () => {
       log.info('flush', 'start', {
         scope,
@@ -322,6 +809,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         log.fail('flush', err);
       } finally {
         pending.unblock(scope);
+        activeBatchCount = Math.max(0, activeBatchCount - 1);
+        await maybeLaunchDeferredRestart().catch((err) =>
+          log.fail('service', err, { step: 'deferred-restart' }),
+        );
         log.info('flush', 'end');
       }
     });
@@ -935,27 +1426,29 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
       : claudeCapability(controls.profileConfig);
-  const flow = await startRunFlow({
-    scopeId: scope,
-    scope: scopeContext,
-    prompt,
-    attachments: attachments.map(toPolicyAttachment),
-    access: accessDecision,
-    capability,
-    profileConfig: controls.profileConfig,
-    sessions,
-    sessionCatalog,
-    workspaces,
-    executor,
-    now: Date.now(),
-    stopGraceMs: getAgentStopGraceMs(controls.cfg),
-    observability: {
-      profile: controls.profile,
-      agent: capability.agentId,
-      source: 'im',
-      stage: 'submit',
-    },
-  });
+  const startFlow = (stage: 'submit' | 'startup-retry') =>
+    startRunFlow({
+      scopeId: scope,
+      scope: scopeContext,
+      prompt,
+      attachments: attachments.map(toPolicyAttachment),
+      access: accessDecision,
+      capability,
+      profileConfig: controls.profileConfig,
+      sessions,
+      sessionCatalog,
+      workspaces,
+      executor,
+      now: Date.now(),
+      stopGraceMs: getAgentStopGraceMs(controls.cfg),
+      observability: {
+        profile: controls.profile,
+        agent: capability.agentId,
+        source: 'im',
+        stage,
+      },
+    });
+  const flow = await startFlow('submit');
   if (!flow.ok) {
     log.info('run-flow', 'rejected', { scope, code: flow.rejectReason.code });
     log.warn('policy', 'denied', {
@@ -1002,18 +1495,57 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       log.info('session', 'set-thread', { threadId: evt.threadId });
     }
   };
+  let startupRetryUsed = false;
+  const recoverStartupTimeout = async (): Promise<
+    { handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined
+  > => {
+    if (capability.agentId !== 'codex' || startupRetryUsed) return undefined;
+    startupRetryUsed = true;
+    await execution.stop();
+    const safe = await execution.run.canRetryAfterNoOutput?.() ?? false;
+    if (!safe) {
+      log.warn('agent', 'startup-timeout-retry-skipped', {
+        scope,
+        reason: execution.run.canRetryAfterNoOutput
+          ? 'turn-not-empty-terminal'
+          : 'agent-does-not-support-verification',
+      });
+      return undefined;
+    }
+    const replacement = await startFlow('startup-retry');
+    if (!replacement.ok) {
+      log.warn('agent', 'startup-timeout-retry-rejected', {
+        scope,
+        code: replacement.rejectReason.code,
+      });
+      return undefined;
+    }
+    log.warn('agent', 'startup-timeout-retry-started', {
+      scope,
+      previousRunId: execution.runId,
+      retryRunId: replacement.execution.runId,
+      threadId: replacement.resumeFrom,
+    });
+    return {
+      handle: replacement.execution.handle,
+      events: replacement.execution.subscribe(),
+    };
+  };
 
   // Resolve idle-timeout for this run: scope override (on SessionEntry) wins
   // over global default (preferences). 0 / undefined = no watchdog.
   const scopeOverride = sessions.getIdleTimeoutMinutes(scope);
-  const idleTimeoutMs =
-    scopeOverride !== undefined
-      ? scopeOverride > 0
-        ? scopeOverride * 60_000
-        : undefined
-      : getRunIdleTimeoutMs(controls.cfg);
+  const idleTimeoutMs = resolveRunIdleTimeoutMs(
+    controls.cfg,
+    scopeOverride,
+    capability.agentId,
+  );
+  const startupTimeoutMs = resolveRunStartupTimeoutMs(capability.agentId);
   if (idleTimeoutMs) {
     log.info('flush', 'idle-watchdog', { idleTimeoutMs });
+  }
+  if (startupTimeoutMs) {
+    log.info('flush', 'startup-watchdog', { startupTimeoutMs });
   }
 
   const replyMode = getMessageReplyMode(controls.cfg);
@@ -1073,8 +1605,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           eventStream,
           scope,
           idleTimeoutMs,
+          startupTimeoutMs,
           recordSession,
           async () => {},
+          recoverStartupTimeout,
         );
         await cotDone;
         if (cotPublisher.degradedReason) {
@@ -1111,6 +1645,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         eventStream,
         scope,
         idleTimeoutMs,
+        startupTimeoutMs,
         recordSession,
         async (state) => {
           latestState = state;
@@ -1118,6 +1653,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
           }
         },
+        recoverStartupTimeout,
       );
       const streamDone = channel.stream(
         chatId,
@@ -1149,38 +1685,105 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       });
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
+      let latestMarkdown = renderMarkdownStreamText(latestState);
+      let markdownFlushes = 0;
       let producerStarted = false;
+      let lastSetContent:
+        | ({ flush: number; phase: string; durationMs: number } & ReturnType<typeof textLogFields>)
+        | undefined;
       let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
+      const setMarkdownContent = async (
+        phase: 'initial' | 'update' | 'terminal',
+        markdown: string,
+      ): Promise<void> => {
+        if (!markdownCtrl) return;
+        latestMarkdown = markdown;
+        markdownFlushes++;
+        const flush = markdownFlushes;
+        const start = Date.now();
+        try {
+          await markdownCtrl.setContent(markdown);
+          lastSetContent = {
+            flush,
+            phase,
+            durationMs: Date.now() - start,
+            ...textLogFields('markdown', markdown),
+          };
+          if (phase !== 'update') {
+            log.info('stream', 'markdown-set-content', lastSetContent);
+          }
+        } catch (err) {
+          log.fail('stream', err, {
+            step: 'markdown-set-content',
+            flush,
+            phase,
+            ...textLogFields('markdown', markdown),
+          });
+          throw err;
+        }
+      };
       const renderDone = processAgentStream(
         handle,
         eventStream,
         scope,
         idleTimeoutMs,
+        startupTimeoutMs,
         recordSession,
         async (state) => {
           latestState = state;
           if (markdownCtrl) {
-            await markdownCtrl.setContent(renderText(filterForPrefs(state)));
+            const markdown = renderMarkdownStreamText(filterForPrefs(state));
+            await setMarkdownContent(state.terminal === 'running' ? 'update' : 'terminal', markdown);
           }
         },
+        recoverStartupTimeout,
       );
-      const streamDone = channel.stream(
-        chatId,
-        {
-          markdown: async (ctrl) => {
-            producerStarted = true;
-            markdownCtrl = ctrl;
-            await ctrl.setContent(renderText(filterForPrefs(latestState)));
-            await renderDone;
+      const streamDone = channel
+        .stream(
+          chatId,
+          {
+            markdown: async (ctrl) => {
+              producerStarted = true;
+              markdownCtrl = ctrl;
+              const initialMarkdown = renderMarkdownStreamText(filterForPrefs(latestState));
+              await setMarkdownContent('initial', initialMarkdown);
+              const finalState = await renderDone;
+              const finalMarkdown = renderMarkdownStreamText(filterForPrefs(finalState));
+              log.info('stream', 'markdown-producer-final', {
+                terminal: finalState.terminal,
+                chars: latestMarkdown.length,
+                flushes: markdownFlushes,
+                hasRunningFooter: hasRunningFooter(latestMarkdown),
+                finalMatchesLatest: finalMarkdown === latestMarkdown,
+                ...textLogFields('finalMarkdown', finalMarkdown),
+                lastSetContent,
+              });
+            },
           },
-        },
-        sendOpts,
-      );
+          sendOpts,
+        )
+        .then((result) => {
+          log.info('stream', 'markdown-terminal-resolved', {
+            chars: latestMarkdown.length,
+            flushes: markdownFlushes,
+            hasRunningFooter: hasRunningFooter(latestMarkdown),
+            ...textLogFields('latestMarkdown', latestMarkdown),
+            lastSetContent,
+            ...streamResultLogFields(result),
+          });
+          return result;
+        });
       await awaitRenderAwareStream({
         mode: replyMode,
         streamDone,
         renderDone,
         producerStarted: () => producerStarted,
+        verifyFinal: async (streamValue, state) =>
+          verifyMarkdownFinalReadback(
+            channel,
+            streamValue,
+            renderMarkdownStreamText(filterForPrefs(state)),
+          ),
         fallback: async (state) => {
           const body = renderText(filterForPrefs(state));
           if (body.trim()) {
@@ -1197,8 +1800,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         eventStream,
         scope,
         idleTimeoutMs,
+        startupTimeoutMs,
         recordSession,
         async () => {},
+        recoverStartupTimeout,
       );
       await sendFinalReply({
         channel,
@@ -1318,18 +1923,44 @@ function outboundLogFields(
   };
 }
 
+function renderMarkdownStreamText(state: RunState): string {
+  return renderText(state);
+}
+
+function hasRunningFooter(markdown: string): boolean {
+  return (
+    markdown.includes('正在思考') ||
+    markdown.includes('正在调用工具') ||
+    markdown.includes('正在输出')
+  );
+}
+
+function streamResultLogFields(result: unknown): Record<string, unknown> {
+  if (!result || typeof result !== 'object') return {};
+  const messageId = (result as { messageId?: unknown }).messageId;
+  const chunkIds = (result as { chunkIds?: unknown }).chunkIds;
+  return {
+    ...(typeof messageId === 'string' ? { messageId } : {}),
+    ...(Array.isArray(chunkIds) ? { chunkIds } : {}),
+  };
+}
+
 /**
  * Drive the agent's event stream into a stateful RunState, calling `flush`
  * on every state transition. Used by both card and markdown reply modes —
  * the only difference between the two is what `flush` does with the state.
  */
-async function processAgentStream(
+export async function processAgentStream(
   handle: RunHandle,
   events: AsyncIterable<AgentEvent>,
   scope: string,
   idleTimeoutMs: number | undefined,
+  startupTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
   flush: (state: RunState) => Promise<void>,
+  recoverStartupTimeout?: () => Promise<
+    { handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined
+  >,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = initialState;
@@ -1350,26 +1981,46 @@ async function processAgentStream(
   //  - any non-tool event arrives while the set is empty.
   let idleFired = false;
   let timer: NodeJS.Timeout | undefined;
+  let startupFired = false;
+  let startupTimer: NodeJS.Timeout | undefined;
   const inFlightTools = new Set<string>();
+  const stopForTimeout = (kind: 'idle' | 'startup', timeoutMs: number): void => {
+    if (idleFired || startupFired) return;
+    if (kind === 'idle') idleFired = true;
+    else startupFired = true;
+    handle.interrupted = true;
+    log.warn('agent', `${kind}-timeout`, { scope, timeoutMs });
+    void handle.run.stop().catch(() => {
+      /* stop errors are non-fatal */
+    });
+  };
   const armOrPauseIdle = (): void => {
     if (!idleTimeoutMs) return;
     if (timer) clearTimeout(timer);
     timer = undefined;
     if (inFlightTools.size > 0) return;
     timer = setTimeout(() => {
-      idleFired = true;
-      handle.interrupted = true;
-      log.warn('agent', 'idle-timeout', { scope, idleTimeoutMs });
-      void handle.run.stop().catch(() => {
-        /* stop errors are non-fatal */
-      });
+      stopForTimeout('idle', idleTimeoutMs);
     }, idleTimeoutMs);
   };
   armOrPauseIdle();
+  if (startupTimeoutMs) {
+    startupTimer = setTimeout(() => {
+      stopForTimeout('startup', startupTimeoutMs);
+    }, startupTimeoutMs);
+  }
 
   try {
     for await (const evt of events) {
       if (handle.interrupted) break;
+
+      // Codex can emit thread/task metadata and then permanently stop making
+      // progress when a broken resume transcript is loaded. Metadata alone
+      // does not prove startup completed; any substantive event does.
+      if (evt.type !== 'system' && evt.type !== 'usage' && startupTimer) {
+        clearTimeout(startupTimer);
+        startupTimer = undefined;
+      }
 
       // Track tool flight before re-arming the idle timer so the arm step
       // sees the correct set size. tool_use opens a window; tool_result
@@ -1419,6 +2070,28 @@ async function processAgentStream(
     }
   } finally {
     if (timer) clearTimeout(timer);
+    if (startupTimer) clearTimeout(startupTimer);
+  }
+
+  if (state.terminal === 'running' && startupFired && recoverStartupTimeout) {
+    await handle.run.stop().catch(() => {});
+    try {
+      const replacement = await recoverStartupTimeout();
+      if (replacement) {
+        log.warn('agent', 'startup-timeout-retrying', { scope });
+        return processAgentStream(
+          replacement.handle,
+          replacement.events,
+          scope,
+          idleTimeoutMs,
+          startupTimeoutMs,
+          recordSession,
+          flush,
+        );
+      }
+    } catch (err) {
+      log.fail('agent', err, { step: 'startup-timeout-recovery', scope });
+    }
   }
 
   // If state already reached a terminal event (done/error/etc.) before the
@@ -1426,8 +2099,9 @@ async function processAgentStream(
   // wins. This avoids "claude finished but flush was slow → timer fired
   // mid-flush → user sees 'idle_timeout' on a successful run".
   if (state.terminal === 'running') {
-    if (idleFired) {
-      state = markIdleTimeout(state, Math.round(idleTimeoutMs! / 60_000));
+    if (idleFired || startupFired) {
+      const timeoutMs = startupFired ? startupTimeoutMs! : idleTimeoutMs!;
+      state = markIdleTimeout(state, Math.round(timeoutMs / 60_000));
     } else if (handle.interrupted) {
       state = markInterrupted(state);
     } else {
@@ -1448,10 +2122,11 @@ async function awaitRenderAwareStream(input: {
   streamDone: Promise<unknown>;
   renderDone: Promise<RunState>;
   producerStarted: () => boolean;
+  verifyFinal?: (streamValue: unknown, state: RunState) => Promise<boolean | undefined>;
   fallback: (state: RunState) => Promise<void>;
 }): Promise<void> {
   const streamResult = input.streamDone.then(
-    () => ({ kind: 'stream' as const, ok: true as const }),
+    (value) => ({ kind: 'stream' as const, ok: true as const, value }),
     (err) => ({ kind: 'stream' as const, ok: false as const, err }),
   );
   const renderResult = input.renderDone.then(
@@ -1473,6 +2148,7 @@ async function awaitRenderAwareStream(input: {
   if (first.kind === 'stream') {
     const rendered = await renderResult;
     if (!rendered.ok) throw rendered.err;
+    await runFallbackOnFinalMismatch(input, first.value, rendered.state);
     return;
   }
 
@@ -1498,7 +2174,398 @@ async function awaitRenderAwareStream(input: {
     });
     return;
   }
-  if (!terminal.ok) throw terminal.err;
+  if (!terminal.ok) {
+    log.fail('stream', terminal.err, { mode: input.mode, step: 'stream-terminal' });
+    await runFallbackReply(input.mode, first.state, input.fallback);
+    return;
+  }
+  await runFallbackOnFinalMismatch(input, terminal.value, first.state);
+}
+
+async function runFallbackOnFinalMismatch(
+  input: {
+    mode: 'card' | 'markdown';
+    verifyFinal?: (streamValue: unknown, state: RunState) => Promise<boolean | undefined>;
+    fallback: (state: RunState) => Promise<void>;
+  },
+  streamValue: unknown,
+  state: RunState,
+): Promise<void> {
+  if (!input.verifyFinal) return;
+  const visible = await input.verifyFinal(streamValue, state);
+  if (visible === false) {
+    log.warn('stream', 'final-readback-mismatch-no-fallback', { mode: input.mode });
+  }
+}
+
+async function verifyMarkdownFinalReadback(
+  channel: LarkChannel,
+  streamValue: unknown,
+  expected: string,
+): Promise<boolean | undefined> {
+  const messageId = streamMessageId(streamValue);
+  const chunkIds = streamChunkIds(streamValue);
+  const readbackMessageId = streamReadbackMessageId(messageId, chunkIds);
+  if (!readbackMessageId) {
+    log.warn('stream', 'markdown-readback-skipped', {
+      reason: 'missing-message-id',
+      didRollover: chunkIds.length > 0,
+      chunkIds,
+    });
+    return undefined;
+  }
+  if (isLikelyUntrackedMarkdownRollover(expected, chunkIds)) {
+    log.warn('stream', 'markdown-readback-skipped', {
+      reason: 'likely-rollover-without-chunk-ids',
+      messageId,
+      readbackMessageId,
+      chars: expected.length,
+      maxElementChars: MARKDOWN_STREAM_MAX_ELEMENT_CHARS,
+    });
+    return undefined;
+  }
+
+  const first = await readMarkdownMessageSnapshot(channel, readbackMessageId, messageId, chunkIds);
+  if (first === undefined) return undefined;
+  if (markdownReadbackMatches(first.text, expected)) {
+    log.info('stream', 'markdown-readback-match', {
+      messageId,
+      readbackMessageId,
+      didRollover: chunkIds.length > 0,
+      chunkIds,
+      ...readbackLogFields(first, expected),
+    });
+    return true;
+  }
+
+  await delay(FINAL_READBACK_RETRY_MS);
+  const second = await readMarkdownMessageSnapshot(channel, readbackMessageId, messageId, chunkIds);
+  if (second === undefined) return undefined;
+  const matches = markdownReadbackMatches(second.text, expected);
+  if (!matches) {
+    const finalAnchorPresent = markdownFinalAnchorPresent(second.text, expected);
+    log.warn('stream', 'markdown-readback-mismatch', {
+      messageId,
+      readbackMessageId,
+      didRollover: chunkIds.length > 0,
+      chunkIds,
+      ...readbackLogFields(second, expected),
+      liveTail: tailForLog(second.text),
+      expectedTail: tailForLog(expected),
+      finalAnchorPresent,
+    });
+    if (finalAnchorPresent && !hasRunningFooter(second.text)) return false;
+    const repaired = await repairStaleMarkdownCard(channel, readbackMessageId, expected);
+    if (repaired) {
+      await delay(FINAL_READBACK_RETRY_MS);
+      const repairedSnapshot = await readMarkdownMessageSnapshot(
+        channel,
+        readbackMessageId,
+        messageId,
+        chunkIds,
+      );
+      const repairVisible = repairedSnapshot !== undefined
+        && markdownReadbackMatches(repairedSnapshot.text, expected);
+      log.info('stream', 'markdown-readback-repair-verified', {
+        messageId,
+        readbackMessageId,
+        visible: repairVisible,
+        ...(repairedSnapshot ? readbackLogFields(repairedSnapshot, expected) : {}),
+      });
+      return repairVisible;
+    }
+  }
+  return matches;
+}
+
+async function repairStaleMarkdownCard(
+  channel: LarkChannel,
+  messageId: string,
+  expected: string,
+): Promise<boolean> {
+  const tracker = getOrCreateCardkitStreamTracker(channel);
+  const cardId = tracker.cardByMessageId.get(messageId);
+  const updateCard = (channel.rawClient as RawClientShape).cardkit?.v1?.card?.update;
+  if (!cardId || !updateCard) {
+    log.warn('stream', 'markdown-readback-repair-skipped', {
+      messageId,
+      reason: cardId ? 'missing-card-update-api' : 'missing-card-correlation',
+    });
+    return false;
+  }
+
+  const sequence = (tracker.sequenceByCardId.get(cardId) ?? 0) + 1;
+  const request = {
+    path: { card_id: cardId },
+    data: {
+      card: {
+        type: 'card_json',
+        data: JSON.stringify(buildClosedMarkdownCard('stream_md', expected)),
+      },
+      sequence,
+      uuid: `u_repair_${cardId}_${sequence}_${Date.now()}`,
+    },
+  };
+  const start = Date.now();
+  log.warn('stream', 'markdown-readback-repair-request', {
+    messageId,
+    cardId,
+    sequence,
+    ...textLogFields('expected', expected),
+  });
+  try {
+    const result = await updateCard.call(
+      (channel.rawClient as RawClientShape).cardkit?.v1?.card,
+      request,
+    );
+    const resultFields = summarizeApiResult(result);
+    if (numberAt(resultFields, 'code') !== 0) {
+      log.warn('stream', 'markdown-readback-repair-rejected', {
+        messageId,
+        cardId,
+        sequence,
+        durationMs: Date.now() - start,
+        ...resultFields,
+      });
+      return false;
+    }
+    rememberBounded(tracker.sequenceByCardId, cardId, sequence);
+    log.info('stream', 'markdown-readback-repair-result', {
+      messageId,
+      cardId,
+      sequence,
+      durationMs: Date.now() - start,
+      ...resultFields,
+    });
+    return true;
+  } catch (err) {
+    log.fail('stream', err, {
+      step: 'markdown-readback-repair',
+      messageId,
+      cardId,
+      sequence,
+      durationMs: Date.now() - start,
+    });
+    return false;
+  }
+}
+
+interface MarkdownReadbackSnapshot {
+  text: string;
+  messageType?: string;
+  createTime?: string;
+  updateTime?: string;
+  rawContent?: string;
+}
+
+async function readMarkdownMessageSnapshot(
+  channel: LarkChannel,
+  readbackMessageId: string,
+  messageId: string | undefined,
+  chunkIds: string[],
+): Promise<MarkdownReadbackSnapshot | undefined> {
+  try {
+    const result = await Promise.race([
+      channel.rawClient.im.v1.message.get({
+        path: { message_id: readbackMessageId },
+        params: { card_msg_content_type: 'user_card_content' },
+      }),
+      delay(FINAL_READBACK_TIMEOUT_MS).then(() => READBACK_TIMEOUT),
+    ]);
+    if (result === READBACK_TIMEOUT) {
+      log.warn('stream', 'markdown-readback-timeout', {
+        messageId,
+        readbackMessageId,
+        timeoutMs: FINAL_READBACK_TIMEOUT_MS,
+        didRollover: chunkIds.length > 0,
+        chunkIds,
+      });
+      return undefined;
+    }
+    const item = firstMessageItem(result);
+    const text = extractMessageText(result);
+    if (text === undefined) {
+      log.warn('stream', 'markdown-readback-unsupported-content', {
+        messageId,
+        readbackMessageId,
+        didRollover: chunkIds.length > 0,
+        chunkIds,
+        ...messageItemMetadata(item),
+      });
+      return undefined;
+    }
+    return {
+      text,
+      ...messageItemMetadata(item),
+    };
+  } catch (err) {
+    log.fail('stream', err, {
+      step: 'markdown-readback',
+      messageId,
+      readbackMessageId,
+      didRollover: chunkIds.length > 0,
+      chunkIds,
+    });
+    return undefined;
+  }
+}
+
+const READBACK_TIMEOUT = Symbol('readback-timeout');
+
+function streamMessageId(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const messageId = (value as { messageId?: unknown }).messageId;
+  return typeof messageId === 'string' ? messageId : undefined;
+}
+
+function streamChunkIds(value: unknown): string[] {
+  if (!value || typeof value !== 'object') return [];
+  const chunkIds = (value as { chunkIds?: unknown }).chunkIds;
+  return Array.isArray(chunkIds)
+    ? chunkIds.filter((chunkId): chunkId is string => typeof chunkId === 'string')
+    : [];
+}
+
+function streamReadbackMessageId(
+  messageId: string | undefined,
+  chunkIds: string[],
+): string | undefined {
+  return chunkIds.at(-1) ?? messageId;
+}
+
+function isLikelyUntrackedMarkdownRollover(expected: string, chunkIds: string[]): boolean {
+  return chunkIds.length === 0 && expected.length > MARKDOWN_STREAM_MAX_ELEMENT_CHARS;
+}
+
+function readbackLogFields(
+  snapshot: MarkdownReadbackSnapshot,
+  expected: string,
+): Record<string, unknown> {
+  const expectedTail = tailForLog(normalizeReadbackText(expected));
+  const normalizedLive = normalizeReadbackText(snapshot.text);
+  return {
+    messageType: snapshot.messageType,
+    createTime: snapshot.createTime,
+    updateTime: snapshot.updateTime,
+    expectedTailPresent: expectedTail ? normalizedLive.includes(expectedTail) : true,
+    liveHasRunningFooter: hasRunningFooter(snapshot.text),
+    ...textLogFields('live', snapshot.text),
+    ...textLogFields('expected', expected),
+    ...textLogFields('rawContent', snapshot.rawContent),
+  };
+}
+
+function firstMessageItem(value: unknown): Record<string, unknown> | undefined {
+  const item = (
+    value as
+      | { data?: { items?: Array<Record<string, unknown>> } }
+      | undefined
+  )?.data?.items?.[0];
+  return item && typeof item === 'object' ? item : undefined;
+}
+
+function messageItemMetadata(item: Record<string, unknown> | undefined): Omit<MarkdownReadbackSnapshot, 'text'> {
+  if (!item) return {};
+  const content = messageItemRawContent(item);
+  return {
+    messageType: typeof item.message_type === 'string' ? item.message_type : undefined,
+    createTime: typeof item.create_time === 'string' ? item.create_time : undefined,
+    updateTime: typeof item.update_time === 'string' ? item.update_time : undefined,
+    rawContent: typeof content === 'string' ? content : undefined,
+  };
+}
+
+function extractMessageText(value: unknown): string | undefined {
+  const item = firstMessageItem(value);
+  const content = item ? messageItemRawContent(item) : undefined;
+  if (typeof content !== 'string') return undefined;
+  const parsed = parseJson(content);
+  if (isUnsupportedInteractiveCardContent(parsed)) return undefined;
+  const extracted = parsed === undefined ? '' : collectText(parsed).join('\n');
+  const text = `${content}\n${extracted}`.trim();
+  return text || undefined;
+}
+
+function messageItemRawContent(item: Record<string, unknown>): unknown {
+  const body = item.body;
+  return item.content ?? (body && typeof body === 'object'
+    ? (body as { content?: unknown }).content
+    : undefined);
+}
+
+function parseJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function collectText(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap(collectText);
+  if (!value || typeof value !== 'object') return [];
+  return Object.values(value).flatMap(collectText);
+}
+
+function isUnsupportedInteractiveCardContent(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (record.type === 'card') return true;
+  if (typeof record.card_id === 'string') return true;
+  const data = record.data;
+  if (data && typeof data === 'object' && typeof (data as { card_id?: unknown }).card_id === 'string') {
+    return true;
+  }
+  return isDowngradedInteractiveCard(value);
+}
+
+function isDowngradedInteractiveCard(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (record.schema === '2.0' || record.body !== undefined) return false;
+  if (!('elements' in record)) return false;
+  return collectText(value).some((text) => text.includes('请升级至最新版本客户端，以查看内容'));
+}
+
+function markdownReadbackMatches(live: string, expected: string): boolean {
+  const expectedTail = tailForLog(normalizeReadbackText(expected));
+  if (!expectedTail) return true;
+  return normalizeReadbackText(live).includes(expectedTail);
+}
+
+function markdownFinalAnchorPresent(live: string, expected: string): boolean {
+  const paragraphs = expected
+    .trim()
+    .split(/\n\s*\n/)
+    .map(normalizeReadbackText)
+    .filter(Boolean);
+  const finalParagraph = paragraphs.at(-1);
+  if (!finalParagraph) return true;
+  const anchor = finalParagraph.slice(-TAIL_COMPARE_CHARS);
+  return normalizeReadbackText(live).includes(anchor);
+}
+
+function textLogFields(prefix: string, value: string | undefined): Record<string, unknown> {
+  if (value === undefined) return {};
+  return {
+    [`${prefix}Chars`]: value.length,
+    [`${prefix}Hash`]: textHash(value),
+    [`${prefix}HasRunningFooter`]: hasRunningFooter(value),
+    [`${prefix}Tail`]: tailForLog(value),
+  };
+}
+
+function textHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, STREAM_HASH_HEX_CHARS);
+}
+
+function tailForLog(value: string): string {
+  return value.slice(-TAIL_COMPARE_CHARS);
+}
+
+function normalizeReadbackText(value: string): string {
+  return value.trim().replace(/\s+/g, ' ');
 }
 
 async function runFallbackReply(

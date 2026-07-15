@@ -1,9 +1,10 @@
 import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../../src/agent/codex/adapter.js';
 import { buildCodexArgs } from '../../src/agent/codex/argv.js';
+import { log } from '../../src/core/logger.js';
 import type { AgentEvent } from '../../src/agent/types.js';
 
 interface FakeBinary {
@@ -408,6 +409,367 @@ describe('CodexAdapter process contract', () => {
     await iterator.return?.();
   });
 
+  it('logs stdout idle while the Codex child stays alive without new lines', async () => {
+    const fake = await createFakeCodex({
+      lines: [],
+      exitDelayMs: 5_000,
+    });
+    cleanup.push(fake.dir);
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const run = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      stdoutIdleProbeMs: 20,
+    }).run({
+      runId: 'run-stdout-idle',
+      prompt: 'idle',
+      cwd: await realpath(fake.dir),
+    });
+    const iterator = run.events[Symbol.asyncIterator]();
+    const next = iterator.next();
+
+    await waitFor(() =>
+      warn.mock.calls.some(
+        (call) =>
+          call[0] === 'agent' &&
+          call[1] === 'stdout-idle' &&
+          (call[2] as { childExitCode?: unknown; childSignalCode?: unknown } | undefined)
+            ?.childExitCode === null &&
+          (call[2] as { childExitCode?: unknown; childSignalCode?: unknown } | undefined)
+            ?.childSignalCode === null,
+      ),
+    );
+
+    await run.stop();
+    expect(await next).toEqual({
+      done: false,
+      value: { type: 'done', terminationReason: 'interrupted' },
+    });
+    await iterator.return?.();
+  });
+
+  it('finishes a resumed run when Codex persists a new completed turn but stdout loses its terminal event', async () => {
+    const fake = await createFakeCodex({
+      lines: [
+        { type: 'thread.started', thread_id: 'thread-terminal-probe' },
+        { type: 'agent_message', message: 'final answer already persisted' },
+      ],
+      exitDelayMs: 200,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed' })
+      .mockResolvedValueOnce({
+        id: 'turn-current',
+        status: 'completed',
+        finalText: 'persisted final answer',
+      });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      stdoutIdleProbeMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-terminal-probe',
+      prompt: 'resume after a lost terminal event',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-terminal-probe',
+    };
+
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+
+    expect(await collect(run.events)).toEqual([
+      { type: 'system', threadId: 'thread-terminal-probe' },
+      { type: 'text', delta: 'final answer already persisted' },
+      { type: 'text', delta: 'persisted final answer' },
+      { type: 'done', threadId: 'thread-terminal-probe', terminationReason: 'normal' },
+    ]);
+    await run.stop();
+    expect(turnStateProbe).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not finish a resumed run from the pre-run baseline turn or an in-progress turn', async () => {
+    const fake = await createFakeCodex({
+      lines: [
+        { type: 'thread.started', thread_id: 'thread-still-running' },
+        { type: 'agent_message', message: 'work is still continuing' },
+      ],
+      exitDelayMs: 180,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed' })
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed' })
+      .mockResolvedValue({ id: 'turn-current', status: 'inProgress' });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stdoutIdleProbeMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-still-running',
+      prompt: 'keep working',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-still-running',
+    };
+
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+    const events = await collect(run.events);
+
+    expect(events.at(-1)).toEqual({
+      type: 'error',
+      message: 'codex stream ended before a terminal event',
+      terminationReason: 'failed',
+    });
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: 'done', terminationReason: 'normal' }),
+    );
+  });
+
+  it('does not synthesize a terminal event from a persisted interrupted turn', async () => {
+    const fake = await createFakeCodex({
+      lines: [
+        { type: 'thread.started', thread_id: 'thread-persisted-interrupted' },
+        { type: 'agent_message', message: 'work had started' },
+      ],
+      exitDelayMs: 180,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed', itemCount: 1 })
+      .mockResolvedValue({ id: 'turn-current', status: 'interrupted', itemCount: 2 });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stdoutIdleProbeMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-persisted-interrupted',
+      prompt: 'keep working despite a stale interrupted status',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-persisted-interrupted',
+    };
+
+    await adapter.prepareRun(options);
+    const events = await collect(adapter.run(options).events);
+
+    expect(events.at(-1)).toEqual({
+      type: 'error',
+      message: 'codex stream ended before a terminal event',
+      terminationReason: 'failed',
+    });
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: 'done', terminationReason: 'interrupted' }),
+    );
+  });
+
+  it('does not probe persisted terminal state while a Codex tool is still in flight', async () => {
+    const fake = await createFakeCodex({
+      lines: [
+        { type: 'thread.started', thread_id: 'thread-long-tool' },
+        {
+          type: 'item.started',
+          item: {
+            id: 'tool-long',
+            type: 'command_execution',
+            command: './gradlew compile',
+          },
+        },
+      ],
+      exitDelayMs: 180,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed', itemCount: 1 })
+      .mockResolvedValue({
+        id: 'turn-current',
+        status: 'completed',
+        itemCount: 3,
+        finalText: 'must not be recovered while the tool is running',
+      });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stdoutIdleProbeMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-long-tool',
+      prompt: 'run a long build',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-long-tool',
+    };
+
+    await adapter.prepareRun(options);
+    const events = await collect(adapter.run(options).events);
+
+    expect(events).toContainEqual(expect.objectContaining({ type: 'tool_use', id: 'tool-long' }));
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: 'text', delta: 'must not be recovered while the tool is running' }),
+    );
+    expect(turnStateProbe).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not duplicate a persisted final answer that stdout already delivered', async () => {
+    const finalText = 'the complete answer';
+    const fake = await createFakeCodex({
+      lines: [
+        { type: 'thread.started', thread_id: 'thread-final-dedup' },
+        { type: 'agent_message', message: finalText },
+      ],
+      exitDelayMs: 200,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed' })
+      .mockResolvedValueOnce({
+        id: 'turn-current',
+        status: 'completed',
+        finalText,
+      });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      stdoutIdleProbeMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-final-dedup',
+      prompt: 'resume after a lost terminal event',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-final-dedup',
+    };
+
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+
+    expect(await collect(run.events)).toEqual([
+      { type: 'system', threadId: 'thread-final-dedup' },
+      { type: 'text', delta: finalText },
+      { type: 'done', threadId: 'thread-final-dedup', terminationReason: 'normal' },
+    ]);
+    await run.stop();
+  });
+
+  it('allows one replay only when the stopped Codex turn is new, terminal, and has zero items', async () => {
+    const fake = await createFakeCodex({
+      lines: [{ type: 'thread.started', thread_id: 'thread-empty-turn' }],
+      exitDelayMs: 500,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({
+        id: 'turn-before-run',
+        status: 'completed',
+        itemCount: 1,
+      })
+      .mockResolvedValueOnce({
+        id: 'turn-empty-interrupted',
+        status: 'interrupted',
+        itemCount: 0,
+      });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-empty-turn',
+      prompt: 'retry this prompt',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-empty-turn',
+    };
+
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+    await run.stop();
+
+    await expect(run.canRetryAfterNoOutput?.()).resolves.toBe(true);
+  });
+
+  it('fails closed when the interrupted Codex turn contains any persisted item', async () => {
+    const fake = await createFakeCodex({
+      lines: [{ type: 'thread.started', thread_id: 'thread-with-item' }],
+      exitDelayMs: 500,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({
+        id: 'turn-before-run',
+        status: 'completed',
+        itemCount: 1,
+      })
+      .mockResolvedValueOnce({
+        id: 'turn-with-user-message',
+        status: 'interrupted',
+        itemCount: 1,
+      });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-with-item',
+      prompt: 'must not replay',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-with-item',
+    };
+
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+    await run.stop();
+
+    await expect(run.canRetryAfterNoOutput?.()).resolves.toBe(false);
+  });
+
+  it('fails closed while the latest Codex turn is still in progress even with zero items', async () => {
+    const fake = await createFakeCodex({
+      lines: [{ type: 'thread.started', thread_id: 'thread-in-progress' }],
+      exitDelayMs: 500,
+    });
+    cleanup.push(fake.dir);
+    const turnStateProbe = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed', itemCount: 1 })
+      .mockResolvedValueOnce({ id: 'turn-in-progress', status: 'inProgress', itemCount: 0 });
+    const adapter = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      stopGraceMs: 20,
+      turnStateProbe,
+    } as ConstructorParameters<typeof CodexAdapter>[0]);
+    const options = {
+      runId: 'run-in-progress',
+      prompt: 'must not overlap',
+      cwd: await realpath(fake.dir),
+      threadId: 'thread-in-progress',
+    };
+
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+    await run.stop();
+
+    await expect(run.canRetryAfterNoOutput?.()).resolves.toBe(false);
+  });
+
   it('requires cwd to be resolved by policy before spawning', () => {
     expect(() =>
       new CodexAdapter({ binary: 'unused', profileStateDir: tmpdir() }).run({
@@ -499,4 +861,13 @@ async function readRecord(path: string): Promise<{
       PATH?: string;
     };
   };
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('timed out waiting for async work');
 }
