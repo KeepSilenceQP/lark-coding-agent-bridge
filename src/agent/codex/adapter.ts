@@ -17,6 +17,10 @@ import type {
 } from '../types';
 import { buildCodexArgs } from './argv';
 import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
+import {
+  createCodexTurnStateProbe,
+  type CodexTurnStateProbe,
+} from './turn-state-probe';
 
 export interface CodexAdapterOptions {
   binary: string;
@@ -27,10 +31,13 @@ export interface CodexAdapterOptions {
   ignoreRules?: boolean;
   sandbox?: SandboxMode;
   stopGraceMs?: number;
+  stdoutIdleProbeMs?: number;
+  turnStateProbe?: CodexTurnStateProbe;
   larkChannel?: LarkChannelEnvContext;
 }
 
 type CodexChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
+const DEFAULT_STDOUT_IDLE_PROBE_MS = 60_000;
 
 export class CodexAdapter implements AgentAdapter {
   readonly id = 'codex';
@@ -44,6 +51,12 @@ export class CodexAdapter implements AgentAdapter {
   private readonly ignoreRules: boolean;
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
+  private readonly stdoutIdleProbeMs: number;
+  private readonly turnStateProbe: CodexTurnStateProbe;
+  private readonly turnProbeBaselines = new Map<
+    string,
+    { enabled: boolean; turnId?: string }
+  >();
   private readonly larkChannel: LarkChannelEnvContext | undefined;
   private botIdentity: AgentBotIdentity | undefined;
 
@@ -56,6 +69,15 @@ export class CodexAdapter implements AgentAdapter {
     this.ignoreRules = opts.ignoreRules !== false;
     this.sandbox = opts.sandbox ?? 'danger-full-access';
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
+    this.stdoutIdleProbeMs = opts.stdoutIdleProbeMs ?? DEFAULT_STDOUT_IDLE_PROBE_MS;
+    this.turnStateProbe =
+      opts.turnStateProbe ??
+      createCodexTurnStateProbe({
+        binary: opts.binary,
+        profileStateDir: opts.profileStateDir,
+        codexHome: opts.codexHome,
+        inheritCodexHome: opts.inheritCodexHome,
+      });
     this.larkChannel = opts.larkChannel;
   }
 
@@ -76,7 +98,7 @@ export class CodexAdapter implements AgentAdapter {
     });
   }
 
-  async prepareRun(): Promise<void> {
+  async prepareRun(opts?: AgentRunOptions): Promise<void> {
     const availability = await this.checkAvailability();
     if (!availability.ok) {
       throw new SpawnFailed(
@@ -86,12 +108,37 @@ export class CodexAdapter implements AgentAdapter {
         availability.diagnostic,
       );
     }
+    if (!opts) return;
+    if (this.stdoutIdleProbeMs <= 0 || !opts.threadId) {
+      this.turnProbeBaselines.set(opts.runId, { enabled: true });
+      return;
+    }
+    try {
+      const latest = await this.turnStateProbe(opts.threadId);
+      this.turnProbeBaselines.set(opts.runId, {
+        enabled: true,
+        ...(latest ? { turnId: latest.id } : {}),
+      });
+    } catch (error) {
+      this.turnProbeBaselines.set(opts.runId, { enabled: false });
+      log.warn('agent', 'terminal-probe-baseline-failed', {
+        threadId: opts.threadId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   run(opts: AgentRunOptions): AgentRun {
     if (!opts.cwd) {
       throw new Error('cwd is required for CodexAdapter.run');
     }
+    const preparedProbe = this.turnProbeBaselines.get(opts.runId);
+    this.turnProbeBaselines.delete(opts.runId);
+    const terminalProbe = opts.threadId
+      ? preparedProbe?.enabled
+        ? this.turnStateProbe
+        : undefined
+      : this.turnStateProbe;
 
     const args = buildCodexArgs({
       cwd: opts.cwd,
@@ -159,7 +206,16 @@ export class CodexAdapter implements AgentAdapter {
 
     return {
       runId: opts.runId,
-      events: createEventStream(child, stderrChunks, () => runtimeError, () => stopReason),
+      events: createEventStream(
+        child,
+        stderrChunks,
+        () => runtimeError,
+        () => stopReason,
+        this.stdoutIdleProbeMs,
+        opts.threadId,
+        preparedProbe?.turnId,
+        terminalProbe,
+      ),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
         stopReason = 'interrupted';
@@ -199,6 +255,33 @@ export class CodexAdapter implements AgentAdapter {
           child.once('exit', onExit);
         });
       },
+      async canRetryAfterNoOutput(): Promise<boolean> {
+        if (!opts.threadId || !terminalProbe) return false;
+        try {
+          const latest = await terminalProbe(opts.threadId);
+          const safe = Boolean(
+            latest &&
+            latest.id !== preparedProbe?.turnId &&
+            (latest.status === 'interrupted' || latest.status === 'failed') &&
+            latest.itemCount === 0,
+          );
+          log.warn('agent', 'no-output-retry-check', {
+            threadId: opts.threadId,
+            baselineTurnId: preparedProbe?.turnId,
+            turnId: latest?.id,
+            turnStatus: latest?.status,
+            itemCount: latest?.itemCount,
+            safe,
+          });
+          return safe;
+        } catch (error) {
+          log.warn('agent', 'no-output-retry-check-failed', {
+            threadId: opts.threadId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          return false;
+        }
+      },
     };
   }
 }
@@ -208,6 +291,10 @@ async function* createEventStream(
   stderrChunks: Buffer[],
   getError: () => Error | null,
   getStopReason: () => CodexFinishReason | undefined,
+  stdoutIdleProbeMs: number,
+  initialThreadId: string | undefined,
+  baselineTurnId: string | undefined,
+  turnStateProbe: CodexTurnStateProbe | undefined,
 ): AsyncGenerator<AgentEvent> {
   const translator = new CodexJsonlTranslator();
   if (!child.pid) {
@@ -222,6 +309,82 @@ async function* createEventStream(
 
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
   let sawStdout = false;
+  let lastStdoutAt = Date.now();
+  let currentThreadId = initialThreadId;
+  let sawSubstantiveEvent = false;
+  const inFlightTools = new Set<string>();
+  const emittedText = new Set<string>();
+  let terminalProbeInFlight = false;
+  let recoveredReason: CodexFinishReason | undefined;
+  let recoveredText: string | undefined;
+  let streamClosed = false;
+  const probePersistedTerminal = async (idleMs: number): Promise<void> => {
+    if (
+      !turnStateProbe ||
+      !currentThreadId ||
+      !sawSubstantiveEvent ||
+      inFlightTools.size > 0 ||
+      terminalProbeInFlight ||
+      streamClosed ||
+      recoveredReason
+    ) {
+      return;
+    }
+    terminalProbeInFlight = true;
+    try {
+      const latest = await turnStateProbe(currentThreadId);
+      if (
+        streamClosed ||
+        !latest ||
+        latest.id === baselineTurnId ||
+        latest.status !== 'completed'
+      ) {
+        return;
+      }
+      recoveredReason = 'normal';
+      if (
+        latest.status === 'completed' &&
+        latest.finalText &&
+        !emittedText.has(latest.finalText)
+      ) {
+        recoveredText = latest.finalText;
+      }
+      log.warn('agent', 'terminal-recovered', {
+        pid: child.pid ?? null,
+        threadId: currentThreadId,
+        turnId: latest.id,
+        turnStatus: latest.status,
+        idleMs,
+      });
+      rl.close();
+      child.stdout.destroy();
+    } catch (error) {
+      if (!streamClosed) {
+        log.warn('agent', 'terminal-probe-failed', {
+          pid: child.pid ?? null,
+          threadId: currentThreadId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } finally {
+      terminalProbeInFlight = false;
+    }
+  };
+  const stdoutIdleTimer =
+    stdoutIdleProbeMs > 0
+      ? setInterval(() => {
+          const idleMs = Date.now() - lastStdoutAt;
+          if (idleMs < stdoutIdleProbeMs) return;
+          log.warn('agent', 'stdout-idle', {
+            pid: child.pid ?? null,
+            idleMs,
+            childExitCode: child.exitCode,
+            childSignalCode: child.signalCode,
+          });
+          lastStdoutAt = Date.now();
+          void probePersistedTerminal(idleMs);
+        }, stdoutIdleProbeMs)
+      : undefined;
   let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
   const closeSilentStdout = (): void => {
     silentExitTimer = setTimeout(() => {
@@ -232,6 +395,7 @@ async function* createEventStream(
   try {
     for await (const line of rl) {
       sawStdout = true;
+      lastStdoutAt = Date.now();
       const trimmed = line.trim();
       if (!trimmed) continue;
       let parsed: unknown;
@@ -240,12 +404,39 @@ async function* createEventStream(
       } catch {
         continue;
       }
-      yield* translator.translate(parsed);
+      const raw = parsed as { type?: unknown; thread_id?: unknown; threadId?: unknown };
+      if (raw.type === 'thread.started') {
+        const threadId =
+          typeof raw.thread_id === 'string'
+            ? raw.thread_id
+            : typeof raw.threadId === 'string'
+              ? raw.threadId
+              : undefined;
+        if (threadId) currentThreadId = threadId;
+      }
+      const translated = translator.translate(parsed);
+      for (const event of translated) {
+        if (event.type === 'text') emittedText.add(event.delta);
+        if (event.type === 'tool_use') inFlightTools.add(event.id);
+        if (event.type === 'tool_result') inFlightTools.delete(event.id);
+      }
+      if (translated.some((event) => event.type !== 'system' && event.type !== 'usage')) {
+        sawSubstantiveEvent = true;
+      }
+      yield* translated;
     }
   } finally {
+    streamClosed = true;
+    if (stdoutIdleTimer) clearInterval(stdoutIdleTimer);
     if (silentExitTimer) clearTimeout(silentExitTimer);
     child.removeListener('exit', closeSilentStdout);
     rl.close();
+  }
+
+  if (recoveredReason) {
+    if (recoveredText) yield { type: 'text', delta: recoveredText };
+    yield* translator.finish(recoveredReason);
+    return;
   }
 
   const earlyRuntimeError = getError();

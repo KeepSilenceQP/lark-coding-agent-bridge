@@ -1,0 +1,261 @@
+# 2026-07-09 Markdown Stream Runtime Issues
+
+This note records the recent Lark bridge markdown/card runtime issues reported by Qin Peng. It is a diagnosis log, not a fix plan approval.
+
+## Current Boundary
+
+- Confirmed problem area: Codex/Lark bridge markdown streaming replies, especially CardKit streaming card update/finalization and readback.
+- Current branch: `fix/msg_break`
+- Current deployed HEAD: `0d0adcb fix: avoid terminal recovery during active tools`
+- Dropped bad fixes: `f107f89 fix: hard-timeout silent agent runs`, `757f99b Revert "fix: hard-timeout silent agent runs"`, `4ec93fc fix: serialize codex bridge runs`
+- Important constraint: only count user-reported message interruption / incomplete / stale / stuck cases here. Later indirect issues introduced by bugfix attempts, such as visible UI changes or duplicate fallback sends, are excluded from the main issue list.
+
+## Resolution Snapshot (2026-07-14)
+
+### Final Classification
+
+The historical incidents resolve into four runtime paths rather than one generic "message interruption" bug:
+
+| Runtime path | Historical evidence | Final handling |
+|---|---|---|
+| CardKit stream expires after 10 minutes | `9csdgepc`, first `300309` at 605.784 seconds | Switch the same card to full `card.update`; later snapshots stay on that path |
+| Stream resolves but final readback is genuinely stale | `8k2mhyaz`, `clujpjym` | Correlate message/card/sequence, update the same card once, then read it back again; never send a duplicate message |
+| Codex persisted `completed` but resume stdout lost terminal/EOF | `e59vesuq` | Reconcile through app-server only for a new `completed` turn, with no tool in flight; supplement a missing persisted final answer |
+| Codex resume produces metadata only and no items | `7shw6nug` | Stop and clean up the old execution; replay once only after app-server confirms a new `interrupted/failed` turn with `items=[]` |
+
+`1cp6kpmz` exposed a fifth guard condition, not another recovery path: a long-running Gradle tool can make stdout idle while app-server reports `interrupted`. Persisted `interrupted/failed` states must not synthesize terminal events, and persisted-terminal probing must pause while a tool is in flight.
+
+### Changes
+
+- `dd77d18 fix: classify safe Codex no-output retries`
+- `a36a53a fix: recover stale cards and empty Codex turns`
+- `7520122 docs: close remaining bridge interruption cases`
+- `0d0adcb fix: avoid terminal recovery during active tools`
+
+All commits are pushed to `origin/fix/msg_break`.
+
+### Verification And Deployment
+
+- Full local CI after the final guard change: 99 test files, 638 tests passed.
+- `git diff --check`, TypeScript typecheck, and production build passed.
+- Active global command is symlinked to this worktree; local and global `dist/cli.js` SHA-256 both equal `d3ac11608cba23f7098c720049aafa7b91e6228a36f25a8ca8b09d9b9a0af5ca`.
+- Codex profile was restarted only after the unrelated active run completed normally. Deployed bridge PID: `71897`, start time `2026-07-14 21:38:13 +08:00`.
+- Repository was clean and `HEAD == origin/fix/msg_break == 0d0adcb4197f76f417a968cdfdbb6020f8452b68` after deployment.
+
+### Remaining Evidence Boundary
+
+No historical incident class in the reviewed group remains without a code path. Production acceptance still requires natural-trigger evidence for:
+
+1. A run longer than 10 minutes showing `300309/200850 -> card.update code=0 -> final readback match`.
+2. A confirmed non-expiry stale readback showing same-card repair and `visible=true` without a second message.
+3. A metadata-only empty turn showing `no-output-retry-check safe=true -> startup-timeout-retry-started -> replacement run terminal`.
+4. A future long tool call showing stdout-idle does not cause persisted-terminal recovery while the tool is in flight.
+
+## Issue 1: Task Completed But Card Did Not Update To Final Content
+
+### 1. Phenomenon
+
+User saw a card stuck in an old/running state, while the actual Codex task had completed. Screenshot showed the card still around intermediate content such as tool calls / "正在调用工具".
+
+### 2. Runtime / Trace / Session Info
+
+Concrete confirmed case:
+
+- User message: `om_x100b6bc2776ef0e4c22c3e0a38fe1de`
+- Trace: `8k2mhyaz`
+- Run ID: `82435a1d-8f2a-42c5-bfe0-22d2b10e880b`
+- Session ID: `019f44a3-fa34-7452-803b-3e1f1284d094`
+- Codex session file:
+  `/Users/bytedance/.codex/sessions/2026/07/09/rollout-2026-07-09T10-10-25-019f44a3-fa34-7452-803b-3e1f1284d094.jsonl`
+- Final answer existed in Codex session at 17:24, saying the test doc was updated to revision 13.
+- Bridge log:
+  - `run completed`, result `normal`, duration `1305310ms`
+  - `card final`, terminal `done`
+  - `markdown-producer-final`, `chars=20423`, `flushes=316`, `hasRunningFooter=false`
+  - `markdown-terminal-resolved`, message `om_x100b6bc2771800acc39eba9f347d771`
+  - `markdown-readback-mismatch`, same message ID, `didRollover=false`, `chunkIds=[]`
+
+Important mismatch details:
+
+- `liveTail` was still old running/intermediate card content, including `正在调用工具`, `stream_md`, `markdown`, `fast`, `2.0`.
+- `expectedTail` was the final answer beginning with `已完成。测试文档已更新到 revision 13`.
+
+Second confirmed case:
+
+- User message: `om_x100b6bcc6dc0acb4c4a41658f8e1b1d`
+- Trace: `clujpjym`
+- Run ID: `68d30069-9409-4301-be10-2de9c3a67f5c`
+- Session ID: `019f44a3-fa34-7452-803b-3e1f1284d094`
+- Reply card message: `om_x100b6bcc6df0c484c4eca45347d1fc1`
+- Chat: `oc_f89495c27df18efb279272477122c0cc`
+- Codex session file:
+  `/Users/bytedance/.codex/sessions/2026/07/09/rollout-2026-07-09T10-10-25-019f44a3-fa34-7452-803b-3e1f1284d094.jsonl`
+- Codex final answer existed in the session, saying the `add_to_desktop`补测 was completed and the test document was updated to revision 22.
+- Bridge log:
+  - `completed`, result `normal`, duration `715969ms`
+  - `markdown-producer-final`, `terminal=done`, `chars=11553`, `flushes=172`, `hasRunningFooter=false`
+  - `exit`, PID `92360`, `code=0`, `signal=null`
+  - `markdown-terminal-resolved`, message `om_x100b6bcc6df0c484c4eca45347d1fc1`
+  - `markdown-readback-mismatch`, same message ID, `didRollover=false`, `chunkIds=[]`
+
+Important mismatch details:
+
+- `liveTail` was still old card content around `刚才更新命令的环境变量写法不兼容 zsh` and `正在调用工具`.
+- `expectedTail` was the final answer around `这次补的是 add_to_desktop` and `本地仓库工作区是干净的`.
+- Independent `lark-cli im +messages-mget --message-ids om_x100b6bcc6df0c484c4eca45347d1fc1 --as user --format json` still read the stale card content after the run.
+
+Third confirmed case, captured after the CardKit probes were deployed:
+
+- Source message: `om_x100b6a6b25fd9024c38fcee16b988ac`
+- Trace: `9csdgepc`
+- Run ID: `c3d2cc87-aa0d-49ab-b673-da8559b571c4`
+- Card ID: `7662301595611106587`
+- Reply card message: `om_x100b6a6b25903c88c0b6575f0f9f3e2`
+- Chat: `oc_f89495c27df18efb279272477122c0cc`
+- Card created successfully at `2026-07-14 16:43:33.413 +08:00`.
+- Element updates sequence 1 through 42 returned `code=0`.
+- The first failed update was sequence 43 at `16:53:39.197`, 605.784 seconds after card creation. It returned `code=300309`, `streaming mode is closed`.
+- Every later element update through the final sequence 57 returned the same `300309` response.
+- Codex still completed normally. The bridge rendered final markdown with `chars=5116`, `hash=9085df7d5ac2`, and no running footer.
+- `card.settings` sequence 58 returned `code=0`, but it only finalized card settings; it did not restore the rejected element content.
+- Readback remained on the old running content with `hash=d4bdbeaac704` and a running footer.
+
+### 3. Current Analysis
+
+This is not a Codex execution failure or a readback-only inconsistency. The root cause is now confirmed:
+
+1. Feishu automatically closes CardKit streaming mode after 10 minutes.
+2. `@larksuite/channel@0.3.0` knows about that limit in its source comments but does not recover the markdown controller when it is reached.
+3. The Lark node SDK resolves CardKit business errors as response objects. `OutboundSender.updateCardElementContent()` ignored the response `code`, so `code=300309` was treated as success instead of an error.
+4. The controller therefore continued sending rejected element updates, called `card.settings`, and returned a successful stream result. `card.settings` cannot restore markdown that the element API rejected.
+
+The exact failure chain is: long run crosses the CardKit 10-minute streaming lifetime -> element updates return `300309` -> channel ignores the business error -> final settings succeeds -> stream falsely resolves -> readback exposes stale running content.
+
+### 4. Fix Status
+
+- Fix implemented in the bridge's CardKit boundary wrapper, because a dependency-local pnpm patch is not inherited by downstream/global installs.
+- When `cardElement.content` returns the documented expiry codes `300309` or `200850`, the bridge immediately retries the same content and sequence through `card.update`, replacing the same card with `streaming_mode=false`.
+- The bridge remembers that card as expired for the lifetime of the current stream. Later controller snapshots go directly through `card.update` instead of first repeating an element request that is guaranteed to fail.
+- Recovery business responses are accepted only when `code=0`. A transient recovery failure can be cleared by a later successful snapshot; if the final recovery state is still failed, `channel.stream()` rejects and the bridge sends its existing final Markdown fallback.
+- Recovery request/result logs include card ID, sequence, content hash, duration, and raw business result.
+- Regression tests cover successful recovery, both expiry codes, rejected and malformed recovery responses, transient recovery, the normal streaming path, later full-card snapshots, and the real `channel.stream()` / final fallback path.
+- Previous hard-timeout and serialized-Codex changes remain excluded; they did not address this root cause.
+
+### 5. Next Plan
+
+- On the next run longer than 10 minutes, require direct proof of this sequence: expiry element response -> full `card.update code=0` -> later full-card snapshots without repeated element failures -> final readback match.
+
+## Issue 2: Card/Readback Mismatch Recurs Across Multiple Normal Runs
+
+### 1. Phenomenon
+
+Several normal runs complete, but final readback does not match expected markdown. Sometimes the user-visible card appears stale; sometimes readback mismatch may only be a CardKit text rewrite.
+
+### 2. Runtime / Trace / Session Info
+
+Confirmed examples:
+
+- `yp61vkyr`, message `om_x100b6bc7dfa6bcb4c1038a39343715c`, `final-readback-mismatch-no-fallback`
+- `2lhybkem`, message `om_x100b6bc7d1486ca4c3ba41a96267ce2`, `final-readback-mismatch-no-fallback`
+- `94dzimie`, message `om_x100b6bc7d55da8b0c3c95551fbea8b5`, `final-readback-mismatch-no-fallback`
+- `4wemjyzo`, message `om_x100b6bc28d4078b4c444b4afc5850be`, `final-readback-mismatch-no-fallback`
+- `8k2mhyaz`, message `om_x100b6bc2771800acc39eba9f347d771`, `final-readback-mismatch-no-fallback`
+
+All examples have `didRollover=false` and `chunkIds=[]` in readback mismatch logs.
+
+### 3. Current Analysis
+
+There are at least two subtypes under the same log event:
+
+1. Benign/canonicalization mismatch: readback rewrites markdown or returns downgraded card wrapper content.
+2. Real stale-card mismatch: final content does not become visible, as in trace `8k2mhyaz`.
+
+Current logs are not rich enough to reliably separate these subtypes without inspecting actual card update/finalization behavior.
+
+### 4. Fix Status
+
+- Duplicate fallback risk fixed by no longer sending text fallback.
+- Real stale final readback is now repaired on the original CardKit entity, without sending a duplicate message.
+- The bridge records the SDK's `message_id -> card_id` correlation and the latest observed sequence. After two supported readbacks confirm that the expected final tail is absent, it performs one full `card.update` with `streaming_mode=false` and `sequence+1`, then reads the same message back again.
+- Canonicalized matches, downgraded/unsupported card content, readback failures, missing card correlation, and likely untracked rollover do not trigger a blind repair.
+
+### 5. Next Plan
+
+- Verify a real stale-card occurrence produces `markdown-readback-repair-request`, `card.update code=0`, and `markdown-readback-repair-verified visible=true` for the same message.
+
+## Issue 3: Codex Child Process Alive But No stdout / Card Stays Thinking
+
+### 1. Phenomenon
+
+The card stayed in a thinking/running state. Bridge logs showed the Codex child process remained alive, but stdout had no new terminal event.
+
+### 2. Runtime / Trace / Session Info
+
+Concrete case previously inspected:
+
+- Trace: `7shw6nug`
+- Run ID: `81c77a0c-7495-4a4d-8d29-bdfe473c4321`
+- PID: `74358`, child PID `74359`
+- Start time: `2026-07-09 15:49:29`
+- Logs: repeated `agent.stdout-idle`, `childExitCode=null`, `childSignalCode=null`
+- Manual action taken: killed stale `74358/74359`; bridge then unblocked the queue and removed reaction.
+
+Second confirmed case reconstructed from the historical Codex session:
+
+- Trace: `e59vesuq`
+- Session: `019f40cc-68ef-7551-bead-f0981b0c124d`
+- Run started at `2026-07-08 18:09Z`.
+- Codex persisted a final answer at `18:38:15Z` and marked turn `c69d4615-efa0-458b-8df3-86e07f97fbea` completed at `18:38:16Z`.
+- The bridge-side `codex exec resume --json` process did not deliver a terminal event or close stdout, so the child remained alive until external interruption at `20:18Z`.
+- The same completed turn and its `final_answer` item are readable through the supported Codex app-server API.
+
+Additional possibly related but not yet classified case:
+
+- Trace: `8fs7agd1`
+- PID: `61625`
+- `stdout-idle` occurred once with `idleMs=61006`, but later readback matched. This should not be grouped as the same confirmed hang without more evidence.
+
+### 3. Current Analysis
+
+This is a separate class from the stale final card issue. Historical case `e59vesuq` proves a split-brain terminal state at the Codex process boundary: the persisted Codex turn was complete while `codex exec resume --json` neither emitted the terminal event nor closed stdout. The bridge previously trusted stdout as its only terminal authority, so it could not finalize the card or release the run.
+
+`7shw6nug` is a different startup subtype: it produced metadata only and no substantive agent event. It is covered by the separate Codex startup watchdog and must not be used to weaken the terminal reconciliation safeguards below.
+
+Previous attempted fixes were wrong:
+
+- Hard timeout only releases the queue; it does not explain why the child process stops producing events.
+- Serializing all Codex runs reduces product capability and was not a proven root-cause fix.
+
+### 4. Fix Status
+
+- Fixed at the bridge/Codex boundary without parsing Codex rollout JSONL.
+- Before a resumed run starts, the adapter records the latest persisted turn ID through Codex's supported app-server `thread/read` API.
+- After stdout becomes idle, and only after this run has emitted a substantive event and has no tool in flight, the adapter checks the same API. It recovers only when the latest turn is new relative to the pre-run baseline and has `completed` status.
+- A later live trace (`1cp6kpmz`) showed why "any terminal status" was too broad: while `./gradlew :ai_proactive_ui:compileObricDebugKotlin` was still in flight, stdout was idle for 75 seconds and app-server reported the turn as `interrupted`; the adapter prematurely finalized the card as interrupted.
+- Terminal reconciliation is therefore restricted to a new `completed` turn. It is also paused while any translated tool call lacks its matching result. Persisted `interrupted` / `failed` states cannot synthesize stdout terminal events.
+- For a completed turn, the adapter also reads the persisted `final_answer` item and emits it if stdout did not already deliver that exact text, then synthesizes the normal terminal event. The existing post-done cleanup stops the lingering CLI child.
+- A baseline turn, an `inProgress` turn, a failed baseline probe, or a run with no substantive event cannot be treated as completed.
+- Bad hard-timeout and global-serialization fixes remain dropped; the recovery is based on Codex's persisted terminal fact, not elapsed wall time or reduced concurrency.
+- The metadata-only startup subtype is now also recoverable, but under a narrower replay guard. At startup timeout the bridge stops and cleans up the old execution, then checks the latest turn through `thread/read`. It retries the identical prompt once only when the turn is new, has status `interrupted` or `failed`, and has exactly zero persisted items.
+- A turn that is still `inProgress`, contains any user/agent/tool item, matches the baseline, or cannot be probed is never replayed. This prevents duplicating side effects from a run that may actually have started.
+
+### 5. Next Plan
+
+- Confirm the next real completed-turn occurrence logs `agent.terminal-recovered` with thread ID, new turn ID, `completed` status, and idle duration.
+- Verify the resulting Lark card contains the persisted final answer and no running footer.
+- Keep collecting stdout-idle cases that do not satisfy the recovery guard; those indicate a different producer-side failure and must not be force-completed.
+
+## Cross-Issue Notes
+
+- Readback mismatch is currently a symptom, not a root cause.
+- A final answer in Codex session JSONL is stronger evidence than the Lark card visual state.
+- A Lark card staying stale after final answer means the failure is in outbound card update/finalization or readback/display consistency, not in agent task execution.
+- Future fixes must be evidence-first and should be approved before implementation.
+
+## 中文简表
+
+| # | 问题 | 现象 | 关键 runtime 信息 | 当前结论 | 修复情况 | 下一步 |
+|---|---|---|---|---|---|---|
+| 1 | 任务完成但卡片没更新最终内容 | Codex 已完成，飞书卡片仍停在旧的工具调用/运行态内容 | `trace=8k2mhyaz` / `clujpjym` / `9csdgepc`；最新现场在卡片创建 605.784 秒后从 sequence 43 起持续返回 `300309` | 根因已确认：CardKit 10 分钟自动关闭 streaming；`@larksuite/channel@0.3.0` 忽略业务响应码，继续伪成功 finish | 已在 bridge CardKit 边界修复并部署：`300309` / `200850` 后同卡全量更新；后续快照直达全量路径；最终恢复仍失败时触发 Markdown fallback | 下一次 >10 分钟 run 验证 `expiry -> card.update code=0 -> final readback match` |
+| 2 | 多个正常 run 出现 final readback mismatch | run 正常结束，但 readback 和期望 markdown 不一致，有些可能是真 stale，有些只是 CardKit 改写 | `yp61vkyr`、`2lhybkem`、`94dzimie`、`4wemjyzo`、`8k2mhyaz`，均 `didRollover=false`、`chunkIds=[]` | `markdown-readback-mismatch` 是症状；只有受支持 readback 连续确认 final tail 缺失才属于可修复 stale | 已记录 message/card/sequence 关联并部署同卡 `card.update` + 再回读；不发送重复消息 | 验证真实现场的 same-card repair 日志闭环 |
+| 3 | Codex 子进程活着但 stdout 无终态 | 卡片一直 thinking/running，进程还在但没有 terminal event | `e59vesuq` 的持久化 turn 已 `completed` 且含 final answer；`7shw6nug` 的官方 turn 状态为 `interrupted` 且 `items=[]`；`1cp6kpmz` 证明长工具期间不能信 `interrupted` | 分为“持久化已完成但 stdout 丢终态”和“metadata-only 空 turn”两个子类 | 已部署：前者只接受无 in-flight tool 的新 `completed` turn；后者仅在停止后确认新 `interrupted/failed` turn 且 `items=[]` 时单次续跑 | 分别验证 `terminal-recovered` 和 `no-output-retry-check safe=true -> startup-timeout-retry-started` |

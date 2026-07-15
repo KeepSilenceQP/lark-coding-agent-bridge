@@ -1,7 +1,7 @@
 import type { AgentEvent } from '../types';
 import { log } from '../../core/logger';
 
-export type CodexFinishReason = 'failed' | 'interrupted' | 'timeout';
+export type CodexFinishReason = 'normal' | 'failed' | 'interrupted' | 'timeout';
 
 export interface ProtocolDriftState {
   unknownEvents: number;

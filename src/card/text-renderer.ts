@@ -11,7 +11,15 @@ import { toolHeaderText } from './tool-render';
  *   - No reasoning / thinking output (no place to fold it; would be noise)
  *   - Footer is appended inline at the bottom while running
  */
-export function renderText(state: RunState): string {
+export interface RenderTextOptions {
+  includeRunningFooter?: boolean;
+}
+
+export function renderText(
+  state: RunState,
+  options: RenderTextOptions = {},
+): string {
+  const includeRunningFooter = options.includeRunningFooter ?? true;
   const parts: string[] = [];
 
   for (const block of state.blocks) {
@@ -26,7 +34,7 @@ export function renderText(state: RunState): string {
     parts.push(`_⏱ ${mins} 分钟无响应,已自动终止_`);
   } else if (state.terminal === 'error' && state.errorMsg) {
     parts.push(`⚠️ agent 失败:${state.errorMsg}`);
-  } else if (state.terminal === 'running' && state.footer) {
+  } else if (includeRunningFooter && state.terminal === 'running' && state.footer) {
     parts.push(footerLine(state.footer));
   }
 

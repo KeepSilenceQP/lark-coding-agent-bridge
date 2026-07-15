@@ -3,6 +3,7 @@ import { join } from 'node:path';
 export interface LarkChannelEnvContext {
   profile?: string;
   rootDir?: string;
+  bridgePid?: number;
   configPath?: string;
   larkCliConfigDir?: string;
   larkCliSourceConfigFile?: string;
@@ -14,6 +15,10 @@ export function buildLarkChannelEnv(context?: LarkChannelEnvContext): NodeJS.Pro
   };
   const profile = nonEmpty(context?.profile);
   if (profile) env.LARK_CHANNEL_PROFILE = profile;
+
+  if (context?.bridgePid && context.bridgePid > 0) {
+    env.LARK_CHANNEL_BRIDGE_PID = String(context.bridgePid);
+  }
 
   const rootDir = nonEmpty(context?.rootDir);
   if (rootDir) env.LARK_CHANNEL_HOME = rootDir;

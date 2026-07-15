@@ -63,6 +63,12 @@ export interface AgentRun {
    * 143 instead of 0; waiting it out lets it exit cleanly.
    */
   waitForExit(timeoutMs: number): Promise<boolean>;
+  /**
+   * After this run has been stopped for producing no substantive output,
+   * verify through the agent's supported state API whether replaying the same
+   * prompt is safe. Implementations must fail closed.
+   */
+  canRetryAfterNoOutput?(): Promise<boolean>;
 }
 
 /**
