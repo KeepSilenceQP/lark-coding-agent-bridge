@@ -1,6 +1,10 @@
 import { modelLabel, supportedModels } from '../agent/models';
 import type { KnownChat } from '../bot/lark-info';
-import type { AgentKind, LarkCliIdentityPreset } from '../config/profile-schema';
+import type {
+  AgentKind,
+  GroupResponseMode,
+  LarkCliIdentityPreset,
+} from '../config/profile-schema';
 import type { CotMessagesMode, MessageReplyMode } from '../config/schema';
 
 export interface ConfigFormOpts {
@@ -14,7 +18,7 @@ export interface ConfigFormOpts {
   maxConcurrentRuns: number;
   /** 0 means "disabled". */
   runIdleTimeoutMinutes: number;
-  requireMentionInGroup: boolean;
+  groupResponseMode: GroupResponseMode;
   larkCliIdentity: LarkCliIdentityPreset;
   allowedUsers: string[];
   allowedChats: string[];
@@ -220,18 +224,29 @@ export function configFormCard(opts: ConfigFormOpts): object {
             {
               tag: 'markdown',
               content:
-                '\n**群里需要 @ bot**\n' +
-                '_是(默认):群和话题群里,不 @ bot 的消息不会触发回复,bot 不接群里聊天_\n' +
-                '_否:任何消息都会发给 agent(0.1.21 及更早版本的行为)_\n' +
-                '_私聊永远不需要 @;`@全员` 永远不响应_',
+                '\n**群消息响应方式**\n' +
+                '_仅响应 @bot(默认):保持群聊安静_\n' +
+                '_应用所有者未 @ 任何账号时响应:只有当前应用 owner 发言且没有 @ 人、bot 或全员时默认响应_\n' +
+                '_响应所有消息:任何群消息都会发给 agent_\n' +
+                '_显式 @bot、多 bot @ 和 @全员继续沿用原有行为;私聊不受影响_',
             },
             {
               tag: 'select_static',
-              name: 'require_mention_in_group',
-              initial_option: opts.requireMentionInGroup ? 'yes' : 'no',
+              name: 'group_response_mode',
+              initial_option: opts.groupResponseMode,
               options: [
-                { text: { tag: 'plain_text', content: '是(默认)' }, value: 'yes' },
-                { text: { tag: 'plain_text', content: '否' }, value: 'no' },
+                {
+                  text: { tag: 'plain_text', content: '仅响应 @bot（默认）' },
+                  value: 'mention-only',
+                },
+                {
+                  text: { tag: 'plain_text', content: '应用所有者未 @ 任何账号时响应' },
+                  value: 'owner-default',
+                },
+                {
+                  text: { tag: 'plain_text', content: '响应所有消息' },
+                  value: 'all-messages',
+                },
               ],
             },
             {
@@ -317,7 +332,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
             `**COT 过程消息**:\`${cotLabel}\`\n` +
             `**并发上限**:\`${opts.maxConcurrentRuns}\`\n` +
             `**run 探活**:\`${opts.runIdleTimeoutMinutes > 0 ? `${opts.runIdleTimeoutMinutes} 分钟` : '关闭'}\`\n` +
-            `**群里需要 @ bot**:\`${opts.requireMentionInGroup ? '是' : '否'}\`\n\n` +
+            `**群消息响应方式**:\`${groupResponseModeLabel(opts.groupResponseMode)}\`\n\n` +
             `**lark-cli 身份策略**:\`${opts.larkCliIdentity === 'user-default' ? '允许用户身份' : '只允许应用身份'}\`\n\n` +
             '🔒 **访问控制**\n' +
             `**允许私聊的用户**:${summarize(opts.allowedUsers)}\n` +
@@ -337,8 +352,14 @@ function cotMessagesLabel(value: CotMessagesMode): string {
   return '关闭';
 }
 
+function groupResponseModeLabel(value: GroupResponseMode): string {
+  if (value === 'owner-default') return '应用所有者未 @ 任何账号时响应';
+  if (value === 'all-messages') return '响应所有消息';
+  return '仅响应 @bot';
+}
+
 /**
- * Shown after `/config` saves "群里不需要 @ bot" but the app is missing the
+ * Shown after `/config` enables a non-mention response mode but the app is missing the
  * `im:message.group_msg` scope. Guides the user through one-click incremental
  * authorization via the link from `requestScopeGrantLink`.
  */
@@ -351,8 +372,8 @@ export function groupMsgScopeGrantCard(url: string, expireMins: number): object 
         {
           tag: 'markdown',
           content:
-            '⚠️ **「群里不需要 @ bot」还差一个权限**\n\n' +
-            '你已开启「不 @ bot 也回复」，但当前应用没有 **获取群组中所有消息**（`im:message.group_msg`）权限。' +
+            '⚠️ **接收群里非 @ 消息还差一个权限**\n\n' +
+            '你已开启需要接收非 @ 群消息的响应方式，但当前应用没有 **获取群组中所有消息**（`im:message.group_msg`）权限。' +
             '没有它，飞书不会把群里非 @ 的消息推给 bot，所以这个设置暂时不生效。\n\n' +
             `**点下面的链接补授权**（约 ${expireMins} 分钟内有效）：\n` +
             `[🔗 点此一键授权](${url})\n\n` +
@@ -376,7 +397,7 @@ export function groupMsgScopeGrantedCard(): object {
           tag: 'markdown',
           content:
             '✅ **授权成功**\n\n' +
-            '`im:message.group_msg` 权限已生效，群里非 @ bot 的消息从现在开始会触发回复。\n\n' +
+            '`im:message.group_msg` 权限已生效，群里非 @ bot 的消息现在可以按所选响应方式进入路由。\n\n' +
             '_若仍未生效，发 `/reconnect` 重连一次。_',
         },
       ],

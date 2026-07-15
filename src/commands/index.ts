@@ -29,14 +29,18 @@ import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '.
 import {
   getAgentStopGraceMs,
   getCotMessages,
+  getGroupResponseMode,
   getMaxConcurrentRuns,
   getMessageReplyMode,
-  getRequireMentionInGroup,
   getRunIdleTimeoutMs,
   getShowToolCalls,
   secretKeyForApp,
 } from '../config/schema';
-import type { ProfileAccess, ProfileConfig } from '../config/profile-schema';
+import type {
+  GroupResponseMode,
+  ProfileAccess,
+  ProfileConfig,
+} from '../config/profile-schema';
 import { resolveAppPaths } from '../config/app-paths';
 import { accessToClaudePermissionMode } from '../config/permissions';
 import {
@@ -2617,7 +2621,7 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     cotMessages: getCotMessages(ctx.controls.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
-    requireMentionInGroup: getRequireMentionInGroup(ctx.controls.cfg),
+    groupResponseMode: access.groupResponseMode,
     larkCliIdentity: ctx.controls.profileConfig.larkCli.identityPreset,
     allowedUsers: access.allowedUsers,
     allowedChats: access.allowedChats,
@@ -2710,12 +2714,25 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       runIdleTimeoutMinutes = Math.min(120, Math.max(1, Math.floor(parsedIdle)));
     }
   }
-  // Parse require_mention_in_group. Empty / unexpected keeps current.
+  // Canonical tri-state field wins. Continue accepting the legacy boolean
+  // field so an already-rendered pre-upgrade config card can still submit.
+  const rawGroupResponseMode = String(fv.group_response_mode ?? '').trim();
   const rawRequireMention = String(fv.require_mention_in_group ?? '').trim();
-  let requireMentionInGroup: boolean;
-  if (rawRequireMention === 'yes') requireMentionInGroup = true;
-  else if (rawRequireMention === 'no') requireMentionInGroup = false;
-  else requireMentionInGroup = getRequireMentionInGroup(ctx.controls.cfg);
+  let groupResponseMode: GroupResponseMode;
+  if (
+    rawGroupResponseMode === 'mention-only' ||
+    rawGroupResponseMode === 'owner-default' ||
+    rawGroupResponseMode === 'all-messages'
+  ) {
+    groupResponseMode = rawGroupResponseMode;
+  } else if (rawRequireMention === 'yes') {
+    groupResponseMode = 'mention-only';
+  } else if (rawRequireMention === 'no') {
+    groupResponseMode = 'all-messages';
+  } else {
+    groupResponseMode = getGroupResponseMode(ctx.controls.cfg);
+  }
+  const requireMentionInGroup = groupResponseMode !== 'all-messages';
   const rawLarkCliIdentity = String(fv.lark_cli_identity ?? '').trim();
   const larkCliIdentity =
     rawLarkCliIdentity === 'user-default' || rawLarkCliIdentity === 'bot-only'
@@ -2767,7 +2784,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         larkCliPolicyApplied = true;
         failureStep = 'config.save';
       }
-      await savePreferencesConfig(ctx, nextPreferences, requireMentionInGroup, larkCliIdentity);
+      await savePreferencesConfig(ctx, nextPreferences, groupResponseMode, larkCliIdentity);
     } catch (err) {
       let rollbackFailed = false;
       if (larkCliIdentityChanged) {
@@ -2797,6 +2814,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       cotMessages,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
+      groupResponseMode,
       requireMentionInGroup,
       larkCliIdentity,
       allowedUsersCount: access.allowedUsers.length,
@@ -2816,7 +2834,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         cotMessages,
         maxConcurrentRuns,
         runIdleTimeoutMinutes,
-        requireMentionInGroup,
+        groupResponseMode,
         larkCliIdentity,
         allowedUsers: access.allowedUsers,
         allowedChats: access.allowedChats,
@@ -2826,17 +2844,17 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       }),
     );
 
-    // "群里不需要 @ bot" only works if the app can actually receive non-@
+    // Non-mention modes only work if the app can actually receive non-@
     // group messages (`im:message.group_msg`). When the user opts in, verify
     // the scope and, if missing, push a one-click re-authorization link.
-    if (!requireMentionInGroup) {
+    if (groupResponseMode !== 'mention-only') {
       await promptGroupMsgScopeIfMissing(ctx);
     }
   })();
 }
 
 /**
- * When the user enables "群里不需要 @ bot", confirm the app holds the
+ * When the user enables a non-mention response mode, confirm the app holds the
  * `im:message.group_msg` scope. If it's missing, generate an incremental
  * authorization link and push a guidance card; once the user finishes
  * authorizing, swap the card to a success state in place. Best-effort — any
@@ -2958,9 +2976,10 @@ async function saveAccountConfig(
 async function savePreferencesConfig(
   ctx: CommandContext,
   preferences: AppPreferences,
-  requireMentionInGroup: boolean,
+  groupResponseMode: GroupResponseMode,
   larkCliIdentity: ProfileConfig['larkCli']['identityPreset'],
 ): Promise<void> {
+  const requireMentionInGroup = groupResponseMode !== 'all-messages';
   const larkCli = {
     identityPreset: larkCliIdentity,
     localUserImport: {
@@ -2989,6 +3008,7 @@ async function savePreferencesConfig(
       },
       access: {
         ...profile.access,
+        groupResponseMode,
         requireMentionInGroup,
       },
       larkCli,

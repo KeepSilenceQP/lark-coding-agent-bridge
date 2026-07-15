@@ -96,8 +96,32 @@ describe('profile schema', () => {
       allowedChats: [],
       admins: [],
       botAdmins: [],
+      groupResponseMode: 'mention-only',
       requireMentionInGroup: true,
     });
+  });
+
+  it('maps legacy mention booleans and lets the canonical group mode win', () => {
+    const legacyAll = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: { requireMentionInGroup: false },
+    });
+    expect(legacyAll.access.groupResponseMode).toBe('all-messages');
+    expect(legacyAll.access.requireMentionInGroup).toBe(false);
+
+    const ownerDefault = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        groupResponseMode: 'owner-default',
+        requireMentionInGroup: false,
+      },
+    });
+    expect(ownerDefault.access.groupResponseMode).toBe('owner-default');
+    expect(ownerDefault.access.requireMentionInGroup).toBe(true);
   });
 
   it('drops invalid legacy message reply values instead of blocking config load', () => {

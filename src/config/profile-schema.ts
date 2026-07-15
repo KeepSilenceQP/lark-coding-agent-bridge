@@ -17,11 +17,14 @@ export type AgentKind = 'claude' | 'codex';
 export type SandboxMode = CodexSandboxMode;
 export type { AccessMode, PermissionConfig, PermissionSource };
 
+export type GroupResponseMode = 'mention-only' | 'owner-default' | 'all-messages';
+
 export interface ProfileAccess {
   allowedUsers: string[];
   allowedChats: string[];
   admins: string[];
   botAdmins: string[];
+  groupResponseMode: GroupResponseMode;
   requireMentionInGroup: boolean;
 }
 
@@ -250,13 +253,26 @@ function normalizeAccess(
   access: Partial<ProfileAccess> | undefined,
   legacyRequireMentionInGroup: boolean | undefined,
 ): ProfileAccess {
+  const legacyMention = access?.requireMentionInGroup ?? legacyRequireMentionInGroup ?? true;
+  const groupResponseMode = isGroupResponseMode(access?.groupResponseMode)
+    ? access.groupResponseMode
+    : legacyMention
+      ? 'mention-only'
+      : 'all-messages';
   return {
     allowedUsers: stringArray(access?.allowedUsers),
     allowedChats: stringArray(access?.allowedChats),
     admins: stringArray(access?.admins),
     botAdmins: stringArray(access?.botAdmins),
-    requireMentionInGroup: access?.requireMentionInGroup ?? legacyRequireMentionInGroup ?? true,
+    groupResponseMode,
+    // Keep the legacy boolean synchronized for old config cards and safe
+    // rollback to binaries that predate the tri-state response policy.
+    requireMentionInGroup: groupResponseMode !== 'all-messages',
   };
+}
+
+function isGroupResponseMode(value: unknown): value is GroupResponseMode {
+  return value === 'mention-only' || value === 'owner-default' || value === 'all-messages';
 }
 
 function normalizeWorkspaces(input: {

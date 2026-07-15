@@ -414,6 +414,7 @@ describe('profile runtime resolver', () => {
       allowedChats: ['oc_allowed'],
       admins: ['ou_admin'],
       botAdmins: [],
+      groupResponseMode: 'all-messages',
       requireMentionInGroup: false,
     });
     expect(runtime.profileConfig.preferences).toMatchObject({
@@ -431,6 +432,7 @@ describe('profile runtime resolver', () => {
       allowedChats: ['oc_allowed'],
       admins: ['ou_admin'],
       botAdmins: [],
+      groupResponseMode: 'all-messages',
       requireMentionInGroup: false,
     });
     expect(saved.profiles.claude?.preferences).toMatchObject({

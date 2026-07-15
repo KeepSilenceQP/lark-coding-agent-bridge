@@ -52,6 +52,7 @@ describe('profile store canonical serialization', () => {
           allowedUsers: ['ou_user'],
           allowedChats: ['oc_chat'],
           admins: ['ou_admin'],
+          groupResponseMode: 'owner-default',
           requireMentionInGroup: false,
         },
         codex: {
@@ -131,6 +132,12 @@ describe('profile store canonical serialization', () => {
     expect(savedProfile).not.toHaveProperty('runtimeOnlyFutureField');
     expect(savedProfile).not.toHaveProperty('permissionSource');
     expect(savedProfile).not.toHaveProperty('sandbox');
+
+    const loaded = await loadRootConfig(configPath);
+    expect(loaded?.profiles.codex?.access).toMatchObject({
+      groupResponseMode: 'owner-default',
+      requireMentionInGroup: true,
+    });
   });
 
   it('loads canonical-only saved config and re-derives runtime sandbox', async () => {

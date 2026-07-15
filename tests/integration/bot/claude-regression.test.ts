@@ -53,13 +53,15 @@ describe('Claude IM regression boundaries', () => {
     ]);
   });
 
-  it('documents the private intake policy that drops @all and undirected group chatter', async () => {
+  it('documents the private intake policy and its position before command handling', async () => {
     const source = await readFile(join(process.cwd(), 'src/bot/channel.ts'), 'utf8');
 
     expect(source).toContain('respondToMentionAll: false');
-    expect(source).toContain('getRequireMentionInGroup(controls.cfg)');
-    expect(source).toContain('!msg.mentionedBot');
-    expect(source).toContain('msg.chatType !== \'p2p\'');
+    expect(source).toContain('decideGroupResponse({');
+    expect(source).toContain('mode: controls.profileConfig.access.groupResponseMode');
+    expect(source.indexOf('decideGroupResponse({')).toBeLessThan(
+      source.indexOf('const handled = await tryHandleCommand({'),
+    );
   });
 });
 

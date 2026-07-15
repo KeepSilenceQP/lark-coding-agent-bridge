@@ -37,7 +37,6 @@ import {
   getCotMessages,
   getMaxConcurrentRuns,
   getMessageReplyMode,
-  getRequireMentionInGroup,
   getShowToolCalls,
 } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
@@ -63,6 +62,7 @@ import { ActiveRuns, type RunHandle } from './active-runs';
 import { resolveRunIdleTimeoutMs, resolveRunStartupTimeoutMs } from './run-idle-timeout';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
+import { decideGroupResponse } from './group-response-policy';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
@@ -1196,18 +1196,26 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     }
   }
 
-  // Group-mention policy. p2p is always unrestricted; in groups (regular and
-  // topic) we drop messages that don't @bot when the user has opted into the
-  // quiet-by-default behavior. Slash commands are NOT exempt — the user
-  // chose strict mode so the group stays uniformly quiet unless mentioned.
-  // @全员 is already filtered by SDK (`respondToMentionAll: false`), so any
-  // event reaching here is either targeted or undirected chatter.
-  if (
-    msg.chatType !== 'p2p' &&
-    getRequireMentionInGroup(controls.cfg) &&
-    !msg.mentionedBot
-  ) {
-    log.info('intake', 'skip-no-mention', { scope, chatType: msg.chatType });
+  // This gate is intentionally after access control and before commands,
+  // pending queues, runs, and cards. Explicit @bot messages retain their
+  // original path; owner-default is a narrow opt-in for owner messages with
+  // no structured mention of any account.
+  const groupResponseDecision = decideGroupResponse({
+    chatType: msg.chatType,
+    mode: controls.profileConfig.access.groupResponseMode,
+    senderId: msg.senderId,
+    botOwnerId: controls.botOwnerId,
+    ownerRefreshState: controls.ownerRefreshState,
+    mentionedBot: msg.mentionedBot,
+    mentionCount: msg.mentions?.length ?? 0,
+    mentionAll: msg.mentionAll,
+  });
+  if (!groupResponseDecision.accept) {
+    log.info('intake', 'skip-group-response-policy', {
+      scope,
+      chatType: msg.chatType,
+      reason: groupResponseDecision.reason,
+    });
     return;
   }
 
