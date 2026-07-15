@@ -1,3 +1,5 @@
+import type { GroupResponseMode } from './profile-schema';
+
 export type TenantBrand = 'feishu' | 'lark';
 
 /**
@@ -134,15 +136,7 @@ export interface AppPreferences {
    * can hang indefinitely). Per-scope `/timeout` overrides this.
    */
   runIdleTimeoutMinutes?: number;
-  /**
-   * Whether the bot only responds to messages that @-mention it in groups
-   * (regular and topic groups). p2p is always unrestricted. Default true:
-   * groups are quiet unless the user @bot. Set false to let any group
-   * message reach Claude (the 0.1.21-and-earlier behavior).
-   *
-   * @全员 is never responded to regardless (SDK `respondToMentionAll: false`).
-   * Cloud-doc comments still require @-mention unconditionally.
-   */
+  /** Legacy projection of profile access.groupResponseMode. */
   requireMentionInGroup?: boolean;
   /** Access control — user/chat allowlists + admin gating. See AppAccess. */
   access?: AppAccess;
@@ -240,17 +234,32 @@ export function getMaxConcurrentRuns(cfg: AppConfig): number {
  * `!== false` check makes "undefined" (older configs that don't have the
  * field) inherit the new safer default automatically.
  */
-export function getRequireMentionInGroup(cfg: AppConfig): boolean {
-  if (cfg.preferences?.requireMentionInGroup !== undefined) {
-    return cfg.preferences.requireMentionInGroup !== false;
-  }
+export function getGroupResponseMode(cfg: AppConfig): GroupResponseMode {
   const profileAccess = (cfg as AppConfig & {
-    access?: { requireMentionInGroup?: boolean };
+    access?: {
+      groupResponseMode?: unknown;
+      requireMentionInGroup?: boolean;
+    };
   }).access;
-  if (profileAccess?.requireMentionInGroup !== undefined) {
-    return profileAccess.requireMentionInGroup;
+  if (
+    profileAccess?.groupResponseMode === 'mention-only' ||
+    profileAccess?.groupResponseMode === 'owner-default' ||
+    profileAccess?.groupResponseMode === 'all-messages'
+  ) {
+    return profileAccess.groupResponseMode;
   }
-  return true;
+  if (cfg.preferences?.requireMentionInGroup !== undefined) {
+    return cfg.preferences.requireMentionInGroup !== false ? 'mention-only' : 'all-messages';
+  }
+  if (profileAccess?.requireMentionInGroup !== undefined) {
+    return profileAccess.requireMentionInGroup ? 'mention-only' : 'all-messages';
+  }
+  return 'mention-only';
+}
+
+/** Legacy boolean resolver retained for old callers and config compatibility. */
+export function getRequireMentionInGroup(cfg: AppConfig): boolean {
+  return getGroupResponseMode(cfg) !== 'all-messages';
 }
 
 /**

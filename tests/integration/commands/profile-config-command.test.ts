@@ -12,7 +12,12 @@ import {
   type RootConfig,
 } from '../../../src/config/profile-schema';
 import { runtimeProfileConfig } from '../../../src/config/profile-store';
-import { getMessageReplyMode, getRequireMentionInGroup, secretKeyForApp } from '../../../src/config/schema';
+import {
+  getGroupResponseMode,
+  getMessageReplyMode,
+  getRequireMentionInGroup,
+  secretKeyForApp,
+} from '../../../src/config/schema';
 import { SessionStore } from '../../../src/session/store';
 import { WorkspaceStore } from '../../../src/workspace/store';
 import { FakeAgentAdapter } from '../../helpers/fake-agent';
@@ -88,6 +93,22 @@ describe('profile-aware account and config commands', () => {
     });
     expect(getRequireMentionInGroup(runtimeProfileConfig(root, 'claude'))).toBe(false);
     expect((root as unknown as { accounts?: unknown }).accounts).toBeUndefined();
+  });
+
+  it('saves owner-default as the canonical group response mode', async () => {
+    vi.useFakeTimers();
+    const h = await createHarness();
+
+    await h.command('/config submit', {
+      group_response_mode: 'owner-default',
+    });
+
+    const root = await waitForRoot(h.rootDir, (candidate) =>
+      candidate.profiles.claude?.access.groupResponseMode === 'owner-default',
+    );
+    expect(root.profiles.claude?.access.groupResponseMode).toBe('owner-default');
+    expect(root.profiles.claude?.access.requireMentionInGroup).toBe(true);
+    expect(getGroupResponseMode(runtimeProfileConfig(root, 'claude'))).toBe('owner-default');
   });
 
   it('persists the picked model and clears it when "default" is chosen', async () => {

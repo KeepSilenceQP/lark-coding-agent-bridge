@@ -3,6 +3,7 @@ import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
+import type { Controls } from '../../../src/commands/index.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
@@ -31,6 +32,8 @@ interface MessageHandlerMap {
 }
 
 interface FakeLarkChannel {
+  sendCalls: Array<{ chatId: string; content: unknown }>;
+  streamCalls: Array<{ chatId: string; input: unknown }>;
   botIdentity: { openId: string; name: string };
   rawClient: {
     request: ReturnType<typeof vi.fn>;
@@ -226,6 +229,97 @@ describe('sender identity in bridge_context', () => {
   });
 });
 
+describe('owner-default group intake', () => {
+  it('starts a run for an owner message with no mention', async () => {
+    const h = await createHarness();
+    setGroupResponseMode(h.profileConfig, 'owner-default');
+    await startTestBridge(h);
+    setOwner(h.controls, 'ok', 'ou_owner');
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_owner_no_mention',
+        senderId: 'ou_owner',
+        content: '直接帮我处理这个需求',
+        mentions: [],
+        mentionedBot: false,
+        rawSenderType: 'user',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    expect(h.agent.runOptions).toHaveLength(1);
+  });
+
+  it('stays silent before command, run, and card output when the owner mentions a person', async () => {
+    const h = await createHarness();
+    setGroupResponseMode(h.profileConfig, 'owner-default');
+    await startTestBridge(h);
+    setOwner(h.controls, 'ok', 'ou_owner');
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_owner_at_person',
+        senderId: 'ou_owner',
+        content: '/status',
+        mentions: [{ key: '@_user_1', openId: 'ou_alice', name: 'Alice', isBot: false }],
+        mentionedBot: false,
+        rawSenderType: 'user',
+      }),
+    );
+    await settleIntake();
+
+    expect(h.agent.runOptions).toHaveLength(0);
+    expect(h.channel.sendCalls).toHaveLength(0);
+    expect(h.channel.streamCalls).toHaveLength(0);
+  });
+
+  it('fails closed after an owner refresh failure even with a stale matching owner id', async () => {
+    const h = await createHarness();
+    setGroupResponseMode(h.profileConfig, 'owner-default');
+    await startTestBridge(h);
+    setOwner(h.controls, 'failed', 'ou_owner');
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_stale_owner',
+        senderId: 'ou_owner',
+        content: '不应该触发',
+        mentions: [],
+        mentionedBot: false,
+        rawSenderType: 'user',
+      }),
+    );
+    await settleIntake();
+
+    expect(h.agent.runOptions).toHaveLength(0);
+  });
+
+  it('preserves explicit multi-mention wake-up behavior', async () => {
+    const h = await createHarness();
+    setGroupResponseMode(h.profileConfig, 'owner-default');
+    await startTestBridge(h);
+    setOwner(h.controls, 'ok', 'ou_owner');
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_explicit_multi_at',
+        senderId: 'ou_owner',
+        content: '@Bridge @OtherBot 一起看下',
+        mentions: [
+          { key: '@_user_1', openId: 'ou_bot', name: 'Bridge', isBot: true },
+          { key: '@_user_2', openId: 'ou_other_bot', name: 'OtherBot', isBot: true },
+        ],
+        mentionedBot: true,
+        rawSenderType: 'user',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    expect(h.agent.runOptions).toHaveLength(1);
+  });
+});
+
 async function createHarness(): Promise<{
   tmp: TmpProfile;
   channel: FakeLarkChannel & { handlers: MessageHandlerMap };
@@ -300,8 +394,12 @@ async function startTestBridge(h: {
 
 function createFakeLarkChannel(): FakeLarkChannel & { handlers: MessageHandlerMap } {
   const handlers: MessageHandlerMap = {};
+  const sendCalls: FakeLarkChannel['sendCalls'] = [];
+  const streamCalls: FakeLarkChannel['streamCalls'] = [];
   return {
     handlers,
+    sendCalls,
+    streamCalls,
     botIdentity: { openId: 'ou_bot', name: 'Bridge' },
     rawClient: {
       request: vi.fn(async () => ({ data: { items: [] } })),
@@ -337,8 +435,11 @@ function createFakeLarkChannel(): FakeLarkChannel & { handlers: MessageHandlerMa
     getConnectionStatus() {
       return { state: 'connected', reconnectAttempts: 0 };
     },
-    async send() {},
-    async stream(_chatId, input) {
+    async send(chatId, content) {
+      sendCalls.push({ chatId, content });
+    },
+    async stream(chatId, input) {
+      streamCalls.push({ chatId, input });
       if (isMarkdownStreamInput(input)) {
         await input.markdown({ setContent: async () => {} });
       }
@@ -346,7 +447,7 @@ function createFakeLarkChannel(): FakeLarkChannel & { handlers: MessageHandlerMa
   };
 }
 
-function createControls(profileConfig: ReturnType<typeof createDefaultProfileConfig>) {
+function createControls(profileConfig: ReturnType<typeof createDefaultProfileConfig>): Controls {
   return {
     profile: 'test',
     profileConfig,
@@ -367,6 +468,8 @@ function message(input: {
   senderName?: string;
   rawSenderType?: string;
   mentions?: Array<{ key: string; openId?: string; name?: string; isBot?: boolean }>;
+  mentionAll?: boolean;
+  mentionedBot?: boolean;
 }): NormalizedMessage {
   return {
     messageId: input.messageId,
@@ -380,8 +483,8 @@ function message(input: {
     mentions: input.mentions ?? [
       { key: '@_user_1', openId: 'ou_bot', name: 'Bridge', isBot: true },
     ],
-    mentionAll: false,
-    mentionedBot: true,
+    mentionAll: input.mentionAll ?? false,
+    mentionedBot: input.mentionedBot ?? true,
     createTime: 1760000001000,
     ...(input.rawSenderType
       ? {
@@ -395,6 +498,27 @@ function message(input: {
         }
       : {}),
   } as unknown as NormalizedMessage;
+}
+
+function setGroupResponseMode(
+  profileConfig: ReturnType<typeof createDefaultProfileConfig>,
+  mode: 'mention-only' | 'owner-default' | 'all-messages',
+): void {
+  profileConfig.access.groupResponseMode = mode;
+  profileConfig.access.requireMentionInGroup = mode !== 'all-messages';
+}
+
+function setOwner(
+  controls: Controls,
+  state: Controls['ownerRefreshState'],
+  ownerId?: string,
+): void {
+  controls.ownerRefreshState = state;
+  controls.botOwnerId = ownerId;
+}
+
+async function settleIntake(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 750));
 }
 
 function readSection(prompt: string, tag: string): unknown {

@@ -130,6 +130,27 @@ describe('policy fingerprint', () => {
       }),
     );
   });
+
+  it('changes the access digest when the canonical group response mode changes', () => {
+    const profile = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: {
+        app: {
+          id: 'cli_test',
+          secret: '${APP_SECRET}',
+          tenant: 'feishu',
+        },
+      },
+    });
+
+    expect(
+      accessPolicyDigest({
+        ...profile.access,
+        groupResponseMode: 'owner-default',
+        requireMentionInGroup: true,
+      }),
+    ).not.toBe(accessPolicyDigest(profile.access));
+  });
 });
 
 function baseInput(): FingerprintInputV2 {

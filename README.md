@@ -284,12 +284,15 @@ If you'd rather not do it inside Feishu, `/invite` and `/config` write the match
         "allowedUsers": ["ou_xxxxxxxxxxxxx"],
         "allowedChats": ["oc_xxxxxxxxxxxxx"],
         "admins": ["ou_xxxxxxxxxxxxx"],
+        "groupResponseMode": "mention-only",
         "requireMentionInGroup": true
       }
     }
   }
 }
 ```
+
+`groupResponseMode` 支持 `mention-only`（仅显式 @bot）、`owner-default`（应用所有者未 @ 任何账号时默认响应）和 `all-messages`（响应所有群消息）。`requireMentionInGroup` 是兼容旧版本的降级字段：前两种模式写 `true`，`all-messages` 写 `false`；建议通过 `/config` 修改，避免两个字段不一致。
 
 `allowedUsers` / `admins` take user `open_id`s; `allowedChats` takes group `chat_id`s. The easiest way to find an ID by hand: have the person message the bot (or `@` it in the group), then check the active profile's log:
 
