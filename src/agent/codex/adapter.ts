@@ -506,6 +506,10 @@ async function* createEventStream(
       if (translated.some((event) => event.type !== 'system' && event.type !== 'usage')) {
         sawSubstantiveEvent = true;
       }
+      // The translator intentionally holds the newest agent message until it
+      // can decide whether it is progress or the final answer. It still counts
+      // as substantive stdout for persisted-terminal recovery.
+      if (translator.hasPendingAgentMessage()) sawSubstantiveEvent = true;
       yield* translated;
     }
   } finally {
@@ -517,14 +521,13 @@ async function* createEventStream(
   }
 
   if (recoveredReason) {
-    if (recoveredText) yield { type: 'text', delta: recoveredText };
-    yield* translator.finish(recoveredReason);
+    yield* translator.finishRecovered(recoveredText);
     return;
   }
 
   const earlyRuntimeError = getError();
   if (earlyRuntimeError && child.exitCode === null && child.signalCode === null) {
-    yield terminalError(`codex runtime error: ${redactPrompt(earlyRuntimeError.message)}`);
+    yield* translator.fail(`codex runtime error: ${redactPrompt(earlyRuntimeError.message)}`);
     return;
   }
 
@@ -540,24 +543,16 @@ async function* createEventStream(
     if (!translator.terminalEmitted()) {
       const stderr = redactPrompt(Buffer.concat(stderrChunks).toString('utf8').trim());
       const detail = stderr ? `: ${stderr.slice(0, 500)}` : '';
-      yield terminalError(`codex exited with code ${exitCode}${detail}`);
+      yield* translator.fail(`codex exited with code ${exitCode}${detail}`);
     }
     return;
   }
   if (runtimeError && !translator.terminalEmitted()) {
-    yield terminalError(`codex runtime error: ${redactPrompt(runtimeError.message)}`);
+    yield* translator.fail(`codex runtime error: ${redactPrompt(runtimeError.message)}`);
     return;
   }
 
   yield* translator.finish();
-}
-
-function terminalError(message: string): AgentEvent {
-  return {
-    type: 'error',
-    message,
-    terminationReason: 'failed',
-  };
 }
 
 async function waitForExitCode(child: CodexChild): Promise<number | null> {

@@ -1960,6 +1960,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             renderMarkdownStreamText(filterForPrefs(state)),
           ),
         fallback: async (state) => {
+          if (controls.profileConfig.agentKind === 'codex') return;
           const body = renderText(filterForPrefs(state));
           if (body.trim()) {
             await channel.send(chatId, { markdown: body }, sendOpts);
@@ -1967,6 +1968,17 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
       });
       await recallIfEmptyStreamedReply(channel, streamDone, filterForPrefs(latestState), scope);
+      if (controls.profileConfig.agentKind === 'codex') {
+        await sendFinalReply({
+          channel,
+          chatId,
+          scope,
+          state: finalAnswerOnlyState(filterForPrefs(latestState)),
+          replyMode,
+          sendOpts,
+          cardRenderOptions,
+        });
+      }
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -1985,7 +1997,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         channel,
         chatId,
         scope,
-        state: filterForPrefs(finalState),
+        state:
+          controls.profileConfig.agentKind === 'codex'
+            ? finalAnswerOnlyState(filterForPrefs(finalState))
+            : filterForPrefs(finalState),
         replyMode,
         sendOpts,
         cardRenderOptions,
@@ -2056,31 +2071,17 @@ async function sendFinalReply(input: {
       { card: renderCard(input.state, input.cardRenderOptions) },
       input.sendOpts,
     );
+    requireMessageReceipt(result, 'card');
     log.info('outbound', 'sent', outboundLogFields(input, 'card', body, result));
   } else if (input.replyMode === 'markdown') {
     if (body.trim()) {
-      try {
-        await input.channel.stream(
-          input.chatId,
-          {
-            markdown: async (ctrl) => {
-              await ctrl.setContent(body);
-            },
-          },
-          input.sendOpts,
-        );
-        log.info('outbound', 'sent', outboundLogFields(input, 'markdown-stream', body));
-      } catch (err) {
-        log.warn('outbound', 'markdown-stream-fallback', {
-          err: err instanceof Error ? err.message : String(err),
-        });
-        const result = await input.channel.send(
-          input.chatId,
-          { markdown: body },
-          input.sendOpts,
-        );
-        log.info('outbound', 'sent', outboundLogFields(input, 'markdown', body, result));
-      }
+      const result = await input.channel.send(
+        input.chatId,
+        { markdown: body },
+        input.sendOpts,
+      );
+      requireMessageReceipt(result, 'markdown');
+      log.info('outbound', 'sent', outboundLogFields(input, 'markdown', body, result));
     }
   } else if (body.trim()) {
     const result = await input.channel.send(
@@ -2088,7 +2089,14 @@ async function sendFinalReply(input: {
       { markdown: body },
       input.sendOpts,
     );
+    requireMessageReceipt(result, 'text');
     log.info('outbound', 'sent', outboundLogFields(input, 'text', body, result));
+  }
+}
+
+function requireMessageReceipt(result: { messageId?: string }, type: string): void {
+  if (!result.messageId?.trim()) {
+    throw new Error(`final ${type} reply missing message receipt`);
   }
 }
 
