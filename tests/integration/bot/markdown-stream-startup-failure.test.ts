@@ -596,6 +596,45 @@ describe('markdown stream startup failures', () => {
       info.mock.calls.some((call) => call[0] === 'outbound' && call[1] === 'sent'),
     ).toBe(false);
   });
+
+  it('sends one dedicated final reply card after progress completes in card mode', async () => {
+    const progressCards: unknown[] = [];
+    const h = await createHarness({
+      messageReply: 'card',
+      events: [
+        { type: 'text', delta: 'progress update' },
+        { type: 'final_text', content: 'FINAL_SENTINEL' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          card?: { producer?: (ctrl: { update(next: unknown): Promise<void> }) => Promise<void> };
+        }).card?.producer;
+        await producer?.({
+          update: vi.fn(async (next: unknown) => {
+            progressCards.push(next);
+          }),
+        });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_card_final', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+
+    // Intermediate agent messages stream as progress; the final answer never
+    // leaks into the progress card (it is held back for the dedicated reply).
+    const progressJson = JSON.stringify(progressCards);
+    expect(progressJson).toContain('progress update');
+    expect(progressJson).not.toContain('FINAL_SENTINEL');
+
+    // The terminal answer arrives as exactly one non-streaming card send.
+    expect(h.channel.sent).toHaveLength(1);
+    const finalJson = JSON.stringify(h.channel.sent[0]?.content);
+    expect(finalJson).toContain('FINAL_SENTINEL');
+    expect(finalJson).not.toContain('progress update');
+    expect(h.channel.sent[0]?.options).toMatchObject({ replyTo: 'om_card_final' });
+  });
 });
 
 async function createHarness(options: {
@@ -603,6 +642,7 @@ async function createHarness(options: {
   stream?: StreamFn;
   send?: SendFn;
   events?: readonly AgentEvent[];
+  messageReply?: 'card' | 'markdown' | 'text';
 } = {}): Promise<{
   tmp: TmpProfile;
   channel: FakeLarkChannel;
@@ -629,6 +669,7 @@ async function createHarness(options: {
     codex: {
       binaryPath: '/usr/local/bin/codex',
     },
+    ...(options.messageReply ? { preferences: { messageReply: options.messageReply } } : {}),
   });
   const profileConfig = {
     ...baseProfileConfig,

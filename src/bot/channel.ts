@@ -1843,21 +1843,38 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
         sendOpts,
       );
-      await awaitRenderAwareStream({
-        mode: replyMode,
-        streamDone,
-        renderDone,
-        producerStarted: () => producerStarted,
-        fallback: async (state) => {
-          if (renderText(filterForPrefs(state)).trim() === '') return;
-          await channel.send(
-            chatId,
-            { card: renderCard(filterForPrefs(state), cardRenderOptions) },
-            sendOpts,
-          );
-        },
-      });
+      try {
+        await awaitRenderAwareStream({
+          mode: replyMode,
+          streamDone,
+          renderDone,
+          producerStarted: () => producerStarted,
+          fallback: async (state) => {
+            if (controls.profileConfig.agentKind === 'codex') return;
+            if (renderText(filterForPrefs(state)).trim() === '') return;
+            await channel.send(
+              chatId,
+              { card: renderCard(filterForPrefs(state), cardRenderOptions) },
+              sendOpts,
+            );
+          },
+        });
+      } catch (err) {
+        if (controls.profileConfig.agentKind !== 'codex') throw err;
+        log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
+      }
       await recallIfEmptyStreamedReply(channel, streamDone, filterForPrefs(latestState), scope);
+      if (controls.profileConfig.agentKind === 'codex') {
+        await sendFinalReply({
+          channel,
+          chatId,
+          scope,
+          state: finalAnswerOnlyState(filterForPrefs(latestState)),
+          replyMode,
+          sendOpts,
+          cardRenderOptions,
+        });
+      }
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let latestMarkdown = renderMarkdownStreamText(latestState);
