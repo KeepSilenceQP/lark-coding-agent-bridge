@@ -12,10 +12,7 @@ vi.mock('../../../src/platform/spawn', async (importOriginal) => {
   return { ...actual, spawnProcess: spawnMock.spawnProcess };
 });
 
-import {
-  buildBridgeSystemPrompt,
-  prefixBridgeSystemPrompt,
-} from '../../../src/agent/bridge-system-prompt';
+import { buildBridgeSystemPrompt } from '../../../src/agent/bridge-system-prompt';
 import { ClaudeAdapter } from '../../../src/agent/claude/adapter';
 import { CodexAdapter } from '../../../src/agent/codex/adapter';
 
@@ -89,7 +86,7 @@ describe('CodexAdapter system prompt wiring', () => {
     });
   }
 
-  it('prefixes stdin with the identity-aware bridge system prompt after setBotIdentity', async () => {
+  it('passes the identity-aware bridge system prompt as developer instructions after setBotIdentity', async () => {
     const child = fakeChild();
     spawnMock.spawnProcess.mockReturnValue(child);
     const adapter = codexAdapter();
@@ -97,9 +94,9 @@ describe('CodexAdapter system prompt wiring', () => {
 
     adapter.run({ runId: 'r1', prompt: 'hi', cwd: '/tmp' });
 
-    const stdin = await readAll(child.stdin);
-    expect(stdin).toBe(
-      prefixBridgeSystemPrompt('hi', { openId: 'ou_bot_self', name: 'Bridge' }),
+    expect(await readAll(child.stdin)).toBe('hi');
+    expect(developerInstructions()).toBe(
+      buildBridgeSystemPrompt({ openId: 'ou_bot_self', name: 'Bridge' }),
     );
   });
 
@@ -110,9 +107,16 @@ describe('CodexAdapter system prompt wiring', () => {
 
     adapter.run({ runId: 'r1', prompt: 'hi', cwd: '/tmp' });
 
-    const stdin = await readAll(child.stdin);
-    expect(stdin).toBe(prefixBridgeSystemPrompt('hi', undefined));
+    expect(await readAll(child.stdin)).toBe('hi');
+    expect(developerInstructions()).toBe(buildBridgeSystemPrompt(undefined));
   });
+
+  function developerInstructions(): string {
+    const args = spawnMock.spawnProcess.mock.calls[0]?.[1] as string[];
+    const override = args.find((arg) => arg.startsWith('developer_instructions='));
+    if (!override) throw new Error('missing developer_instructions override');
+    return JSON.parse(override.slice('developer_instructions='.length)) as string;
+  }
 });
 
 async function readAll(stream: PassThrough): Promise<string> {

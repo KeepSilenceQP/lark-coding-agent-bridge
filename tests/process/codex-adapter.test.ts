@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../../src/agent/codex/adapter.js';
 import { buildCodexArgs } from '../../src/agent/codex/argv.js';
+import { buildBridgeSystemPrompt } from '../../src/agent/bridge-system-prompt.js';
 import { log } from '../../src/core/logger.js';
 import type { AgentEvent } from '../../src/agent/types.js';
 
@@ -68,18 +69,24 @@ describe('CodexAdapter process contract', () => {
     const record = await readRecord(fake.recordPath);
 
     expect(await realpath(record.cwd)).toBe(cwd);
-    expect(record.argv).toEqual(buildCodexArgs({ cwd, sandbox: 'read-only' }));
+    expect(record.argv).toEqual(
+      buildCodexArgs({
+        cwd,
+        sandbox: 'read-only',
+        developerInstructions: buildBridgeSystemPrompt(undefined),
+      }),
+    );
     expect(record.argv).not.toContain('--ignore-user-config');
     expect(record.argv).toContain('--skip-git-repo-check');
     expect(record.argv).not.toContain('hello from lark');
-    expect(record.stdin).toContain('lark-channel-bridge 运行约定');
-    expect(record.stdin).toContain('__bridge_cb');
-    expect(record.stdin).toContain('lark-cli auth login');
-    expect(record.stdin).toContain('LARK_CHANNEL_PROFILE');
-    expect(record.stdin).toContain('LARKSUITE_CLI_CONFIG_DIR');
-    expect(record.stdin).not.toContain('lark-cli config bind --source lark-channel');
-    expect(record.stdin).toContain('hello from lark');
-    expect(record.stdin).not.toBe('hello from lark');
+    expect(record.stdin).toBe('hello from lark');
+    const developerInstructions = readDeveloperInstructions(record.argv);
+    expect(developerInstructions).toBe(buildBridgeSystemPrompt(undefined));
+    expect(developerInstructions).toContain('__bridge_cb');
+    expect(developerInstructions).toContain('lark-cli auth login');
+    expect(developerInstructions).toContain('LARK_CHANNEL_PROFILE');
+    expect(developerInstructions).toContain('LARKSUITE_CLI_CONFIG_DIR');
+    expect(developerInstructions).not.toContain('lark-cli config bind --source lark-channel');
     expect(record.env).toMatchObject({
       LARK_CHANNEL: '1',
       CODEX_HOME: '/outer/codex-home',
@@ -178,8 +185,11 @@ describe('CodexAdapter process contract', () => {
         sandbox: 'workspace-write',
         threadId: 'thread-old',
         images: [image],
+        developerInstructions: buildBridgeSystemPrompt(undefined),
       }),
     );
+    expect(record.stdin).toBe('continue');
+    expect(readDeveloperInstructions(record.argv)).toBe(buildBridgeSystemPrompt(undefined));
   });
 
   it('lets per-run policy sandbox override the adapter default', async () => {
@@ -202,7 +212,13 @@ describe('CodexAdapter process contract', () => {
 
     await collect(run.events);
     const record = await readRecord(fake.recordPath);
-    expect(record.argv).toEqual(buildCodexArgs({ cwd, sandbox: 'read-only' }));
+    expect(record.argv).toEqual(
+      buildCodexArgs({
+        cwd,
+        sandbox: 'read-only',
+        developerInstructions: buildBridgeSystemPrompt(undefined),
+      }),
+    );
   });
 
   it('honors a profile-configured Codex home', async () => {
@@ -317,6 +333,35 @@ describe('CodexAdapter process contract', () => {
         terminationReason: 'failed',
       },
     ]);
+  });
+
+  it('redacts dynamic and developer prompt bodies from stderr logs and error events', async () => {
+    const dynamicPrompt = 'dynamic-prompt-secret-7c66';
+    const developerInstructions = buildBridgeSystemPrompt(undefined);
+    const developerArg = `developer_instructions=${JSON.stringify(developerInstructions)}`;
+    const fake = await createFakeCodex({
+      lines: [],
+      stderr: `${dynamicPrompt}\n${developerArg}\n`,
+      exitCode: 42,
+    });
+    cleanup.push(fake.dir);
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+
+    const run = new CodexAdapter({ binary: fake.path, profileStateDir: fake.dir }).run({
+      runId: 'run-redacted-fail',
+      prompt: dynamicPrompt,
+      cwd: await realpath(fake.dir),
+    });
+
+    const events = await collect(run.events);
+    expect(JSON.stringify(events)).not.toContain(dynamicPrompt);
+    expect(JSON.stringify(events)).not.toContain(developerInstructions);
+    expect(JSON.stringify(events)).not.toContain(developerArg);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(dynamicPrompt);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(developerInstructions);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(developerArg);
+    expect(JSON.stringify(events)).toContain('[REDACTED_PROMPT]');
+    warn.mockRestore();
   });
 
   it('continues after retryable raw error events and waits for the terminal turn event', async () => {
@@ -786,6 +831,12 @@ async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]>
   return out;
 }
 
+function readDeveloperInstructions(argv: string[]): string {
+  const override = argv.find((arg) => arg.startsWith('developer_instructions='));
+  if (!override) throw new Error('missing developer_instructions override');
+  return JSON.parse(override.slice('developer_instructions='.length)) as string;
+}
+
 async function createFakeCodex(options: {
   lines: unknown[];
   stderr?: string;
@@ -800,6 +851,19 @@ async function createFakeCodex(options: {
     [
       '#!/usr/bin/env node',
       'import { writeFileSync } from "node:fs";',
+      'const args = process.argv.slice(2);',
+      'if (args[0] === "debug" && args[1] === "prompt-input") {',
+      '  const configIndex = args.indexOf("-c");',
+      '  const config = configIndex >= 0 ? args[configIndex + 1] : "";',
+      '  const prefix = "developer_instructions=";',
+      '  const developerText = JSON.parse(config.slice(prefix.length));',
+      '  const userText = args.at(-1) ?? "";',
+      '  console.log(JSON.stringify([',
+      '    { role: "developer", content: [{ type: "input_text", text: developerText }] },',
+      '    { role: "user", content: [{ type: "input_text", text: userText }] },',
+      '  ]));',
+      '  process.exit(0);',
+      '}',
       'let stdin = "";',
       'process.stdin.setEncoding("utf8");',
       'process.stdin.on("data", (chunk) => { stdin += chunk; });',

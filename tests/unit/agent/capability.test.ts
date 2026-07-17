@@ -20,7 +20,7 @@ describe('agent capability contract', () => {
     });
   });
 
-  it('defines Codex capability with thread sessions and stdin prompt injection', () => {
+  it('defines Codex capability with thread sessions and developer instructions', () => {
     const profile = createDefaultProfileConfig({
       agentKind: 'codex',
       accounts: {
@@ -42,7 +42,7 @@ describe('agent capability contract', () => {
     expect(codexCapability(profile)).toMatchObject({
       agentId: 'codex',
       sessionKind: 'codex-thread',
-      promptInjection: 'stdin-prefix',
+      promptInjection: 'developer-instructions',
       supportsNativeHistory: false,
       systemPrompt: BRIDGE_SYSTEM_PROMPT,
       permissions: {
