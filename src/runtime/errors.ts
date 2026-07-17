@@ -8,6 +8,7 @@ export type RunRejectedCode =
 export type SpawnFailedCode =
   | 'agent-spawn-failed'
   | 'agent-prepare-failed'
+  | 'codex-developer-instructions-unsupported'
   | AgentPreflightErrorCode;
 
 export class RunRejected extends Error {

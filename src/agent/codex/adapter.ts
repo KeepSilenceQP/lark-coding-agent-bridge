@@ -5,7 +5,7 @@ import type { SandboxMode } from '../../config/profile-schema';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
 import { SpawnFailed } from '../../runtime/errors';
-import { prefixBridgeSystemPrompt } from '../bridge-system-prompt';
+import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import type {
@@ -17,6 +17,10 @@ import type {
 } from '../types';
 import { buildCodexArgs } from './argv';
 import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
+import {
+  CodexDeveloperInstructionsUnsupported,
+  verifyCodexDeveloperInstructions,
+} from './prompt-input-capability';
 import {
   createCodexTurnStateProbe,
   type CodexTurnStateProbe,
@@ -32,6 +36,9 @@ export interface CodexAdapterOptions {
   sandbox?: SandboxMode;
   stopGraceMs?: number;
   stdoutIdleProbeMs?: number;
+  promptCapabilityProbeTimeoutMs?: number;
+  promptCapabilityProbeMaxOutputBytes?: number;
+  promptCapabilityProbeKillGraceMs?: number;
   turnStateProbe?: CodexTurnStateProbe;
   larkChannel?: LarkChannelEnvContext;
 }
@@ -52,11 +59,15 @@ export class CodexAdapter implements AgentAdapter {
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
   private readonly stdoutIdleProbeMs: number;
+  private readonly promptCapabilityProbeTimeoutMs: number | undefined;
+  private readonly promptCapabilityProbeMaxOutputBytes: number | undefined;
+  private readonly promptCapabilityProbeKillGraceMs: number | undefined;
   private readonly turnStateProbe: CodexTurnStateProbe;
   private readonly turnProbeBaselines = new Map<
     string,
     { enabled: boolean; turnId?: string }
   >();
+  private readonly promptCapabilityProbes = new Map<string, Promise<void>>();
   private readonly larkChannel: LarkChannelEnvContext | undefined;
   private botIdentity: AgentBotIdentity | undefined;
 
@@ -70,6 +81,9 @@ export class CodexAdapter implements AgentAdapter {
     this.sandbox = opts.sandbox ?? 'danger-full-access';
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
     this.stdoutIdleProbeMs = opts.stdoutIdleProbeMs ?? DEFAULT_STDOUT_IDLE_PROBE_MS;
+    this.promptCapabilityProbeTimeoutMs = opts.promptCapabilityProbeTimeoutMs;
+    this.promptCapabilityProbeMaxOutputBytes = opts.promptCapabilityProbeMaxOutputBytes;
+    this.promptCapabilityProbeKillGraceMs = opts.promptCapabilityProbeKillGraceMs;
     this.turnStateProbe =
       opts.turnStateProbe ??
       createCodexTurnStateProbe({
@@ -109,6 +123,50 @@ export class CodexAdapter implements AgentAdapter {
       );
     }
     if (!opts) return;
+    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
+    if (this.codexHome) {
+      envOverrides.CODEX_HOME = this.codexHome;
+    } else if (!this.inheritCodexHome) {
+      envOverrides.CODEX_HOME = join(this.profileStateDir, 'codex-home');
+    }
+    const cwd = opts.cwd ?? process.cwd();
+    const env = mergeProcessEnv(process.env, envOverrides);
+    const probeKey = JSON.stringify({
+      binary: this.binary,
+      cwd,
+      codexHome: env.CODEX_HOME ?? null,
+      profile: env.LARK_CHANNEL_PROFILE ?? null,
+      channelHome: env.LARK_CHANNEL_HOME ?? null,
+      channelConfig: env.LARK_CHANNEL_CONFIG ?? null,
+      larkCliConfigDir: env.LARKSUITE_CLI_CONFIG_DIR ?? null,
+    });
+    let capabilityProbe = this.promptCapabilityProbes.get(probeKey);
+    if (!capabilityProbe) {
+      capabilityProbe = verifyCodexDeveloperInstructions({
+        binary: this.binary,
+        cwd,
+        env,
+        timeoutMs: this.promptCapabilityProbeTimeoutMs,
+        maxOutputBytes: this.promptCapabilityProbeMaxOutputBytes,
+        killGraceMs: this.promptCapabilityProbeKillGraceMs,
+      });
+      this.promptCapabilityProbes.set(probeKey, capabilityProbe);
+    }
+    try {
+      await capabilityProbe;
+    } catch (error) {
+      if (this.promptCapabilityProbes.get(probeKey) === capabilityProbe) {
+        this.promptCapabilityProbes.delete(probeKey);
+      }
+      if (error instanceof CodexDeveloperInstructionsUnsupported) {
+        throw new SpawnFailed(
+          error.message,
+          error,
+          'codex-developer-instructions-unsupported',
+        );
+      }
+      throw error;
+    }
     if (this.stdoutIdleProbeMs <= 0 || !opts.threadId) {
       this.turnProbeBaselines.set(opts.runId, { enabled: true });
       return;
@@ -140,6 +198,7 @@ export class CodexAdapter implements AgentAdapter {
         : undefined
       : this.turnStateProbe;
 
+    const developerInstructions = buildBridgeSystemPrompt(this.botIdentity);
     const args = buildCodexArgs({
       cwd: opts.cwd,
       sandbox: opts.sandbox ?? this.sandbox,
@@ -148,7 +207,13 @@ export class CodexAdapter implements AgentAdapter {
       ignoreUserConfig: this.ignoreUserConfig,
       ignoreRules: this.ignoreRules,
       model: opts.model,
+      developerInstructions,
     });
+    const redactPrompt = createPromptRedactor([
+      opts.prompt,
+      developerInstructions,
+      `developer_instructions=${JSON.stringify(developerInstructions)}`,
+    ]);
     const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
     if (this.codexHome) {
       envOverrides.CODEX_HOME = this.codexHome;
@@ -180,9 +245,10 @@ export class CodexAdapter implements AgentAdapter {
       while (nl !== -1) {
         const line = stderrBuffer.slice(0, nl);
         stderrBuffer = stderrBuffer.slice(nl + 1);
-        if (line.trim()) log.warn('agent', 'stderr', { line });
+        const redactedLine = redactPrompt(line);
+        if (redactedLine.trim()) log.warn('agent', 'stderr', { line: redactedLine });
         if (isWindowsCommandNotFoundLine(line)) {
-          runtimeError = new Error(`failed to spawn codex: ${line.trim()}`);
+          runtimeError = new Error(`failed to spawn codex: ${redactPrompt(line.trim())}`);
           child.stdout.destroy();
           child.kill();
         }
@@ -192,15 +258,15 @@ export class CodexAdapter implements AgentAdapter {
 
     let stopReason: CodexFinishReason | undefined;
     child.on('error', (err) => {
-      runtimeError = err;
+      runtimeError = new Error(redactPrompt(err.message));
     });
     child.on('exit', (code, signal) => {
       log.info('agent', 'exit', { pid: child.pid ?? null, code, signal });
     });
     child.stdin.on('error', (err) => {
-      log.warn('agent', 'stdin-error', { message: err.message });
+      log.warn('agent', 'stdin-error', { message: redactPrompt(err.message) });
     });
-    child.stdin.end(prefixBridgeSystemPrompt(opts.prompt, this.botIdentity), 'utf8');
+    child.stdin.end(opts.prompt, 'utf8');
 
     const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
 
@@ -215,6 +281,7 @@ export class CodexAdapter implements AgentAdapter {
         opts.threadId,
         preparedProbe?.turnId,
         terminalProbe,
+        redactPrompt,
       ),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
@@ -295,13 +362,14 @@ async function* createEventStream(
   initialThreadId: string | undefined,
   baselineTurnId: string | undefined,
   turnStateProbe: CodexTurnStateProbe | undefined,
+  redactPrompt: (value: string) => string,
 ): AsyncGenerator<AgentEvent> {
   const translator = new CodexJsonlTranslator();
   if (!child.pid) {
     const err = getError();
     yield {
       type: 'error',
-      message: err ? `failed to spawn codex: ${err.message}` : 'spawn returned no pid',
+      message: err ? `failed to spawn codex: ${redactPrompt(err.message)}` : 'spawn returned no pid',
       terminationReason: 'failed',
     };
     return;
@@ -414,7 +482,11 @@ async function* createEventStream(
               : undefined;
         if (threadId) currentThreadId = threadId;
       }
-      const translated = translator.translate(parsed);
+      const translated = translator.translate(parsed).map((event) =>
+        event.type === 'error'
+          ? { ...event, message: redactPrompt(event.message) }
+          : event,
+      );
       for (const event of translated) {
         if (event.type === 'text') emittedText.add(event.delta);
         if (event.type === 'tool_use') inFlightTools.add(event.id);
@@ -441,7 +513,7 @@ async function* createEventStream(
 
   const earlyRuntimeError = getError();
   if (earlyRuntimeError && child.exitCode === null && child.signalCode === null) {
-    yield terminalError(`codex runtime error: ${earlyRuntimeError.message}`);
+    yield terminalError(`codex runtime error: ${redactPrompt(earlyRuntimeError.message)}`);
     return;
   }
 
@@ -455,14 +527,14 @@ async function* createEventStream(
   const runtimeError = getError();
   if (exitCode !== 0 && exitCode !== null) {
     if (!translator.terminalEmitted()) {
-      const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
+      const stderr = redactPrompt(Buffer.concat(stderrChunks).toString('utf8').trim());
       const detail = stderr ? `: ${stderr.slice(0, 500)}` : '';
       yield terminalError(`codex exited with code ${exitCode}${detail}`);
     }
     return;
   }
   if (runtimeError && !translator.terminalEmitted()) {
-    yield terminalError(`codex runtime error: ${runtimeError.message}`);
+    yield terminalError(`codex runtime error: ${redactPrompt(runtimeError.message)}`);
     return;
   }
 
@@ -474,6 +546,21 @@ function terminalError(message: string): AgentEvent {
     type: 'error',
     message,
     terminationReason: 'failed',
+  };
+}
+
+function createPromptRedactor(values: readonly string[]): (value: string) => string {
+  const exactValues = [...new Set(values.filter(Boolean))].sort((a, b) => b.length - a.length);
+  const promptLines = new Set(
+    exactValues.flatMap((value) => value.split(/\r?\n/)).filter(Boolean),
+  );
+  return (value: string): string => {
+    if (promptLines.has(value)) return '[REDACTED_PROMPT]';
+    let redacted = value;
+    for (const sensitive of exactValues) {
+      redacted = redacted.replaceAll(sensitive, '[REDACTED_PROMPT]');
+    }
+    return redacted;
   };
 }
 
