@@ -1,7 +1,7 @@
 # Codex Bridge Prompt Developer Instructions Implementation Plan
 
 Date: 2026-07-18
-Status: implemented and verified; runtime rollout pending
+Status: merged and deployment scheduled; runtime acceptance pending
 Source Spec: `docs/specs/20260718-codex-bridge-prompt-developer-instructions.md`
 Spec Review: PASS after independent SubAgent review
 
@@ -326,17 +326,18 @@ Implementation completed on 2026-07-18 in
 - Real non-model prompt inspection: exactly one developer sentinel under role
   `developer`, exactly one task sentinel under role `user`, and zero cross-role
   matches.
-- Automated verification: 100 test files and 652 tests passed.
+- Feature-worktree verification: 100 test files and 652 tests passed.
+- Combined-main verification after merging the already deployed
+  `owner-no-mention` feature: 102 test files and 672 tests passed.
 - `pnpm typecheck`, `pnpm build`, and `git diff --check`: PASS.
 - Claude adapter and shared Bridge Prompt builder source: no diff.
 - Claude process-contract tests: PASS.
 
-Runtime deployment and the fresh plus same-thread resume canary are `NOT_RUN`.
-The live global CLI currently resolves to the separate
-`feat/owner-no-mention-default-response` worktree at commit `0f9466f`, while
-this implementation worktree is based on main commit `fe69309`. Repointing the
-shared global artifact directly would remove an already-deployed feature from
-the Codex process. The current Claude process was not restarted, reconfigured,
-or repointed. Rollout must first produce a combined artifact containing the
-deployed `0f9466f` behavior plus this Codex-only diff, then restart only the
-Codex profile and perform the runtime canary.
+Main now contains both the already deployed `owner-no-mention` feature and this
+Codex-only change. The global CLI resolves to the main worktree, and a deferred
+restart was requested for the Codex profile so the active reply is not cut off.
+The Claude process remained running with PID `10050` and was not restarted,
+reconfigured, or repointed at service level.
+
+Post-restart verification and the fresh plus same-thread resume canary remain
+`NOT_RUN` until the deferred Codex restart completes after this reply.
