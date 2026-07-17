@@ -4,7 +4,10 @@ import { BRIDGE_SYSTEM_PROMPT } from './bridge-system-prompt';
 
 export type AgentCapabilityId = 'claude' | 'codex';
 export type AgentSessionKind = 'claude-session' | 'codex-thread';
-export type PromptInjectionMode = 'append-system-prompt' | 'stdin-prefix';
+export type PromptInjectionMode =
+  | 'append-system-prompt'
+  | 'stdin-prefix'
+  | 'developer-instructions';
 
 export interface AgentCapability {
   agentId: AgentCapabilityId;
@@ -44,7 +47,7 @@ export function codexCapability(profile: Pick<ProfileConfig, 'permissions'>): Ag
   return {
     agentId: 'codex',
     sessionKind: 'codex-thread',
-    promptInjection: 'stdin-prefix',
+    promptInjection: 'developer-instructions',
     systemPrompt: BRIDGE_SYSTEM_PROMPT,
     supportsNativeHistory: false,
     callback: {

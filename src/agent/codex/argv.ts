@@ -7,6 +7,7 @@ export interface BuildCodexArgsInput {
   images?: readonly string[];
   ignoreUserConfig?: boolean;
   ignoreRules?: boolean;
+  developerInstructions?: string;
   /** Forwarded to `codex exec --model`. Omitted uses the Codex default. */
   model?: string;
 }
@@ -28,6 +29,9 @@ export function buildCodexArgs(input: BuildCodexArgsInput): string[] {
     'approval_policy="never"',
     '-c',
     'shell_environment_policy.inherit="all"',
+    ...(input.developerInstructions === undefined
+      ? []
+      : ['-c', `developer_instructions=${JSON.stringify(input.developerInstructions)}`]),
     ...(input.ignoreUserConfig === true ? ['--ignore-user-config'] : []),
     ...(input.ignoreRules === false ? [] : ['--ignore-rules']),
     '--skip-git-repo-check',

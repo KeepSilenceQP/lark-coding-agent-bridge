@@ -136,4 +136,21 @@ describe('Codex argv contract', () => {
     ).toContain('--ignore-user-config');
   });
 
+  it('encodes developer instructions as a global Codex config override', () => {
+    const developerInstructions = 'line one\n"quoted" `code` <bridge_context> 中文';
+    const args = buildCodexArgs({
+      cwd: '/repo',
+      sandbox: 'workspace-write',
+      threadId: 'thread-123',
+      developerInstructions,
+    });
+    const overrideIndex = args.findIndex((arg) => arg.startsWith('developer_instructions='));
+
+    expect(args[overrideIndex - 1]).toBe('-c');
+    expect(overrideIndex).toBeLessThan(args.indexOf('resume'));
+    expect(JSON.parse(args[overrideIndex]!.slice('developer_instructions='.length))).toBe(
+      developerInstructions,
+    );
+  });
+
 });
