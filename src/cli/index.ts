@@ -26,6 +26,7 @@ import {
 import { runStart } from './commands/start';
 import { runAtBotCli } from './commands/at-bot';
 import { createBotRegistryCommand } from './commands/bot-registry';
+import { runUi } from './commands/ui';
 
 const program = new Command();
 
@@ -41,6 +42,7 @@ program
   .description('Run the bridge in the foreground (was `start` in older versions)')
   .option('-c, --config <path>', 'path to config file')
   .option('--profile <name>', 'profile name to run')
+  .option('--web-ui', 'run the machine-wide supervisor and local web console')
   .option('--agent <kind>', 'agent kind for a new profile (claude or codex)')
   .option('--workspace <path>', 'initial working directory for first-run profile bootstrap')
   .option('--app-id <id>', 'use an existing Lark/Feishu app instead of QR app creation')
@@ -50,6 +52,7 @@ program
   .action(async (opts: {
     config?: string;
     profile?: string;
+    webUi?: boolean;
     agent?: string;
     workspace?: string;
     appId?: string;
@@ -139,6 +142,15 @@ profile
 program.addCommand(createBotRegistryCommand());
 
 program
+  .command('ui')
+  .description('Open the local web console (config, profiles, online bots)')
+  .option('--profile <name>', 'accepted for compatibility')
+  .option('--print', 'print the URL instead of opening a browser')
+  .action(async (opts: { profile?: string; print?: boolean }) => {
+    await runUi(opts);
+  });
+
+program
   .command('ps')
   .description('List running bridge processes on this machine')
   .action(() => {
@@ -158,6 +170,7 @@ program
   .command('start')
   .description('Install (if needed) and start the bridge as an OS-managed daemon')
   .option('--profile <name>', 'profile name (defaults to active profile)')
+  .option('--web-ui', 'run the supervisor and web console as the background service')
   .option('--agent <kind>', 'agent kind for first-run profile bootstrap (claude or codex)')
   .option('--workspace <path>', 'initial working directory for first-run profile bootstrap')
   .option('--app-id <id>', 'use an existing Lark/Feishu app instead of QR app creation')
@@ -166,6 +179,7 @@ program
   .option('--skip-check-lark-cli', 'skip lark-cli pre-flight check (auto-install + bind)')
   .action(async (opts: {
     profile?: string;
+    webUi?: boolean;
     agent?: string;
     workspace?: string;
     appId?: string;
@@ -180,32 +194,36 @@ program
   .command('stop')
   .description('Stop the OS-managed daemon (unload from launchd; plist stays)')
   .option('--profile <name>', 'profile name (defaults to active profile)')
-  .action(async (opts: { profile?: string }) => {
-    await runServiceStop({ profile: opts.profile });
+  .option('--web-ui', 'target the supervisor service')
+  .action(async (opts: { profile?: string; webUi?: boolean }) => {
+    await runServiceStop({ profile: opts.profile, webUi: opts.webUi });
   });
 
 program
   .command('restart')
   .description('Restart the OS-managed daemon')
   .option('--profile <name>', 'profile name (defaults to active profile)')
-  .action(async (opts: { profile?: string }) => {
-    await runServiceRestart({ profile: opts.profile });
+  .option('--web-ui', 'target the supervisor service')
+  .action(async (opts: { profile?: string; webUi?: boolean }) => {
+    await runServiceRestart({ profile: opts.profile, webUi: opts.webUi });
   });
 
 program
   .command('status')
   .description('Show OS service status (pid, last exit, log paths)')
   .option('--profile <name>', 'profile name (defaults to active profile)')
-  .action(async (opts: { profile?: string }) => {
-    await runServiceStatus({ profile: opts.profile });
+  .option('--web-ui', 'target the supervisor service')
+  .action(async (opts: { profile?: string; webUi?: boolean }) => {
+    await runServiceStatus({ profile: opts.profile, webUi: opts.webUi });
   });
 
 program
   .command('unregister')
   .description('Remove the OS service registration (bootout + delete plist)')
   .option('--profile <name>', 'profile name (defaults to active profile)')
-  .action(async (opts: { profile?: string }) => {
-    await runServiceUnregister({ profile: opts.profile });
+  .option('--web-ui', 'target the supervisor service')
+  .action(async (opts: { profile?: string; webUi?: boolean }) => {
+    await runServiceUnregister({ profile: opts.profile, webUi: opts.webUi });
   });
 
 const secrets = program

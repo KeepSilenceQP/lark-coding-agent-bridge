@@ -22,6 +22,11 @@ import { isComplete } from '../../config/schema';
 import { configureLogger, gcOldLogs, log, reportError } from '../../core/logger';
 import { loadTelemetryAdapter, telemetry } from '../../core/telemetry';
 import { gcMediaCache } from '../../media/cache';
+import { startUiServer } from '../../ui/server';
+import { readUiSidecar, removeUiSidecar, writeUiSidecar } from '../../ui/sidecar';
+import type { UiServerHandle } from '../../ui/types';
+import { Supervisor } from '../../runtime/supervisor';
+import { acquireHostLock } from '../../runtime/host-lock';
 import { preFlightChecks } from '../preflight';
 import { promptAndStopActiveBridgeMigrationConflict } from './migrate';
 import { stopProcessEntry, type StopProcessEntryResult } from './ps';
@@ -82,11 +87,17 @@ export interface StartOptions {
   appSecret?: string;
   tenant?: string;
   skipCheckLarkCli?: boolean;
+  /** Run the machine-wide supervisor and local management console. */
+  webUi?: boolean;
   confirmStopRuntimeLockProcess?: (err: RuntimeLockConflictError) => boolean | Promise<boolean>;
   stopRuntimeLockProcess?: (meta: RuntimeLockMeta) => StopProcessEntryResult | Promise<StopProcessEntryResult>;
 }
 
 export async function runStart(opts: StartOptions): Promise<void> {
+  if (opts.webUi) {
+    await runSupervisorConsole(opts);
+    return;
+  }
   const runtime = await resolveProfileRuntime({
     ...opts,
     allowBootstrap: true,
@@ -427,6 +438,96 @@ export async function runStart(opts: StartOptions): Promise<void> {
       throw err;
     }
   }
+}
+
+/**
+ * Start the machine-wide supervisor and its localhost-only web console. The
+ * existing single-profile runtime remains the default path above so all of the
+ * fork's reconnect, owner-persistence and deferred-restart behaviour is kept.
+ */
+async function runSupervisorConsole(opts: StartOptions): Promise<void> {
+  const runtime = await resolveProfileRuntime({
+    ...opts,
+    allowBootstrap: true,
+    handleActiveBridgeMigrationConflict: async (err) => {
+      const handled = await promptAndStopActiveBridgeMigrationConflict(err, {
+        cancelMessage: '已取消启动。',
+      });
+      if (!handled) process.exit(0);
+      return true;
+    },
+  });
+  const { cfg, configPath, appPaths } = runtime;
+  configureLogger({ logsDir: appPaths.hostLogsDir });
+
+  const hostLock = await acquireHostLock(appPaths.hostLockFile);
+  if (!hostLock) {
+    const sidecar = await readUiSidecar(appPaths.hostUiFile);
+    console.log(
+      sidecar
+        ? `控制面已在运行：${sidecar.url}`
+        : '控制面已在运行（另一个 supervisor 进程持有锁）。',
+    );
+    return;
+  }
+
+  await loadTelemetryAdapter({
+    version: pkg.version,
+    appId: cfg.accounts.app.id,
+    tenant: cfg.accounts.app.tenant,
+    hostname: os.hostname(),
+  });
+  await gcOldLogs();
+
+  const supervisor = new Supervisor({ configPath, rootDir: appPaths.rootDir });
+  let uiServer: UiServerHandle | undefined;
+  try {
+    uiServer = await startUiServer({
+      supervisor,
+      version: pkg.version,
+      rootDir: appPaths.rootDir,
+    });
+    await writeUiSidecar(appPaths.hostUiFile, uiServer, new Date().toISOString());
+    console.log(`✓ 控制台：${uiServer.url}`);
+  } catch (err) {
+    log.warn('ui', 'server-start-failed', { err: String(err) });
+  }
+
+  try {
+    await supervisor.startProfile(appPaths.profile);
+    console.log(`✓ profile「${appPaths.profile}」已上线`);
+  } catch (err) {
+    console.warn(
+      `⚠️ active profile「${appPaths.profile}」启动失败：${err instanceof Error ? err.message : String(err)}`,
+    );
+    log.warn('supervisor', 'active-start-failed', {
+      profile: appPaths.profile,
+      err: String(err),
+    });
+  }
+
+  let shuttingDown = false;
+  const shutdown = async (sig: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n收到 ${sig}，正在关闭...`);
+    if (uiServer) {
+      await uiServer.close().catch(() => {});
+      await removeUiSidecar(appPaths.hostUiFile);
+    }
+    await supervisor.shutdown();
+    await hostLock.release().catch(() => {});
+    await flushTelemetry();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('beforeExit', () => void flushTelemetry());
+  process.on('exit', () => {
+    supervisor.unregisterAllSync();
+    cleanupTmpFiles(appPaths.userRegistryFile);
+  });
+  await new Promise<void>(() => {});
 }
 
 async function checkRuntimeAgentAvailability(agent: AgentAdapter): Promise<AgentAvailability> {

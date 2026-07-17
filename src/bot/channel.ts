@@ -1821,9 +1821,15 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
               return canUseGroup(controls.profileConfig, controls, chatId, senderId);
             },
             checkGroupResponse: (_chatType, chatId, senderId) => {
+              const mentionOverride = controls.profileConfig.access.chatRequireMention?.[chatId];
               const decision = decideGroupResponse({
                 chatType: 'group',
-                mode: controls.profileConfig.access.groupResponseMode,
+                mode:
+                  mentionOverride === true
+                    ? 'mention-only'
+                    : mentionOverride === false
+                      ? 'all-messages'
+                      : controls.profileConfig.access.groupResponseMode,
                 senderId,
                 botOwnerId: controls.botOwnerId,
                 mentionedBot: false,
@@ -2291,9 +2297,15 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // pending queues, runs, and cards. Explicit @bot messages retain their
   // original path; owner-default is a narrow opt-in for owner messages with
   // no structured mention of any account.
+  const mentionOverride = controls.profileConfig.access.chatRequireMention?.[msg.chatId];
   const groupResponseDecision = decideGroupResponse({
     chatType: msg.chatType,
-    mode: controls.profileConfig.access.groupResponseMode,
+    mode:
+      mentionOverride === true
+        ? 'mention-only'
+        : mentionOverride === false
+          ? 'all-messages'
+          : controls.profileConfig.access.groupResponseMode,
     senderId: msg.senderId,
     botOwnerId: controls.botOwnerId,
     mentionedBot: msg.mentionedBot,

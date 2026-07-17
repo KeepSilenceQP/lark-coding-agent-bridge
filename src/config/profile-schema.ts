@@ -34,6 +34,8 @@ export interface ProfileAccess {
   groupResponseMode: GroupResponseMode;
   requireMentionInGroup: boolean;
   ownerNoMentionChats: string[];
+  /** Per-chat @-mention override. Missing chats follow groupResponseMode. */
+  chatRequireMention?: Record<string, boolean>;
 }
 
 export interface SandboxConfig {
@@ -317,6 +319,7 @@ function normalizeAccess(
       ? 'mention-only'
       : 'all-messages';
   const owner = normalizeAppOwnerIdentity(access?.owner);
+  const chatRequireMention = normalizeChatMentionMap(access?.chatRequireMention);
   return {
     ...(owner ? { owner } : {}),
     allowedUsers: stringArray(access?.allowedUsers),
@@ -328,7 +331,17 @@ function normalizeAccess(
     // rollback to binaries that predate the tri-state response policy.
     requireMentionInGroup: groupResponseMode !== 'all-messages',
     ownerNoMentionChats: stringArray(access?.ownerNoMentionChats),
+    ...(Object.keys(chatRequireMention).length > 0 ? { chatRequireMention } : {}),
   };
+}
+
+function normalizeChatMentionMap(input: unknown): Record<string, boolean> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const out: Record<string, boolean> = {};
+  for (const [chatId, value] of Object.entries(input as Record<string, unknown>)) {
+    if (chatId && typeof value === 'boolean') out[chatId] = value;
+  }
+  return out;
 }
 
 function normalizeAppOwnerIdentity(input: unknown): AppOwnerIdentity | undefined {

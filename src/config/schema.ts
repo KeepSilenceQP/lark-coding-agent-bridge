@@ -93,6 +93,8 @@ export interface AppAccess {
    * Independent from allowedChats; only active when groupResponseMode
    * is owner-allowlist. topic group thread_ids inherit the chat config. */
   ownerNoMentionChats?: string[];
+  /** Per-chat @-mention override; true requires @, false accepts all messages. */
+  chatRequireMention?: Record<string, boolean>;
 }
 
 export interface AppPreferences {

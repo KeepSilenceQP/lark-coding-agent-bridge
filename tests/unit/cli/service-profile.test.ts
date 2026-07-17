@@ -58,6 +58,7 @@ vi.mock('../../../src/config/paths', () => ({
 vi.mock('../../../src/daemon/paths', () => ({
   daemonStdoutPath: (profile: string) => `/tmp/lark-channel-home/profiles/${profile}/logs/daemon/stdout.log`,
   daemonStderrPath: (profile: string) => `/tmp/lark-channel-home/profiles/${profile}/logs/daemon/stderr.log`,
+  SUPERVISOR_SERVICE_ID: 'supervisor',
 }));
 
 vi.mock('../../../src/cli/preflight', () => ({
@@ -139,7 +140,8 @@ describe('profile-aware service commands', () => {
 
     await runServiceStart({ profile: 'codex-dev', skipCheckLarkCli: true });
 
-    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev');
+    // Classic per-profile service pins `run --profile <profile>`.
+    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev', ['run', '--profile', 'codex-dev']);
     expect(mocks.resolveProfileRuntime).toHaveBeenNthCalledWith(1, expect.objectContaining({
       profile: 'codex-dev',
       agent: undefined,
@@ -474,7 +476,7 @@ describe('profile-aware service commands', () => {
       profile: 'claude',
       allowBootstrap: false,
     });
-    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('claude');
+    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('claude', ['run', '--profile', 'claude']);
     expect(mocks.materializeEnvSecretForService).toHaveBeenCalledWith({ profile: 'claude' });
     expect(mocks.adapter.install).toHaveBeenCalled();
     expect(mocks.adapter.start).toHaveBeenCalled();
@@ -485,7 +487,9 @@ describe('profile-aware service commands', () => {
     (mocks.adapter.fileExists as ReturnType<typeof vi.fn>).mockReturnValue(false);
 
     await runServiceStatus();
-    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev');
+    // Lifecycle commands (status/stop/restart/unregister) don't install, so
+    // they pass no runArgs.
+    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev', undefined);
 
     mocks.readActiveProfile.mockResolvedValue(undefined);
     mocks.loadRootConfig.mockResolvedValue(undefined);
@@ -506,7 +510,7 @@ describe('profile-aware service commands', () => {
     await runServiceStatus({ profile: 'codex-dev' });
     await runServiceUnregister({ profile: 'codex-dev' });
 
-    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev');
+    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev', undefined);
     expect(mocks.adapter.deleteFile).toHaveBeenCalled();
     expect(lines).toContain('✓ 已清除后台运行注册');
     expect(lines).toContain('  (配置 / 日志 / 会话保留在 /tmp/lark-channel-home)');

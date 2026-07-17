@@ -114,6 +114,7 @@ import {
 } from '../session/codex-history';
 import type { SessionCatalog, SessionCatalogIdentity } from '../session/catalog';
 import { isAlive, readAndPrune, resolveTarget } from '../runtime/registry';
+import { readUiSidecar } from '../ui/sidecar';
 import type { SessionStore } from '../session/store';
 import type { PromptSessionService } from '../session/prompt-session-service';
 import { resolveWorkingDirectory } from '../policy/workspace';
@@ -3097,6 +3098,8 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
 
   const ms = getRunIdleTimeoutMs(ctx.controls.cfg);
   const access = ctx.controls.profileConfig.access;
+  const sidecar = await readUiSidecar(commandProfilePaths(ctx).hostUiFile).catch(() => undefined);
+  const consoleUrl = sidecar && isAlive(sidecar.pid) ? sidecar.url : undefined;
   const card = configFormCard({
     agentKind: ctx.controls.profileConfig.agentKind,
     mode: ctx.controls.profileConfig.mode,
@@ -3117,6 +3120,7 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     botAdmins: access.botAdmins,
     knownChats: ctx.controls.knownChats ?? [],
     ownerNoMentionChats: access.ownerNoMentionChats,
+    ...(consoleUrl ? { consoleUrl } : {}),
   });
   if (ctx.fromCardAction) await recallMessage(ctx, ctx.msg.messageId);
   await sendManagedCard(ctx.channel, ctx.msg.chatId, card, commandReplyOptions(ctx));

@@ -29,6 +29,8 @@ export interface ConfigFormOpts {
   botAdmins: string[];
   knownChats: KnownChat[];
   ownerNoMentionChats: string[];
+  /** Local supervisor console URL, when one is running. */
+  consoleUrl?: string;
 }
 
 function collapsedAccessPanel(title: string, elements: object[]): object {
@@ -144,6 +146,16 @@ export function configFormCard(opts: ConfigFormOpts): object {
             '⚙️ **偏好设置**\n\n' +
             '调整 bot 的行为偏好。改完点提交后写入当前 profile 配置；消息和访问控制设置立即生效。',
         },
+        ...(opts.consoleUrl
+          ? [
+              {
+                tag: 'markdown',
+                content:
+                  `🖥️ **Web 控制台**（仅本机可访问，可管理所有 profile）\n` +
+                  `[${opts.consoleUrl}](${opts.consoleUrl})`,
+              },
+            ]
+          : []),
         { tag: 'hr' },
         {
           tag: 'form',

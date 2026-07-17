@@ -227,6 +227,10 @@ describe('helperRestartAndWait — injected deps', () => {
       userLockDir: join(dir, 'registry', 'locks'),
       profileLockFile: join(dir, 'registry', 'locks', 'profile', 'codex.lock'),
       appLockFile: () => join(dir, 'registry', 'locks', 'app', 'test.lock'),
+      uiFile: join(dir, 'ui.json'),
+      hostUiFile: join(dir, 'host-ui.json'),
+      hostLogsDir: join(dir, 'host-logs'),
+      hostLockFile: join(dir, 'host.lock'),
     };
 
     // Direct DI — no dynamic imports needed
