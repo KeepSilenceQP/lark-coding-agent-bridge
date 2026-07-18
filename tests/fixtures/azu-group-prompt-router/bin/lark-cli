@@ -1,0 +1,21 @@
+#!/usr/bin/env node
+import { appendFileSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const args = process.argv.slice(2);
+const scenario = JSON.parse(readFileSync(process.env.AZU_SCENARIO_FILE ?? join(process.cwd(), '.acceptance', 'scenario.json'), 'utf8'));
+const operation = args[0] === 'fixture' ? args[1] : undefined;
+if (!['source', 'context', 'groups', 'bots'].includes(operation)) fail('unsupported invocation');
+appendFileSync(process.env.AZU_SHIM_LOG ?? join(process.cwd(), '.acceptance', 'shim.jsonl'), `${JSON.stringify({ tool: 'lark-cli', operation })}\n`);
+process.stdout.write(`${JSON.stringify({ ok: true, data: scenario.fixtureData[operation] })}\n`);
+
+function requiredEnv(name) {
+  const value = process.env[name];
+  if (!value) fail(`missing ${name}`);
+  return value;
+}
+
+function fail(message) {
+  process.stderr.write(`fixture lark-cli: ${message}\n`);
+  process.exit(64);
+}
