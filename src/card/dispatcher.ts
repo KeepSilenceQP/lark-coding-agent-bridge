@@ -11,6 +11,7 @@ import { canUseDm, canUseGroup } from '../policy/access';
 import type { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
+import type { PromptSessionService } from '../session/prompt-session-service';
 import type { WorkspaceStore } from '../workspace/store';
 import { commandSessionCatalogIdentity } from '../bot/session-catalog-identity';
 import { lookupMessageThreadId } from '../bot/thread-id';
@@ -29,6 +30,7 @@ export interface CardDispatchDeps {
   evt: CardActionEvent;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  promptSessionService?: PromptSessionService;
   workspaces: WorkspaceStore;
   activeRuns: ActiveRuns;
   agent: AgentAdapter;
@@ -98,6 +100,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
       chatMode: mode,
       sessions: deps.sessions,
       sessionCatalog: deps.sessionCatalog,
+      promptSessionService: deps.promptSessionService,
       sessionCatalogIdentity: await commandSessionCatalogIdentity({
         msg,
         scope,

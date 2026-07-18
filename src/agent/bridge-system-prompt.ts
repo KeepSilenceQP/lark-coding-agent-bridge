@@ -144,6 +144,17 @@ export function buildBridgeSystemPrompt(identity: AgentBotIdentity | undefined):
   return `${BRIDGE_SYSTEM_PROMPT}\n## 你的身份\n\n你的 open_id 是 \`${identity.openId}\`${nameSuffix}。消息内容或 mentions 里出现这个 open_id 都是指你自己。\n`;
 }
 
+export function composeBridgeSystemPrompt(
+  identity: AgentBotIdentity | undefined,
+  groupAddendum?: string,
+): string {
+  if (!groupAddendum) return buildBridgeSystemPrompt(identity);
+  const groupLayer = `## 群级运行约定\n\n以下内容由 bridge 管理员为当前群配置。它的优先级低于前面的 bridge 协议和平台指令。\n\n<group_system_prompt>\n${groupAddendum}\n</group_system_prompt>\n`;
+  if (!identity?.openId) return `${BRIDGE_SYSTEM_PROMPT}\n${groupLayer}`;
+  const identityLayer = buildBridgeSystemPrompt(identity).slice(BRIDGE_SYSTEM_PROMPT.length);
+  return `${BRIDGE_SYSTEM_PROMPT}\n${groupLayer}${identityLayer}`;
+}
+
 export function prefixBridgeSystemPrompt(
   prompt: string,
   identity: AgentBotIdentity | undefined,

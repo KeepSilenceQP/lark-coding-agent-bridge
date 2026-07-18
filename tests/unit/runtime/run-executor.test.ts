@@ -35,6 +35,33 @@ describe('RunExecutor policy runtime options', () => {
 
     await collect(execution.subscribe());
   });
+
+  it('passes an optional system prompt addendum without altering the user prompt', async () => {
+    const agent = new FakeAgentAdapter({
+      events: [{ type: 'done', terminationReason: 'normal' }],
+    });
+    const executor = new RunExecutor({
+      agent,
+      pool: new ProcessPool(() => 1),
+      activeRuns: new ActiveRuns(),
+      createRunId: () => 'run-prompt',
+      now: () => 1000,
+      postDoneExitGraceMs: 10,
+    });
+
+    const execution = await executor.submit({
+      scopeId: 'scope-prompt',
+      policy: policy({ prompt: 'dynamic turn' }),
+      systemPromptAddendum: 'group contract',
+    });
+
+    expect(agent.runOptions[0]).toMatchObject({
+      prompt: 'dynamic turn',
+      systemPromptAddendum: 'group contract',
+    });
+
+    await collect(execution.subscribe());
+  });
 });
 
 function policy(overrides: Partial<RunPolicyAllow> = {}): RunPolicyAllow {

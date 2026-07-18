@@ -128,7 +128,7 @@ describe('agent-aware run-flow resume', () => {
     if (!claudeRun.ok) throw new Error('expected claude run');
     await collect(claudeRun.execution.subscribe());
 
-    recordRunSessionEvent({
+    await recordRunSessionEvent({
       scopeId: 'chat-1',
       sessions: claude.sessions,
       sessionCatalog: claude.catalog,
@@ -153,7 +153,7 @@ describe('agent-aware run-flow resume', () => {
     if (!codexRun.ok) throw new Error('expected codex run');
     await collect(codexRun.execution.subscribe());
 
-    recordRunSessionEvent({
+    await recordRunSessionEvent({
       scopeId: 'chat-1',
       sessions: codex.sessions,
       sessionCatalog: codex.catalog,

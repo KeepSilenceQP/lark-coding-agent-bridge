@@ -12,10 +12,11 @@ import { evaluateRunPolicy } from '../policy/run-policy';
 import { resolveWorkingDirectory } from '../policy/workspace';
 import { RunRejected } from '../runtime/errors';
 import type { ActiveRuns } from './active-runs';
-import { recordRunSessionEvent } from './run-flow';
+import { recordRunSessionEvent, recordRunSessionEventAwaited } from './run-flow';
 import type { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
+import type { PromptSessionService } from '../session/prompt-session-service';
 import type { WorkspaceStore } from '../workspace/store';
 import {
   commentDocumentScopeId,
@@ -33,6 +34,7 @@ export interface CommentDeps {
   agent: AgentAdapter;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  promptSessionService?: PromptSessionService;
   workspaces: WorkspaceStore;
   activeRuns?: ActiveRuns;
   executor: RunExecutor;
@@ -242,12 +244,77 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
             policyFingerprint: policy.policyFingerprint,
           })
         : undefined;
-      const sessionId =
+      let sessionId =
         canResumeAgentSession && capability.agentId === 'claude'
           ? sessions.resumeFor(docSessionScopeId, cwdRealpath) ??
             sessions.resumeFor(legacyDocSessionScopeId, cwdRealpath)
           : undefined;
-      const threadId = capability.agentId === 'codex' ? catalogEntry?.threadId : undefined;
+      let threadId = capability.agentId === 'codex' ? catalogEntry?.threadId : undefined;
+      const promptOrigin = {
+        source: 'comment' as const,
+        scopeId: agentSessionScopeId,
+        documentId: targetDocScopeId,
+        commentThreadId: commentThreadScopeId,
+      };
+      const promptIdentity = {
+        scopeId: agentSessionScopeId,
+        agentId: capability.agentId,
+        cwdRealpath,
+        policyFingerprint: policy.policyFingerprint,
+      };
+      let promptDecision:
+        | Awaited<ReturnType<PromptSessionService['prepareSession']>>
+        | undefined;
+      try {
+        promptDecision = deps.promptSessionService
+          ? await deps.promptSessionService.prepareSession({
+              identity: promptIdentity,
+              origin: promptOrigin,
+              ...(sessionId ?? threadId
+                ? { existingAgentSessionId: (sessionId ?? threadId)! }
+                : {}),
+              allowResume: canResumeAgentSession,
+            })
+          : undefined;
+      } catch (err) {
+        log.fail('comment', err, { step: 'prompt-session-prepare', commentScopeId: runScopeId });
+        await postCommentReply(channel, target, evt, '会话状态暂时不可用，请稍后重试。', {
+          isWhole: ctx.isWhole,
+        }).catch((replyErr) =>
+          log.fail('comment', replyErr, { step: 'postPromptSessionFailure' }),
+        );
+        return;
+      }
+      if (promptDecision?.kind === 'fresh') {
+        sessionId = undefined;
+        threadId = undefined;
+      } else if (promptDecision?.kind === 'resume') {
+        sessionId = capability.agentId === 'claude' ? promptDecision.agentSessionId : undefined;
+        threadId = capability.agentId === 'codex' ? promptDecision.agentSessionId : undefined;
+      }
+      let promptAdmission:
+        | ReturnType<PromptSessionService['admitRun']>
+        | undefined;
+      try {
+        promptAdmission = deps.promptSessionService?.admitRun({
+          runId: `${runScopeId}:${Date.now()}`,
+          source: 'comment',
+        });
+      } catch (err) {
+        log.fail('comment', err, { step: 'prompt-session-admit', commentScopeId: runScopeId });
+        await postCommentReply(channel, target, evt, '会话状态暂时不可用，请稍后重试。', {
+          isWhole: ctx.isWhole,
+        }).catch((replyErr) =>
+          log.fail('comment', replyErr, { step: 'postPromptSessionFailure' }),
+        );
+        return;
+      }
+      if (
+        promptDecision?.kind === 'resume' ||
+        (promptDecision?.kind === 'dormant' && promptDecision.existingAgentSessionId)
+      ) {
+        promptAdmission?.markIdentifierDurable();
+      }
       log.info('comment', 'session', {
         commentScopeId: runScopeId,
         sessionScopeId: agentSessionScopeId,
@@ -269,6 +336,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
           stage: 'submit',
         },
       }).catch(async (err: unknown) => {
+        promptAdmission?.finishWithoutIdentifier();
         if (err instanceof RunRejected) {
           log.info('comment', 'skip', {
             reason: err.code,
@@ -289,6 +357,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
       let errorMsg: string | undefined;
       let terminal = false;
       let timedOut = false;
+      let sessionCommitFailed = false;
       const eventStream = execution.subscribe()[Symbol.asyncIterator]();
       try {
         while (true) {
@@ -320,16 +389,62 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
             break;
           }
           const e = next.value;
-          recordCommentSessionEvent({
-            scopeId: agentSessionScopeId,
-            sessions,
-            sessionCatalog,
-            capability,
-            policy,
-            event: e,
-          });
-          if (capability.agentId === 'claude' && e.type === 'system' && e.sessionId) {
-            sessions.set(docSessionScopeId, e.sessionId, policy.cwdRealpath);
+          const agentSessionId =
+            e.type === 'system'
+              ? capability.agentId === 'claude'
+                ? e.sessionId
+                : e.threadId
+              : undefined;
+          try {
+            if (promptDecision?.kind === 'fresh' && agentSessionId) {
+              await deps.promptSessionService!.recordIdentifier({
+                identity: promptIdentity,
+                origin: promptOrigin,
+                binding: promptDecision.binding,
+                generation: promptDecision.generation,
+                agentSessionId,
+                admission: promptAdmission,
+              });
+            } else if (promptDecision?.kind === 'dormant') {
+              const durability = recordCommentSessionEventAwaited({
+                scopeId: agentSessionScopeId,
+                sessions,
+                sessionCatalog,
+                capability,
+                policy,
+                event: e,
+              });
+              if (agentSessionId) {
+                const completeDurability =
+                  capability.agentId === 'claude' && e.type === 'system' && e.sessionId
+                    ? durability.then(() =>
+                        sessions.setAwaited(docSessionScopeId, e.sessionId!, policy.cwdRealpath),
+                      )
+                    : durability;
+                promptAdmission?.trackIdentifierDurability(completeDurability);
+                void completeDurability.catch((err) => {
+                  log.fail('comment', err, {
+                    step: 'dormant-identifier-persist',
+                    commentScopeId: runScopeId,
+                  });
+                });
+              }
+            } else if (!promptDecision) {
+              recordCommentSessionEvent({
+                scopeId: agentSessionScopeId,
+                sessions,
+                sessionCatalog,
+                capability,
+                policy,
+                event: e,
+              });
+            }
+          } catch (err) {
+            log.fail('comment', err, { step: 'identifier-commit', commentScopeId: runScopeId });
+            sessionCommitFailed = true;
+            terminal = true;
+            await execution.stop().catch(() => {});
+            break;
           }
           switch (e.type) {
             case 'text':
@@ -358,6 +473,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
         }
       } finally {
         await eventStream.return?.();
+        promptAdmission?.finishWithoutIdentifier();
       }
 
       if (timedOut) {
@@ -370,6 +486,13 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
         }).catch((err) => {
           log.fail('comment', err, { step: 'postTimeoutReply' });
         });
+        return;
+      }
+
+      if (sessionCommitFailed) {
+        await postCommentReply(channel, target, evt, '会话状态保存失败，请稍后重试。', {
+          isWhole: ctx.isWhole,
+        }).catch((err) => log.fail('comment', err, { step: 'postSessionCommitFailure' }));
         return;
       }
 
@@ -511,6 +634,16 @@ function recordCommentSessionEvent(
       ? { ...input.event, cwd: input.policy.cwdRealpath }
       : input.event;
   recordRunSessionEvent({ ...input, event });
+}
+
+function recordCommentSessionEventAwaited(
+  input: Parameters<typeof recordRunSessionEventAwaited>[0],
+): Promise<void> {
+  const event =
+    input.event.type === 'system'
+      ? { ...input.event, cwd: input.policy.cwdRealpath }
+      : input.event;
+  return recordRunSessionEventAwaited({ ...input, event });
 }
 
 function commentRunRejectedReply(code: RunRejected['code']): string | undefined {

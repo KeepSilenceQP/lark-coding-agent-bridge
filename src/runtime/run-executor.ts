@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentAdapter, AgentEvent, AgentRun } from '../agent/types';
-import { ActiveRuns, type RunHandle } from '../bot/active-runs';
+import { ActiveRuns, type RunHandle, type RunReservation } from '../bot/active-runs';
 import { ProcessPool } from '../bot/process-pool';
 import type { RunPolicyAllow } from '../policy/run-policy';
 import { log } from '../core/logger';
@@ -20,10 +20,12 @@ export interface SubmitRunInput {
   policy: RunPolicyAllow;
   sessionId?: string;
   threadId?: string;
+  systemPromptAddendum?: string;
   model?: string;
   images?: readonly string[];
   stopGraceMs?: number;
   nowait?: boolean;
+  reservation?: RunReservation;
   observability?: {
     profile: string;
     agent: string;
@@ -60,30 +62,56 @@ export class RunExecutor {
     this.postDoneExitGraceMs = deps.postDoneExitGraceMs ?? DEFAULT_POST_DONE_EXIT_GRACE_MS;
   }
 
+  reserveScope(scopeId: string): RunReservation | undefined {
+    return this.activeRuns.reserve(scopeId);
+  }
+
   async submit(input: SubmitRunInput): Promise<RunExecution> {
     const submittedAt = this.now();
     if (input.policy.expiresAt <= this.now()) {
+      input.reservation?.release();
       throw new RunRejected('policy-expired', 'run policy expired before spawn');
     }
     if (this.activeRuns.newRunsPaused()) {
+      input.reservation?.release();
       throw new RunRejected(
         'reconnect-in-progress',
         this.activeRuns.newRunsPauseReason() ?? 'new runs are temporarily paused',
       );
     }
-    const releaseScope = this.activeRuns.reserve(input.scopeId);
-    if (!releaseScope) {
+    const reservation = input.reservation ?? this.activeRuns.reserve(input.scopeId);
+    if (!reservation) {
       throw new RunRejected('run-already-active', 'another run is already active for this scope');
     }
+    if (reservation.scopeId !== input.scopeId) {
+      reservation.release();
+      throw new RunRejected('run-interrupted', 'run reservation scope does not match submission');
+    }
 
-    const release = input.nowait ? this.pool.tryAcquire() : await this.pool.acquire();
+    let release: (() => void) | undefined;
+    try {
+      release = input.nowait
+        ? this.pool.tryAcquire()
+        : await this.pool.acquire(reservation.signal);
+    } catch (err) {
+      reservation.release();
+      if (reservation.signal.aborted) {
+        throw new RunRejected('run-interrupted', 'run was interrupted before spawn');
+      }
+      throw err;
+    }
     if (!release) {
-      releaseScope();
+      reservation.release();
       throw new RunRejected('pool-full', 'process pool is full');
+    }
+    if (reservation.signal.aborted) {
+      release();
+      reservation.release();
+      throw new RunRejected('run-interrupted', 'run was interrupted before spawn');
     }
     if (this.activeRuns.newRunsPaused()) {
       release();
-      releaseScope();
+      reservation.release();
       throw new RunRejected(
         'reconnect-in-progress',
         this.activeRuns.newRunsPauseReason() ?? 'new runs are temporarily paused',
@@ -99,6 +127,7 @@ export class RunExecutor {
       cwd: input.policy.cwdRealpath,
       sessionId: input.sessionId,
       threadId: input.threadId,
+      systemPromptAddendum: input.systemPromptAddendum,
       model: input.model,
       images: input.images,
       sandbox: input.policy.sandbox,
@@ -110,13 +139,21 @@ export class RunExecutor {
       await this.agent.prepareRun?.(runOptions);
     } catch (err) {
       release();
-      releaseScope();
+      reservation.release();
+      if (reservation.signal.aborted) {
+        throw new RunRejected('run-interrupted', 'run was interrupted before spawn');
+      }
       if (err instanceof SpawnFailed) throw err;
       throw new SpawnFailed('agent prepare failed', err, 'agent-prepare-failed');
     }
+    if (reservation.signal.aborted) {
+      release();
+      reservation.release();
+      throw new RunRejected('run-interrupted', 'run was interrupted before spawn');
+    }
     if (this.activeRuns.newRunsPaused()) {
       release();
-      releaseScope();
+      reservation.release();
       throw new RunRejected(
         'reconnect-in-progress',
         this.activeRuns.newRunsPauseReason() ?? 'new runs are temporarily paused',
@@ -126,7 +163,7 @@ export class RunExecutor {
       run = this.agent.run(runOptions);
     } catch (err) {
       release();
-      releaseScope();
+      reservation.release();
       throw new SpawnFailed('agent spawn failed', err);
     }
     const dimensions = {
@@ -147,9 +184,9 @@ export class RunExecutor {
 
     let handle: RunHandle;
     try {
-      handle = this.activeRuns.register(input.scopeId, run);
+      handle = this.activeRuns.register(input.scopeId, run, reservation);
     } catch (err) {
-      releaseScope();
+      reservation.release();
       release();
       await run.stop().catch(() => {});
       throw new RunRejected(
@@ -157,6 +194,7 @@ export class RunExecutor {
         err instanceof Error ? err.message : 'another run is already active for this scope',
       );
     }
+    reservation.release();
     let cleaned = false;
     const cleanup = async (waitForExit: boolean): Promise<void> => {
       if (cleaned) return;

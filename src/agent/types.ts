@@ -33,6 +33,7 @@ export interface AgentRunOptions {
   cwd?: string;
   sessionId?: string;
   threadId?: string;
+  systemPromptAddendum?: string;
   model?: string;
   images?: readonly string[];
   sandbox?: CodexSandboxMode;

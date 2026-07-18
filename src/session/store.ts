@@ -75,6 +75,16 @@ export class SessionStore {
   }
 
   set(chatId: string, sessionId: string, cwd: string): void {
+    this.applySet(chatId, sessionId, cwd);
+    this.schedulePersist();
+  }
+
+  async setAwaited(chatId: string, sessionId: string, cwd: string): Promise<void> {
+    this.applySet(chatId, sessionId, cwd);
+    await this.persistAwaited();
+  }
+
+  private applySet(chatId: string, sessionId: string, cwd: string): void {
     // Preserve idleTimeoutMinutes across run starts — it's a per-scope
     // preference, not per-run-instance state. /new (clear) wipes it.
     const prev = this.data[chatId];
@@ -86,12 +96,22 @@ export class SessionStore {
         ? { idleTimeoutMinutes: prev.idleTimeoutMinutes }
         : {}),
     };
-    this.schedulePersist();
   }
 
   clear(chatId: string): void {
+    const changed = this.applyClear(chatId);
+    if (changed) this.schedulePersist();
+  }
+
+  async clearAwaited(chatId: string): Promise<boolean> {
+    const changed = this.applyClear(chatId);
+    if (changed) await this.persistAwaited();
+    return changed;
+  }
+
+  private applyClear(chatId: string): boolean {
     const prev = this.data[chatId];
-    if (!prev) return;
+    if (!prev) return false;
     if (prev.idleTimeoutMinutes !== undefined) {
       this.data[chatId] = {
         idleTimeoutMinutes: prev.idleTimeoutMinutes,
@@ -100,7 +120,11 @@ export class SessionStore {
     } else {
       delete this.data[chatId];
     }
-    this.schedulePersist();
+    return true;
+  }
+
+  entries(): Array<[string, SessionEntry]> {
+    return Object.entries(this.data).map(([scopeId, entry]) => [scopeId, { ...entry }]);
   }
 
   /** Per-scope idle-timeout override. `undefined` means no override set. */
@@ -144,5 +168,17 @@ export class SessionStore {
       .catch((err: unknown) => {
         log.fail('session', err, { step: 'persist' });
       });
+  }
+
+  private persistAwaited(): Promise<void> {
+    const operation = this.saving.then(() =>
+      writeFileAtomic(this.path, `${JSON.stringify(this.data, null, 2)}\n`, {
+        mode: 0o600,
+      }),
+    );
+    this.saving = operation.catch((err: unknown) => {
+      log.fail('session', err, { step: 'persist' });
+    });
+    return operation;
   }
 }

@@ -18,6 +18,15 @@ import {
 import type { RunExecution, RunExecutor } from '../runtime/run-executor';
 import { RunRejected, type RunRejectedCode } from '../runtime/errors';
 import type { SessionCatalog } from '../session/catalog';
+import type {
+  PromptBindingIdentity,
+  PromptBindingOrigin,
+} from '../session/prompt-binding-ledger';
+import type { PromptRunAdmission } from '../session/prompt-run-admission';
+import type {
+  PromptSessionDecision,
+  PromptSessionService,
+} from '../session/prompt-session-service';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 
@@ -25,12 +34,19 @@ export interface StartRunFlowInput {
   scopeId: string;
   scope: ScopeContext;
   prompt: string;
+  systemPromptAddendum?: string;
   attachments: AgentAttachment[];
   access: AccessDecision;
   capability: AgentCapability;
   profileConfig: ProfileConfig;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  promptSession?: {
+    service: PromptSessionService;
+    origin: PromptBindingOrigin;
+    /** Startup retry for the same user turn must reuse the first resolution. */
+    reuseDecision?: PromptSessionDecision;
+  };
   workspaces: WorkspaceStore;
   executor: RunExecutor;
   now: number;
@@ -46,7 +62,8 @@ export interface StartRunFlowInput {
 export type RunFlowRejectCode =
   | WorkingDirectoryRejectReason
   | RunPolicyReject['rejectReason']['code']
-  | RunRejectedCode;
+  | RunRejectedCode
+  | 'prompt-session-unavailable';
 
 export type StartRunFlowResult =
   | {
@@ -55,6 +72,12 @@ export type StartRunFlowResult =
       policy: RunPolicyAllow;
       cwdRealpath: string;
       resumeFrom?: string;
+      promptSession?: {
+        identity: PromptBindingIdentity;
+        origin: PromptBindingOrigin;
+        decision: PromptSessionDecision;
+        admission: PromptRunAdmission;
+      };
     }
   | {
       ok: false;
@@ -75,10 +98,27 @@ export interface RecordRunSessionEventInput {
 }
 
 export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFlowResult> {
+  const reservation = input.executor.reserveScope(input.scopeId);
+  if (!reservation) {
+    return {
+      ok: false,
+      rejectReason: {
+        code: 'run-already-active',
+        userVisible: '当前会话已有运行在执行，请稍后再试或先停止当前运行。',
+      },
+    };
+  }
   const requestedCwd =
     input.workspaces.cwdFor(input.scopeId) ?? input.profileConfig.workspaces.default ?? '';
-  const workspace = await resolveWorkingDirectory(requestedCwd);
+  let workspace: WorkingDirectoryResolveResult;
+  try {
+    workspace = await resolveWorkingDirectory(requestedCwd);
+  } catch (error) {
+    reservation.release();
+    throw error;
+  }
   if (!workspace.ok) {
+    reservation.release();
     return {
       ok: false,
       rejectReason: {
@@ -103,6 +143,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     inheritCodexHome: input.profileConfig.codex?.inheritCodexHome,
   });
   if (!policy.ok) {
+    reservation.release();
     return {
       ok: false,
       rejectReason: policy.rejectReason,
@@ -137,6 +178,75 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     }
   }
 
+  let promptSessionContext:
+    | {
+        identity: PromptBindingIdentity;
+        origin: PromptBindingOrigin;
+        decision: PromptSessionDecision;
+        admission: PromptRunAdmission;
+      }
+    | undefined;
+  let systemPromptAddendum = input.systemPromptAddendum;
+  if (input.promptSession) {
+    const identity: PromptBindingIdentity = {
+      scopeId: input.scopeId,
+      agentId: input.capability.agentId,
+      cwdRealpath: workspace.cwdRealpath,
+      policyFingerprint: policy.policyFingerprint,
+    };
+    try {
+      const decision =
+        input.promptSession.reuseDecision ??
+        (await input.promptSession.service.prepareSession({
+          identity,
+          origin: input.promptSession.origin,
+          signal: reservation.signal,
+          ...(resumeFrom ? { existingAgentSessionId: resumeFrom } : {}),
+        }));
+      if (decision.kind === 'fresh') {
+        sessionId = undefined;
+        threadId = undefined;
+        resumeFrom = undefined;
+        systemPromptAddendum = decision.systemPromptAddendum;
+      } else if (decision.kind === 'resume') {
+        resumeFrom = decision.agentSessionId;
+        sessionId = input.capability.agentId === 'claude' ? decision.agentSessionId : undefined;
+        threadId = input.capability.agentId === 'codex' ? decision.agentSessionId : undefined;
+        systemPromptAddendum = decision.systemPromptAddendum;
+      }
+      const admission = input.promptSession.service.admitRun({
+        runId: `${input.scopeId}:${input.now}`,
+        source: input.promptSession.origin.source,
+      });
+      if (
+        decision.kind === 'resume' ||
+        (decision.kind === 'dormant' && decision.existingAgentSessionId)
+      ) {
+        admission.markIdentifierDurable();
+      }
+      promptSessionContext = {
+        identity,
+        origin: input.promptSession.origin,
+        decision,
+        admission,
+      };
+    } catch {
+      reservation.release();
+      return {
+        ok: false,
+        rejectReason: {
+          code: reservation.signal.aborted
+            ? 'run-interrupted'
+            : 'prompt-session-unavailable',
+          userVisible: reservation.signal.aborted
+            ? '当前任务已中断。'
+            : '当前会话状态不可用，请稍后重试或联系管理员检查配置。',
+        },
+        workspace,
+      };
+    }
+  }
+
   let execution: RunExecution;
   try {
     execution = await input.executor.submit({
@@ -144,6 +254,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       policy,
       sessionId,
       threadId,
+      systemPromptAddendum,
       model: resolveModelArg(
         input.profileConfig.agentKind,
         input.profileConfig.preferences.model,
@@ -157,8 +268,10 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
           : undefined,
       stopGraceMs: input.stopGraceMs,
       observability: input.observability,
+      reservation,
     });
   } catch (err) {
+    promptSessionContext?.admission.finishWithoutIdentifier();
     if (err instanceof RunRejected) {
       return {
         ok: false,
@@ -183,6 +296,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     policy,
     cwdRealpath: workspace.cwdRealpath,
     ...(resumeFrom ? { resumeFrom } : {}),
+    ...(promptSessionContext ? { promptSession: promptSessionContext } : {}),
   };
 }
 
@@ -202,6 +316,35 @@ export function recordRunSessionEvent(input: RecordRunSessionEventInput): void {
   }
   if (input.capability.agentId === 'codex' && input.event.threadId) {
     input.sessionCatalog?.upsertActive({
+      scopeId: input.scopeId,
+      agentId: 'codex',
+      cwdRealpath: input.policy.cwdRealpath,
+      policyFingerprint: input.policy.policyFingerprint,
+      threadId: input.event.threadId,
+    });
+  }
+}
+
+export async function recordRunSessionEventAwaited(
+  input: RecordRunSessionEventInput,
+): Promise<void> {
+  if (input.event.type !== 'system') return;
+  if (input.capability.agentId === 'claude' && input.event.sessionId) {
+    const cwdRealpath = input.event.cwd ?? input.policy.cwdRealpath;
+    await Promise.all([
+      input.sessions.setAwaited(input.scopeId, input.event.sessionId, cwdRealpath),
+      input.sessionCatalog?.upsertActiveAwaited({
+        scopeId: input.scopeId,
+        agentId: 'claude',
+        cwdRealpath,
+        policyFingerprint: input.policy.policyFingerprint,
+        sessionId: input.event.sessionId,
+      }),
+    ]);
+    return;
+  }
+  if (input.capability.agentId === 'codex' && input.event.threadId) {
+    await input.sessionCatalog?.upsertActiveAwaited({
       scopeId: input.scopeId,
       agentId: 'codex',
       cwdRealpath: input.policy.cwdRealpath,

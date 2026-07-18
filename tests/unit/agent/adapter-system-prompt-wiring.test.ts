@@ -69,6 +69,24 @@ describe('ClaudeAdapter system prompt wiring', () => {
     expect(systemPromptFileContent()).toBe(buildBridgeSystemPrompt(undefined));
   });
 
+  it('transports a group addendum in the appended system-prompt file without changing stdin', async () => {
+    const child = fakeChild();
+    spawnMock.spawnProcess.mockReturnValue(child);
+    const adapter = new ClaudeAdapter();
+
+    adapter.run({
+      runId: 'r1',
+      prompt: 'dynamic turn',
+      cwd: '/tmp',
+      systemPromptAddendum: 'group contract',
+    });
+
+    expect(await readAll(child.stdin)).toBe('dynamic turn');
+    expect(systemPromptFileContent()).toContain(
+      '<group_system_prompt>\ngroup contract\n</group_system_prompt>',
+    );
+  });
+
   function systemPromptFileContent(): string {
     const args = spawnMock.spawnProcess.mock.calls[0]?.[1] as string[];
     const flagIndex = args.indexOf('--append-system-prompt-file');
@@ -109,6 +127,24 @@ describe('CodexAdapter system prompt wiring', () => {
 
     expect(await readAll(child.stdin)).toBe('hi');
     expect(developerInstructions()).toBe(buildBridgeSystemPrompt(undefined));
+  });
+
+  it('transports a group addendum as developer instructions without changing stdin', async () => {
+    const child = fakeChild();
+    spawnMock.spawnProcess.mockReturnValue(child);
+    const adapter = codexAdapter();
+
+    adapter.run({
+      runId: 'r1',
+      prompt: 'dynamic turn',
+      cwd: '/tmp',
+      systemPromptAddendum: 'group contract',
+    });
+
+    expect(await readAll(child.stdin)).toBe('dynamic turn');
+    expect(developerInstructions()).toContain(
+      '<group_system_prompt>\ngroup contract\n</group_system_prompt>',
+    );
   });
 
   function developerInstructions(): string {
