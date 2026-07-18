@@ -44,6 +44,7 @@ import { resolveProfileRuntime } from '../../runtime/profile-runtime';
 import { refreshOwnerControls } from '../../policy/owner';
 import { SessionStore } from '../../session/store';
 import { SessionCatalog } from '../../session/catalog';
+import { PromptSessionService } from '../../session/prompt-session-service';
 import { WorkspaceStore } from '../../workspace/store';
 
 // Prefer IPv4 — Node 20+ defaults to "verbatim" which respects whatever
@@ -141,6 +142,30 @@ export async function runStart(opts: StartOptions): Promise<void> {
           await sessions.load();
           const sessionCatalog = new SessionCatalog(`${appPaths.sessionsFile}.catalog.json`);
           await sessionCatalog.load();
+          const promptSessionService = await PromptSessionService.open({
+            profileDir: appPaths.profileDir,
+            profile: appPaths.profile,
+            sessionCatalog,
+            sessionStore: sessions,
+          });
+          if (promptSessionService.health.health === 'healthy') {
+            await promptSessionService
+              .gc()
+              .then((result) => {
+                log.info('prompt-session', 'gc', {
+                  profile: appPaths.profile,
+                  retiredRecordsRemoved: result.retiredRecordsRemoved,
+                  orphanSnapshotsDetected: result.orphanSnapshotsDetected,
+                  snapshotsDeleted: result.snapshotsDeleted,
+                });
+              })
+              .catch((err) => {
+                log.fail('prompt-session', err, {
+                  step: 'gc',
+                  profile: appPaths.profile,
+                });
+              });
+          }
           const workspaces = new WorkspaceStore(appPaths.workspacesFile);
           await workspaces.load();
 
@@ -271,6 +296,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
                   agent: nextAgent,
                   sessions,
                   sessionCatalog,
+                  promptSessionService,
                   workspaces,
                   controls: nextControls,
                   appPaths: nextRuntime.appPaths,
@@ -327,6 +353,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
           agent,
           sessions,
           sessionCatalog,
+          promptSessionService,
           workspaces,
           controls,
           appPaths,

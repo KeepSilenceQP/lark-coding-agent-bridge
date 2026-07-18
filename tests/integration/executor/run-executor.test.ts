@@ -101,28 +101,36 @@ describe('RunExecutor', () => {
 
   it('rejects expired policy before spawning the adapter', async () => {
     const h = await createHarness({ events: [] });
+    const reservation = h.executor.reserveScope('scope-1');
+    expect(reservation).toBeDefined();
 
     await expect(
       h.executor.submit({
         scopeId: 'scope-1',
         policy: policy(h.tmp.workspace, { expiresAt: 999 }),
+        reservation,
       }),
     ).rejects.toBeInstanceOf(RunRejected);
     expect(h.agent.runs).toHaveLength(0);
+    h.executor.reserveScope('scope-1')?.release();
   });
 
   it('rejects new submissions while reconnect is draining active runs', async () => {
     const h = await createHarness({ events: [] });
+    const reservation = h.executor.reserveScope('scope-1');
+    expect(reservation).toBeDefined();
     const resume = h.activeRuns.pauseNewRuns('reconnect');
     try {
       await expect(
         h.executor.submit({
           scopeId: 'scope-1',
           policy: policy(h.tmp.workspace),
+          reservation,
         }),
       ).rejects.toMatchObject({ code: 'reconnect-in-progress' });
       expect(h.agent.runs).toHaveLength(0);
       expect(h.pool.snapshot()).toMatchObject({ active: 0, waiting: 0 });
+      h.executor.reserveScope('scope-1')?.release();
     } finally {
       resume();
     }
@@ -191,6 +199,32 @@ describe('RunExecutor', () => {
     } finally {
       resume();
     }
+  });
+
+  it('cancels a scope reservation that is still waiting for a pool slot', async () => {
+    const h = await createHarness({
+      events: [
+        [{ type: 'done', terminationReason: 'normal' }],
+        [{ type: 'done', terminationReason: 'normal' }],
+      ],
+      poolCap: 1,
+    });
+    const first = await h.executor.submit({
+      scopeId: 'scope-1',
+      policy: policy(h.tmp.workspace),
+    });
+    const queued = h.executor.submit({
+      scopeId: 'scope-2',
+      policy: policy(h.tmp.workspace),
+    });
+    expect(h.pool.snapshot()).toMatchObject({ active: 1, waiting: 1 });
+
+    expect(h.activeRuns.interrupt('scope-2')).toBe(true);
+    await expect(queued).rejects.toMatchObject({ code: 'run-interrupted' });
+    expect(h.pool.snapshot()).toMatchObject({ active: 1, waiting: 0 });
+    expect(h.agent.runs).toHaveLength(1);
+
+    await collect(first.subscribe());
   });
 
   it('rejects submissions paused while prepareRun is still pending', async () => {

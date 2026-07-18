@@ -1,4 +1,4 @@
-import { realpath, writeFile } from 'node:fs/promises';
+import { mkdir, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { CommentEvent } from '@larksuite/channel';
@@ -13,6 +13,7 @@ import { evaluateRunPolicy } from '../../../src/policy/run-policy.js';
 import { RunExecutor } from '../../../src/runtime/run-executor.js';
 import { SessionCatalog } from '../../../src/session/catalog.js';
 import { SessionStore } from '../../../src/session/store.js';
+import { PromptSessionService } from '../../../src/session/prompt-session-service.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { makeFakeCommentSurface } from '../../helpers/fake-comment-surface.js';
@@ -159,6 +160,50 @@ describe('comment run flow', () => {
     await Promise.all([first, second]);
   });
 
+  it('does not reuse an authoritative Codex thread while another activated comment run is active', async () => {
+    const h = await createBlockingHarness({
+      agentKind: 'codex',
+      threadIds: ['thread-one', 'thread-two'],
+    });
+    await mkdir(join(h.tmp.profile, 'prompts', 'groups'), { recursive: true });
+    await writeFile(join(h.tmp.profile, 'prompts', 'groups', 'activation-chat.md'), 'activate');
+    const firstDeps = h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' }));
+    const service = await PromptSessionService.open({
+      profileDir: h.tmp.profile,
+      profile: 'test',
+      sessionCatalog: h.sessionCatalog,
+      sessionStore: firstDeps.sessions,
+    });
+    await service.prepareSession({
+      identity: {
+        scopeId: 'activation-chat',
+        agentId: 'codex',
+        cwdRealpath: await realpath(h.tmp.workspace),
+        policyFingerprint: 'activation-policy',
+      },
+      origin: {
+        source: 'im',
+        scopeId: 'activation-chat',
+        chatId: 'activation-chat',
+        chatType: 'group',
+      },
+    });
+    firstDeps.promptSessionService = service;
+
+    const first = handleCommentMention(firstDeps);
+    await waitFor(() => h.agent.runOptions.length === 1);
+    const secondDeps = h.deps(event({ commentId: 'comment-2', replyId: 'reply-2' }));
+    secondDeps.promptSessionService = service;
+    const second = handleCommentMention(secondDeps);
+    await waitFor(() => h.agent.runOptions.length === 2);
+
+    expect(h.agent.runOptions[0]?.threadId).toBeUndefined();
+    expect(h.agent.runOptions[1]?.threadId).toBeUndefined();
+    h.agent.finishRun(0);
+    h.agent.finishRun(1);
+    await Promise.all([first, second]);
+  });
+
   it('keeps replying when typing reaction add fails', async () => {
     const h = await createHarness({ reactionFails: true });
 
@@ -210,6 +255,22 @@ describe('comment run flow', () => {
     );
 
     expect(source).not.toContain('agent.run(');
+  });
+
+  it('replies safely when prompt-session preparation is unavailable', async () => {
+    const h = await createHarness({ agentKind: 'codex' });
+    const deps = h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' }));
+    deps.promptSessionService = {
+      async prepareSession() {
+        throw new Error('sensitive prompt ledger failure');
+      },
+    } as never;
+
+    await handleCommentMention(deps);
+
+    expect(h.agent.runOptions).toEqual([]);
+    expect(h.inThreadReplies).toEqual(['会话状态暂时不可用，请稍后重试。']);
+    expect(h.inThreadReplies.join('\n')).not.toContain('sensitive prompt ledger failure');
   });
 });
 

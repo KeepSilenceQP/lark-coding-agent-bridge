@@ -5,8 +5,9 @@ import type { SandboxMode } from '../../config/profile-schema';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
 import { SpawnFailed } from '../../runtime/errors';
-import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
+import { composeBridgeSystemPrompt } from '../bridge-system-prompt';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
+import { createPromptRedactor } from '../prompt-redaction';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import type {
   AgentAdapter,
@@ -198,7 +199,10 @@ export class CodexAdapter implements AgentAdapter {
         : undefined
       : this.turnStateProbe;
 
-    const developerInstructions = buildBridgeSystemPrompt(this.botIdentity);
+    const developerInstructions = composeBridgeSystemPrompt(
+      this.botIdentity,
+      opts.systemPromptAddendum,
+    );
     const args = buildCodexArgs({
       cwd: opts.cwd,
       sandbox: opts.sandbox ?? this.sandbox,
@@ -212,6 +216,7 @@ export class CodexAdapter implements AgentAdapter {
     const redactPrompt = createPromptRedactor([
       opts.prompt,
       developerInstructions,
+      opts.systemPromptAddendum ?? '',
       `developer_instructions=${JSON.stringify(developerInstructions)}`,
     ]);
     const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
@@ -546,21 +551,6 @@ function terminalError(message: string): AgentEvent {
     type: 'error',
     message,
     terminationReason: 'failed',
-  };
-}
-
-function createPromptRedactor(values: readonly string[]): (value: string) => string {
-  const exactValues = [...new Set(values.filter(Boolean))].sort((a, b) => b.length - a.length);
-  const promptLines = new Set(
-    exactValues.flatMap((value) => value.split(/\r?\n/)).filter(Boolean),
-  );
-  return (value: string): string => {
-    if (promptLines.has(value)) return '[REDACTED_PROMPT]';
-    let redacted = value;
-    for (const sensitive of exactValues) {
-      redacted = redacted.replaceAll(sensitive, '[REDACTED_PROMPT]');
-    }
-    return redacted;
   };
 }
 

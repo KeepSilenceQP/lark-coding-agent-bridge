@@ -92,6 +92,7 @@ import {
 import type { SessionCatalog, SessionCatalogIdentity } from '../session/catalog';
 import { isAlive, readAndPrune, resolveTarget } from '../runtime/registry';
 import type { SessionStore } from '../session/store';
+import type { PromptSessionService } from '../session/prompt-session-service';
 import { resolveWorkingDirectory } from '../policy/workspace';
 import { evaluateRunPolicy } from '../policy/run-policy';
 import type { ProcessPool } from '../bot/process-pool';
@@ -144,6 +145,7 @@ export interface CommandContext {
   chatMode: 'p2p' | 'group' | 'topic';
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  promptSessionService?: PromptSessionService;
   sessionCatalogIdentity?: SessionCatalogIdentity;
   workspaces: WorkspaceStore;
   agent: AgentAdapter;
@@ -175,6 +177,7 @@ interface ResumeCandidate {
   policyFingerprint: string;
   sessionId?: string;
   threadId?: string;
+  updatedAt: number;
   expiresAt: number;
 }
 
@@ -470,15 +473,46 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
     return handleNewChat(rawName, ctx);
   }
 
+  // Cancel both spawned runs and pool-waiting reservations before reset. An
+  // activation reset may need to drain the admission owned by that work, so
+  // awaiting reset first would deadlock the two lifecycle barriers.
   const wasRunning = ctx.activeRuns.interrupt(ctx.scope);
-  if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
-    ctx.sessionCatalog.archiveActive({
-      ...ctx.sessionCatalogIdentity,
-      now: Date.now(),
-    });
+  const resetReservation = ctx.activeRuns.reserve(ctx.scope);
+  if (!resetReservation) {
+    await reply(ctx, '当前会话仍在切换中，请稍后重试。');
+    return;
   }
-  ctx.sessions.clear(ctx.scope);
-  await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
+  let resetByPromptService = false;
+  try {
+    if (ctx.promptSessionService && ctx.sessionCatalogIdentity) {
+      const reset = await ctx.promptSessionService.resetSession({
+        identity: ctx.sessionCatalogIdentity,
+        origin: {
+          source: 'im',
+          scopeId: ctx.scope,
+          chatId: ctx.msg.chatId,
+          chatType: ctx.msg.chatType,
+          ...(ctx.msg.threadId ? { threadId: ctx.msg.threadId } : {}),
+        },
+      });
+      resetByPromptService = reset.kind === 'reset';
+    }
+    if (!resetByPromptService) {
+      if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
+        ctx.sessionCatalog.archiveActive({
+          ...ctx.sessionCatalogIdentity,
+          now: Date.now(),
+        });
+      }
+      ctx.sessions.clear(ctx.scope);
+    }
+    await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
+  } catch (err) {
+    log.fail('session', err, { step: 'group-prompt-reset', scope: ctx.scope });
+    await reply(ctx, '当前会话状态无法安全重置，请稍后重试或联系管理员检查配置。');
+  } finally {
+    resetReservation.release();
+  }
 }
 
 async function handleNewChat(rawName: string, ctx: CommandContext): Promise<void> {
@@ -1174,9 +1208,23 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
         ? ctx.sessionCatalog.activeFor(identity)
         : undefined;
     const history = identity ? await listCodexResumeHistory(ctx, cwd, limit) : [];
-    if (history.length > 0 && identity) {
-      const entries = history.map((thread) => {
-        const nonce = issueResumeCandidate(identity, { threadId: thread.threadId });
+    const visibleHistory =
+      identity && ctx.promptSessionService
+        ? history.filter((thread) =>
+            ctx.promptSessionService!.canManualResume({
+              identity,
+              origin: commandPromptOrigin(ctx),
+              agentSessionId: thread.threadId,
+              updatedAt: thread.updatedAtMs,
+            }),
+          )
+        : history;
+    if (visibleHistory.length > 0 && identity) {
+      const entries = visibleHistory.map((thread) => {
+        const nonce = issueResumeCandidate(identity, {
+          threadId: thread.threadId,
+          updatedAt: thread.updatedAtMs,
+        });
         return {
           sessionId: nonce,
           preview: thread.name || thread.preview,
@@ -1190,7 +1238,23 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
       return;
     }
     if (entry?.threadId && identity) {
-      const nonce = issueResumeCandidate(identity, { threadId: entry.threadId });
+      if (
+        ctx.promptSessionService &&
+        !ctx.promptSessionService.canManualResume({
+          identity,
+          origin: commandPromptOrigin(ctx),
+          agentSessionId: entry.threadId,
+          updatedAt: entry.updatedAt,
+        })
+      ) {
+        const card = resumeCard(cwd, []);
+        await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
+        return;
+      }
+      const nonce = issueResumeCandidate(identity, {
+        threadId: entry.threadId,
+        updatedAt: entry.updatedAt,
+      });
       await reply(
         ctx,
         `当前 Codex thread 可恢复。\n使用 \`/resume use ${nonce}\` 恢复（10 分钟内有效）。`,
@@ -1205,9 +1269,20 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
   const sessions = await listClaudeResumeHistory(ctx, cwd, limit);
   const currentSession = ctx.sessions.getRaw(ctx.scope);
   const identity = ctx.sessionCatalogIdentity;
-  const entries = sessions.map((s) => ({
+  const visibleSessions =
+    identity && ctx.promptSessionService
+      ? sessions.filter((session) =>
+          ctx.promptSessionService!.canManualResume({
+            identity,
+            origin: commandPromptOrigin(ctx),
+            agentSessionId: session.sessionId,
+            updatedAt: session.mtime,
+          }),
+        )
+      : sessions;
+  const entries = visibleSessions.map((s) => ({
     sessionId: identity
-      ? issueResumeCandidate(identity, { sessionId: s.sessionId })
+      ? issueResumeCandidate(identity, { sessionId: s.sessionId, updatedAt: s.mtime })
       : s.sessionId,
     displayId: s.sessionId,
     preview: s.preview,
@@ -1224,6 +1299,24 @@ async function applyResume(sessionId: string, ctx: CommandContext): Promise<void
     const entry = ctx.sessionCatalog.activeFor(ctx.sessionCatalogIdentity);
     const resolved = consumeResumeCandidate(sessionId, ctx.sessionCatalogIdentity);
     if (resolved) {
+      if (ctx.promptSessionService) {
+        try {
+          const applied = await ctx.promptSessionService.applyManualResume({
+            identity: ctx.sessionCatalogIdentity,
+            origin: commandPromptOrigin(ctx),
+            agentSessionId: (resolved.sessionId ?? resolved.threadId)!,
+            updatedAt: resolved.updatedAt,
+          });
+          if (applied === 'applied') {
+            ctx.activeRuns.interrupt(ctx.scope);
+            await reply(ctx, RESUME_APPLIED_REPLY);
+            return;
+          }
+        } catch {
+          await reply(ctx, '当前上下文不可恢复这个会话，请重新选择可用会话。');
+          return;
+        }
+      }
       ctx.activeRuns.interrupt(ctx.scope);
       if (ctx.sessionCatalogIdentity.agentId === 'codex') {
         ctx.sessionCatalog.upsertActive({
@@ -1280,7 +1373,7 @@ async function applyResume(sessionId: string, ctx: CommandContext): Promise<void
 
 function issueResumeCandidate(
   identity: SessionCatalogIdentity,
-  target: { sessionId: string } | { threadId: string },
+  target: ({ sessionId: string } | { threadId: string }) & { updatedAt: number },
 ): string {
   pruneResumeCandidates();
   let nonce = randomUUID().slice(0, 12);
@@ -1294,6 +1387,15 @@ function issueResumeCandidate(
     expiresAt: Date.now() + RESUME_CANDIDATE_TTL_MS,
   });
   return nonce;
+}
+
+function commandPromptOrigin(ctx: CommandContext) {
+  return {
+    source: 'im' as const,
+    scopeId: ctx.scope,
+    chatId: ctx.msg.chatId,
+    chatType: 'p2p' as const,
+  };
 }
 
 function consumeResumeCandidate(

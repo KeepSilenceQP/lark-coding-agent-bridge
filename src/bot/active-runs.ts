@@ -5,26 +5,47 @@ export interface RunHandle {
   interrupted: boolean;
 }
 
+export interface RunReservation {
+  readonly scopeId: string;
+  readonly signal: AbortSignal;
+  release(): void;
+}
+
+interface ReservationState {
+  controller: AbortController;
+  released: boolean;
+}
+
 export class ActiveRuns {
   private readonly handles = new Map<string, RunHandle>();
-  private readonly reservations = new Set<string>();
+  private readonly reservations = new Map<string, ReservationState>();
   private pauseDepth = 0;
   private pauseReason: string | undefined;
 
-  reserve(chatId: string): (() => void) | undefined {
+  reserve(chatId: string): RunReservation | undefined {
     if (this.handles.has(chatId) || this.reservations.has(chatId)) return undefined;
-    this.reservations.add(chatId);
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this.reservations.delete(chatId);
+    const state: ReservationState = {
+      controller: new AbortController(),
+      released: false,
+    };
+    this.reservations.set(chatId, state);
+    return {
+      scopeId: chatId,
+      signal: state.controller.signal,
+      release: () => {
+        if (state.released) return;
+        state.released = true;
+        if (this.reservations.get(chatId) === state) this.reservations.delete(chatId);
+      },
     };
   }
 
-  register(chatId: string, run: AgentRun): RunHandle {
+  register(chatId: string, run: AgentRun, reservation?: RunReservation): RunHandle {
     if (this.handles.has(chatId)) {
       throw new Error(`run already active for scope: ${chatId}`);
+    }
+    if (reservation?.signal.aborted) {
+      throw new Error(`run reservation was interrupted for scope: ${chatId}`);
     }
     this.reservations.delete(chatId);
     const handle: RunHandle = { run, interrupted: false };
@@ -75,9 +96,16 @@ export class ActiveRuns {
    * generator exits on its own as the subprocess dies.
    */
   interrupt(chatId: string): boolean {
+    let interrupted = false;
+    const reservation = this.reservations.get(chatId);
+    if (reservation) {
+      this.reservations.delete(chatId);
+      reservation.released = true;
+      reservation.controller.abort();
+      interrupted = true;
+    }
     const h = this.handles.get(chatId);
-    if (!h) return false;
-    this.reservations.delete(chatId);
+    if (!h) return interrupted;
     h.interrupted = true;
     this.handles.delete(chatId);
     void h.run.stop().catch(() => {
@@ -89,6 +117,10 @@ export class ActiveRuns {
   async stopAll(): Promise<void> {
     const all = [...this.handles.values()];
     this.handles.clear();
+    for (const reservation of this.reservations.values()) {
+      reservation.released = true;
+      reservation.controller.abort();
+    }
     this.reservations.clear();
     for (const h of all) h.interrupted = true;
     await Promise.allSettled(all.map((h) => h.run.stop()));

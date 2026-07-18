@@ -150,6 +150,33 @@ describe('ClaudeAdapter process contract', () => {
     ]);
   });
 
+  it('redacts the group prompt when Claude echoes it in a process error', async () => {
+    const secret = 'operator-only-group-contract\nnever expose this second line';
+    const fake = await createFakeClaude({
+      lines: [],
+      stderr: 'failed while reading never expose this second line\n',
+      exitCode: 42,
+    });
+    cleanup.push(fake.dir);
+
+    const run = new ClaudeAdapter({ binary: fake.path }).run({
+      runId: 'run-redact-group-prompt',
+      prompt: 'safe user prompt',
+      systemPromptAddendum: secret,
+      cwd: fake.dir,
+    });
+    const events = await collect(run.events);
+
+    expect(JSON.stringify(events)).not.toContain(secret);
+    expect(events).toEqual([
+      {
+        type: 'error',
+        message: 'claude exited with code 42: failed while reading [REDACTED_PROMPT]',
+        terminationReason: 'failed',
+      },
+    ]);
+  });
+
   it('surfaces spawn errors as stream error events', async () => {
     let run: ReturnType<ClaudeAdapter['run']>;
     if (process.platform === 'win32') {

@@ -16,7 +16,12 @@ import { log, reportMetric } from '../core/logger';
  */
 export class ProcessPool {
   private active = 0;
-  private readonly waiters: Array<() => void> = [];
+  private readonly waiters: Array<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+  }> = [];
   /** Snapshot of the cap captured at the moment acquire() decided to wait. */
   private cap: () => number;
 
@@ -24,7 +29,8 @@ export class ProcessPool {
     this.cap = cap;
   }
 
-  async acquire(): Promise<() => void> {
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) throw abortedAcquireError();
     if (this.active < this.cap()) {
       this.active++;
       log.info('pool', 'acquired', { active: this.active, cap: this.cap() });
@@ -33,7 +39,20 @@ export class ProcessPool {
     }
     log.info('pool', 'wait', { active: this.active, cap: this.cap(), waiting: this.waiters.length + 1 });
     reportMetric('pool_waiting', this.waiters.length + 1);
-    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    await new Promise<void>((resolve, reject) => {
+      const waiter: (typeof this.waiters)[number] = { resolve, reject, signal };
+      if (signal) {
+        waiter.onAbort = () => {
+          const index = this.waiters.indexOf(waiter);
+          if (index >= 0) this.waiters.splice(index, 1);
+          signal.removeEventListener('abort', waiter.onAbort!);
+          reject(abortedAcquireError());
+          reportMetric('pool_waiting', this.waiters.length);
+        };
+        signal.addEventListener('abort', waiter.onAbort, { once: true });
+      }
+      this.waiters.push(waiter);
+    });
     this.active++;
     log.info('pool', 'acquired', { active: this.active, cap: this.cap() });
     reportMetric('pool_active', this.active);
@@ -58,11 +77,22 @@ export class ProcessPool {
     // via /config, this naturally throttles by not waking.
     if (this.active < this.cap() && this.waiters.length > 0) {
       const next = this.waiters.shift();
-      if (next) next();
+      if (next) {
+        if (next.signal && next.onAbort) {
+          next.signal.removeEventListener('abort', next.onAbort);
+        }
+        next.resolve();
+      }
     }
   }
 
   snapshot(): { active: number; waiting: number; cap: number } {
     return { active: this.active, waiting: this.waiters.length, cap: this.cap() };
   }
+}
+
+function abortedAcquireError(): Error {
+  const error = new Error('process pool acquire aborted');
+  error.name = 'AbortError';
+  return error;
 }

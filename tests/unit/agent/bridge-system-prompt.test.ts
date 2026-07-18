@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BRIDGE_SYSTEM_PROMPT,
   buildBridgeSystemPrompt,
+  composeBridgeSystemPrompt,
   prefixBridgeSystemPrompt,
 } from '../../../src/agent/bridge-system-prompt';
 
@@ -54,6 +55,19 @@ describe('buildBridgeSystemPrompt', () => {
   it('appends the identity line even when the bot name is missing', () => {
     const prompt = buildBridgeSystemPrompt({ openId: 'ou_bot_self' });
     expect(prompt).toContain('ou_bot_self');
+  });
+});
+
+describe('composeBridgeSystemPrompt', () => {
+  it('adds a lower-priority group layer before the concrete runtime identity', () => {
+    const prompt = composeBridgeSystemPrompt(
+      { openId: 'ou_bot_self', name: 'Bridge' },
+      '你是这个群的项目协调者。',
+    );
+
+    expect(prompt.startsWith(BRIDGE_SYSTEM_PROMPT)).toBe(true);
+    expect(prompt).toContain('<group_system_prompt>\n你是这个群的项目协调者。\n</group_system_prompt>');
+    expect(prompt.indexOf('<group_system_prompt>')).toBeLessThan(prompt.indexOf('## 你的身份'));
   });
 });
 

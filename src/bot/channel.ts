@@ -57,13 +57,21 @@ import {
 } from '../runtime/deferred-service-restart';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
+import type {
+  PromptSessionDecision,
+  PromptSessionService,
+} from '../session/prompt-session-service';
 import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
 import { resolveRunIdleTimeoutMs, resolveRunStartupTimeoutMs } from './run-idle-timeout';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { decideGroupResponse } from './group-response-policy';
-import { recordRunSessionEvent, startRunFlow } from './run-flow';
+import {
+  recordRunSessionEvent,
+  recordRunSessionEventAwaited,
+  startRunFlow,
+} from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
 import { PendingQueue } from './pending-queue';
@@ -634,6 +642,7 @@ export interface StartChannelDeps {
   agent: AgentAdapter;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  promptSessionService?: PromptSessionService;
   workspaces: WorkspaceStore;
   controls: Controls;
   appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'> &
@@ -794,6 +803,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           executor,
           sessions,
           sessionCatalog,
+          promptSessionService: deps.promptSessionService,
           workspaces,
           media,
           batch,
@@ -829,6 +839,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           agent,
           sessions,
           sessionCatalog,
+          promptSessionService: deps.promptSessionService,
           workspaces,
           activeRuns,
           pending,
@@ -851,6 +862,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           evt,
           sessions,
           sessionCatalog,
+          promptSessionService: deps.promptSessionService,
           workspaces,
           activeRuns,
           agent,
@@ -872,6 +884,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           agent,
           sessions,
           sessionCatalog,
+          promptSessionService: deps.promptSessionService,
           workspaces,
           activeRuns,
           executor,
@@ -1085,6 +1098,7 @@ interface IntakeDeps {
   agent: AgentAdapter;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  promptSessionService?: PromptSessionService;
   workspaces: WorkspaceStore;
   activeRuns: ActiveRuns;
   pending: PendingQueue;
@@ -1108,6 +1122,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     agent,
     sessions,
     sessionCatalog,
+    promptSessionService,
     workspaces,
     activeRuns,
     pending,
@@ -1229,6 +1244,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     agent,
     activeRuns,
     sessionCatalog,
+    promptSessionService,
     sessionCatalogIdentity: await commandSessionCatalogIdentity({
       msg: emsg,
       scope,
@@ -1267,6 +1283,7 @@ interface RunBatchDeps {
   executor: RunExecutor;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  promptSessionService?: PromptSessionService;
   workspaces: WorkspaceStore;
   media: MediaCache;
   batch: NormalizedMessage[];
@@ -1285,6 +1302,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     executor,
     sessions,
     sessionCatalog,
+    promptSessionService,
     workspaces,
     media,
     batch,
@@ -1434,7 +1452,17 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
       : claudeCapability(controls.profileConfig);
-  const startFlow = (stage: 'submit' | 'startup-retry') =>
+  const promptOrigin = {
+    source: 'im' as const,
+    scopeId: scope,
+    chatId,
+    chatType: firstMsg.chatType,
+    ...(threadId ? { threadId } : {}),
+  };
+  const startFlow = (
+    stage: 'submit' | 'startup-retry',
+    reuseDecision?: PromptSessionDecision,
+  ) =>
     startRunFlow({
       scopeId: scope,
       scope: scopeContext,
@@ -1445,6 +1473,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       profileConfig: controls.profileConfig,
       sessions,
       sessionCatalog,
+      ...(promptSessionService
+        ? {
+            promptSession: {
+              service: promptSessionService,
+              origin: promptOrigin,
+              ...(reuseDecision ? { reuseDecision } : {}),
+            },
+          }
+        : {}),
       workspaces,
       executor,
       now: Date.now(),
@@ -1459,6 +1496,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const flow = await startFlow('submit');
   if (!flow.ok) {
     log.info('run-flow', 'rejected', { scope, code: flow.rejectReason.code });
+    if (flow.rejectReason.code === 'run-interrupted') return;
     log.warn('policy', 'denied', {
       scope,
       source: 'im',
@@ -1469,6 +1507,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   }
 
   const { execution, cwdRealpath: cwd } = flow;
+  let activeFlow = flow;
+  const promptAdmissions = flow.promptSession ? [flow.promptSession.admission] : [];
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
   const eventStream = execution.subscribe();
@@ -1477,15 +1517,39 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   } else {
     log.info('session', 'fresh', { cwd });
   }
-  const recordSession = (evt: AgentEvent): void => {
-    recordRunSessionEvent({
-      scopeId: scope,
-      sessions,
-      sessionCatalog,
-      capability,
-      policy: flow.policy,
-      event: evt,
-    });
+  const recordSession = async (evt: AgentEvent): Promise<void> => {
+    const promptSession = activeFlow.promptSession;
+    const agentSessionId =
+      evt.type === 'system'
+        ? capability.agentId === 'claude'
+          ? evt.sessionId
+          : evt.threadId
+        : undefined;
+    if (promptSession?.decision.kind === 'fresh' && agentSessionId) {
+      await promptSessionService!.recordIdentifier({
+        identity: promptSession.identity,
+        origin: promptSession.origin,
+        binding: promptSession.decision.binding,
+        generation: promptSession.decision.generation,
+        agentSessionId,
+        admission: promptSession.admission,
+      });
+    } else if (promptSession?.decision.kind === 'dormant') {
+      const durability = recordRunSessionEventAwaited({
+        scopeId: scope,
+        sessions,
+        sessionCatalog,
+        capability,
+        policy: activeFlow.policy,
+        event: evt,
+      });
+      if (agentSessionId) {
+        promptSession.admission.trackIdentifierDurability(durability);
+        void durability.catch((err) => {
+          log.fail('session', err, { step: 'dormant-identifier-persist', scope });
+        });
+      }
+    }
     if (evt.type === 'system' && evt.sessionId) {
       log.info('session', 'set', { sessionId: evt.sessionId });
     }
@@ -1520,7 +1584,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       });
       return undefined;
     }
-    const replacement = await startFlow('startup-retry');
+    const replacement = await startFlow(
+      'startup-retry',
+      activeFlow.promptSession?.decision,
+    );
     if (!replacement.ok) {
       log.warn('agent', 'startup-timeout-retry-rejected', {
         scope,
@@ -1534,6 +1601,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       retryRunId: replacement.execution.runId,
       threadId: replacement.resumeFrom,
     });
+    activeFlow = replacement;
+    if (replacement.promptSession) promptAdmissions.push(replacement.promptSession.admission);
     return {
       handle: replacement.execution.handle,
       events: replacement.execution.subscribe(),
@@ -1826,6 +1895,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   } catch (err) {
     log.fail('stream', err);
   } finally {
+    for (const admission of promptAdmissions) admission.finishWithoutIdentifier();
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
@@ -1964,7 +2034,7 @@ export async function processAgentStream(
   scope: string,
   idleTimeoutMs: number | undefined,
   startupTimeoutMs: number | undefined,
-  recordSession: (event: AgentEvent) => void,
+  recordSession: (event: AgentEvent) => void | Promise<void>,
   flush: (state: RunState) => Promise<void>,
   recoverStartupTimeout?: () => Promise<
     { handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined
@@ -2046,7 +2116,21 @@ export async function processAgentStream(
       armOrPauseIdle();
 
       if (evt.type === 'system') {
-        recordSession(evt);
+        try {
+          await recordSession(evt);
+        } catch (err) {
+          log.fail('session', err, { step: 'identifier-commit', scope });
+          handle.interrupted = true;
+          await handle.run.stop().catch(() => {});
+          await handle.run.waitForExit(2_000).catch(() => false);
+          state = reduce(state, {
+            type: 'error',
+            message: '会话状态保存失败，请稍后重试。',
+            terminationReason: 'failed',
+          });
+          await flush(state);
+          return state;
+        }
         continue;
       }
       if (evt.type === 'usage') {

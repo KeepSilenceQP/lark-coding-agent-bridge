@@ -100,6 +100,18 @@ export class SessionCatalog {
   }
 
   upsertActive(input: UpsertSessionCatalogInput): SessionCatalogEntry {
+    const entry = this.applyUpsertActive(input);
+    this.schedulePersist();
+    return entry;
+  }
+
+  async upsertActiveAwaited(input: UpsertSessionCatalogInput): Promise<SessionCatalogEntry> {
+    const entry = this.applyUpsertActive(input);
+    await this.persistAwaited();
+    return entry;
+  }
+
+  private applyUpsertActive(input: UpsertSessionCatalogInput): SessionCatalogEntry {
     assertAgentIdentity(input);
     const key = sessionCatalogKey(input);
     const entry: SessionCatalogEntry = {
@@ -115,11 +127,22 @@ export class SessionCatalog {
       ...(input.lastSummary ? { lastSummary: input.lastSummary } : {}),
     };
     this.data.set(key, entry);
-    this.schedulePersist();
     return { ...entry };
   }
 
   archiveActive(input: ArchiveSessionCatalogInput): boolean {
+    const archived = this.applyArchiveActive(input);
+    if (archived) this.schedulePersist();
+    return archived;
+  }
+
+  async archiveActiveAwaited(input: ArchiveSessionCatalogInput): Promise<boolean> {
+    const archived = this.applyArchiveActive(input);
+    if (archived) await this.persistAwaited();
+    return archived;
+  }
+
+  private applyArchiveActive(input: ArchiveSessionCatalogInput): boolean {
     const key = sessionCatalogKey(input);
     const entry = this.data.get(key);
     if (!entry || entry.status !== 'active') return false;
@@ -128,7 +151,6 @@ export class SessionCatalog {
       status: 'archived',
       updatedAt: input.now ?? Date.now(),
     });
-    this.schedulePersist();
     return true;
   }
 
@@ -181,6 +203,14 @@ export class SessionCatalog {
       .catch((err: unknown) => {
         log.fail('session-catalog', err, { step: 'persist' });
       });
+  }
+
+  private persistAwaited(): Promise<void> {
+    const operation = this.saving.then(() => this.persist());
+    this.saving = operation.catch((err: unknown) => {
+      log.fail('session-catalog', err, { step: 'persist' });
+    });
+    return operation;
   }
 
   private async persist(): Promise<void> {

@@ -8,6 +8,42 @@ afterEach(() => {
 });
 
 describe('Codex startup watchdog', () => {
+  it('treats identifier persistence as a delivery barrier and discards later output on failure', async () => {
+    const events = (async function* (): AsyncGenerator<AgentEvent> {
+      yield { type: 'system', threadId: 'thread-uncommitted' };
+      yield { type: 'text', delta: 'must not be delivered' };
+      yield { type: 'done', terminationReason: 'normal' };
+    })();
+    const stop = vi.fn(async () => {});
+    const waitForExit = vi.fn(async () => true);
+    const handle = runHandle(events, stop, waitForExit);
+    const recover = vi.fn(async () => undefined);
+    const flush = vi.fn(async () => {});
+
+    await expect(
+      processAgentStream(
+        handle,
+        events,
+        'oc_commit_failure',
+        undefined,
+        5 * 60_000,
+        async () => {
+          throw new Error('secret persistence details');
+        },
+        flush,
+        recover,
+      ),
+    ).resolves.toMatchObject({
+      blocks: [],
+      terminal: 'error',
+      errorMsg: '会话状态保存失败，请稍后重试。',
+    });
+    expect(handle.interrupted).toBe(true);
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(waitForExit).toHaveBeenCalledTimes(1);
+    expect(recover).not.toHaveBeenCalled();
+  });
+
   it('times out when resume emits only thread metadata and then stalls', async () => {
     vi.useFakeTimers();
     const stopped = deferred<void>();
@@ -92,12 +128,16 @@ describe('Codex startup watchdog', () => {
   });
 });
 
-function runHandle(events: AsyncIterable<AgentEvent>, stop: () => Promise<void>): RunHandle {
+function runHandle(
+  events: AsyncIterable<AgentEvent>,
+  stop: () => Promise<void>,
+  waitForExit: (timeoutMs: number) => Promise<boolean> = async () => true,
+): RunHandle {
   const run: AgentRun = {
     runId: 'run-test',
     events,
     stop,
-    waitForExit: async () => true,
+    waitForExit,
   };
   return { run, interrupted: false };
 }

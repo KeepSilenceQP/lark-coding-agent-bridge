@@ -5,8 +5,9 @@ import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
-import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
+import { composeBridgeSystemPrompt } from '../bridge-system-prompt';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
+import { createPromptRedactor } from '../prompt-redaction';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import {
   CLAUDE_DEFAULT_PERMISSION_MODE,
@@ -68,7 +69,9 @@ export class ClaudeAdapter implements AgentAdapter {
     // stream-json response. Pass the prompt via stdin and the appended system
     // prompt via a temp file (the same approach the Codex adapter uses) so no
     // special characters ever reach the shell.
-    const systemPromptFile = writeSystemPromptFile(buildBridgeSystemPrompt(this.botIdentity));
+    const systemPrompt = composeBridgeSystemPrompt(this.botIdentity, opts.systemPromptAddendum);
+    const redactPrompt = createPromptRedactor([opts.prompt, systemPrompt, opts.systemPromptAddendum ?? '']);
+    const systemPromptFile = writeSystemPromptFile(systemPrompt);
 
     const args = [
       '-p',
@@ -111,9 +114,10 @@ export class ClaudeAdapter implements AgentAdapter {
       while (nl !== -1) {
         const line = stderrBuffer.slice(0, nl);
         stderrBuffer = stderrBuffer.slice(nl + 1);
-        if (line.trim()) log.warn('agent', 'stderr', { line });
+        const redactedLine = redactPrompt(line);
+        if (redactedLine.trim()) log.warn('agent', 'stderr', { line: redactedLine });
         if (isWindowsCommandNotFoundLine(line)) {
-          runtimeError = new Error(`failed to spawn claude: ${line.trim()}`);
+          runtimeError = new Error(`failed to spawn claude: ${redactPrompt(line.trim())}`);
           child.stdout.destroy();
           child.kill();
         }
@@ -122,7 +126,7 @@ export class ClaudeAdapter implements AgentAdapter {
     });
 
     child.on('error', (err) => {
-      runtimeError = err;
+      runtimeError = new Error(redactPrompt(err.message));
       systemPromptFile.cleanup();
     });
     child.on('exit', (code, signal) => {
@@ -130,7 +134,7 @@ export class ClaudeAdapter implements AgentAdapter {
       systemPromptFile.cleanup();
     });
     child.stdin.on('error', (err) => {
-      log.warn('agent', 'stdin-error', { message: err.message });
+      log.warn('agent', 'stdin-error', { message: redactPrompt(err.message) });
     });
     child.stdin.end(opts.prompt, 'utf8');
 
@@ -143,7 +147,7 @@ export class ClaudeAdapter implements AgentAdapter {
 
     return {
       runId: opts.runId,
-      events: createEventStream(child, stderrChunks, () => runtimeError),
+      events: createEventStream(child, stderrChunks, () => runtimeError, redactPrompt),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
         log.info('agent', 'stop-sigterm', { pid: child.pid ?? null, graceMs: stopGraceMs });
@@ -190,6 +194,7 @@ async function* createEventStream(
   child: ClaudeChild,
   stderrChunks: Buffer[],
   getError: () => Error | null,
+  redactPrompt: (value: string) => string,
 ): AsyncGenerator<AgentEvent> {
   // If fork itself failed synchronously, child.pid is undefined. The 'error'
   // event (ENOENT etc.) fires in the next tick, so also check getError().
@@ -197,7 +202,7 @@ async function* createEventStream(
     const err = getError();
     yield {
       type: 'error',
-      message: err ? `failed to spawn claude: ${err.message}` : 'spawn returned no pid',
+      message: err ? `failed to spawn claude: ${redactPrompt(err.message)}` : 'spawn returned no pid',
       terminationReason: 'failed',
     };
     return;
@@ -223,7 +228,11 @@ async function* createEventStream(
       } catch {
         continue;
       }
-      yield* translateEvent(parsed);
+      for (const event of translateEvent(parsed)) {
+        yield event.type === 'error'
+          ? { ...event, message: redactPrompt(event.message) }
+          : event;
+      }
     }
   } finally {
     if (silentExitTimer) clearTimeout(silentExitTimer);
@@ -235,7 +244,7 @@ async function* createEventStream(
   if (earlyRuntimeError && child.exitCode === null && child.signalCode === null) {
     yield {
       type: 'error',
-      message: `claude runtime error: ${earlyRuntimeError.message}`,
+      message: `claude runtime error: ${redactPrompt(earlyRuntimeError.message)}`,
       terminationReason: 'failed',
     };
     return;
@@ -254,7 +263,7 @@ async function* createEventStream(
 
   const runtimeError = getError();
   if (exitCode !== 0 && exitCode !== null) {
-    const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
+    const stderr = redactPrompt(Buffer.concat(stderrChunks).toString('utf8').trim());
     const detail = stderr ? `: ${stderr.slice(0, 500)}` : '';
     yield {
       type: 'error',
@@ -264,7 +273,7 @@ async function* createEventStream(
   } else if (runtimeError) {
     yield {
       type: 'error',
-      message: `claude runtime error: ${runtimeError.message}`,
+      message: `claude runtime error: ${redactPrompt(runtimeError.message)}`,
       terminationReason: 'failed',
     };
   }

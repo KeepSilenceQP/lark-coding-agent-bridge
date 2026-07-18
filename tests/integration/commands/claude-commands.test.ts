@@ -7,6 +7,7 @@ import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { tryHandleCommand, type CommandContext, type Controls } from '../../../src/commands/index.js';
 import { createDefaultProfileConfig, type ProfileConfig } from '../../../src/config/profile-schema.js';
 import { SessionStore } from '../../../src/session/store.js';
+import type { PromptSessionService } from '../../../src/session/prompt-session-service.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { createFakeAgent, type FakeAgentRun } from '../../helpers/fake-agent.js';
 import { createFakeChannel, type FakeChannel } from '../../helpers/fake-channel.js';
@@ -21,7 +22,7 @@ interface Harness {
   agent: ReturnType<typeof createFakeAgent>;
   controls: Controls;
   cleanup(): Promise<void>;
-  run(content: string): Promise<boolean>;
+  run(content: string, overrides?: Partial<CommandContext>): Promise<boolean>;
 }
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -62,6 +63,33 @@ describe('Claude slash command visible behavior', () => {
 
     expect(h.sessions.resumeFor('chat-1', h.tmp.workspace)).toBeUndefined();
     expect(h.sessions.getIdleTimeoutMinutes('chat-1')).toBe(15);
+  });
+
+  it('interrupts a queued scope reservation before awaiting prompt-session reset', async () => {
+    const h = await createHarness();
+    const reservation = h.activeRuns.reserve('chat-1');
+    if (!reservation) throw new Error('expected reservation');
+    const resetSession = vi.fn(async () => {
+      expect(reservation.signal.aborted).toBe(true);
+      expect(h.activeRuns.reserve('chat-1')).toBeUndefined();
+      return { kind: 'dormant' as const };
+    });
+
+    await expect(
+      h.run('/new', {
+        promptSessionService: { resetSession } as unknown as PromptSessionService,
+        sessionCatalogIdentity: {
+          scopeId: 'chat-1',
+          agentId: 'claude',
+          cwdRealpath: h.tmp.workspace,
+          policyFingerprint: 'policy-1',
+        },
+      }),
+    ).resolves.toBe(true);
+
+    expect(resetSession).toHaveBeenCalledTimes(1);
+    expect(lastMarkdown(h.channel)).toBe('已中断当前任务并开始新会话。');
+    h.activeRuns.reserve('chat-1')?.release();
   });
 
   it('handles /cd by requiring absolute paths and resetting session on success', async () => {
@@ -333,7 +361,7 @@ async function createHarness(): Promise<Harness> {
     processId: 'proc-1',
   } satisfies Controls;
 
-  const run = (content: string): Promise<boolean> =>
+  const run = (content: string, overrides: Partial<CommandContext> = {}): Promise<boolean> =>
     tryHandleCommand({
       channel: channel as unknown as CommandContext['channel'],
       msg: message(content),
@@ -344,6 +372,7 @@ async function createHarness(): Promise<Harness> {
       agent,
       activeRuns,
       controls,
+      ...overrides,
     });
 
   const cleanup = async (): Promise<void> => {
