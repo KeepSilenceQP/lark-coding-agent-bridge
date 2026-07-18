@@ -2,6 +2,11 @@
 
 把飞书 / Lark 消息和本地 Claude Code 或 Codex CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
 
+> **Fork 声明：**本仓库是
+> [`zarazhangrui/lark-coding-agent-bridge`](https://github.com/zarazhangrui/lark-coding-agent-bridge)
+> 的定制 fork。原项目与本 fork 均按 MIT License 发布；归属和许可说明见
+> [NOTICE.md](./NOTICE.md) 与 [LICENSE](./LICENSE)。
+
 [English README](./README.md)
 
 关于能实现的效果，详情可以阅读[飞书文档](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
@@ -28,10 +33,13 @@
 ## 安装
 
 ```bash
-npm i -g lark-channel-bridge
+npm i -g @keepsilenceqp/lark-channel-bridge
 # 或
-pnpm add -g lark-channel-bridge
+pnpm add -g @keepsilenceqp/lark-channel-bridge
 ```
+
+该包由本 fork 通过 `@keepsilenceqp` scope 发布；安装后的 CLI 命令仍为
+`lark-channel-bridge`。
 
 ## 首次启动
 
