@@ -1,6 +1,6 @@
 {
-  "name": "lark-channel-bridge",
-  "version": "0.5.6",
+  "name": "@keepsilenceqp/lark-channel-bridge",
+  "version": "0.5.6-qp.1",
   "description": "Bridge Feishu/Lark messenger with local CLI coding agents",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -10,12 +10,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zarazhangrui/feishu-claude-code-bridge.git"
+    "url": "git+https://github.com/KeepSilenceQP/lark-coding-agent-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/zarazhangrui/feishu-claude-code-bridge/issues"
+    "url": "https://github.com/KeepSilenceQP/lark-coding-agent-bridge/issues"
   },
-  "homepage": "https://github.com/zarazhangrui/feishu-claude-code-bridge#readme",
+  "homepage": "https://github.com/KeepSilenceQP/lark-coding-agent-bridge#readme",
   "bin": {
     "lark-channel-bridge": "./bin/lark-channel-bridge.mjs"
   },
@@ -30,6 +30,7 @@
     "bin",
     "README.md",
     "README.zh.md",
+    "NOTICE.md",
     "LICENSE"
   ],
   "scripts": {

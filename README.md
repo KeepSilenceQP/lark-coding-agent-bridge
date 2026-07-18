@@ -2,6 +2,11 @@
 
 A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
 
+> **Fork notice:** This repository is a customized fork of
+> [`zarazhangrui/lark-coding-agent-bridge`](https://github.com/zarazhangrui/lark-coding-agent-bridge).
+> The original project and this fork are distributed under the MIT License. See
+> [NOTICE.md](./NOTICE.md) and [LICENSE](./LICENSE) for attribution and license terms.
+
 [中文 README](./README.zh.md)
 
 For a product walkthrough, see the [Feishu document](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e).
@@ -28,10 +33,13 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 ## Install
 
 ```bash
-npm i -g lark-channel-bridge
+npm i -g @keepsilenceqp/lark-channel-bridge
 # or
-pnpm add -g lark-channel-bridge
+pnpm add -g @keepsilenceqp/lark-channel-bridge
 ```
+
+The package is published from this fork under the `@keepsilenceqp` scope. The
+installed CLI command remains `lark-channel-bridge`.
 
 ## First run
 
