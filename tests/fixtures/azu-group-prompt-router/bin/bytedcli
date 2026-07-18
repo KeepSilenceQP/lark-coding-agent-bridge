@@ -1,0 +1,20 @@
+#!/usr/bin/env node
+import { appendFileSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const args = process.argv.slice(2);
+if (args[0] !== 'fixture' || args[1] !== 'lineage') fail('unsupported invocation');
+const scenario = JSON.parse(readFileSync(process.env.AZU_SCENARIO_FILE ?? join(process.cwd(), '.acceptance', 'scenario.json'), 'utf8'));
+appendFileSync(process.env.AZU_SHIM_LOG ?? join(process.cwd(), '.acceptance', 'shim.jsonl'), `${JSON.stringify({ tool: 'bytedcli', operation: 'lineage' })}\n`);
+process.stdout.write(`${JSON.stringify({ ok: true, data: scenario.fixtureData.lineage })}\n`);
+
+function requiredEnv(name) {
+  const value = process.env[name];
+  if (!value) fail(`missing ${name}`);
+  return value;
+}
+
+function fail(message) {
+  process.stderr.write(`fixture bytedcli: ${message}\n`);
+  process.exit(64);
+}

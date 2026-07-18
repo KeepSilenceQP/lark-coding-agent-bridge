@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+
+const realGit = '/usr/bin/git';
+const args = process.argv.slice(2);
+const acceptanceDir = join(process.cwd(), '.acceptance');
+let scenario;
+try {
+  scenario = JSON.parse(readFileSync(join(acceptanceDir, 'scenario.json'), 'utf8'));
+} catch {
+  passthrough();
+}
+const statePath = join(acceptanceDir, 'git-state.json');
+let state = {};
+try {
+  state = JSON.parse(readFileSync(statePath, 'utf8'));
+} catch {}
+
+const result = spawnSync(realGit, args, { encoding: 'utf8', env: process.env });
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+if ((result.status ?? 1) !== 0) process.exit(result.status ?? 1);
+
+if (!state.mutated && scenario.repo.mode === 'concurrent_content' && isTrackedDiff(args)) {
+  const repo = resolveGitCwd(args);
+  writeFileSync(
+    join(repo, 'src', 'discount.mjs'),
+    'export const total = (subtotal, discount) => subtotal + discount; // concurrent external edit\n',
+  );
+  state.mutated = 'content';
+  writeFileSync(statePath, `${JSON.stringify(state)}\n`);
+}
+
+if (!state.mutated && scenario.repo.mode === 'concurrent_head' && args.includes('log')) {
+  const repo = resolveGitCwd(args);
+  const mutation = spawnSync(realGit, ['-C', repo, 'commit', '--allow-empty', '-qm', 'concurrent fixture change'], {
+    encoding: 'utf8',
+    env: process.env,
+  });
+  if ((mutation.status ?? 1) !== 0) {
+    if (mutation.stderr) process.stderr.write(mutation.stderr);
+    process.exit(mutation.status ?? 1);
+  }
+  state.mutated = 'head';
+  writeFileSync(statePath, `${JSON.stringify(state)}\n`);
+}
+
+function isTrackedDiff(values) {
+  return values.includes('diff') && !values.includes('--cached') && !values.includes('--staged');
+}
+
+function resolveGitCwd(values) {
+  const index = values.indexOf('-C');
+  return index >= 0 ? resolve(process.cwd(), values[index + 1]) : process.cwd();
+}
+
+function passthrough() {
+  const child = spawnSync(realGit, args, { stdio: 'inherit', env: process.env });
+  process.exit(child.status ?? 1);
+}

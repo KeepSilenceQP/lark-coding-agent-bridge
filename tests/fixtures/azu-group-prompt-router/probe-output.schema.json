@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "nonce",
+    "classification",
+    "trust_state",
+    "selected_lineage",
+    "requested_action",
+    "degraded_reason",
+    "write_intent"
+  ],
+  "properties": {
+    "nonce": { "type": "string", "minLength": 1 },
+    "classification": {
+      "enum": [
+        "bug",
+        "feature_request",
+        "question",
+        "test",
+        "vague_complaint",
+        "untrusted_relay",
+        "degraded"
+      ]
+    },
+    "trust_state": {
+      "enum": [
+        "trusted",
+        "untrusted_sender",
+        "multi_message_batch",
+        "source_unreadable",
+        "source_conflict",
+        "ambiguous_lineage",
+        "dirty_baseline_unknown",
+        "concurrent_change"
+      ]
+    },
+    "selected_lineage": { "type": "string" },
+    "requested_action": {
+      "enum": ["fix_local", "investigate_read_only", "ask_one_question", "explain_only", "stop"]
+    },
+    "degraded_reason": { "type": "string" },
+    "write_intent": { "enum": ["none", "local_patch", "derived_worktree_patch"] }
+  }
+}
