@@ -17,7 +17,7 @@
   },
   "homepage": "https://github.com/KeepSilenceQP/lark-coding-agent-bridge#readme",
   "bin": {
-    "lark-channel-bridge": "./bin/lark-channel-bridge.mjs"
+    "lark-channel-bridge": "bin/lark-channel-bridge.mjs"
   },
   "exports": {
     ".": {
