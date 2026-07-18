@@ -33,12 +33,12 @@
 ## 安装
 
 ```bash
-npm i -g @keepsilenceqp/lark-channel-bridge
+npm i -g @penn.qp/lark-channel-bridge
 # 或
-pnpm add -g @keepsilenceqp/lark-channel-bridge
+pnpm add -g @penn.qp/lark-channel-bridge
 ```
 
-该包由本 fork 通过 `@keepsilenceqp` scope 发布；安装后的 CLI 命令仍为
+该包由本 fork 通过 `@penn.qp` scope 发布；安装后的 CLI 命令仍为
 `lark-channel-bridge`。
 
 ## 首次启动
