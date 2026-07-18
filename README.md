@@ -33,12 +33,12 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 ## Install
 
 ```bash
-npm i -g @keepsilenceqp/lark-channel-bridge
+npm i -g @penn.qp/lark-channel-bridge
 # or
-pnpm add -g @keepsilenceqp/lark-channel-bridge
+pnpm add -g @penn.qp/lark-channel-bridge
 ```
 
-The package is published from this fork under the `@keepsilenceqp` scope. The
+The package is published from this fork under the `@penn.qp` scope. The
 installed CLI command remains `lark-channel-bridge`.
 
 ## First run
