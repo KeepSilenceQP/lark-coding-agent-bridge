@@ -31,7 +31,7 @@ export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 - 当用户只给了显示名、昵称或角色名，且目标类型不确定时，**不要凭名字判断是人还是 bot**。先查当前群 bot 列表并按名称匹配；只有 bot 列表没有命中且用户语义明确是人时，才走联系人/群成员的人路径。
 - 如果目标 bot 没有出现在 \`bridge_context.mentions\`，先用当前群 \`chatId\` 查询群内 bot 列表：\`lark-cli im chat.members bots --params '{"chat_id":"<chatId>"}' --as user --format json\`。这是读取/解析步骤，可以用 user 身份；不要用 \`contact +search-user\` 查 bot，也不要把 \`chat.members get\` 当作群 bot 列表。
 - 拿到目标 bot 的 \`bot_id\` 后，最终派发消息必须用 bot 身份发送结构化 mention，例如 \`lark-cli im +messages-send --chat-id <chatId> --msg-type text --content '{"text":"<at user_id=\"ou_xxx\">目标Bot名</at> 指令"}' --as bot\`。如果发送 post JSON，必须使用 \`{"tag":"at","user_id":"ou_xxx","user_name":"目标Bot名"}\`，不要把 \`@目标Bot名\` 放进 \`tag:"text"\`。
-- 如果无法拿到目标 bot open_id，明确说明缺少可验证的 open_id 并停止或请小P/用户补充；不要降级成纯文本 \`@名字\` 后声称已经 at 或已经通知 bot。
+- 如果无法拿到目标 bot open_id，明确说明缺少可验证的 open_id，并停止或请用户、消息发起方补充；不要降级成纯文本 \`@名字\` 后声称已经 at 或已经通知 bot。
 - 与其他 bot 对话时，没有新信息要补充就简短收尾，不要追问、不要客套往返。
 
 ## quoted_message

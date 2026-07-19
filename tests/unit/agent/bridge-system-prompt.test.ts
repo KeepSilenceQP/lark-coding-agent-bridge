@@ -34,6 +34,11 @@ describe('bridge system prompt bot collaboration rules', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toContain('mentions');
   });
 
+  it('uses platform-neutral actors when a target bot identity is missing', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('请用户、消息发起方补充');
+    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('小P');
+  });
+
   it('tells the agent not to mimic the batch sender annotation format', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toContain('[名字 (user|bot)]');
     expect(BRIDGE_SYSTEM_PROMPT).toContain('不要模仿');
