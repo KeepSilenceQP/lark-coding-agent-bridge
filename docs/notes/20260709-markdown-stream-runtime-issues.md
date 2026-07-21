@@ -40,7 +40,7 @@ All commits are pushed to `origin/fix/msg_break`.
 - `git diff --check`, TypeScript typecheck, and production build passed.
 - Active global command is symlinked to this worktree; local and global `dist/cli.js` SHA-256 both equal `d3ac11608cba23f7098c720049aafa7b91e6228a36f25a8ca8b09d9b9a0af5ca`.
 - Codex profile was restarted only after the unrelated active run completed normally. Deployed bridge PID: `71897`, start time `2026-07-14 21:38:13 +08:00`.
-- Repository was clean and `HEAD == origin/fix/msg_break == 0d0adcb4197f76f417a968cdfdbb6020f8452b68` after deployment.
+- Repository was clean and `HEAD == origin/fix/msg_break == bbdd488da68ff0b13c53fdf481f2b37813b9941a` after deployment.
 
 ### Remaining Evidence Boundary
 
