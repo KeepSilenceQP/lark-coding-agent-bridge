@@ -4,7 +4,7 @@ import { log } from '../core/logger';
 /**
  * Scope that lets the app receive group messages that DON'T @ the bot.
  * Without it, Feishu's event gateway only pushes @-bot group messages, so
- * `groupResponseMode: owner-default|all-messages` silently has no effect. Kept as a named
+ * `groupResponseMode: owner-default|all-messages|owner-allowlist` silently has no effect. Kept as a named
  * constant so it's easy to adjust if the platform renames the scope id.
  */
 export const GROUP_MSG_SCOPE = 'im:message.group_msg';

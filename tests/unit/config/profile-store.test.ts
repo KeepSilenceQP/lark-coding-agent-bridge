@@ -181,4 +181,28 @@ describe('profile store canonical serialization', () => {
 
     expect(root.migrations?.permissionDefaultsV1).toEqual(['claude']);
   });
+
+  it('roundtrips ownerNoMentionChats through save and reload', async () => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const profile = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        ownerNoMentionChats: ['oc_a', 'oc_b'],
+        groupResponseMode: 'owner-allowlist',
+      },
+    });
+
+    await saveRootConfig({
+      schemaVersion: 2,
+      activeProfile: 'claude',
+      preferences: {},
+      profiles: { claude: profile },
+    }, configPath);
+
+    const loaded = await loadRootConfig(configPath);
+    expect(loaded?.profiles.claude?.access.ownerNoMentionChats).toEqual(['oc_a', 'oc_b']);
+    expect(loaded?.profiles.claude?.access.groupResponseMode).toBe('owner-allowlist');
+  });
 });

@@ -151,6 +151,79 @@ describe('policy fingerprint', () => {
       }),
     ).not.toBe(accessPolicyDigest(profile.access));
   });
+
+  // ────────────── owner-allowlist fingerprint ──────────────
+
+  it('includes ownerNoMentionChats in access policy digest (stable when empty)', () => {
+    const profile = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app: { id: 'cli_test', secret: '${APP_SECRET}', tenant: 'feishu' } },
+    });
+
+    // Default profile has ownerNoMentionChats=[] after normalization
+    const d1 = accessPolicyDigest(profile.access);
+    const d2 = accessPolicyDigest({
+      ...profile.access,
+      ownerNoMentionChats: [],
+    } as Parameters<typeof accessPolicyDigest>[0]);
+    expect(d1).toBe(d2);
+  });
+
+  it('changes access digest when ownerNoMentionChats changes', () => {
+    const profile = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app: { id: 'cli_test', secret: '${APP_SECRET}', tenant: 'feishu' } },
+    });
+
+    const empty = accessPolicyDigest({
+      ...profile.access,
+      ownerNoMentionChats: [],
+    } as Parameters<typeof accessPolicyDigest>[0]);
+
+    const withChat = accessPolicyDigest({
+      ...profile.access,
+      ownerNoMentionChats: ['oc_a'],
+    } as Parameters<typeof accessPolicyDigest>[0]);
+
+    expect(withChat).not.toBe(empty);
+  });
+
+  it('keeps ownerNoMentionChats order-independent in digest', () => {
+    const profile = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app: { id: 'cli_test', secret: '${APP_SECRET}', tenant: 'feishu' } },
+    });
+
+    const d1 = accessPolicyDigest({
+      ...profile.access,
+      ownerNoMentionChats: ['oc_b', 'oc_a'],
+    } as Parameters<typeof accessPolicyDigest>[0]);
+
+    const d2 = accessPolicyDigest({
+      ...profile.access,
+      ownerNoMentionChats: ['oc_a', 'oc_b'],
+    } as Parameters<typeof accessPolicyDigest>[0]);
+
+    expect(d1).toBe(d2);
+  });
+
+  it('does NOT require equality with pre-upgrade digest (accepts one-time invalidation)', () => {
+    const profile = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app: { id: 'cli_test', secret: '${APP_SECRET}', tenant: 'feishu' } },
+    });
+
+    // With the new ownerNoMentionChats field, the digest WILL differ from
+    // the old one. This test documents that this is expected — the plan
+    // accepts a one-time digest invalidation on upgrade.
+    const digestWithNewField = accessPolicyDigest({
+      ...profile.access,
+      ownerNoMentionChats: [],
+    } as Parameters<typeof accessPolicyDigest>[0]);
+
+    // The digest is still well-formed
+    expect(digestWithNewField).toMatch(/^[A-Za-z0-9_-]{22}$/);
+  });
 });
 
 function baseInput(): FingerprintInputV2 {
