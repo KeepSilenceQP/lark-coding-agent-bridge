@@ -10,11 +10,13 @@ export interface GroupResponsePolicyInput {
   mentionedBot: boolean;
   mentionCount: number;
   mentionAll: boolean;
+  chatId: string;
+  ownerNoMentionChats: string[];
 }
 
 export type GroupResponsePolicyDecision =
-  | { accept: true; reason: 'p2p' | 'mentioned-bot' | 'all-messages' | 'owner-default' }
-  | { accept: false; reason: 'mention-required' | 'owner-default-not-eligible' };
+  | { accept: true; reason: 'p2p' | 'mentioned-bot' | 'all-messages' | 'owner-default' | 'owner-allowlist' }
+  | { accept: false; reason: 'mention-required' | 'owner-default-not-eligible' | 'owner-allowlist-not-eligible' | 'owner-allowlist-chat-not-listed' };
 
 /**
  * Decide whether a normalized IM message may enter command/pending/run intake.
@@ -29,14 +31,25 @@ export function decideGroupResponse(
   if (input.mode === 'all-messages') return { accept: true, reason: 'all-messages' };
   if (input.mode === 'mention-only') return { accept: false, reason: 'mention-required' };
 
-  const eligible =
+  const ownerEligible =
     input.ownerRefreshState === 'ok' &&
     Boolean(input.botOwnerId) &&
     input.botOwnerId === input.senderId &&
     input.mentionCount === 0 &&
     input.mentionAll === false;
 
-  return eligible
+  if (input.mode === 'owner-allowlist') {
+    if (!ownerEligible) {
+      return { accept: false, reason: 'owner-allowlist-not-eligible' };
+    }
+    if (!input.ownerNoMentionChats.includes(input.chatId)) {
+      return { accept: false, reason: 'owner-allowlist-chat-not-listed' };
+    }
+    return { accept: true, reason: 'owner-allowlist' };
+  }
+
+  // owner-default
+  return ownerEligible
     ? { accept: true, reason: 'owner-default' }
     : { accept: false, reason: 'owner-default-not-eligible' };
 }

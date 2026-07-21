@@ -25,6 +25,7 @@ export interface ConfigFormOpts {
   admins: string[];
   botAdmins: string[];
   knownChats: KnownChat[];
+  ownerNoMentionChats: string[];
 }
 
 function collapsedAccessPanel(title: string, elements: object[]): object {
@@ -85,6 +86,16 @@ export function configFormCard(opts: ConfigFormOpts): object {
         `${chatList(opts.allowedChats, opts.knownChats)}\n\n` +
         '_一键加全部 bot 所在的群：_ `/invite all group`\n' +
         '_加 / 删（在目标群里发）：_ `/invite group`  `/remove group`',
+    },
+    { tag: 'hr' },
+    {
+      tag: 'markdown',
+      content:
+        `**Owner 免 @ 群**（共 ${opts.ownerNoMentionChats.length} 个）\n` +
+        `${chatList(opts.ownerNoMentionChats, opts.knownChats)}\n\n` +
+        '_仅当群消息响应方式为「仅在指定群响应 owner 无 @ 消息」时生效。_ 与「允许响应的群」相互独立。\n' +
+        '_加 / 删（在目标群里 @ 当前 Bot 发）：_\n' +
+        '`@当前Bot /invite owner-default group`  `@当前Bot /remove owner-default group`',
     },
     { tag: 'hr' },
     {
@@ -228,6 +239,7 @@ export function configFormCard(opts: ConfigFormOpts): object {
                 '_仅响应 @bot(默认):保持群聊安静_\n' +
                 '_应用所有者未 @ 任何账号时响应:只有当前应用 owner 发言且没有 @ 人、bot 或全员时默认响应_\n' +
                 '_响应所有消息:任何群消息都会发给 agent_\n' +
+                '_仅在指定群响应 owner 无 @ 消息:只有 owner 在独立名单群无 @ 发言时才响应_\n' +
                 '_显式 @bot、多 bot @ 和 @全员继续沿用原有行为;私聊不受影响_',
             },
             {
@@ -246,6 +258,10 @@ export function configFormCard(opts: ConfigFormOpts): object {
                 {
                   text: { tag: 'plain_text', content: '响应所有消息' },
                   value: 'all-messages',
+                },
+                {
+                  text: { tag: 'plain_text', content: '仅在指定群响应 owner 无 @ 消息' },
+                  value: 'owner-allowlist',
                 },
               ],
             },
@@ -337,6 +353,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
             '🔒 **访问控制**\n' +
             `**允许私聊的用户**:${summarize(opts.allowedUsers)}\n` +
             `**允许响应的群**:${summarize(opts.allowedChats)}\n` +
+            `**Owner 免 @ 群**:${summarize(opts.ownerNoMentionChats)}\n` +
             `**管理员**:${summarize(opts.admins)}\n` +
             `**Bot 管理员**:${summarize(opts.botAdmins)}\n\n` +
             '下条消息开始生效。',
@@ -355,6 +372,7 @@ function cotMessagesLabel(value: CotMessagesMode): string {
 function groupResponseModeLabel(value: GroupResponseMode): string {
   if (value === 'owner-default') return '应用所有者未 @ 任何账号时响应';
   if (value === 'all-messages') return '响应所有消息';
+  if (value === 'owner-allowlist') return '仅在指定群响应 owner 无 @ 消息';
   return '仅响应 @bot';
 }
 

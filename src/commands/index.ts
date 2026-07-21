@@ -2213,6 +2213,59 @@ async function recallMessage(ctx: CommandContext, messageId: string): Promise<vo
 async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
   const tokens = args.trim().split(/\s+/).filter(Boolean).map((token) => token.toLowerCase());
 
+  // owner-default group — precise grammar, must be exactly ['owner-default', 'group'].
+  // Intercept before the legacy 'all group' branch so /invite all owner-default group
+  // does NOT fall through to the old allowedChats path.
+  if (tokens.includes('owner-default')) {
+    if (tokens.length !== 2 || tokens[0] !== 'owner-default' || tokens[1] !== 'group') {
+      await reply(
+        ctx,
+        '用法：\n' +
+          '• `/invite owner-default group` — 把当前群加入**本 Bot** 的 owner 免 @ 名单\n' +
+          '（需要 @ 当前 Bot）',
+      );
+      return;
+    }
+    // p2p intercept before mentionedBot guard
+    if (ctx.chatMode === 'p2p') {
+      await reply(ctx, '❌ `/invite owner-default group` 只能在目标群中 @ 当前 Bot 执行，私聊里无法指定群。');
+      return;
+    }
+    // Command-layer @ guard
+    if (!ctx.msg.mentionedBot) {
+      await reply(ctx, '❌ 请 @ 当前 Bot 执行该命令。');
+      return;
+    }
+    // Permission gate
+    const perm = canRunBotAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId);
+    if (!perm.ok) {
+      await reply(ctx, '❌ 你没有权限执行该命令。需要应用 owner、人类管理员或 Bot 管理员权限。');
+      return;
+    }
+    const chatId = ctx.msg.chatId;
+    const currentMode = ctx.controls.profileConfig.access.groupResponseMode;
+    let already = false;
+    await saveAccessConfig(ctx, (current) => {
+      const list = new Set(current.ownerNoMentionChats);
+      already = list.has(chatId);
+      if (!already) list.add(chatId);
+      return {
+        ...current,
+        ownerNoMentionChats: [...list],
+      };
+    });
+    const modeHint =
+      currentMode !== 'owner-allowlist'
+        ? '\n_名单已保存。当前群消息响应方式不是「仅在指定群响应 owner 无 @ 消息」，切换到该模式后生效。_'
+        : '';
+    if (already) {
+      await reply(ctx, `✅ 当前群已在**本 Bot** 的 owner 免 @ 名单中，无需重复添加。${modeHint}`);
+      return;
+    }
+    await reply(ctx, `✅ 已把当前群加入**本 Bot** 的 owner 免 @ 名单。${modeHint}`);
+    return;
+  }
+
   if (tokens.includes('all') && tokens.includes('group')) {
     const list = new Set(ctx.controls.profileConfig.access.allowedChats);
     let knownChats = ctx.controls.knownChats ?? [];
@@ -2258,7 +2311,8 @@ async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
         '• `/invite user @某人` — 加入允许私聊\n' +
         '• `/invite admin @某人` — 加入管理员\n' +
         '• `/invite group` — 把当前群加入响应群名单\n' +
-        '• `/invite all group` — 把 bot 所在的所有群一键加入',
+        '• `/invite all group` — 把 bot 所在的所有群一键加入\n' +
+        '• `/invite owner-default group` — 把当前群加入 owner 免 @ 名单（需 @ 当前 Bot）',
     );
     return;
   }
@@ -2331,6 +2385,58 @@ async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
 
 async function handleRemove(args: string, ctx: CommandContext): Promise<void> {
   const tokens = args.trim().split(/\s+/).filter(Boolean).map((token) => token.toLowerCase());
+
+  // owner-default group — precise grammar, mirror of handleInvite
+  if (tokens.includes('owner-default')) {
+    if (tokens.length !== 2 || tokens[0] !== 'owner-default' || tokens[1] !== 'group') {
+      await reply(
+        ctx,
+        '用法：\n' +
+          '• `/remove owner-default group` — 把当前群移出**本 Bot** 的 owner 免 @ 名单\n' +
+          '（需要 @ 当前 Bot）',
+      );
+      return;
+    }
+    // p2p intercept before mentionedBot guard
+    if (ctx.chatMode === 'p2p') {
+      await reply(ctx, '❌ `/remove owner-default group` 只能在目标群中 @ 当前 Bot 执行，私聊里无法指定群。');
+      return;
+    }
+    // Command-layer @ guard
+    if (!ctx.msg.mentionedBot) {
+      await reply(ctx, '❌ 请 @ 当前 Bot 执行该命令。');
+      return;
+    }
+    // Permission gate
+    const perm = canRunBotAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId);
+    if (!perm.ok) {
+      await reply(ctx, '❌ 你没有权限执行该命令。需要应用 owner、人类管理员或 Bot 管理员权限。');
+      return;
+    }
+    const chatId = ctx.msg.chatId;
+    const currentMode = ctx.controls.profileConfig.access.groupResponseMode;
+    let missing = false;
+    await saveAccessConfig(ctx, (current) => {
+      const list = new Set(current.ownerNoMentionChats);
+      missing = !list.has(chatId);
+      list.delete(chatId);
+      return {
+        ...current,
+        ownerNoMentionChats: [...list],
+      };
+    });
+    const modeHint =
+      currentMode !== 'owner-allowlist'
+        ? '\n_名单已保存。当前群消息响应方式不是「仅在指定群响应 owner 无 @ 消息」，切换到该模式后生效。_'
+        : '';
+    if (missing) {
+      await reply(ctx, `✅ 当前群本来就不在**本 Bot** 的 owner 免 @ 名单里，无需移除。${modeHint}`);
+      return;
+    }
+    await reply(ctx, `✅ 已把当前群移出**本 Bot** 的 owner 免 @ 名单。${modeHint}`);
+    return;
+  }
+
   const kind = tokens.find((token) => /^(user|admin|group)$/.test(token)) as
     | 'user'
     | 'admin'
@@ -2342,7 +2448,8 @@ async function handleRemove(args: string, ctx: CommandContext): Promise<void> {
       '用法：\n' +
         '• `/remove user @某人` — 移出用户白名单\n' +
         '• `/remove admin @某人` — 移出管理员\n' +
-        '• `/remove group` — 把当前群移出响应群名单',
+        '• `/remove group` — 把当前群移出响应群名单\n' +
+        '• `/remove owner-default group` — 把当前群移出 owner 免 @ 名单（需 @ 当前 Bot）',
     );
     return;
   }
@@ -2653,6 +2760,7 @@ async function saveAccessConfig(
             allowedChats: access.allowedChats,
             admins: access.admins,
             botAdmins: access.botAdmins,
+            ownerNoMentionChats: access.ownerNoMentionChats,
           },
           requireMentionInGroup: access.requireMentionInGroup,
         };
@@ -2675,6 +2783,7 @@ async function saveAccessConfig(
         allowedChats: access.allowedChats.length,
         admins: access.admins.length,
         botAdmins: access.botAdmins.length,
+        ownerNoMentionChats: access.ownerNoMentionChats.length,
       });
       return access;
     });
@@ -2730,6 +2839,7 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     admins: access.admins,
     botAdmins: access.botAdmins,
     knownChats: ctx.controls.knownChats ?? [],
+    ownerNoMentionChats: access.ownerNoMentionChats,
   });
   if (ctx.fromCardAction) await recallMessage(ctx, ctx.msg.messageId);
   await sendManagedCard(ctx.channel, ctx.msg.chatId, card, commandReplyOptions(ctx));
@@ -2824,7 +2934,8 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
   if (
     rawGroupResponseMode === 'mention-only' ||
     rawGroupResponseMode === 'owner-default' ||
-    rawGroupResponseMode === 'all-messages'
+    rawGroupResponseMode === 'all-messages' ||
+    rawGroupResponseMode === 'owner-allowlist'
   ) {
     groupResponseMode = rawGroupResponseMode;
   } else if (rawRequireMention === 'yes') {
@@ -2943,6 +3054,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         admins: access.admins,
         botAdmins: access.botAdmins,
         knownChats: ctx.controls.knownChats ?? [],
+        ownerNoMentionChats: access.ownerNoMentionChats,
       }),
     );
 
