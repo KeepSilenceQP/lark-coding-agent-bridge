@@ -17,7 +17,7 @@ export type AgentKind = 'claude' | 'codex';
 export type SandboxMode = CodexSandboxMode;
 export type { AccessMode, PermissionConfig, PermissionSource };
 
-export type GroupResponseMode = 'mention-only' | 'owner-default' | 'all-messages';
+export type GroupResponseMode = 'mention-only' | 'owner-default' | 'all-messages' | 'owner-allowlist';
 
 export interface ProfileAccess {
   allowedUsers: string[];
@@ -26,6 +26,7 @@ export interface ProfileAccess {
   botAdmins: string[];
   groupResponseMode: GroupResponseMode;
   requireMentionInGroup: boolean;
+  ownerNoMentionChats: string[];
 }
 
 export interface SandboxConfig {
@@ -268,11 +269,17 @@ function normalizeAccess(
     // Keep the legacy boolean synchronized for old config cards and safe
     // rollback to binaries that predate the tri-state response policy.
     requireMentionInGroup: groupResponseMode !== 'all-messages',
+    ownerNoMentionChats: stringArray(access?.ownerNoMentionChats),
   };
 }
 
 function isGroupResponseMode(value: unknown): value is GroupResponseMode {
-  return value === 'mention-only' || value === 'owner-default' || value === 'all-messages';
+  return (
+    value === 'mention-only' ||
+    value === 'owner-default' ||
+    value === 'all-messages' ||
+    value === 'owner-allowlist'
+  );
 }
 
 function normalizeWorkspaces(input: {

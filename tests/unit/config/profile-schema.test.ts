@@ -98,6 +98,7 @@ describe('profile schema', () => {
       botAdmins: [],
       groupResponseMode: 'mention-only',
       requireMentionInGroup: true,
+      ownerNoMentionChats: [],
     });
   });
 
@@ -561,5 +562,122 @@ describe('profile schema', () => {
       defaultAccess: 'workspace',
       maxAccess: 'workspace',
     });
+  });
+
+  // ────────────── owner-allowlist normalization ──────────────
+
+  it('normalizes ownerNoMentionChats to empty array when missing', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        allowedUsers: [],
+        allowedChats: [],
+        admins: [],
+      },
+    });
+
+    expect(cfg.access.ownerNoMentionChats).toEqual([]);
+  });
+
+  it('preserves ownerNoMentionChats through normalization', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        allowedUsers: [],
+        allowedChats: [],
+        admins: [],
+        ownerNoMentionChats: ['oc_group_a', 'oc_group_b'],
+      },
+    });
+
+    expect(cfg.access.ownerNoMentionChats).toEqual(['oc_group_a', 'oc_group_b']);
+  });
+
+  it('accepts owner-allowlist as a valid group response mode', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        groupResponseMode: 'owner-allowlist',
+      },
+    });
+
+    expect(cfg.access.groupResponseMode).toBe('owner-allowlist');
+    // owner-allowlist is not all-messages → requireMentionInGroup is true
+    expect(cfg.access.requireMentionInGroup).toBe(true);
+  });
+
+  it('keeps ownerNoMentionChats when switching away from owner-allowlist and back', () => {
+    // Start with owner-allowlist + some chats
+    const cfg1 = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        groupResponseMode: 'owner-allowlist',
+        ownerNoMentionChats: ['oc_a'],
+      },
+    });
+    expect(cfg1.access.groupResponseMode).toBe('owner-allowlist');
+    expect(cfg1.access.ownerNoMentionChats).toEqual(['oc_a']);
+
+    // Switch to mention-only; ownerNoMentionChats should be preserved
+    const cfg2 = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        groupResponseMode: 'mention-only',
+        ownerNoMentionChats: ['oc_a'],
+      },
+    });
+    expect(cfg2.access.groupResponseMode).toBe('mention-only');
+    expect(cfg2.access.ownerNoMentionChats).toEqual(['oc_a']);
+
+    // Switch back to owner-allowlist; chats still there
+    const cfg3 = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        groupResponseMode: 'owner-allowlist',
+        ownerNoMentionChats: ['oc_a'],
+      },
+    });
+    expect(cfg3.access.groupResponseMode).toBe('owner-allowlist');
+    expect(cfg3.access.ownerNoMentionChats).toEqual(['oc_a']);
+  });
+
+  it('filters non-string values from ownerNoMentionChats', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        ownerNoMentionChats: ['oc_a', 123, null, 'oc_b', undefined] as unknown as string[],
+      },
+    });
+
+    expect(cfg.access.ownerNoMentionChats).toEqual(['oc_a', 'oc_b']);
+  });
+
+  it('normalizes ownerNoMentionChats from legacy access path', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      preferences: {
+        access: {
+          ownerNoMentionChats: ['oc_legacy'],
+        },
+      } as never,
+    });
+
+    expect(cfg.access.ownerNoMentionChats).toEqual(['oc_legacy']);
   });
 });
