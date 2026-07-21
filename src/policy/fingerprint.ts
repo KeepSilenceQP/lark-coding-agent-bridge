@@ -51,6 +51,7 @@ export function accessPolicyDigest(access: ProfileConfig['access']): string {
     allowedUsers: [...access.allowedUsers].sort(),
     groupResponseMode: access.groupResponseMode,
     requireMentionInGroup: access.requireMentionInGroup,
+    ownerNoMentionChats: [...access.ownerNoMentionChats].sort(),
   });
 }
 

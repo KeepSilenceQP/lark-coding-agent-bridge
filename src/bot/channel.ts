@@ -1224,6 +1224,8 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     mentionedBot: msg.mentionedBot,
     mentionCount: msg.mentions?.length ?? 0,
     mentionAll: msg.mentionAll,
+    chatId: msg.chatId,
+    ownerNoMentionChats: controls.profileConfig.access.ownerNoMentionChats,
   });
   if (!groupResponseDecision.accept) {
     log.info('intake', 'skip-group-response-policy', {
@@ -1274,7 +1276,12 @@ export function shouldBypassDeniedChatForInviteGroup(
   if (msg.chatType === 'p2p') return false;
   if (!msg.mentionedBot) return false;
   const content = msg.content.trim();
-  if (!/^(?:@\S+[ \t]+)?\/invite[ \t]+group$/.test(content)) return false;
+  if (
+    !/^(?:@\S+[ \t]+)?\/(?:invite[ \t]+group|invite[ \t]+owner-default[ \t]+group|remove[ \t]+owner-default[ \t]+group)$/.test(
+      content,
+    )
+  )
+    return false;
   return canRunBotAdminCommand(controls.profileConfig, controls, msg.senderId).ok;
 }
 

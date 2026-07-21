@@ -89,6 +89,10 @@ export interface AppAccess {
   /** open_id list of bots with admin privileges. Same gates as admins
    * but for other bots — enables bot-to-bot admin delegation. */
   botAdmins?: string[];
+  /** chat_id allowlist for owner-no-mention response groups.
+   * Independent from allowedChats; only active when groupResponseMode
+   * is owner-allowlist. topic group thread_ids inherit the chat config. */
+  ownerNoMentionChats?: string[];
 }
 
 export interface AppPreferences {
@@ -244,7 +248,8 @@ export function getGroupResponseMode(cfg: AppConfig): GroupResponseMode {
   if (
     profileAccess?.groupResponseMode === 'mention-only' ||
     profileAccess?.groupResponseMode === 'owner-default' ||
-    profileAccess?.groupResponseMode === 'all-messages'
+    profileAccess?.groupResponseMode === 'all-messages' ||
+    profileAccess?.groupResponseMode === 'owner-allowlist'
   ) {
     return profileAccess.groupResponseMode;
   }

@@ -300,7 +300,9 @@ If you'd rather not do it inside Feishu, `/invite` and `/config` write the match
 }
 ```
 
-`groupResponseMode` 支持 `mention-only`（仅显式 @bot）、`owner-default`（应用所有者未 @ 任何账号时默认响应）和 `all-messages`（响应所有群消息）。`requireMentionInGroup` 是兼容旧版本的降级字段：前两种模式写 `true`，`all-messages` 写 `false`；建议通过 `/config` 修改，避免两个字段不一致。
+`groupResponseMode` 支持 `mention-only`（仅显式 @bot，默认）、`owner-default`（应用所有者未 @ 任何账号时默认响应）、`all-messages`（响应所有群消息）和 `owner-allowlist`（仅在指定群响应 owner 无 @ 消息）。`requireMentionInGroup` 是兼容旧版本的降级字段：`all-messages` 写 `false`，其他写 `true`；建议通过 `/config` 修改，避免字段不一致。
+
+`owner-allowlist` 模式下，需配合 `ownerNoMentionChats` 指定生效的群聊。该字段独立于 `allowedChats`，只对 owner 的无 @ 消息生效；管理员和已开放群用户仍需 @bot 才能触发。维护命令（需在目标群 @ 当前 Bot）：`/invite owner-default group` 和 `/remove owner-default group`。多 Bot 各自独立配置，不做中央互斥。
 
 `allowedUsers` / `admins` take user `open_id`s; `allowedChats` takes group `chat_id`s. The easiest way to find an ID by hand: have the person message the bot (or `@` it in the group), then check the active profile's log:
 

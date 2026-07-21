@@ -68,6 +68,102 @@ describe('channel intake command bypass', () => {
       ),
     ).toBe(false);
   });
+
+  // ────────────── owner-default group bypass ──────────────
+
+  it('bypasses denied chat for @bot /invite owner-default group by botAdmin', () => {
+    const controls = createControls(['ou-bot-admin']);
+
+    expect(
+      shouldBypassDeniedChatForInviteGroup(
+        message('@小C /invite owner-default group', {
+          senderId: 'ou-bot-admin',
+          mentionedBot: true,
+        }),
+        controls,
+      ),
+    ).toBe(true);
+  });
+
+  it('bypasses denied chat for @bot /remove owner-default group by botAdmin', () => {
+    const controls = createControls(['ou-bot-admin']);
+
+    expect(
+      shouldBypassDeniedChatForInviteGroup(
+        message('@小C /remove owner-default group', {
+          senderId: 'ou-bot-admin',
+          mentionedBot: true,
+        }),
+        controls,
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects bypass for owner-default group without @bot', () => {
+    const controls = createControls(['ou-bot-admin']);
+
+    expect(
+      shouldBypassDeniedChatForInviteGroup(
+        message('/invite owner-default group', {
+          senderId: 'ou-bot-admin',
+          mentionedBot: false,
+        }),
+        controls,
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects bypass for owner-default group with extra tokens', () => {
+    const controls = createControls(['ou-bot-admin']);
+
+    expect(
+      shouldBypassDeniedChatForInviteGroup(
+        message('@小C /invite owner-default group extra', {
+          senderId: 'ou-bot-admin',
+          mentionedBot: true,
+        }),
+        controls,
+      ),
+    ).toBe(false);
+
+    expect(
+      shouldBypassDeniedChatForInviteGroup(
+        message('@小C /invite all owner-default group', {
+          senderId: 'ou-bot-admin',
+          mentionedBot: true,
+        }),
+        controls,
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects bypass for owner-default group by non-botAdmin', () => {
+    const controls = createControls([]);
+
+    expect(
+      shouldBypassDeniedChatForInviteGroup(
+        message('@小C /invite owner-default group', {
+          senderId: 'ou-stranger',
+          mentionedBot: true,
+        }),
+        controls,
+      ),
+    ).toBe(false);
+  });
+
+  it('still bypasses old /invite group for botAdmin (no regression)', () => {
+    const controls = createControls(['ou-bot-admin']);
+
+    expect(
+      shouldBypassDeniedChatForInviteGroup(
+        message('@小C /invite group', {
+          senderId: 'ou-bot-admin',
+          mentionedBot: true,
+        }),
+        controls,
+      ),
+    ).toBe(true);
+  });
 });
 
 function createControls(botAdmins: string[]): Controls {

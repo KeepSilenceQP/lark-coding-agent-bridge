@@ -9,6 +9,7 @@ import { resolveAppPaths } from '../../../src/config/app-paths';
 import { getSecret, listSecretIds } from '../../../src/config/keystore';
 import {
   createDefaultProfileConfig,
+  type GroupResponseMode,
   type RootConfig,
 } from '../../../src/config/profile-schema';
 import { runtimeProfileConfig } from '../../../src/config/profile-store';
@@ -223,6 +224,260 @@ describe('profile-aware account and config commands', () => {
     expect(card).toContain('已回滚');
     expect(card).not.toContain('未做任何修改');
     expect(card).not.toContain('偏好已保存');
+  });
+
+  // ────────────── /invite|/remove owner-default group ──────────────
+
+  async function createGroupHarness(mode: string = 'owner-allowlist', opts: {
+    senderId?: string;
+    senderType?: 'user' | 'bot';
+    mentionedBot?: boolean;
+    botAdmins?: string[];
+    admins?: string[];
+  } = {}): Promise<{
+    rootDir: string;
+    channel: ReturnType<typeof createFakeChannel>;
+    command(content: string): Promise<boolean>;
+    readRoot(): Promise<RootConfig>;
+    controls: Controls;
+  }> {
+    const rootDir = await mkdtemp(join(tmpdir(), 'bridge-owner-default-group-'));
+    roots.push(rootDir);
+    const workspace = join(rootDir, 'workspace');
+    await mkdir(workspace, { recursive: true });
+    const root: RootConfig = {
+      schemaVersion: 2,
+      activeProfile: 'claude',
+      preferences: {},
+      profiles: {
+        claude: createDefaultProfileConfig({
+          agentKind: 'claude',
+          accounts: { app: { id: 'cli_old', secret: '${APP_SECRET}', tenant: 'feishu' } },
+          access: {
+            admins: opts.admins ?? ['ou-admin'],
+            groupResponseMode: mode as GroupResponseMode,
+            botAdmins: opts.botAdmins ?? [],
+          },
+        }),
+      },
+    };
+    root.profiles.claude!.workspaces.default = workspace;
+    await writeJson(resolveAppPaths({ rootDir }).configFile, root);
+    await writeFile(join(rootDir, 'active-profile'), 'claude\n', 'utf8');
+
+    const profileConfig = root.profiles.claude!;
+    const appPaths = resolveAppPaths({ rootDir, profile: 'claude' });
+    const channel = createFakeChannel();
+    const sessions = new SessionStore(appPaths.sessionsFile);
+    const workspaces = new WorkspaceStore(appPaths.workspacesFile);
+    const controls: Controls = {
+      profile: 'claude',
+      profileConfig,
+      botOwnerId: 'ou-admin',
+      ownerRefreshState: 'ok',
+      async refreshOwner() {},
+      restart: vi.fn(async () => {}),
+      exit: vi.fn(async () => {}),
+      configPath: appPaths.configFile,
+      cfg: runtimeProfileConfig(root, 'claude'),
+      processId: 'proc-1',
+    };
+
+    return {
+      rootDir,
+      channel,
+      controls,
+      readRoot: () => readRoot(rootDir),
+      command: (content: string) =>
+        tryHandleCommand({
+          channel: channel as unknown as CommandContext['channel'],
+          msg: {
+            messageId: `om-${content.replace(/\W+/g, '-').slice(0, 20)}`,
+            chatId: 'oc_test_group',
+            chatType: opts.senderType === 'bot' ? 'group' : 'group',
+            senderId: opts.senderId ?? 'ou-admin',
+            senderName: 'Admin',
+            content,
+            resources: [],
+            mentions: opts.mentionedBot
+              ? [{ openId: 'ou-bot', name: '小C', isBot: true }]
+              : [],
+            mentionedBot: opts.mentionedBot ?? false,
+          } as unknown as NormalizedMessage,
+          scope: 'oc_test_group',
+          chatMode: 'group',
+          sessions,
+          workspaces,
+          agent: new FakeAgentAdapter(),
+          activeRuns: new ActiveRuns(),
+          controls,
+        }),
+    };
+  }
+
+  it('adds current group to ownerNoMentionChats with @bot', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
+
+    const handled = await h.command('/invite owner-default group');
+    expect(handled).toBe(true);
+
+    // Small delay to let async file writes complete
+    await new Promise((r) => setTimeout(r, 200));
+
+    const root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats).toContain('oc_test_group');
+    // allowedChats unchanged
+    expect(root.profiles.claude?.access.allowedChats).toEqual([]);
+    // groupResponseMode unchanged
+    expect(root.profiles.claude?.access.groupResponseMode).toBe('owner-allowlist');
+    // Reply sent
+    const lastContent = JSON.stringify(h.channel.sent.at(-1)?.content);
+    expect(lastContent).toContain('owner');
+  });
+
+  it('removes current group from ownerNoMentionChats with @bot', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
+
+    // First add
+    const added = await h.command('/invite owner-default group');
+    expect(added).toBe(true);
+    await new Promise((r) => setTimeout(r, 100));
+    let root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats).toContain('oc_test_group');
+
+    // Then remove
+    const removed = await h.command('/remove owner-default group');
+    expect(removed).toBe(true);
+    await new Promise((r) => setTimeout(r, 100));
+    root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats).not.toContain('oc_test_group');
+  });
+
+  it('rejects /invite owner-default group without @bot (mentionedBot guard)', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: false });
+
+    const handled = await h.command('/invite owner-default group');
+    expect(handled).toBe(true);
+
+    const root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats).not.toContain('oc_test_group');
+
+    // Should get a response about needing to @ the bot
+    const lastContent = JSON.stringify(h.channel.sent.at(-1)?.content);
+    expect(lastContent).toContain('@');
+  });
+
+  it('rejects /invite owner-default group in p2p before mentionedBot check', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: false });
+    const called = await tryHandleCommand({
+      channel: h.channel as unknown as CommandContext['channel'],
+      msg: {
+        messageId: 'om-p2p-invite',
+        chatId: 'p2p-chat',
+        chatType: 'p2p',
+        senderId: 'ou-admin',
+        senderName: 'Admin',
+        content: '/invite owner-default group',
+        resources: [],
+        mentions: [],
+        mentionedBot: false,
+      } as unknown as NormalizedMessage,
+      scope: 'p2p-chat',
+      chatMode: 'p2p',
+      sessions: new SessionStore(join(h.rootDir, 'profiles', 'claude', 'sessions.json')),
+      workspaces: new WorkspaceStore(join(h.rootDir, 'profiles', 'claude', 'workspaces.json')),
+      agent: new FakeAgentAdapter(),
+      activeRuns: new ActiveRuns(),
+      controls: h.controls,
+    });
+    expect(called).toBe(true);
+    const lastContent = JSON.stringify(h.channel.sent.at(-1)?.content);
+    // Must mention group, not just "please @ bot"
+    expect(lastContent).toContain('群');
+  });
+
+  it('rejects /invite all owner-default group (precise grammar negative)', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
+
+    const handled = await h.command('/invite all owner-default group');
+    expect(handled).toBe(true);
+
+    const root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats).not.toContain('oc_test_group');
+    expect(root.profiles.claude?.access.allowedChats).toEqual([]);
+  });
+
+  it('rejects /invite owner-default group extra (precise grammar negative)', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
+
+    const handled = await h.command('/invite owner-default group extra');
+    expect(handled).toBe(true);
+
+    const root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats).not.toContain('oc_test_group');
+  });
+
+  it('is idempotent for /invite owner-default group', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
+
+    await h.command('/invite owner-default group');
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Second invite — should be idempotent
+    await h.command('/invite owner-default group');
+    await new Promise((r) => setTimeout(r, 100));
+
+    const root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats?.filter((id: string) => id === 'oc_test_group').length).toBe(1);
+  });
+
+  it('allows botAdmin to execute /invite owner-default group', async () => {
+    const h = await createGroupHarness('owner-allowlist', {
+      mentionedBot: true,
+      senderId: 'ou-bot-admin',
+      botAdmins: ['ou-bot-admin'],
+    });
+
+    await h.command('/invite owner-default group');
+    await new Promise((r) => setTimeout(r, 100));
+
+    const root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats).toContain('oc_test_group');
+  });
+
+  it('rejects /invite owner-default group if sender lacks permission', async () => {
+    const h = await createGroupHarness('owner-allowlist', {
+      mentionedBot: true,
+      senderId: 'ou-stranger',
+      admins: ['ou-admin'],
+    });
+
+    const handled = await h.command('/invite owner-default group');
+    expect(handled).toBe(true);
+
+    const root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats).not.toContain('oc_test_group');
+  });
+
+  it('shows non-owner-allowlist mode hint when pre-maintaining list', async () => {
+    const h = await createGroupHarness('mention-only', { mentionedBot: true });
+
+    await h.command('/invite owner-default group');
+    await new Promise((r) => setTimeout(r, 100));
+
+    const root = await h.readRoot();
+    expect(root.profiles.claude?.access.ownerNoMentionChats).toContain('oc_test_group');
+    const lastContent = JSON.stringify(h.channel.sent.at(-1)?.content);
+    expect(lastContent).toContain('切换');
+  });
+
+  it('mentions @bot requirement in usage help', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
+
+    await h.command('/invite');
+
+    const lastContent = JSON.stringify(h.channel.sent.at(-1)?.content);
+    expect(lastContent).toContain('owner-default');
   });
 
   it('saves /account submit into the active v2 profile and profile-local keystore', async () => {

@@ -416,6 +416,7 @@ describe('profile runtime resolver', () => {
       botAdmins: [],
       groupResponseMode: 'all-messages',
       requireMentionInGroup: false,
+      ownerNoMentionChats: [],
     });
     expect(runtime.profileConfig.preferences).toMatchObject({
       messageReply: 'card',
@@ -434,6 +435,7 @@ describe('profile runtime resolver', () => {
       botAdmins: [],
       groupResponseMode: 'all-messages',
       requireMentionInGroup: false,
+      ownerNoMentionChats: [],
     });
     expect(saved.profiles.claude?.preferences).toMatchObject({
       messageReply: 'card',

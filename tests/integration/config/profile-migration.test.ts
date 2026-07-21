@@ -89,6 +89,7 @@ describe('profile v2 migration', () => {
       botAdmins: [],
       groupResponseMode: 'all-messages',
       requireMentionInGroup: false,
+      ownerNoMentionChats: [],
     });
     expect(next.profiles.claude?.preferences).toEqual({ messageReply: 'card' });
     expect(next.profiles.claude?.workspaces).toEqual({});
@@ -418,6 +419,36 @@ describe('profile v2 migration', () => {
       maxAccess: 'full',
     });
     expect(next.profiles.codex).not.toHaveProperty('sandbox');
+  });
+
+  it('normalizes missing ownerNoMentionChats to empty array in migrated v2 config', async () => {
+    const root = await makeRoot();
+    const legacyConfig = {
+      accounts: {
+        app: {
+          id: 'cli_test',
+          secret: '${APP_SECRET}',
+          tenant: 'feishu',
+        },
+      },
+      preferences: {
+        messageReply: 'card',
+        requireMentionInGroup: true,
+        access: {
+          allowedUsers: ['ou_allowed'],
+          allowedChats: ['oc_allowed'],
+          admins: ['ou_admin'],
+        },
+      },
+    };
+    await writeJson(join(root, 'config.json'), legacyConfig);
+
+    const result = await migrateV1ToV2({ rootDir: root, profile: 'claude' });
+
+    expect(result).toEqual({ migrated: true, profile: 'claude' });
+    const next = (await readJson(join(root, 'config.json'))) as RootConfig;
+    // ownerNoMentionChats should default to [] when not present in legacy config
+    expect(next.profiles.claude?.access.ownerNoMentionChats).toEqual([]);
   });
 });
 
