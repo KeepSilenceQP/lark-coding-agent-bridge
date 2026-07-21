@@ -1,7 +1,7 @@
 # Per-Group Owner No-Mention Response Coding Plan
 
 Date: 2026-07-21
-Status: revised after CONDITIONAL Plan Review — awaiting re-review
+Status: revised after R2 Plan Re-review — awaiting re-review
 Authority: `docs/specs/20260721-per-group-owner-no-mention-response.md` (confirmed, commit `c1b148b`)
 Branch: `feat/per-group-response-mode`
 Implementer: 小C
@@ -23,7 +23,10 @@ Plan Reviewer: 小P
   - [P2] 指纹 Gate 自相矛盾 + rollback 过度承诺：新增 JSON key 必然改变 digest；接受一次性 digest 失效，不要求与旧 binary hash 相等；rollback 只保证安全降级 `mention-only`，旧 binary 写配置会丢名单。
   - [P2] 「不提供批量命令」与现有 parser 顺序冲突：`/invite all owner-default group` 会落入旧 `/invite all group` 改 `allowedChats`。→ 新命令精确 grammar，在 legacy all-group 分支前拒绝 `owner-default + all/多余 token`。
   - Open point 裁定：(1) 命令层加 `mentionedBot` 守卫，两条新命令都要求显式 @ 目标 Bot；(2) denied-chat bypass 覆盖 invite 与 remove 两条新命令，仍要求精确匹配、显式 @、`canRunBotAdminCommand`；(3) legacy 无 root 投影必须补 `ownerNoMentionChats`，同时扩 `AppAccess` 和回读测试。
-- **R1 修订（本次）**：按上述裁定重写 DD1/DD2/DD4/DD5/DD7、Execution Units gate 顺序、Rollback、Open Points；Status 置为 awaiting re-review。Plan Writer 不自判 GO。
+- **R1 修订**：按上述裁定重写 DD1/DD2/DD4/DD5/DD7、Execution Units gate 顺序、Rollback、Open Points；Status 置为 awaiting re-review。Plan Writer 不自判 GO。
+- **R2（小P，re-review）**：R1 的 5 项 finding 与 3 项裁定均已闭合；仅剩 1 个 P2：
+  - [P2] p2p 拦截与 mentionedBot 守卫顺序冲突：DD4 原写「!mentionedBot 拒绝 → p2p 拦截」，p2p 消息 `mentionedBot=false` 会先返回「请 @ 当前 Bot」，p2p 的 group-only 错误不可达，违反 Spec「私聊返回明确错误」。→ 新命令按「p2p 拦截 → 群聊 mentionedBot 守卫 → 权限/持久化」排序；p2p 回复「请在目标群中 @ 当前 Bot 执行」，不改名单。Unit 1/4 补 p2p + `mentionedBot=false` 回归断言。
+- **R2 修订（本次）**：最小修订 DD4 流程顺序、Unit 1/4 测试表述与 Review History；其余保持不变。Status 置为 awaiting re-review。Plan Writer 不自判 GO。
 
 ## Current Evidence
 
@@ -99,7 +102,7 @@ Plan Reviewer: 小P
 - **命令层 @ 守卫**：两条命令都要求 `ctx.msg.mentionedBot === true`（显式 @ 当前 Bot）。未 @ 时拒绝执行且**不修改任一名单**，回显「请 @ 当前 Bot 执行该命令」。这覆盖所有四种 mode（`all-messages` / `owner-default` / `owner-allowlist` / `mention-only`）下未 @ 命令到达命令层的情形，并防止多 Bot 同时执行未 @ 的初始化命令。
 - **精确 grammar，在 legacy all-group 分支前拦截**：在 `handleInvite` / `handleRemove` 入口、`tokens.includes('all')` 批量判断**之前**，先检测 `tokens.includes('owner-default')`：
   - 若含 `owner-default`：tokens 必须严格等于 `['owner-default', 'group']`。含 `all`、缺 `group` 或多余 token → 用法错误，拒绝，不改名单。
-  - 严格匹配通过后：`!ctx.msg.mentionedBot` → 拒绝（不改名单）→ p2p 拦截（`chatType==='p2p'` 返回明确错误）→ 权限检查 → 改 `ownerNoMentionChats`。
+  - 严格匹配通过后：p2p 拦截（`chatType==='p2p'` → 回复「请在目标群中 @ 当前 Bot 执行」，不改名单）→ `!ctx.msg.mentionedBot` → 拒绝（不改名单）→ 权限检查 → 改 `ownerNoMentionChats`。p2p 拦截优先于 @ 守卫，保证私聊返回明确的群执行提示而非「请 @ 当前 Bot」。
   - 否则（不含 `owner-default`）→ 走原 `handleInvite`/`handleRemove` 逻辑（`all group` 批量 / `user` / `admin` / `group`）。
   - 这样 `/invite all owner-default group` 不会落入旧 `/invite all group` 改 `allowedChats`。
 - **只改 `ownerNoMentionChats`**，不动 `allowedChats`、不动 `groupResponseMode`。经 `saveAccessConfig` 持久化。
@@ -161,6 +164,7 @@ Add failing coverage for：
 - `ownerNoMentionChats` 缺省归一化为 `[]`；load→save→reload 双字段一致；切到其他模式名单保留、切回恢复。
 - `ownerNoMentionChats` 进 `accessPolicyDigest`：缺字段 `[]` 后稳定、顺序无关、名单增删改变 digest（**不与旧 hash 对比**）。
 - **命令层 @ 守卫**（四种 mode 各测）：`/invite owner-default group` 与 `/remove owner-default group` 在 `mentionedBot=false` 时拒绝且不改任一名单；`mentionedBot=true` 时正常执行。覆盖 `all-messages` / `owner-default` / `owner-allowlist` / `mention-only` 四种 mode 下命令到达命令层的情形。
+- **p2p 优先于 @ 守卫**：`chatType==='p2p'`（必然 `mentionedBot=false`）执行两条新命令 → 返回「请在目标群中 @ 当前 Bot 执行」、不改任一名单；断言不会先返回「请 @ 当前 Bot 执行该命令」。
 - **精确 grammar 负例**：`/invite all owner-default group`、`/invite owner-default user`、`/invite owner-default group extra` → 拒绝、不改 `allowedChats`、不改 `ownerNoMentionChats`。
 - **命令正例**：幂等、回显已在/不在、p2p 拦截、只改 `ownerNoMentionChats`（断言 `allowedChats` 与 `groupResponseMode` 不变）、非 `owner-allowlist` 模式回显「切换后生效」、botAdmin 可执行、人类管理员可执行。
 - **多 Bot 场景**：同群两个 Bot，未 @ 的 `/invite owner-default group` 两个 Bot 都不执行；显式 @ 其中一个时只有被 @ 的 Bot 执行。
@@ -207,7 +211,7 @@ Files：
 - `src/bot/channel.ts`（`shouldBypassDeniedChatForInviteGroup` 正则扩展，覆盖 invite + remove）
 
 Changes：
-- 按 DD4 实现命令族：精确 grammar（all-group 分支前拦截 `owner-default`）、命令层 `mentionedBot` 守卫、幂等、p2p 拦截、只改 `ownerNoMentionChats`、非 owner-allowlist 模式回显提示、权限对齐 `/invite group`、回显指明「本 Bot」。
+- 按 DD4 实现命令族：精确 grammar（all-group 分支前拦截 `owner-default`）、**p2p 拦截 → 命令层 `mentionedBot` 守卫**（此顺序，p2p 优先）、幂等、只改 `ownerNoMentionChats`、非 owner-allowlist 模式回显提示、权限对齐 `/invite group`、回显指明「本 Bot」。
 - 按 DD5 扩 bypass，覆盖两条新命令，保持窄匹配。
 - v1 不加批量命令。
 
