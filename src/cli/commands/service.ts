@@ -523,12 +523,29 @@ export async function runServiceUnregister(opts: ServiceProfileOptions = {}): Pr
  * Helper mode: execute the restart and observe the new bridge. If the new
  * bridge doesn't appear within the timeout, send a failure receipt via the
  * receipt state machine. This is the detached coordinator from DD3.
+ *
+ * Optional `deps` exposes IO boundaries for test injection. In production
+ * all deps default to the real implementations.
  */
 export async function helperRestartAndWait(
   profile: string,
   adapter: ServiceAdapter,
   appPaths: ReturnType<typeof resolveAppPaths>,
+  deps?: {
+    resolveRuntime?: typeof import('../../runtime/profile-runtime').resolveProfileRuntime;
+    readRegistry?: typeof import('../../runtime/registry').readAndPrune;
+    sendFailureReceipt?: typeof sendHelperFailureReceipt;
+    exit?: (code: number) => never;
+    waitTimeoutMs?: number;
+  },
 ): Promise<void> {
+  const resolveRuntime = deps?.resolveRuntime ??
+    (await import('../../runtime/profile-runtime')).resolveProfileRuntime;
+  const readRegistry = deps?.readRegistry ??
+    (await import('../../runtime/registry')).readAndPrune;
+  const sendFailure = deps?.sendFailureReceipt ?? sendHelperFailureReceipt;
+  const doExit = deps?.exit ?? ((code: number) => { process.exit(code); });
+
   // Read pending to get receipt info
   const pending = await readPending(appPaths.profileDir);
   if (!pending) {
@@ -538,14 +555,13 @@ export async function helperRestartAndWait(
   }
 
   // Snapshot running PIDs before restart
-  const { cfg } = await (await import('../../runtime/profile-runtime')).resolveProfileRuntime({
+  const { cfg } = await resolveRuntime({
     profile,
     allowBootstrap: false,
   });
   const appId = cfg.accounts?.app?.id ?? '';
-  const { readAndPrune } = await import('../../runtime/registry');
   const beforePids = new Set(
-    readAndPrune()
+    readRegistry()
       .filter((e) => e.appId === appId && e.profileName === profile)
       .map((e) => e.pid),
   );
@@ -554,7 +570,7 @@ export async function helperRestartAndWait(
   const r = await adapter.restart();
   if (!r.ok) {
     // Service action failure → claim failure + send
-    await sendHelperFailureReceipt(
+    await sendFailure(
       profile,
       appPaths,
       pending.receiptId,
@@ -562,17 +578,17 @@ export async function helperRestartAndWait(
       'service-action-failure',
     );
     console.error(`✗ 重启失败 (service action): ${formatServiceStderr(r.stderr)}`);
-    process.exit(1);
+    doExit(1);
   }
 
   // Wait for new bridge to register
   console.log('正在等待新 bot 连接...');
-  const timeoutMs = 30_000;
+  const timeoutMs = deps?.waitTimeoutMs ?? 30_000;
   const deadline = Date.now() + timeoutMs;
-  let newEntry: Awaited<ReturnType<typeof import('../../runtime/registry').readAndPrune>>[number] | undefined;
+  let newEntry: ReturnType<typeof readRegistry>[number] | undefined;
 
   while (Date.now() < deadline) {
-    const live = readAndPrune();
+    const live = readRegistry();
     newEntry = live.find(
       (e) =>
         e.appId === appId &&
@@ -590,11 +606,13 @@ export async function helperRestartAndWait(
     return;
   }
 
-  // Final short复查: check one more time with a shorter window
+  // Final short复查: check one more time with a shorter window.
+  // Scaled proportionally to the main timeout; floor 0 for test injection.
+  const finalWindowMs = timeoutMs === 0 ? 0 : Math.min(5_000, Math.max(500, Math.floor(timeoutMs / 6)));
   console.log('⚠ 30 秒内未观察到新 bot 连接，进行最终复查...');
-  const finalDeadline = Date.now() + 5_000;
+  const finalDeadline = Date.now() + finalWindowMs;
   while (Date.now() < finalDeadline) {
-    const live = readAndPrune();
+    const live = readRegistry();
     newEntry = live.find(
       (e) =>
         e.appId === appId &&
@@ -610,7 +628,7 @@ export async function helperRestartAndWait(
   }
 
   // Still no new bridge → send failure receipt
-  await sendHelperFailureReceipt(
+  await sendFailure(
     profile,
     appPaths,
     pending.receiptId,
@@ -618,7 +636,7 @@ export async function helperRestartAndWait(
     'startup-timeout',
   );
   console.error('✗ 重启失败 (startup-timeout): 新 bot 未在超时时间内连接。');
-  process.exit(1);
+  doExit(1);
 }
 
 /**

@@ -46,33 +46,51 @@ interface LarkApiResponse {
 export async function sendRestartReceipt(
   params: ReceiptSendParams,
 ): Promise<ReceiptSendResult> {
-  const { cfg, appPaths } = await resolveProfileRuntime({
-    profile: params.profile,
-    allowBootstrap: false,
-  });
-  const domain =
-    cfg.accounts.app.tenant === 'lark'
-      ? 'https://open.larksuite.com'
-      : 'https://open.feishu.cn';
+  // Resolve credentials deterministically from profile. Any deterministic
+  // failure here (config, secret, token) must return {ok:false} so callers
+  // can write terminal(delivery-failed). We must not throw past claim+attempt
+  // creation — that would strand the receipt in an unrecoverable state.
+  let domain: string;
+  let token: string;
+  let body: string;
+  try {
+    const { cfg, appPaths } = await resolveProfileRuntime({
+      profile: params.profile,
+      allowBootstrap: false,
+    });
+    domain =
+      cfg.accounts.app.tenant === 'lark'
+        ? 'https://open.larksuite.com'
+        : 'https://open.feishu.cn';
 
-  const appSecret = await resolveAppSecret(cfg, {
-    secretsFile: appPaths.secretsFile,
-    keystoreSaltFile: appPaths.keystoreSaltFile,
-  });
+    const appSecret = await resolveAppSecret(cfg, {
+      secretsFile: appPaths.secretsFile,
+      keystoreSaltFile: appPaths.keystoreSaltFile,
+    });
 
-  // Get a short-lived tenant access token for this send session.
-  const token = await getTenantAccessToken(
-    domain,
-    cfg.accounts.app.id,
-    appSecret,
-  );
-  if (!token) {
-    log.warn('receipt', 'token-failed', { receiptId: params.receiptId });
+    const t = await getTenantAccessToken(
+      domain,
+      cfg.accounts.app.id,
+      appSecret,
+    );
+    if (!t) {
+      log.warn('receipt', 'token-failed', { receiptId: params.receiptId });
+      return { ok: false };
+    }
+    token = t;
+    body = buildReceiptRequestBody(params);
+  } catch (err) {
+    log.warn('receipt', 'setup-failed', {
+      receiptId: params.receiptId,
+      kind: params.kind,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return { ok: false };
   }
 
-  const body = buildReceiptRequestBody(params);
-
+  // Bounded retry loop for the actual send. Only truly transient errors
+  // (network, HTTP 5xx) are retried. Deterministic API errors (4xx, bad
+  // content) break immediately.
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
