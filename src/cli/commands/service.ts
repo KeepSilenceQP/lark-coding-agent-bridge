@@ -38,7 +38,6 @@ import {
   returnRouteFromLease,
 } from '../../runtime/route-lease';
 import { sendRestartReceipt } from '../../runtime/restart-receipt-sender';
-import { isAlive } from '../../runtime/registry';
 
 export interface ServiceStartOptions {
   profile?: string;
@@ -415,7 +414,7 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
       const pendingCreated = await createPending(appPaths.profileDir, {
         receiptId,
         profile,
-        oldPid: process.pid,
+        oldPid: bridgePid,
         requestedAt: new Date().toISOString(),
         returnRoute,
       });
@@ -525,7 +524,7 @@ export async function runServiceUnregister(opts: ServiceProfileOptions = {}): Pr
  * bridge doesn't appear within the timeout, send a failure receipt via the
  * receipt state machine. This is the detached coordinator from DD3.
  */
-async function helperRestartAndWait(
+export async function helperRestartAndWait(
   profile: string,
   adapter: ServiceAdapter,
   appPaths: ReturnType<typeof resolveAppPaths>,
@@ -536,14 +535,6 @@ async function helperRestartAndWait(
     // No pending receipt — fall back to old restart behavior
     await reportConnectAfter('restarted', profile, adapter.restart);
     return;
-  }
-
-  // Verify oldPid — only handle if the requesting bridge is the one that
-  // launched this helper.
-  if (pending.oldPid !== process.pid && isAlive(pending.oldPid)) {
-    // Old bridge still alive — shouldn't happen in drain flow, skip
-    console.error('✗ 旧 bridge 进程仍在运行，无法安全重启。');
-    process.exit(1);
   }
 
   // Snapshot running PIDs before restart
@@ -634,7 +625,7 @@ async function helperRestartAndWait(
  * Send a failure receipt from the helper. Uses the receipt state machine
  * to ensure exactly-once delivery.
  */
-async function sendHelperFailureReceipt(
+export async function sendHelperFailureReceipt(
   profile: string,
   appPaths: ReturnType<typeof resolveAppPaths>,
   receiptId: string,

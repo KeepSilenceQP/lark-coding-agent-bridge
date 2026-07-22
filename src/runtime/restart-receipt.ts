@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { link, open } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -89,7 +89,7 @@ export async function primitiveA(
   content: object,
 ): Promise<boolean> {
   await mkdir(join(target, '..'), { recursive: true });
-  const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  const temp = `${target}.${process.pid}.${Date.now()}.${randomBytes(4).toString('hex')}.tmp`;
   try {
     await writeFile(temp, `${JSON.stringify(content)}\n`, 'utf8');
     await link(temp, target);
@@ -335,6 +335,45 @@ export function makeClaimUuid(receiptId: string, kind: ReceiptKind): string {
   // Use a simple hash prefix + kind to ensure same uuid for same receipt.
   // This allows Feishu dedup on resend.
   return `${receiptId}-${kind}-v1`;
+}
+
+// ── Orphan cleanup ─────────────────────────────────────────────────────
+
+/**
+ * Remove orphan .tmp files from the receipt directory that are older than
+ * the given TTL. These are left behind when primitiveA crashes between
+ * writeFile and link/unlink. Called on bridge startup.
+ */
+export async function cleanupOrphanTemps(
+  profileDir: string,
+  maxAgeMs = 60_000,
+): Promise<number> {
+  const dir = receiptDir(profileDir);
+  let cleaned = 0;
+  let entries: { name: string }[];
+  try {
+    entries = await (await import('node:fs/promises')).readdir(dir, { withFileTypes: true })
+      .then((items) => items.filter((d) => d.isFile()).map((d) => ({ name: d.name })));
+  } catch {
+    return 0;
+  }
+  const now = Date.now();
+  for (const { name } of entries) {
+    if (!name.endsWith('.tmp')) continue;
+    const filePath = join(dir, name);
+    try {
+      const stat = await (await import('node:fs/promises')).stat(filePath);
+      if (now - stat.mtimeMs > maxAgeMs) {
+        await unlink(filePath);
+        cleaned++;
+      }
+    } catch {
+      // Corrupt/inaccessible — try to remove
+      await unlink(filePath).catch(() => {});
+      cleaned++;
+    }
+  }
+  return cleaned;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────

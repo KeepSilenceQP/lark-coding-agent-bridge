@@ -58,6 +58,7 @@ import {
 import {
   createRouteLease,
   deleteRouteLease,
+  cleanupExpiredLeases,
   routeLeaseDir,
 } from '../runtime/route-lease';
 import {
@@ -72,7 +73,9 @@ import {
   createTerminal,
   readTerminal,
   cleanupReceiptArtifacts,
+  cleanupOrphanTemps,
   scanReceipts,
+  quarantineStalePending,
   makeReceiptId,
   makeClaimUuid,
   receiptDir,
@@ -1050,9 +1053,22 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   });
   console.log('正在监听消息。按 Ctrl+C 退出。\n');
 
-  // ── New bridge: send success receipt for pending restart ──────────
+  // ── New bridge: lifecycle cleanup + receipt handling ──────────────
   const profileDir = deps.appPaths?.profileDir;
   if (profileDir) {
+    // Clean up orphan .tmp files from interrupted primitives.
+    await cleanupOrphanTemps(profileDir).catch((err) =>
+      log.fail('receipt', err, { step: 'cleanup-temps' }),
+    );
+    // Remove expired route leases.
+    await cleanupExpiredLeases(profileDir).catch((err) =>
+      log.fail('route-lease', err, { step: 'cleanup-leases' }),
+    );
+    // Quarantine stale pending (oldPid dead + request too old).
+    await handleStalePendingQuarantine(controls.profile, profileDir).catch((err) =>
+      log.fail('receipt', err, { step: 'stale-pending-quarantine' }),
+    );
+    // Send success receipt for a pending restart.
     await handleNewBridgePendingReceipt(channel, controls.profile, profileDir).catch((err) =>
       log.fail('receipt', err, { step: 'new-bridge-success-receipt' }),
     );
@@ -2963,11 +2979,36 @@ function isDefined<T>(value: T | undefined): value is T {
   return value !== undefined;
 }
 
+// ── Stale pending quarantine ──────────────────────────────────────────
+
+const STALE_PENDING_MAX_AGE_MS = 30 * 60 * 1000; // 30 min — quarantine after
+
+export async function handleStalePendingQuarantine(
+  profile: string,
+  profileDir: string,
+): Promise<void> {
+  const pending = await readPending(profileDir);
+  if (!pending) return;
+
+  const age = Date.now() - new Date(pending.requestedAt).getTime();
+  if (age < STALE_PENDING_MAX_AGE_MS) return;
+
+  // Only quarantine if the requesting bridge is confirmed dead.
+  if (isAlive(pending.oldPid)) return;
+
+  await quarantineStalePending(profileDir, pending.receiptId);
+  log.info('receipt', 'stale-pending-quarantined', {
+    receiptId: pending.receiptId,
+    ageMs: age,
+    oldPid: pending.oldPid,
+  });
+}
+
 // ── New bridge: pending receipt handler ──────────────────────────────
 
 const ATTEMPT_LEASE_TTL_MS = 120_000; // 2 min — attempt lease validity
 
-async function handleNewBridgePendingReceipt(
+export async function handleNewBridgePendingReceipt(
   channel: LarkChannel,
   profile: string,
   profileDir: string,
@@ -3082,7 +3123,7 @@ async function handleNewBridgePendingReceipt(
 
 // ── Recovery: scan claim.* without terminal, attempt takeover ─────────
 
-async function handleReceiptRecovery(
+export async function handleReceiptRecovery(
   channel: LarkChannel,
   profile: string,
   profileDir: string,
