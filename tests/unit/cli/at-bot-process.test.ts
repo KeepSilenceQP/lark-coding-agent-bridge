@@ -360,36 +360,34 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
       const hb = spawn(process.execPath, ['-e',
         'var p=String(process.pid);process.stderr.write("CHILD:"+p+"\\n");setInterval(function(){process.stderr.write(".")},50)'
       ], { stdio: ['ignore', 'ignore', 'inherit'] });
+      // Synchronous: write both PIDs immediately after spawn returns.
       writeFileSync(require('path').join(pd, 'wrapper.pid'), String(process.pid));
+      writeFileSync(require('path').join(pd, 'child.pid'), String(hb.pid));
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
-      var iv = setInterval(function() {
-        if (hb.pid) {
-          writeFileSync(require('path').join(pd, 'child.pid'), String(hb.pid));
-          process.stdout.write('CHILD:' + hb.pid + '\\n');
-          clearInterval(iv);
-        }
-      }, 10);
+      process.stdout.write('CHILD:' + hb.pid + '\\n');
       setInterval(function() { process.stdout.write('w'); }, 200);
     `);
 
-    let wp = 0, cp = 0, r: any = null;
+    let wp = 0, cp = 0, wpDead = false, cpDead = false, r: any = null;
     try {
       r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 4000, maxOutputBytes: 64_000 });
+    } finally {
       wp = fix.readPid('wrapper.pid');
       cp = fix.readPid('child.pid');
-    } finally {
-      if (wp > 0) winTreeKill(wp);
-      if (cp > 0) winTreeKill(cp);
-      await new Promise((res) => setTimeout(res, 200));
-      if (wp > 0) expect(pidDead(wp)).toBe(true);
-      if (cp > 0) expect(pidDead(cp)).toBe(true);
-      await fix.cleanup();
+      try {
+        if (wp > 0) { winTreeKill(wp); await new Promise((res) => setTimeout(res, 200)); wpDead = pidDead(wp); }
+        if (cp > 0) { winTreeKill(cp); await new Promise((res) => setTimeout(res, 200)); cpDead = pidDead(cp); }
+      } finally {
+        await fix.cleanup();
+      }
     }
     expect(r).toBeTruthy();
     expect(r.settled).toBe('timeout');
     expect(wp).toBeGreaterThan(0);
     expect(cp).toBeGreaterThan(0);
     expect(r.stderr).toContain('.');
+    expect(wpDead).toBe(true);
+    expect(cpDead).toBe(true);
   }, 20000);
 
   // ── early-exit ──
@@ -400,35 +398,34 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
       const { writeFileSync } = require('fs');
       const pd = ${JSON.stringify(tmpDir)};
       const hb = spawn(process.execPath, ['-e',
-        'var fs=require("fs"),p=String(process.pid);' +
-        'fs.writeFileSync("' + tmpDir.replace(/\\\\/g, '\\\\\\\\') + '/child.pid",p);' +
-        'process.stderr.write("CHILD:"+p+"\\n");' +
-        'setInterval(function(){process.stderr.write(".")},50)'
+        'var p=String(process.pid);process.stderr.write("CHILD:"+p+"\\n");setInterval(function(){process.stderr.write(".")},50)'
       ], { stdio: ['ignore', 'ignore', 'inherit'] });
+      // Synchronous: write both PIDs immediately after spawn returns.
       writeFileSync(require('path').join(pd, 'wrapper.pid'), String(process.pid));
+      writeFileSync(require('path').join(pd, 'child.pid'), String(hb.pid));
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
-      var iv = setInterval(function() {
-        if (hb.pid) { process.stdout.write('CHILD:' + hb.pid + '\\n'); clearInterval(iv); }
-      }, 10);
+      process.stdout.write('CHILD:' + hb.pid + '\\n');
+      // Exit only after child PID is on disk — child holds pipe.
       setTimeout(function() { process.exit(0); }, 60);
     `);
 
-    let wp = 0, cp = 0, r: any = null;
+    let wp = 0, cp = 0, wpDead = false, cpDead = false, r: any = null;
     try {
       r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 3500, maxOutputBytes: 64_000 });
+    } finally {
       wp = fix.readPid('wrapper.pid');
       cp = fix.readPid('child.pid');
-    } finally {
-      if (wp > 0) winTreeKill(wp);
-      if (cp > 0) winTreeKill(cp);
-      await new Promise((res) => setTimeout(res, 200));
-      if (wp > 0) expect(pidDead(wp)).toBe(true);
-      if (cp > 0) expect(pidDead(cp)).toBe(true);
-      await fix.cleanup();
+      try {
+        if (wp > 0) { winTreeKill(wp); await new Promise((res) => setTimeout(res, 200)); wpDead = pidDead(wp); }
+        if (cp > 0) { winTreeKill(cp); await new Promise((res) => setTimeout(res, 200)); cpDead = pidDead(cp); }
+      } finally {
+        await fix.cleanup();
+      }
     }
     expect(r).toBeTruthy();
     expect(r.settled).toBe('termination-unconfirmed');
     expect(wp).toBeGreaterThan(0);
     expect(cp).toBeGreaterThan(0);
+    expect(cpDead).toBe(true);
   }, 15000);
 });
