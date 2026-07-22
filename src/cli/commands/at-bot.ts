@@ -11,6 +11,7 @@
 import { platform } from 'node:os';
 import {
   runBoundedProcess,
+  type BoundedProcessDeps,
 } from './at-bot-process';
 
 // ── public types ──
@@ -114,10 +115,12 @@ function scanForUnbound(...sources: string[]): string | undefined {
   return undefined;
 }
 
-// ── strict envelope validation (shared by discovery + send) ──
+// ── strict envelope validation ──
 
-function requireNonzeroExit(result: { exitCode: number | null }, category: string, invalidCategory: string): void {
-  if (result.exitCode !== null && result.exitCode !== 0) {
+/** Require exitCode === 0 for a normal exit. exitCode === null is NOT success. */
+function requireZeroExit(result: { exitCode: number | null; settled: string }, category: string): void {
+  if (result.settled !== 'exit') return; // non-exit settled already handled by caller
+  if (result.exitCode !== 0) {
     throw makeError(category, formatError(category));
   }
 }
@@ -160,13 +163,16 @@ function parseNestedApiCode(parsed: LarkCliEnvelope): number | undefined {
 }
 
 function parseEnvelopeJSON(stdout: string, invalidCategory: string): LarkCliEnvelope {
-  let parsed: LarkCliEnvelope;
+  let raw: unknown;
   try {
-    parsed = JSON.parse(stdout) as LarkCliEnvelope;
+    raw = JSON.parse(stdout);
   } catch {
     throw makeError(invalidCategory, formatError(invalidCategory));
   }
-  return parsed;
+  if (raw === null || typeof raw !== 'object') {
+    throw makeError(invalidCategory, formatError(invalidCategory));
+  }
+  return raw as LarkCliEnvelope;
 }
 
 // ── validation ──
@@ -176,10 +182,11 @@ function validateArgs(opts: AtBotOptions): void {
   if (env.LARK_CHANNEL !== '1') {
     throw makeError('at-bot/context-missing', formatError('at-bot/context-missing'));
   }
-  if (!opts.chatId || !opts.chatId.startsWith('oc_')) {
+  // Must start with oc_ / ou_ and have at least one char after the prefix.
+  if (!opts.chatId || !/^oc_.+$/.test(opts.chatId)) {
     throw makeError('at-bot/invalid-argument', formatError('at-bot/invalid-argument'));
   }
-  if (!opts.botId || !opts.botId.startsWith('ou_')) {
+  if (!opts.botId || !/^ou_.+$/.test(opts.botId)) {
     throw makeError('at-bot/invalid-argument', formatError('at-bot/invalid-argument'));
   }
   if (!opts.message || !opts.message.trim()) {
@@ -233,20 +240,26 @@ async function discoverBots(
     throw makeError('at-bot/termination-unconfirmed', formatError('at-bot/termination-unconfirmed'));
   }
 
-  // On normal exit, check the subprocess exit code.
-  requireNonzeroExit(result, 'at-bot/discovery-invalid', 'at-bot/discovery-invalid');
+  // Normal success requires exitCode === 0.
+  requireZeroExit(result, 'at-bot/discovery-invalid');
 
   const parsed = parseEnvelopeJSON(result.stdout, 'at-bot/discovery-invalid');
   validateEnvelopeOk(parsed, 'at-bot/discovery-invalid');
   validateEnvelopeIdentity(parsed, 'at-bot/discovery-invalid');
   validateEnvelopeCode(parsed, 'at-bot/discovery-invalid');
 
-  const data = parsed.data as { items?: BotListItem[] } | undefined;
+  const data = parsed.data as { items?: unknown[] } | undefined;
   if (!data || !Array.isArray(data.items)) {
     throw makeError('at-bot/discovery-invalid', formatError('at-bot/discovery-invalid'));
   }
 
-  return data.items.map(validateBotItem);
+  // Guard null / non-object items so validateBotItem never hits TypeError.
+  return data.items.map((item, idx) => {
+    if (item === null || typeof item !== 'object') {
+      throw makeError('at-bot/discovery-invalid', formatError('at-bot/discovery-invalid'));
+    }
+    return validateBotItem(item as BotListItem);
+  });
 }
 
 // ── target validation ──
@@ -318,7 +331,7 @@ async function sendMessage(
     throw makeError('at-bot/termination-unconfirmed', formatError('at-bot/termination-unconfirmed'));
   }
 
-  requireNonzeroExit(result, 'at-bot/send-invalid', 'at-bot/send-invalid');
+  requireZeroExit(result, 'at-bot/send-invalid');
 
   const parsed = parseEnvelopeJSON(result.stdout, 'at-bot/send-invalid');
 
