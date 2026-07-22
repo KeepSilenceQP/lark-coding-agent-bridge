@@ -217,7 +217,14 @@ export function runBoundedProcess(
 
     child.on('close', () => {
       if (!cause) {
-        settle('exit');
+        // On Windows, when the wrapper exited before close (hasPid false),
+        // the PID is extinct and taskkill cannot tree-discover orphans.
+        // Must fail-closed rather than reporting a clean exit.
+        if (isWindows && !hasPid) {
+          settle('termination-unconfirmed');
+        } else {
+          settle('exit');
+        }
       } else {
         settle(cause);
       }

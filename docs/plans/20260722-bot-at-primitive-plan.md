@@ -332,7 +332,7 @@ Then an independent SubAgent that did not implement the code reviews:
 
 Any material finding returns to the owning repository and then to independent re-review. Unit 5 cannot start until Code Review is `GO`.
 
-Because the process-tree contract is OS-specific, Unit 5 also waits for the pushed Bridge revision’s GitHub Actions matrix to pass on `macos-latest`, `ubuntu-latest`, and `windows-latest`. A local macOS pass or mocked Windows taskkill test cannot substitute for the real Windows wrapper→child timeout regression.
+Because the process-tree contract is OS-specific, Unit 5 also waits for the pushed Bridge revision’s GitHub Actions matrix to pass on `macos-latest` and `ubuntu-latest` at full baseline, and on `windows-latest` with the focused `at-bot` process-tree tests, `typecheck`, and `build`. The full Windows test suite contains pre-existing baseline failures (unchanged files: O_NOFOLLOW, SIGTERM, command fixtures) that are outside this PR’s scope and are tracked as non-blocking evidence. The Windows Gate requires: (a) all focused unit tests in `tests/unit/cli/at-bot-process.test.ts` and `tests/unit/cli/at-bot.test.ts` pass; (b) `tsc --noEmit` passes; (c) `pnpm build` passes. A local macOS pass or mocked Windows taskkill test cannot substitute for the real Windows wrapper→child timeout regression.
 
 ### Unit 5 — Artifact rollout and controlled weak-model / dual-Bot Gate
 

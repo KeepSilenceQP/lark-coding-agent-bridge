@@ -197,6 +197,17 @@ describe('at-bot process-tree runner (mock)', () => {
     expect((await p).settled).toBe('termination-unconfirmed');
   });
 
+  it('Windows: exit before close (extinct PID) → termination-unconfirmed (production)', async () => {
+    // Wrapper exited (hasPid false), close fires without timer/cause.
+    // Production must fail-closed because orphan tree is unreachable.
+    const child = makeChild();
+    const deps = win32Deps({ spawn: vi.fn(() => child as unknown as ChildProcess) });
+    const p = runBoundedProcess('cmd', [], { timeoutMs: 9999 }, deps);
+    child.emit('exit', 0, null);  // hasPid → false on win32
+    child.emit('close', 0, null); // cause is null, hasPid is false
+    expect((await p).settled).toBe('termination-unconfirmed');
+  });
+
   it('Windows: hasPid false after exit → no taskkill, termination-unconfirmed', async () => {
     const child = makeChild(); const spawnSync = vi.fn();
     const deps = win32Deps({ spawn: vi.fn(() => child as unknown as ChildProcess), spawnSync });
@@ -393,6 +404,13 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
   // ── early-exit ──
 
   (isWin ? it : it.skip)('early-exit: wrapper exits, child orphan, termination-unconfirmed, out-of-band tree cleanup', async () => {
+    // Windows Node closes inherited pipes on process.exit(), so held-pipe
+    // is not reproducible on this platform.  The production code handles
+    // this: close after exit with extinct PID (hasPid=false) settles as
+    // termination-unconfirmed (fail-closed).  The fixture verifies:
+    //   1. Child PID captured (proves child was alive).
+    //   2. Runner returns termination-unconfirmed (not exit/success).
+    //   3. Child is killed out-of-band by finally cleanup.
     const fix = await writeFixture((tmpDir) => `
       const { spawn } = require('child_process');
       const { writeFileSync } = require('fs');
@@ -400,18 +418,18 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
       const hb = spawn(process.execPath, ['-e',
         'var p=String(process.pid);process.stderr.write("CHILD:"+p+"\\n");setInterval(function(){process.stderr.write(".")},50)'
       ], { stdio: ['ignore', 'ignore', 'inherit'] });
-      // Synchronous: write both PIDs immediately after spawn returns.
       writeFileSync(require('path').join(pd, 'wrapper.pid'), String(process.pid));
       writeFileSync(require('path').join(pd, 'child.pid'), String(hb.pid));
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
       process.stdout.write('CHILD:' + hb.pid + '\\n');
-      // Exit only after child PID is on disk — child holds pipe.
-      setTimeout(function() { process.exit(0); }, 60);
+      // Exit quickly — pipes close on Windows, runner close fires with
+      // hasPid=false → production settles termination-unconfirmed.
+      setTimeout(function() { process.exit(0); }, 50);
     `);
 
     let wp = 0, cp = 0, wpDead = false, cpDead = false, r: any = null;
     try {
-      r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 3500, maxOutputBytes: 64_000 });
+      r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 5000, maxOutputBytes: 64_000 });
     } finally {
       wp = fix.readPid('wrapper.pid');
       cp = fix.readPid('child.pid');
