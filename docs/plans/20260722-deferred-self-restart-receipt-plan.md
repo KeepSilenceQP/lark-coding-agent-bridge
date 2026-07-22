@@ -1,7 +1,7 @@
 # Deferred Self-Restart And Post-Restart Receipt Coding Plan
 
 Date: 2026-07-22
-Status: Independent Code Review GO — Unit 6 live verification in progress
+Status: Unit 6 runtime PASS — narrow test-isolation re-review pending
 Authority: `docs/specs/20260722-deferred-self-restart-receipt.md` (confirmed by Qin Peng, commit `b906c8b`)
 Branch: `fix/lark-bridge-followup`
 Implementer: 小C
@@ -37,6 +37,8 @@ Plan Reviewer: 小P
 - **Independent Code Review（云上C总，head `6b111dd`，conditional GO）**：核心 DD1-DD7、端到端接线与 targeted 114/114 通过，无 P1；Unit 6 前须关闭两个 P2：（1）`handleReceiptRecovery` 完成后未按 receiptId 删除 crash-window 残留 pending，可能让后续 restart EEXIST 最长 30 分钟，且现有 crash test 只手工删 pending、未跑生产 recovery；（2）`makeClaimUuid` 不是 RFC 4122 UUID，飞书 reply 端点虽支持 uuid 幂等，但当前格式未证明可被服务端接受。Code Review Gate 暂不勾选；已退回小C补生产 recovery 集成测试、verified pending cleanup 与 deterministic RFC 4122 UUID。
 - **P2 rework（小C，`827ffc5` + `5068c0e`）**：生产 `handleReceiptRecovery` 已在 terminal-existing、existing-claim 和 post-terminal 路径按 receiptId 清 pending；claim UUID 改为确定性 RFC 4122 UUIDv5，sender 补 429 有界重试。测试直接调用真实 recovery handler（仅注入 sender），覆盖 crash-window pending+claim+stale attempt → 同 kind/UUID 发送 → terminal(messageId) → 全残留清理，以及 terminal 已存在时不重复发送；另以真实 `runServiceRestart` 覆盖 EEXIST 时 lease 不丢、首个 pending 保留。Coordinator 在 head `5068c0e` 复验：8 files / 123 tests PASS，`pnpm typecheck` PASS，`pnpm build` PASS，`git diff --check b906c8b..HEAD` PASS。现提交同一精确 head 给云上C总独立复审，复审 GO 前 Code Review Gate 仍不勾选、不进入 Unit 6。
 - **Independent Code Re-review（云上C总，head `3645e27`，unconditional GO）**：在独立 Devbox worktree 确认两个 P2 均关闭；真实 `handleReceiptRecovery` 测试覆盖 crash-window 与 terminal-existing 清理，RFC 4122 UUIDv5 确定且重试稳定，真实 `runServiceRestart` EEXIST 保留 lease/首个 pending。独立 targeted 8 files / 123 tests PASS，`pnpm typecheck` PASS，`git diff --check b906c8b..HEAD` PASS；无新 P1/P2。Coordinator 同 head 全量为 976 PASS / 1 FAIL / 3 SKIP，唯一失败仍是 `codex-turn-state-probe` 临时文件竞态，单独重跑 1/1 PASS，记录为非功能路径的已知 process-test 波动。
+- **Unit 6 production success（小P，artifact `8b746ab`，PASS）**：兼容 bootstrap 先将旧进程 `90022` 切到新 artifact PID `76727`；随后由真实 per-run route lease 发起 receipt `restart-0f5c965e-e823-4a6c-b41a-69396abe0c62`。飞书回读顺序为触发消息 `om_x100b6939866bb4a0ddbc8b614399e63` → 最终回复 `om_x100b693986356ca0b4af0219a817898` → success receipt `om_x100b693985f064a0b14bc34d3a64152`；新 PID `85140`，旧 PID `76727` 已死亡。单一 terminal 为 `kind=success,outcome=completed` 且 messageId 与飞书回读一致，pending/claim/attempt 全清。生产 Bot 未构造 failure。
+- **Unit 6 isolated failure/rollback evidence（小P，PASS with safe fixture substitute）**：按 Plan 的非生产隔离边界，不破坏生产 launchd/service，也不复用生产 return route 构造失败消息；以 production-seam mock adapter 覆盖 service-action-failure、startup-timeout、deterministic sender failure→terminal(delivery-failed)、old marker compatibility 与状态清理。5 files / 92 tests PASS，`pnpm typecheck` PASS，`git diff --check` PASS。真实 Bridge 注入 `LARK_CHANNEL_ROUTE_ID` 暴露旧 marker 兼容测试的 env 隔离缺口；`5df6827` 仅在该测试保存/清空/恢复 routeId，当前 bridge-bound 环境复验通过。该 test-only follow-up 需云上C总窄复审后才将 Unit 6 checkbox 最终勾选。
 
 ## Current Evidence
 
