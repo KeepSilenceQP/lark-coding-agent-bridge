@@ -1,7 +1,7 @@
 # Deferred Self-Restart And Post-Restart Receipt Coding Plan
 
 Date: 2026-07-22
-Status: Independent Code Review conditional GO — P2 rework before Unit 6
+Status: P2 rework verified by Coordinator — awaiting independent re-review before Unit 6
 Authority: `docs/specs/20260722-deferred-self-restart-receipt.md` (confirmed by Qin Peng, commit `b906c8b`)
 Branch: `fix/lark-bridge-followup`
 Implementer: 小C
@@ -35,6 +35,7 @@ Plan Reviewer: 小P
 - **Implementation handoff（小C，`7a992ff`，返修中）**：Unit 1-5 首版已提交并报告全量测试/typecheck/build/diff-check 通过；Coordinator 检查发现 receipt sender 虽生成稳定 UUID，但通过不支持 UUID 的 `channel.send` 发送，UUID 未进入飞书 create/reply 请求，不能满足 DD5 exactly-once；同时 README.md/README.zh.md 未按 Unit 5 更新。已退回小C补齐真实 UUID API 传递、出站请求断言/同 UUID 重试测试及文档，修复完成前不勾选 Unit 1-5、不进入独立 Code Review。
 - **Implementation rework complete（小C，`bab1ea1` + `f5545a4` + `2857005` + `22cbf21`）**：真实 REST reply UUID、topic `reply_in_thread`、缺失 messageId 协议错误、Bridge PID 写入、helper 旧进程语义、temp 唯一性、startup lifecycle cleanup、确定性凭据/token 失败收敛及可注入 production seams 已补齐；README 双语文档已更新。Coordinator targeted verification：8 files / 114 tests PASS，`pnpm typecheck` PASS，`pnpm build` PASS，`git diff --check` PASS。全量：967 PASS / 1 FAIL / 3 SKIP；唯一失败 `tests/process/codex-turn-state-probe.test.ts` 在当前长路径 worktree 复现，但同一 `22cbf21` 隔离临时 worktree PASS，记录为独立评审需知的路径/进程退出竞态，不作为本功能 GO 证据。
 - **Independent Code Review（云上C总，head `6b111dd`，conditional GO）**：核心 DD1-DD7、端到端接线与 targeted 114/114 通过，无 P1；Unit 6 前须关闭两个 P2：（1）`handleReceiptRecovery` 完成后未按 receiptId 删除 crash-window 残留 pending，可能让后续 restart EEXIST 最长 30 分钟，且现有 crash test 只手工删 pending、未跑生产 recovery；（2）`makeClaimUuid` 不是 RFC 4122 UUID，飞书 reply 端点虽支持 uuid 幂等，但当前格式未证明可被服务端接受。Code Review Gate 暂不勾选；已退回小C补生产 recovery 集成测试、verified pending cleanup 与 deterministic RFC 4122 UUID。
+- **P2 rework（小C，`827ffc5` + `5068c0e`）**：生产 `handleReceiptRecovery` 已在 terminal-existing、existing-claim 和 post-terminal 路径按 receiptId 清 pending；claim UUID 改为确定性 RFC 4122 UUIDv5，sender 补 429 有界重试。测试直接调用真实 recovery handler（仅注入 sender），覆盖 crash-window pending+claim+stale attempt → 同 kind/UUID 发送 → terminal(messageId) → 全残留清理，以及 terminal 已存在时不重复发送；另以真实 `runServiceRestart` 覆盖 EEXIST 时 lease 不丢、首个 pending 保留。Coordinator 在 head `5068c0e` 复验：8 files / 123 tests PASS，`pnpm typecheck` PASS，`pnpm build` PASS，`git diff --check b906c8b..HEAD` PASS。现提交同一精确 head 给云上C总独立复审，复审 GO 前 Code Review Gate 仍不勾选、不进入 Unit 6。
 
 ## Current Evidence
 
