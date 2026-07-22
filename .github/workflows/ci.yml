@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# Cancel duplicate runs from simultaneous push+PR events.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Node 20 on ${{ matrix.os }}

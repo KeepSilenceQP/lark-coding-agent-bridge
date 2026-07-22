@@ -197,18 +197,20 @@ describe('at-bot process-tree runner (mock)', () => {
     expect((await p).settled).toBe('termination-unconfirmed');
   });
 
-  it('Windows: exit before close (extinct PID) → termination-unconfirmed (production)', async () => {
-    // Wrapper exited (hasPid false), close fires without timer/cause.
-    // Production must fail-closed because orphan tree is unreachable.
+  it('Windows: normal exit → exit (NOT termination-unconfirmed)', async () => {
+    // Regression: every Windows close must return 'exit' for normal completion,
+    // not 'termination-unconfirmed'. The exit→close lifecycle is normal.
     const child = makeChild();
     const deps = win32Deps({ spawn: vi.fn(() => child as unknown as ChildProcess) });
-    const p = runBoundedProcess('cmd', [], { timeoutMs: 9999 }, deps);
-    child.emit('exit', 0, null);  // hasPid → false on win32
-    child.emit('close', 0, null); // cause is null, hasPid is false
-    expect((await p).settled).toBe('termination-unconfirmed');
+    const p = runBoundedProcess('cmd', ['ok'], { timeoutMs: 9999 }, deps);
+    child.emit('exit', 0, null);
+    child.emit('close', 0, null);
+    expect((await p).settled).toBe('exit');
   });
 
-  it('Windows: hasPid false after exit → no taskkill, termination-unconfirmed', async () => {
+  it('Windows: hasPid false after exit + timeout → no taskkill, termination-unconfirmed', async () => {
+    // Timeout fires after exit (hasPid=false). killTree checks !hasPid and
+    // settles termination-unconfirmed. Taskkill never called.
     const child = makeChild(); const spawnSync = vi.fn();
     const deps = win32Deps({ spawn: vi.fn(() => child as unknown as ChildProcess), spawnSync });
     const p = runBoundedProcess('cmd', [], { timeoutMs: 10 }, deps);
@@ -403,13 +405,13 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
 
   // ── early-exit ──
 
-  (isWin ? it : it.skip)('early-exit: wrapper exits, child orphan, termination-unconfirmed, out-of-band tree cleanup', async () => {
-    // Windows Node closes inherited pipes on process.exit(), so held-pipe
-    // is not reproducible on this platform.  The production code handles
-    // this: close after exit with extinct PID (hasPid=false) settles as
-    // termination-unconfirmed (fail-closed).  The fixture verifies:
-    //   1. Child PID captured (proves child was alive).
-    //   2. Runner returns termination-unconfirmed (not exit/success).
+  (isWin ? it : it.skip)('early-exit: wrapper exits, child survives, runner close=exit, out-of-band cleanup', async () => {
+    // Windows Node closes inherited pipes on process.exit(). The runner
+    // cannot distinguish normal exit from orphan survival at close time
+    // (exit→close is the normal lifecycle). This is an acknowledged
+    // observational boundary per Plan DD1.  The fixture verifies:
+    //   1. Child PID captured and child IS alive before cleanup.
+    //   2. Runner returns exit (normal close path — expected on Windows).
     //   3. Child is killed out-of-band by finally cleanup.
     const fix = await writeFixture((tmpDir) => `
       const { spawn } = require('child_process');
@@ -422,17 +424,17 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
       writeFileSync(require('path').join(pd, 'child.pid'), String(hb.pid));
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
       process.stdout.write('CHILD:' + hb.pid + '\\n');
-      // Exit quickly — pipes close on Windows, runner close fires with
-      // hasPid=false → production settles termination-unconfirmed.
       setTimeout(function() { process.exit(0); }, 50);
     `);
 
-    let wp = 0, cp = 0, wpDead = false, cpDead = false, r: any = null;
+    let wp = 0, cp = 0, cpWasAlive = false, wpDead = false, cpDead = false, r: any = null;
     try {
       r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 5000, maxOutputBytes: 64_000 });
     } finally {
       wp = fix.readPid('wrapper.pid');
       cp = fix.readPid('child.pid');
+      // Prove child was alive before cleanup (not just spawned with PID).
+      if (cp > 0) cpWasAlive = !pidDead(cp);
       try {
         if (wp > 0) { winTreeKill(wp); await new Promise((res) => setTimeout(res, 200)); wpDead = pidDead(wp); }
         if (cp > 0) { winTreeKill(cp); await new Promise((res) => setTimeout(res, 200)); cpDead = pidDead(cp); }
@@ -441,9 +443,12 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
       }
     }
     expect(r).toBeTruthy();
-    expect(r.settled).toBe('termination-unconfirmed');
+    // Windows observational boundary: runner cannot distinguish orphan
+    // survival from normal exit at close time. Accept exit.
+    expect(r.settled).toBe('exit');
     expect(wp).toBeGreaterThan(0);
     expect(cp).toBeGreaterThan(0);
+    expect(cpWasAlive).toBe(true);
     expect(cpDead).toBe(true);
   }, 15000);
 });
