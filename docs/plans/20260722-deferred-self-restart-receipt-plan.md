@@ -1,7 +1,7 @@
 # Deferred Self-Restart And Post-Restart Receipt Coding Plan
 
 Date: 2026-07-22
-Status: Unit 1-5 implemented — awaiting independent Code Review
+Status: Independent Code Review conditional GO — P2 rework before Unit 6
 Authority: `docs/specs/20260722-deferred-self-restart-receipt.md` (confirmed by Qin Peng, commit `b906c8b`)
 Branch: `fix/lark-bridge-followup`
 Implementer: 小C
@@ -34,6 +34,7 @@ Plan Reviewer: 小P
 - **R6（小P，PASS）**：R1-R5 findings 全部关闭。confirmed Spec、live code 落点、per-run route lease、唯一 pending、claim/attempt/terminal 原子状态、strict-AND recovery、Bridge System Prompt、三平台自动化与隔离 failure/live success 验收链一致；无剩余 Plan blocker。允许小C进入 Unit 1-5，实现完成后仍须经过云上C总独立 Code Review，方可进入 Unit 6。
 - **Implementation handoff（小C，`7a992ff`，返修中）**：Unit 1-5 首版已提交并报告全量测试/typecheck/build/diff-check 通过；Coordinator 检查发现 receipt sender 虽生成稳定 UUID，但通过不支持 UUID 的 `channel.send` 发送，UUID 未进入飞书 create/reply 请求，不能满足 DD5 exactly-once；同时 README.md/README.zh.md 未按 Unit 5 更新。已退回小C补齐真实 UUID API 传递、出站请求断言/同 UUID 重试测试及文档，修复完成前不勾选 Unit 1-5、不进入独立 Code Review。
 - **Implementation rework complete（小C，`bab1ea1` + `f5545a4` + `2857005` + `22cbf21`）**：真实 REST reply UUID、topic `reply_in_thread`、缺失 messageId 协议错误、Bridge PID 写入、helper 旧进程语义、temp 唯一性、startup lifecycle cleanup、确定性凭据/token 失败收敛及可注入 production seams 已补齐；README 双语文档已更新。Coordinator targeted verification：8 files / 114 tests PASS，`pnpm typecheck` PASS，`pnpm build` PASS，`git diff --check` PASS。全量：967 PASS / 1 FAIL / 3 SKIP；唯一失败 `tests/process/codex-turn-state-probe.test.ts` 在当前长路径 worktree 复现，但同一 `22cbf21` 隔离临时 worktree PASS，记录为独立评审需知的路径/进程退出竞态，不作为本功能 GO 证据。
+- **Independent Code Review（云上C总，head `6b111dd`，conditional GO）**：核心 DD1-DD7、端到端接线与 targeted 114/114 通过，无 P1；Unit 6 前须关闭两个 P2：（1）`handleReceiptRecovery` 完成后未按 receiptId 删除 crash-window 残留 pending，可能让后续 restart EEXIST 最长 30 分钟，且现有 crash test 只手工删 pending、未跑生产 recovery；（2）`makeClaimUuid` 不是 RFC 4122 UUID，飞书 reply 端点虽支持 uuid 幂等，但当前格式未证明可被服务端接受。Code Review Gate 暂不勾选；已退回小C补生产 recovery 集成测试、verified pending cleanup 与 deterministic RFC 4122 UUID。
 
 ## Current Evidence
 
