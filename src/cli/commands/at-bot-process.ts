@@ -40,12 +40,17 @@ export interface BoundedProcessDeps {
   platform: () => string;
   spawn: typeof spawnProcess;
   spawnSync: typeof spawnProcessSync;
+  /** POSIX process-group kill. Production default: process.kill. */
+  processKill: (pid: number, signal: NodeJS.Signals) => boolean;
 }
 
 const DEFAULT_DEPS: BoundedProcessDeps = {
   platform: () => osPlatform(),
   spawn: spawnProcess,
   spawnSync: spawnProcessSync,
+  processKill: (pid, signal) => {
+    try { return process.kill(pid, signal) || true; } catch { return false; }
+  },
 };
 
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -145,11 +150,11 @@ export function runBoundedProcess(
         // POSIX: kill the process group first, then direct child.
         let killOk = false;
         if (child.pid !== undefined) {
-          try {
-            process.kill(-child.pid, 'SIGKILL');
+          const sent = deps.processKill(-child.pid, 'SIGKILL');
+          if (sent) {
             killOk = true;
-          } catch {
-            // Process group already gone; try direct child.
+          } else {
+            // Process group kill failed; try direct child.
             try {
               const ok = child.kill('SIGKILL');
               if (ok) killOk = true;

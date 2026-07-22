@@ -1,7 +1,7 @@
 # Bot-to-Bot Native Mention Primitive Coding Plan
 
 Date: 2026-07-22
-Status: revised after R16 CONDITIONAL — heartbeat-file child survival evidence applied, fixture stability improved, Plan consistency maintained; awaiting re-review (R8 PASS baseline; R12–R16 revisions need independent verification)
+Status: revised after R17 CONDITIONAL — processKill injected into deps, real process.kill no longer called from mock tests; child tmpDir passed via argv to avoid Windows path escaping; awaiting re-review (R8 PASS baseline; R12–R17 revisions need independent verification)
 Authority: `docs/specs/20260722-bot-at-primitive.md` (`confirmed — R7 independent review PASS`)
 Bridge branch: `feat/bot-at-primitive` from `a6185f9`
 Companion repository: `/Users/bytedance/repo/sayToLittleP` (`main@2efbb50`, clean at planning time)

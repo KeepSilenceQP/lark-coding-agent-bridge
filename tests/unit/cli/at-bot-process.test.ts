@@ -30,11 +30,23 @@ function makeChild(pid = 4242): TestChild {
 }
 
 function darwinDeps(overrides?: Partial<BoundedProcessDeps>): BoundedProcessDeps {
-  return { platform: () => 'darwin', spawn: vi.fn(), spawnSync: vi.fn(), ...overrides };
+  return {
+    platform: () => 'darwin',
+    spawn: vi.fn(),
+    spawnSync: vi.fn(),
+    processKill: vi.fn(() => false), // default: group kill fails → fallback to child.kill
+    ...overrides,
+  };
 }
 
 function win32Deps(overrides?: Partial<BoundedProcessDeps>): BoundedProcessDeps {
-  return { platform: () => 'win32', spawn: vi.fn(), spawnSync: vi.fn(), ...overrides };
+  return {
+    platform: () => 'win32',
+    spawn: vi.fn(),
+    spawnSync: vi.fn(),
+    processKill: vi.fn(() => false),
+    ...overrides,
+  };
 }
 
 afterEach(() => { vi.clearAllMocks(); });
@@ -405,24 +417,11 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
 
   // ── early-exit: heartbeat-file-based child survival proof ──
 
-  // Placeholder replaced with actual tmpDir when writeFixture runs.
-  const FIX_DIR_PLACEHOLDER = '<<<FIXDIR>>>';
-
-  const childCodeTemplate = [
-      'var fs=require("fs"),path=require("path");',
-      'var dir="' + FIX_DIR_PLACEHOLDER + '";',
-      'var hbFile=path.join(dir,"heartbeat.txt");',
-      'var pidFile=path.join(dir,"child.pid");',
-      'fs.writeFileSync(hbFile,"0");',
-      'fs.writeFileSync(pidFile,String(process.pid));',
-      'var n=0;',
-      'setInterval(function(){n++;fs.writeFileSync(hbFile,String(n))},80);',
-    ].join('');
+  // Child reads tmpDir from process.argv[1] — no text escaping of paths.
+  const childCode = 'var fs=require("fs"),path=require("path"),dir=process.argv[1],hbFile=path.join(dir,"heartbeat.txt"),pidFile=path.join(dir,"child.pid");fs.writeFileSync(hbFile,"0");fs.writeFileSync(pidFile,String(process.pid));var n=0;setInterval(function(){n++;fs.writeFileSync(hbFile,String(n))},80);';
 
   (isWin ? it : it.skip)('early-exit: wrapper exits, child survives (heartbeat file), out-of-band cleanup', async () => {
-    const fix = await writeFixture((tmpDir) => {
-      const finalChildCode = childCodeTemplate.split(FIX_DIR_PLACEHOLDER).join(tmpDir);
-      return `
+    const fix = await writeFixture((tmpDir) => `
         const { spawn } = require('child_process');
         const { writeFileSync } = require('fs');
         const pd = ${JSON.stringify(tmpDir)};
@@ -432,7 +431,8 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
         // Seed heartbeat so readPid works even if child hasn't started yet.
         writeFileSync(require('path').join(pd, 'heartbeat.txt'), '0');
         // Spawn detached child — survives wrapper exit.
-        var hb = spawn(process.execPath, ['-e', ${JSON.stringify(finalChildCode)}], { stdio: 'ignore', detached: true });
+        // tmpDir passed as extra argv so no path escaping problems.
+        var hb = spawn(process.execPath, ['-e', ${JSON.stringify(childCode)}, pd], { stdio: 'ignore', detached: true });
         hb.unref();
         // Poll until child PID appears, then exit.
         var iv = setInterval(function() {
@@ -442,8 +442,7 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
           } catch(e) {}
         }, 5);
         setTimeout(function() { process.exit(0); }, 100);
-      `;
-    });
+      `);
 
     let wp = 0, cp = 0, hbBefore = -1, hbAfter = -1;
     let cpWasAlive = false, wpDead = false, cpDead = false, r: any = null;
