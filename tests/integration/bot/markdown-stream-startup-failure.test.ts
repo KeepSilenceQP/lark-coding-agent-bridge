@@ -566,6 +566,45 @@ describe('markdown stream startup failures', () => {
     ).toBe(true);
   });
 
+  it('still sends the Codex final reply when markdown rendering fails after final_text', async () => {
+    const fail = vi.spyOn(log, 'fail').mockImplementation(() => {});
+    let setContentCalls = 0;
+    const h = await createHarness({
+      events: [
+        { type: 'text', delta: 'progress update' },
+        { type: 'final_text', content: 'FINAL_AFTER_RENDER_FAILURE' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({
+          setContent: async () => {
+            setContentCalls++;
+            if (setContentCalls >= 3) throw new Error('markdown render failed');
+          },
+        });
+        return { messageId: 'om_progress' };
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_render_fail', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+
+    expect(lastMarkdown(h.channel)).toContain('FINAL_AFTER_RENDER_FAILURE');
+    expect(
+      fail.mock.calls.some(
+        (call) =>
+          call[0] === 'stream' &&
+          call[1] instanceof Error &&
+          call[1].message === 'markdown render failed' &&
+          (call[2] as { step?: string } | undefined)?.step === 'progress-stream',
+      ),
+    ).toBe(true);
+  });
+
   it('does not record delivery when the Codex final send has no message receipt', async () => {
     const fail = vi.spyOn(log, 'fail').mockImplementation(() => {});
     const info = vi.spyOn(log, 'info').mockImplementation(() => {});
