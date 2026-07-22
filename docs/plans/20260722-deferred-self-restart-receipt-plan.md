@@ -1,7 +1,7 @@
 # Deferred Self-Restart And Post-Restart Receipt Coding Plan
 
 Date: 2026-07-22
-Status: draft — awaiting independent Plan Review
+Status: revised after CHANGES REQUIRED Plan Review — awaiting re-review
 Authority: `docs/specs/20260722-deferred-self-restart-receipt.md` (confirmed by Qin Peng, commit `b906c8b`)
 Branch: `fix/lark-bridge-followup`
 Implementer: 小C
@@ -10,185 +10,189 @@ Plan Reviewer: 小P
 
 ## Outcome
 
-把 Bridge 同 profile 自部署重启收敛为一个跨进程闭环：
+把 Bridge 同 profile 自部署重启收敛为一个跨进程闭环，且 receipt 投递 **exactly-once**：
 
-1. Bridge-bound Agent 重启当前 profile 必须调用 `lark-channel-bridge restart --profile <current>`（deferred marker 路径），禁止直接调用 `launchctl`/`systemctl`/`schtasks`/kill。
+1. Bridge-bound Agent 重启当前 profile 必须调用 `lark-channel-bridge restart --profile <current>`（deferred 路径），禁止直接调用 `launchctl`/`systemctl`/`schtasks`/kill。
 2. 当前 Bridge 等所有 active batch 完成、最终回复发送完毕后，才启动 detached helper 执行服务重启（现有 drain 行为保留）。
-3. marker 扩展为持久化跨进程 receipt 状态，携带 receipt ID、return route（由 Bridge 从当前已验证 Agent run 自动绑定）、旧 PID、请求时间、可选部署标识。
-4. 新 Bridge 在飞书连接可用后发送**恰好一条** success receipt；规定时间内未观察到新 Bridge 注册或 service restart 明确失败时，仍存活的 helper 发送 failure receipt。
-5. receipt 用稳定 ID 幂等，原子清理，不重复通知、不误发陈旧请求。
-6. Bridge System Prompt 新增自重启规则，约束所有 Agent。
+3. marker 升级为 profile-private **原子状态机**（rename-based CAS：pending → claimed → completed），携带 receiptId、return route、旧 PID、请求时间、可选部署标识。唯一 pending（新请求原子 create/reject）；claim/complete 按 receiptId；cleanup 只作用同 receiptId。
+4. return route 由 Bridge 在 `runAgentBatch` 为当前已验证 run 生成 **profile-private opaque route lease**，Agent env 只拿 `routeId`；restart CLI 按 profile+bridgePid 校验并消费 lease，模型/命令无法自行提供 chatId。
+5. 新 Bridge 在 `channel.connect` 成功后 claim 并发 success receipt；helper 在新 bridge 超时未注册时发 failure receipt。两者由原子 claim + Feishu `uuid=f(receiptId,kind)` 服务端幂等收敛到恰好一条用户可见 receipt。
+6. receipt sender 回传 messageId 并落账（验收证据）。
+7. Bridge System Prompt 新增自重启规则。
 
 不负责：构建/安装/git 切换/service 定义修改/跨 profile 编排/自动重试部署/通知另一个 Bot（交接仍用 at-bot）/Agent turn 续跑。
 
+## Review History
+
+- **R1（小P，CHANGES REQUIRED）**：现有代码落点核对正确，但 6 项需修订：
+  1. DD5「超时天然互斥」不成立（新 bridge 与 helper 边界可同时读 pending 各发 success/failure；send→status-write 崩溃重复）→ 定义跨进程原子 claim/状态机 + Feishu `uuid=f(receiptId,kind)` 服务端幂等，exactly-once 不留 Open Point。
+  2. return route 不得留给实现者 → 定稿 per-run 数据流（runAgentBatch→AgentRunOptions/spawn overlay）；Bridge 生成 profile-private opaque route lease/routeId，Agent env 只拿 routeId，restart CLI 按 profile+bridgePid 校验消费；测试并发不串路由。
+  3. 单 marker 新请求覆盖/旧发送者清理新请求风险 → 唯一 pending 原子 create/reject（transaction 文件）+ 按 receiptId CAS/claim/complete，cleanup 只同 receiptId。
+  4. Unit 6 不得在生产 Bot 构造 failure → failure live test 用隔离 profile/service fixture，生产 Bot 只做 success self-restart。
+  5. success 时序：channel.connect 成功后发送/claim，registry botName 回填与 helper 观察竞态由 claim+uuid 收敛；receipt messageId 回传落账。
+  6. 删除/裁定 Open Points，不把 v1 关键一致性留实现；deployRevision v1 optional。
+- **R1 修订（本次）**：重写 DD1-DD7、Unit 6、Open Points（→ Resolved），加本 Review History。Status 置为 awaiting re-review。Plan Writer 不自判 GO。
+
 ## Current Evidence
 
-基于 `fix/lark-bridge-followup@b906c8b` 的 live code（`b7563f2`/`77b6b42` per-group 工作已合入，PR #2 at-bot 原语已合入）：
+基于 `fix/lark-bridge-followup@b906c8b` live code（per-group + at-bot 已合入）：
 
-- **marker** `src/runtime/deferred-service-restart.ts`：`MARKER_FILE='.deferred-service-restart.json'`（profileDir）；`DeferredServiceRestartMarker={profile, bridgePid?, requestedAt}`（**无 receiptId/returnRoute/deployRevision**）；`requestDeferredServiceRestart` 原子写（temp+rename）；`consumeDeferredServiceRestart(profileDir, bridgePid)` **读后即删**，仅当 `bridgePid` 匹配返回 true；`launchDeferredServiceRestart(profile)` detached spawn `node <cli> restart --profile <profile>`，**strip LARK_CHANNEL env**，stdio ignore，unref。
-- **drain** `src/bot/channel.ts:666-685` `maybeLaunchDeferredRestart`：门 `activeBatchCount!==0 || deferredRestartLaunching`；归零后 `consume` marker，再 `launchDeferredServiceRestart(controls.profile)`；若 read 期间新 batch 启动则**写回 marker** 延后。`:823` 在 flush `finally` 调用。
-- **restart 命令** `src/cli/commands/service.ts:371-397` `runServiceRestart`：bridge-bound 同 profile（`LARK_CHANNEL==='1' && LARK_CHANNEL_PROFILE===profile`）→ `requestDeferredServiceRestart` 写 marker @384 + 打印"已安排"；否则 `reportConnectAfter('restarted', adapter.restart)` 直接重启 + 等连接。
-- **新 PID 观察** `src/cli/commands/service.ts:201-221` `waitForServiceConnect(appId, profile, beforePids, 30s)`：轮询 `readAndPrune()`（registry）找 `appId+profile` 且 `pid∉beforePids` 且 `botName` 已填（=WS 握手成功）的新 bridge。
-- **service adapter** `src/daemon/service-adapter.ts`：`restart()`/`waitUntilStopped()`/`parseStatus()`（提取 PID）；三平台 `launchd.kickstart`/`systemd.restart`/`schtasks.restartTask`。
-- **agent 子进程 env** `src/agent/lark-channel-env.ts` `buildLarkChannelEnv`：注入 `LARK_CHANNEL/LARK_CHANNEL_PROFILE/LARK_CHANNEL_BRIDGE_PID/LARK_CHANNEL_HOME/LARK_CHANNEL_CONFIG/LARKSUITE_CLI_CONFIG_DIR`，**无 chatId/threadId**。调用点 `src/agent/claude/adapter.ts:91`、`src/agent/codex/adapter.ts:127,222`，`this.larkChannel` 为 **bridge-static**（构造时设置，非 per-run）。
-- **in-process restart** `src/cli/commands/start.ts:254` `Controls.restart`：connect-before-disconnect 的 in-process 重连（keepalive/forceReconnect 用），**非** deferred marker 路径，本需求 out of scope，保持不变。
-- **Bridge System Prompt** `src/agent/bridge-system-prompt.ts`：已有 bridge_context / at-bot / quoted_message / interactive_card / lark-cli / OAuth 等段，**无自重启段**。
-- **profile 私有目录** `src/config/app-paths.ts` `profileDir`（marker 落点）；registry `src/runtime/registry.ts` `readAndPrune`（新 PID 观察）。
+- **marker** `src/runtime/deferred-service-restart.ts`：`MARKER_FILE='.deferred-service-restart.json'`（profileDir）；`DeferredServiceRestartMarker={profile, bridgePid?, requestedAt}`（无 receiptId/returnRoute）；`requestDeferredServiceRestart` 原子写（temp+rename）；`consumeDeferredServiceRestart` **读后删**，bridgePid 匹配返回 true；`launchDeferredServiceRestart(profile)` detached spawn `node <cli> restart --profile <profile>`，**strip LARK_CHANNEL**，stdio ignore，unref。
+- **drain** `src/bot/channel.ts:666-685` `maybeLaunchDeferredRestart`：门 `activeBatchCount!==0 || deferredRestartLaunching`；归零后 consume marker + `launchDeferredServiceRestart`；read 期间新 batch 启动则写回 marker 延后。`:823` flush `finally` 调用。
+- **restart 命令** `src/cli/commands/service.ts:371-397` `runServiceRestart`：bridge-bound 同 profile → `requestDeferredServiceRestart` 写 marker @384 + 打印"已安排"；否则 `reportConnectAfter('restarted', adapter.restart)` 直接重启 + 等连接。
+- **新 PID 观察** `service.ts:201-221` `waitForServiceConnect(appId, profile, beforePids, 30s)`：轮询 `readAndPrune()`（registry）找 `appId+profile` 且 `pid∉beforePids` 且 `botName` 已填的新 bridge。
+- **service adapter** `src/daemon/service-adapter.ts`：`restart()`/`waitUntilStopped()`/`parseStatus()`；三平台 `launchd.kickstart`/`systemd.restart`/`schtasks.restartTask`。
+- **agent 子进程 env** `src/agent/lark-channel-env.ts` `buildLarkChannelEnv`：注入 LARK_CHANNEL/PROFILE/BRIDGE_PID/HOME/CONFIG/LARKSUITE_CLI_CONFIG_DIR，无 chatId/routeId。调用点 `claude/adapter.ts:91`、`codex/adapter.ts:127,222`，`this.larkChannel` 为 **bridge-static**。
+- **runAgentBatch** `src/bot/channel.ts` flush 回调内：`firstMsg.chatId/threadId/replyTo` 为当前已验证入站上下文（= `bridge_context.chatId`）。
+- **in-process restart** `src/cli/commands/start.ts:254` `Controls.restart`：connect-before-disconnect in-process 重连，非 deferred 路径，out of scope 不变。
+- **Bridge System Prompt** `src/agent/bridge-system-prompt.ts`：无自重启段。
+- **profile 私有目录** `src/config/app-paths.ts` `profileDir`；registry `src/runtime/registry.ts` `readAndPrune`。
 - **现有测试** `tests/unit/runtime/deferred-service-restart.test.ts`、`tests/unit/cli/service-profile.test.ts`、`tests/integration/bot/markdown-stream-startup-failure.test.ts`、`tests/unit/bot/channel-intake.test.ts`。
-- receiptId / returnRoute / post-restart 在 live code 中**均不存在**（新概念）。
+- receiptId/returnRoute/routeId/post-restart 在 live code 中均不存在（新概念）。
 
 ## Design Decisions
 
-### DD1 — Marker schema 扩展 + 生命周期（read-on-drain，clear-on-receipt）
+### DD1 — Marker 原子状态机（rename-based CAS，唯一 pending，同 receiptId cleanup）
 
-- 扩展 `DeferredServiceRestartMarker`（`deferred-service-restart.ts`）为：
-  ```ts
-  {
-    receiptId: string;            // 稳定 ID，restart 命令生成，如 restart-<ts>-<rand>
-    profile: string;
-    oldPid?: number;              // 旧 bridge PID（原 bridgePid）
-    requestedAt: string;
-    returnRoute?: { chatId: string; threadId?: string; replyTo?: string };
-    deployRevision?: string;      // 可选非敏感部署标识
-    status?: 'pending' | 'success-sent' | 'failure-sent';  // 幂等状态
-    failureReason?: string;       // failure 时由 helper 填
-  }
-  ```
-- **生命周期改为 read-on-drain + clear-on-receipt**：
-  - restart 命令写 marker（status=pending）。
-  - 旧 bridge drain 归零时**只读不删** marker，把 marker 数据传给 helper（见 DD3），并保持 marker 存在。
-  - 新 bridge 启动后读 marker（见 DD4）；helper 超时/失败时读 marker（见 DD3）。
-  - receipt 发送成功后**原子完成** marker（temp+rename 写 status=sent，或原子 rm）。陈旧 marker（oldPid 不匹配已退出进程 / 过期）不补发。
-- **兼容**：旧 marker（无 receiptId/returnRoute）→ 只执行重启、不发 receipt（Spec compat）。`consumeDeferredServiceRestart` 的"读后删"语义改为"读不删 + 由 receipt 完成时删"；保留对无 returnRoute 旧 marker 的降级（仅重启不通知）。损坏 marker（JSON parse 失败）→ 删除 + 日志，不补发、不重启（防误重启）。
-- marker **不得**包含 App Secret/token/cookie/完整用户消息/可执行 shell。returnRoute 仅 chatId/threadId/replyTo（来自 bridge 验证入站上下文，非模型文本）。
+- profile-private **receipt 目录** `profileDir/restart-receipt/`，文件：
+  - `pending.json` — 唯一待处理请求。
+  - `claimed.<receiptId>.json` — 某 sender 已 claim（原子 rename 自 pending.json）。
+  - `completed.<receiptId>.json` — 已完成（rename 自 claimed），保留 messageId/reason 落账 + TTL 清理。
+- **marker schema**：`{ receiptId, profile, oldPid, requestedAt, returnRoute?:{chatId,threadId?,replyTo?}, deployRevision?, status:'pending'|'claimed'|'completed', claimer?, kind?, messageId?, failureReason? }`。
+- **唯一 pending 原子 create/reject**：restart CLI 用 `open(pending.json, 'wx')`（O_CREAT\|O_EXCL）写。若已存在（EEXIST）→ **拒绝新请求**，回显现有 receiptId（"restart already pending, receiptId=…"），不覆盖。陈旧 pending 不被新请求自动清理（见 cleanup 规则）。
+- **原子 claim（CAS）**：sender 读 pending.json → 校验 `receiptId` 匹配 + `status==='pending'` → `rename(pending.json, claimed.<receiptId>.json)`。rename 原子，唯一赢家；输家见 pending.json 不在（或 claimed 存在）→ 不发。Windows 用 `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` 或独占 create 等价。
+- **原子 complete**：claimer 发送成功后 `rename(claimed.<receiptId>.json, completed.<receiptId>.json)`，写入 messageId。completed 保留作验收证据 + TTL 清理。
+- **cleanup 只作用同 receiptId**：TTL 过期/显式清理命令只删除匹配指定 receiptId 的 `claimed.<receiptId>.json`/`completed.<receiptId>.json`，**绝不**跨 receiptId 删除或清空 `pending.json`（除非同 receiptId）。
+- **陈旧/损坏**：pending.json 的 `oldPid` 不匹配当前/前序 bridge、或过期 → 新 bridge/helper 不 claim、不补发；损坏 JSON → 删除该文件 + 日志，不重启、不补发。
+- **兼容旧 marker**：旧 `.deferred-service-restart.json`（无 receiptId/returnRoute）→ 仅执行重启、不发 receipt（Spec compat）。新代码识别旧格式降级，不阻塞新格式。
+- marker 内容不含 App Secret/token/cookie/完整用户消息/可执行 shell。
 
-### DD2 — return route 由 Bridge 从当前已验证 Agent run 自动绑定
+### DD2 — return route：opaque route lease + per-run 数据流（定稿）
 
-- 在 `buildLarkChannelEnv`（`lark-channel-env.ts`）扩展 `LarkChannelEnvContext` 增加 `returnRoute?: {chatId, threadId?, replyTo?}`，输出 env `LARK_CHANNEL_RETURN_CHAT_ID` / `LARK_CHANNEL_RETURN_THREAD_ID` / `LARK_CHANNEL_RETURN_REPLY_TO`（仅当存在）。
-- **per-run 注入**：当前 `this.larkChannel` 是 bridge-static（adapter 构造时设置）。需在 adapter spawn 站点（`claude/adapter.ts:91`、`codex/adapter.ts:127/222`）把**当前 batch 的 return route**（`firstMsg.chatId`/`threadId`/`replyTo`，来自已验证入站 `bridge_context.chatId`）overlay 进 spawn env。实现方式由小C 定（如 spawn 前合并 per-run env override，或 buildLarkChannelEnv 接受 per-run route 参数），但**必须 per-run**，不得用 bridge-static chatId。
-- restart 命令（`service.ts:384`）读 env 里的 return route，写入 marker。Agent 只跑 `lark-channel-bridge restart --profile <current>`，**不传 chatId/通知正文**。
-- return route 来源约束：仅当前 Bridge 为本轮已验证 `bridge_context.chatId` 创建；不得把任意模型文本当作 returnRoute 或通知 payload。
+完整 per-run 数据流（不留实现者）：
 
-### DD3 — helper 扩为持久化重启协调者（跨旧进程退出 + failure receipt）
+1. `runAgentBatch`（`channel.ts` flush 回调）拿到当前 batch 的 `firstMsg.chatId/threadId/replyTo`（已验证 `bridge_context.chatId`）。
+2. spawn agent 前，Bridge 在 profile-private **route lease store**（`profileDir/route-leases/`，每 lease 一文件 `<routeId>.json` 原子写）创建 lease：`{ routeId: <opaque uuid>, chatId, threadId?, replyTo?, bridgePid: process.pid, runId?, createdAt, expiresAt }`。
+3. **per-run spawn overlay**：`buildLarkChannelEnv` 增 `routeId?` 入参 → 输出 env `LARK_CHANNEL_ROUTE_ID=<routeId>`（仅 routeId，**不输出 chatId**）。`claude/adapter.ts:91`、`codex/adapter.ts:127,222` spawn 站点把当前 run 的 routeId overlay 进 env（覆盖 bridge-static `this.larkChannel`，必须 per-run）。
+4. Agent 跑 `lark-channel-bridge restart --profile <LARK_CHANNEL_PROFILE>`（**不传 chatId/通知正文**）。
+5. restart CLI（`service.ts` bridge-bound 分支）读 env `LARK_CHANNEL_ROUTE_ID` + `LARK_CHANNEL_BRIDGE_PID` → 开 lease store 找 lease → 校验 `lease.bridgePid === LARK_CHANNEL_BRIDGE_PID` 且未过期 → 取 `lease.{chatId,threadId,replyTo}` 为 returnRoute，**消费（删除）该 lease**（一次性），写 pending.json（receiptId+returnRoute+oldPid）。校验失败 → 拒绝（no marker，error）。
+- **routeId 非 chatId**：routeId opaque，泄露给模型输出也无用（无 lease store 解不开）；chatId 由 Bridge/restart CLI 从 lease 解析并按 bridgePid 校验。模型/命令无法自行提供 chatId。
+- **并发 run 不串路由**：每个 run 独立 lease/routeId；restart CLI 消费指定 routeId 的 lease。**必须测试**：两个并发 run（不同 chat）各触发 restart → 各自 pending.json 的 returnRoute 匹配各自 chat，不串。
+- **lease 生命周期**：一次性消费；未消费的 lease 过期（run 最大时长 + buffer）后 TTL 清理（按 routeId）。
 
-- `launchDeferredServiceRestart`（`deferred-service-restart.ts`）扩展：把 marker 数据（receiptId、returnRoute、oldPid、profile、deployRevision）传给 helper。**推荐方式**：helper 直接从 profileDir 读 marker 文件（marker 已持久化，见 DD1），无需经 env/CLI args 传敏感长数据。helper 仍 strip LARK_CHANNEL（非 bridge-bound）。
-- helper（`runServiceRestart` else 分支，`service.ts:392`）职责重写：
-  1. 读 marker（receiptId/returnRoute/oldPid）。
-  2. `adapter.restart()`；若 `!r.ok` → failure reason=`service-action-failure`。
-  3. `waitForServiceConnect(appId, profile, beforePids, timeout)` 观察新 bridge 注册（**不以 adapter 返回 0 判成功**，以新 PID+botName 出现为准）。超时 → failure reason=`startup-timeout`。
-  4. 新 bridge 连接成功 → helper **退出不发**（新 bridge 发 success，见 DD4）。
-  5. failure → helper 用确定性 Bot 发送能力（DD6）发 failure receipt（含 profile/reason/receiptId），原子完成 marker（status=failure-sent）。
-  6. helper 无法发送 failure receipt → 保留 marker 终态 + 写可定位 daemon/helper 日志；下次启动不得改写为成功。
-- helper 重入 / 重复启动：marker status 已 sent 或已 completed → 不再发、不再重启。
+### DD3 — helper 持久化协调者 + failure receipt
 
-### DD4 — 新 Bridge 发 success receipt（飞书连接可用后）
+- `launchDeferredServiceRestart` 仍 spawn `node <cli> restart --profile <profile>`（strip LARK_CHANNEL）。helper 从 `profileDir/restart-receipt/pending.json` 读 marker（已持久化，无需经 env/args 传数据）。
+- helper 职责：
+  1. 读 pending.json（receiptId/returnRoute/oldPid）。
+  2. `adapter.restart()`；`!r.ok` → failure reason=`service-action-failure`。
+  3. `waitForServiceConnect(appId, profile, beforePids, timeout)` 观察新 bridge（**不以 adapter exit 0 判成功**，以新 PID+botName 出现为准）。超时 → 进入 failure 判定前先做 **final 短复查** `waitForServiceConnect(short)`：若新 bridge 已上来 → 不发 failure（让新 bridge 发 success）；仍 down → failure reason=`startup-timeout`。
+  4. 新 bridge 连接成功 → helper **退出不发**（新 bridge 发 success）。
+  5. failure → 原子 claim（rename pending→claimed.<receiptId>）→ `sendRestartReceipt(kind='failure', reason)`（uuid=f(receiptId,'failure')）→ complete（rename→completed，写 reason）。
+  6. helper 无法发送 failure（receipt delivery failure）→ 保留 completed.<receiptId>.json 终态 + 写可定位 daemon/helper 日志；下次启动不得改写为成功。
+- helper 重入 / 重复启动：`claimed.<receiptId>` 或 `completed.<receiptId>` 已存在 → 不再发、不再重启。
 
-- 新 bridge 在 `startChannel` 启动早期（飞书 WS 连接可用后）读 profileDir marker：
-  - marker 存在、returnRoute 存在、oldPid 是已退出的前序 bridge、status=pending → 发 success receipt（含 profile/success/receiptId/newPid；deployRevision 原样回显），原子完成 marker（status=success-sent）。
-  - marker status 已 sent → 不补发，清理。
-  - marker 无 returnRoute（旧格式）→ 不发，清理。
-  - marker oldPid 不匹配 / 陈旧 → 不发，清理。
-- success receipt 必须在新 bridge 自身飞书连接可用后发（不能在连接前猜测）。newPid = `process.pid`。
-- "service active ≠ bridge 已连接飞书；success receipt ≠ 业务功能验收完成"——receipt 仅证明重启+连接闭环。
+### DD4 — 新 Bridge success receipt（channel.connect 成功后 claim）
 
-### DD5 — 幂等 receipt（稳定 ID + 原子完成 + 互斥）
+- 新 bridge 在 `startChannel` **`channel.connect` 成功后**（Feishu WS 连接 + 注册 + botName 回填）检查 pending.json：
+  - 存在、returnRoute 存在、`oldPid` 为已退出的前序 bridge、`status==='pending'` → 原子 claim（rename pending→claimed.<receiptId>）→ `sendRestartReceipt(kind='success', newPid=process.pid, deployRevision 回显)`（uuid=f(receiptId,'success')）→ complete（rename→completed，写 messageId）。
+  - 已 claimed/completed → 不补发。
+  - 无 returnRoute（旧格式）→ 不发，按同 receiptId cleanup。
+  - `oldPid` 不匹配/陈旧 → 不发，同 receiptId cleanup。
+- **时序**：send/claim 在 `channel.connect` 成功**之后**。registry botName 回填（helper 的 waitForServiceConnect 观察依据）与新 bridge connect 之间的竞态，由 **原子 claim（唯一赢家）+ uuid 幂等** 收敛：helper final 复查减少误判 failure，claim 确保只有一方发，uuid 确保重发不重复。
+- receipt sender 回传 messageId → 写入 `completed.<receiptId>.json` 作为验收证据。
 
-- 稳定 `receiptId`：restart 命令生成一次，写 marker，receipt 回显同一 ID。
-- success / failure 互斥：helper 仅在新 bridge**未在超时内连接**时发 failure；新 bridge 仅在自身连接后且 status=pending 时发 success。两者由超时边界天然互斥。
-- 原子完成：发送成功后 temp+rename 写 status=sent（或 rm marker）。重复启动 / helper 重入 / "发送成功但清理前退出"：status 已 sent → 不重复发；status=pending 但发送者已退出 → 由存活方（新 bridge 或 helper）按规则唯一发送。
-- 陈旧 marker（oldPid 不匹配 / 过期）不在无关重启后补发；损坏 marker 删除+日志。
-- 不误删新请求：新 restart 命令写 marker 时若已有 pending marker，按"唯一 pending"合并或拒绝（实现者定，保证不覆盖在途请求）。
+### DD5 — exactly-once：原子 claim 状态机 + Feishu uuid（不留 Open Point）
 
-### DD6 — 确定性 Bot 发送能力（helper failure receipt）
+- **跨进程原子 claim 状态机**（DD1）：`pending → claimed（CAS rename，唯一赢家）→ completed`。新 bridge 与 helper 边界同时读 pending 时，只有一方 claim 成功；另一方见 claimed → 不发。success/failure 互斥由 claim + helper final 复查保证。
+- **Feishu 服务端幂等**：每条 receipt send（success 或 failure）带 `uuid = f(receiptId, kind)`（如 `restart-<receiptId>-success`）作为 Feishu IM create/reply 的 `uuid` 参数。重复 send（同 uuid）→ Feishu 返回同一 messageId，不产生重复用户可见消息。
+- **send→status-write 崩溃**：claimer 发送成功（Feishu 已受理）但 complete（rename）前崩溃 → marker 留 `claimed`。重启后同 sender（或 claim 释放后另一 sender）重发 → 同 uuid → Feishu 去重 → 不重复 → 再 complete。exactly-once 由 **claim（唯一发送者）+ uuid（重发去重）** 共同保证。
+- **claim 释放**：若 claimer 发送失败（Feishu 拒绝/网络），可 `rename(claimed→pending)` 释放让另一 sender 重试（同 uuid 仍幂等）；或保留 claimed 由同 sender 重试。实现选其一，保证不卡死。
+- **不留 Open Point**：exactly-once 在本节定稿，不推迟实现。
 
-- 新增 typed TS 函数 `sendRestartReceipt({profile, returnRoute, kind:'success'|'failure', receiptId, newPid?, reason?, deployRevision?})`，从 profile config 解析 app 凭据（`resolveProfileRuntime`，不经 marker），用飞书 IM API/SDK 发送到 returnRoute.chatId（话题群用 threadId，有 replyTo 则回复）。
-- 通知正文由代码固定生成（Spec 文案模板），**不接受模型文本/shell JSON**。杜绝"临时 shell 脚本手写 JSON typo"类失败。
-- helper（非 bridge-bound 进程）直接调此函数；新 bridge 也调此函数发 success。不启动 Agent、不拼 shell。
-- 凭据解析失败 → failure receipt 发送失败 → 保留终态日志（DD3 步骤 6）。
+### DD6 — 确定性 receipt sender（回传 messageId）
+
+- 新增 `sendRestartReceipt({profile, returnRoute, kind:'success'|'failure', receiptId, newPid?, reason?, deployRevision?})`：
+  - 从 profile config 解析 app 凭据（`resolveProfileRuntime`），不经 marker/env。
+  - Feishu IM API 发送到 `returnRoute.chatId`（threadId 话题、replyTo 回复），`uuid=f(receiptId,kind)`。
+  - 固定文案模板（Spec UX），**不接受模型文本/shell JSON**。杜绝 shell 手写 JSON typo。
+  - 返回 `{ok, messageId}`。失败 → 返回 `{ok:false}`，caller 保留终态日志。
+- 新 bridge（success）与 helper（failure）共用此函数。不启 Agent、不拼 shell。
 
 ### DD7 — Bridge System Prompt 自重启规则
 
-- `src/agent/bridge-system-prompt.ts` 新增 `## 自重启（deferred restart + receipt）` 段，规定：
+- `src/agent/bridge-system-prompt.ts` 新增 `## 自重启（deferred restart + receipt）` 段：
   - 重启当前 Bot/profile 只调 `lark-channel-bridge restart --profile <LARK_CHANNEL_PROFILE>`；**禁止**直接 `launchctl`/`systemctl`/`schtasks`/kill 当前 bridge PID 或等价 service-manager 命令。
   - `restart` 返回"已安排"后继续完成本轮最终回复，不在同一轮等待 post-restart 结果，不把 scheduled 说成 restarted。
   - 收到 post-restart receipt 前不得声称重启成功；receipt 失败/缺失按实际状态报告。
   - 显式运维**其它** profile 不属自重启，沿用现有外部路径；按 `LARK_CHANNEL_PROFILE` 判当前 profile，不按 Bot 显示名猜。
-- System Prompt 只规定动作选择与完成语义；return route 捕获/drain/helper 生命周期/receipt 幂等由 Bridge 确定性代码保证。
-
-### DD8 — 三平台 service adapter 处理
-
-- helper 通过 `ServiceAdapter.restart()` + `waitUntilStopped()` + `waitForServiceConnect`（registry 新 PID）观察，**不依赖 adapter 返回 0**。
-- launchd（kickstart）/systemd（restart）/schtasks（restartTask=end+wait+run）三路径在 helper 中行为一致：restart → 等新 PID+botName。
-- 三平台测试（Unit 6）覆盖：marker 写入/drain/receipt 在三个 adapter 上的等价行为（mock adapter 或平台条件测试）。
+- System Prompt 只规定动作选择与完成语义；route lease/drain/claim/receipt 由 Bridge 确定性代码保证。
 
 ## Execution Units
 
-Owner：Unit 1-5 由小C 实现；Unit 1-5 完成 + 自检后交回小P，由云上C总独立 Code Review GO 后才进 Unit 6。Unit 6 实机自部署 owner = 秦鹏 + 小P，小C 提供构建/配置/日志支持。Plan Review GO 前不修改运行代码、不部署。
+Owner：Unit 1-5 小C 实现；Unit 1-5 + 自检后交回小P，由云上C总 独立 Code Review GO 后才进 Unit 6。Unit 6 live success self-restart owner = 秦鹏+小P（小C 提供构建/配置/日志），failure live test 在隔离 fixture。Plan Review GO 前不修改运行代码、不部署。
 
 ### Unit 1 — RED：失败测试先行  Owner: 小C  ☐
 
-Files：`tests/unit/runtime/deferred-service-restart.test.ts`、`tests/unit/cli/service-profile.test.ts`、`tests/integration/bot/markdown-stream-startup-failure.test.ts`、`tests/unit/bot/channel-intake.test.ts`，新增 helper/receipt 专用测试文件。
+Files：`tests/unit/runtime/deferred-service-restart.test.ts`、`tests/unit/cli/service-profile.test.ts`、`tests/integration/bot/markdown-stream-startup-failure.test.ts`、`tests/unit/bot/channel-intake.test.ts`，新增 receipt/route-lease/helper 专用测试。
 
 Add failing coverage：
-- marker schema：receiptId/returnRoute/oldPid/deployRevision/status 写入与读回；旧 marker（无新字段）降级仅重启不通知；损坏 marker 删除+日志不重启。
-- return route：bridge-bound restart 从 env 自动绑定 chatId/threadId/replyTo；Agent 不传 route；returnRoute 仅来自验证入站上下文。
-- drain：active batch 未归零不调 adapter.restart；归零后只启动一次 helper；drain 期间新 batch 写回 marker 延后。
-- helper：adapter.restart 失败→failure(service-action-failure)；超时无新 PID→failure(startup-timeout)；新 PID+botName 出现→不发（让新 bridge 发 success）；不以 adapter exit 0 判成功。
-- new bridge：飞书连接后发 success（newPid/receiptId/deployRevision 回显）；status=pending 才发；无 returnRoute 不发。
-- 幂等：helper 重入/新进程重复启动/发送成功后清理前崩溃/陈旧 marker/损坏 marker → 不重复通知、不误删新请求、不泄露凭据。
-- System Prompt 契约：含禁止 launchctl/systemctl/schtasks 直调规则；其它 profile 不受误伤。
-- 三平台：launchd/systemd/schtasks adapter 在 helper 流程中等价（mock 或条件测试）。
+- 状态机：pending 唯一（O_EXCL，二次 create reject）；claim CAS 唯一赢家；complete 落 messageId；同 receiptId cleanup；跨 receiptId cleanup 拒绝；陈旧/损坏 marker 不补发不重启；旧格式降级仅重启。
+- route lease：runAgentBatch 为当前 run 建 lease；env 只含 routeId 不含 chatId；restart CLI 按 routeId+bridgePid 校验+消费 lease；校验失败拒绝；**并发两 run 不同 chat 各触发 restart 不串路由**。
+- drain：active batch 未归零不调 adapter.restart；归零后只启一次 helper；drain 期间新 batch 写回延后。
+- helper：adapter.restart 失败→failure(service-action-failure)；超时无新 PID→final 复查→failure(startup-timeout)；新 PID+botName 出现→不发；helper 重入/重复不重复发。
+- new bridge：channel.connect 成功后 claim+发 success（newPid/receiptId/deployRevision 回显）；已 claimed 不补发；无 returnRoute 不发；messageId 落 completed。
+- exactly-once：新 bridge 与 helper 边界并发 claim → 恰一条 receipt；send→complete 间崩溃重发同 uuid 不重复；uuid=f(receiptId,kind)。
+- System Prompt 契约：含禁直调 launchctl/systemctl/schtasks 规则；其它 profile 不误伤。
+- 三平台：launchd/systemd/schtasks adapter 在 helper 流程等价（mock）。
 
 Gate: targeted tests fail for missing behavior before production edits.
 
-### Unit 2 — Marker schema + return route 绑定 + 兼容迁移  Owner: 小C  ☐
+### Unit 2 — Marker 状态机 + route lease + return route 数据流  Owner: 小C  ☐
 
-Files：`src/runtime/deferred-service-restart.ts`、`src/agent/lark-channel-env.ts`、`src/agent/claude/adapter.ts`、`src/agent/codex/adapter.ts`、`src/cli/commands/service.ts`、`src/bot/channel.ts`（drain read 不删）。
+Files：`src/runtime/deferred-service-restart.ts`（receipt 目录 + 状态机 + 旧格式兼容）、新增 `src/runtime/route-lease.ts`（lease store）、`src/agent/lark-channel-env.ts`（routeId）、`src/agent/claude/adapter.ts`+`src/agent/codex/adapter.ts`（per-run routeId overlay）、`src/cli/commands/service.ts`（restart CLI 校验消费 lease + 唯一 pending create）、`src/bot/channel.ts`（runAgentBatch 建 lease + drain 读 pending 不删）。
 
-Changes：按 DD1 扩 marker schema + 生命周期（read-on-drain/clear-on-receipt）+ 兼容降级；按 DD2 扩 env + per-run return route overlay + restart 命令写 returnRoute。`consumeDeferredServiceRestart` 改读不删（保留旧 marker 降级）。
+Changes：按 DD1 建状态机（O_EXCL create + rename CAS + 同 receiptId cleanup + 旧格式降级）；按 DD2 建 lease store + per-run routeId + restart CLI 校验消费。`consumeDeferredServiceRestart` 改读不删（drain 只读 pending 判定是否本 bridge 请求）。
 
-Gate: marker/env/return-route targeted tests pass；旧 marker 行为不变（仅重启不通知）。
+Gate: 状态机 + route lease + 并发不串路由 targeted tests pass；旧 marker 行为不变。
 
-### Unit 3 — helper 持久化协调者 + failure receipt  Owner: 小C  ☐
+### Unit 3 — helper 协调者 + failure receipt  Owner: 小C  ☐
 
-Files：`src/runtime/deferred-service-restart.ts`（launchDeferredServiceRestart 传 marker 数据/读 marker）、`src/cli/commands/service.ts`（helper else 分支重写）、`src/daemon/service-adapter.ts`（如需 observe 新 PID 辅助）。
+Files：`src/runtime/deferred-service-restart.ts`（launchDeferredServiceRestart 仍 strip LARK_CHANNEL）、`src/cli/commands/service.ts`（helper else 分支重写：读 pending + adapter.restart + waitForServiceConnect + final 复查 + claim + failure receipt）、`src/daemon/service-adapter.ts`（如需）。
 
-Changes：按 DD3 重写 helper：读 marker → adapter.restart → waitForServiceConnect 新 PID → failure receipt 或退出。failure reason 区分 service-action-failure/startup-timeout/receipt-delivery-failure。
+Changes：按 DD3 重写 helper；failure reason 区分 service-action-failure/startup-timeout/receipt-delivery-failure。
 
-Gate: helper targeted tests pass（failure 路径 + 新 PID 观察不误判）。
+Gate: helper targeted tests pass（failure 路径 + 新 PID 观察不误判 + final 复查）。
 
-### Unit 4 — 新 Bridge success receipt + 幂等完成  Owner: 小C  ☐
+### Unit 4 — 新 Bridge success receipt + exactly-once  Owner: 小C  ☐
 
-Files：`src/bot/channel.ts`（startChannel 启动早期读 marker + 连接后发 success）、`src/runtime/deferred-service-restart.ts`（marker 完成原语）。
+Files：`src/bot/channel.ts`（startChannel connect 后读 pending + claim + 发 success + complete）、`src/runtime/deferred-service-restart.ts`（claim/complete 原语）。
 
-Changes：按 DD4/DD5 新 bridge 读 marker + 飞书连接后发 success + 原子完成；幂等状态机；陈旧/损坏 marker 处理。
+Changes：按 DD4/DD5 新 bridge channel.connect 后 claim+发 success+complete（messageId 落账）；原子 claim 状态机 + uuid 幂等。
 
-Gate: new-bridge receipt + idempotency targeted tests pass。
+Gate: new-bridge success + exactly-once targeted tests pass（含边界并发 + send→complete 崩溃重发）。
 
-### Unit 5 — 确定性 receipt 发送 + Bridge System Prompt  Owner: 小C  ☐
+### Unit 5 — 确定性 receipt sender + Bridge System Prompt  Owner: 小C  ☐
 
-Files：新增 receipt 发送模块（如 `src/runtime/restart-receipt.ts`）、`src/agent/bridge-system-prompt.ts`（新增自重启段）、`README.md`/`README.zh.md`（自重启规则说明）。
+Files：新增 `src/runtime/restart-receipt.ts`（sendRestartReceipt，uuid 幂等，回传 messageId）、`src/agent/bridge-system-prompt.ts`（自重启段）、`README.md`/`README.zh.md`。
 
-Changes：按 DD6 实现 typed `sendRestartReceipt`（从 config 解析凭据，固定文案，无 shell JSON）；按 DD7 新增 System Prompt 段。
+Changes：按 DD6 实现 typed sender（从 config 解析凭据，固定文案，uuid，回传 messageId）；按 DD7 新增 System Prompt 段。
 
 Gate: receipt-sender + system-prompt contract tests pass；docs contract tests pass。
 
 ### Code Review Gate  Owner: 云上C总  ☐
 
-小C 完成 Unit 1-5 + 自检（`pnpm typecheck && pnpm test && pnpm build && git diff --check` 全绿）后交回小P。云上C总 对照 Spec（`b906c8b`）与本 Plan 独立 Code Review，GO 后才进 Unit 6。小C 不得自行进入实机验收。
+小C 完成 Unit 1-5 + 自检（`pnpm typecheck && pnpm test && pnpm build && git diff --check` 全绿）后交回小P。云上C总 对照 Spec（`b906c8b`）与本 Plan 独立 Code Review，GO 后才进 Unit 6。
 
-### Unit 6 — 三平台测试 + 实机自部署验收 + 回滚  Owner: 秦鹏+小P（小C 提供构建/配置/日志）  ☐
+### Unit 6 — 三平台测试 + 实机自部署（success 生产 Bot / failure 隔离 fixture）+ 回滚  Owner: 秦鹏+小P（小C 提供构建/配置/日志）  ☐
 
 After Code Review GO：
-1. 三平台自动化：mock/条件测试证明 launchd/systemd/schtasks 在 helper 流程等价（drain→restart→新 PID 观察→receipt）。
-2. 实机自部署（当前 Bot，profile=claude 或验收指定 profile）：
-   - 记录旧 PID、最终回复 message ID、receipt ID、新 PID、post-restart receipt message ID。
-   - 回读日志确认顺序：最终回复完成 → 旧进程退出 → 新进程连接飞书 → receipt 发送。
-   - success 路径：新 PID≠旧 PID，恰好一条 success receipt 关联同一 receiptId。
-   - failure 路径（构造 service-action-failure 或 startup-timeout）：不产生 success receipt，helper 发一条 failure receipt（或保留终态日志）。
-3. 回滚演练：恢复旧 deferred marker + helper 行为，停止创建带 returnRoute 的新请求；未完成新格式请求保留为诊断记录或显式清理，不静默误发。
+1. 三平台自动化：mock adapter 证明 launchd/systemd/schtasks 在 helper 流程等价（drain→restart→新 PID 观察→claim→receipt）。
+2. **Live success self-restart（当前生产 Bot，profile=claude 或指定）**：记录旧 PID、最终回复 message ID、receiptId、新 PID、post-restart receipt message ID；回读日志确认顺序：最终回复完成 → 旧进程退出 → 新进程连接飞书 → receipt 发送（messageId 落 completed）。**不在生产 Bot 上构造 failure**。
+3. **Live failure test（隔离 profile/service fixture，非生产 Bot）**：构造 service-action-failure（坏 service 定义）与 startup-timeout（启动即崩的 binary）→ 验证恰好一条 failure receipt（正确 reason）或终态日志；不污染生产 Bot。
+4. 回滚演练：恢复旧 marker + helper 行为，停止创建带 returnRoute/route lease 的新请求；在途新格式 → 诊断记录或显式 cleanup（同 receiptId），不静默误发。
 
-Gate: 三平台测试 pass + 实机 success/failure 两条路径证据齐全。Runtime PASS 需日志顺序证据 + receipt message ID，仅单测/进程存活不算完成。
+Gate: 三平台测试 pass + 生产 Bot success 顺序证据齐全 + 隔离 fixture failure 两条路径证据齐全。Runtime PASS 需日志顺序 + receipt messageId，仅单测/进程存活不算完成。
 
 ## Verification Commands
 
@@ -209,21 +213,21 @@ git diff --check
 
 ## Rollback
 
-- 代码回滚：恢复旧 `DeferredServiceRestartMarker`（无 receiptId/returnRoute）+ 旧 `consumeDeferredServiceRestart`（读后删）+ 旧 helper（不发 receipt）。停止创建带 returnRoute 的新请求。
-- 在途新格式 marker：保留为诊断记录，或由显式清理命令处理（`lark-channel-bridge` 提供 cleanup），不静默误发。
+- 代码回滚：恢复旧 `DeferredServiceRestartMarker`（无 receiptId/returnRoute）+ 旧 `consumeDeferredServiceRestart`（读后删）+ 旧 helper（不发 receipt）；停止创建带 returnRoute/route lease 的新请求。
+- 在途新格式 marker/lease：保留为诊断记录，或由显式 cleanup 命令（同 receiptId/routeId）处理，不静默误发。
 - System Prompt 自重启段可单独保留（约束 Agent 走 deferred 路径，与 receipt 解耦）。
-- 旧 binary 读新格式 marker：忽略未知字段，按旧语义仅重启（向后兼容）。
+- 旧 binary 读新格式：忽略未知字段，按旧语义仅重启（向后兼容）。
 
-## Open Points / For Plan Review
+## Resolved Decisions（原 Open Points 已裁定，不推迟实现）
 
-1. **return route 注入机制**：本 Plan 推荐 env（`LARK_CHANNEL_RETURN_*`）+ per-run overlay（因 `this.larkChannel` bridge-static）。若 Review 倾向 profile-private route token / 受控 IPC，请裁定。约束不变：route 来自验证入站上下文、marker 不含消息正文、重启后不依赖 Agent 恢复上下文。
-2. **marker 生命周期变更**：`consume`（读后删）→ read-on-drain + clear-on-receipt。改变现有语义，需 Review 确认兼容（旧 marker 降级仅重启）。
-3. **helper 获取 marker 数据**：推荐 helper 直接读 profileDir marker 文件（已持久化）。若 Review 要求经 CLI args / 独立 in-flight state 文件，请裁定。
-4. **"发送成功但清理前退出"残余窗口**：用 status 状态机 + success/failure 超时互斥收敛，但 send→status-write 间崩溃理论上可重复发送。若 Review 要求严格 at-most-once，需引入发送前原子占位（status=sending）+ 启动时歧义处理策略，请裁定可接受的残余风险。
-5. **三平台测试环境**：CI/本机为 Linux，macOS/Windows adapter 无法原生跑。推荐 mock adapter + 平台条件测试。若 Review 要求真三平台 CI，需额外基础设施。
-6. **新 bridge 何时读 marker**：本 Plan 定为 `startChannel` 启动早期、飞书连接可用后发 success。需确认连接可用的判定点（WS 握手成功 / botName 注册）与 `waitForServiceConnect` 一致。
-7. **deployRevision 来源**：可选非敏感部署标识（如 git short SHA / 版本号）。由 restart 命令从 env 或参数取（Agent 不填），或留空。请裁定是否 v1 必需。
+1. return route 机制：**route lease/routeId**（DD2），Agent env 只拿 routeId，restart CLI 按 profile+bridgePid 校验消费。已定稿。
+2. marker 生命周期：**receipt 目录 + rename CAS 状态机**（DD1），consume→read+claim+complete。已定稿。
+3. helper 取 marker 数据：**helper 直读 pending.json**（持久化）。已定稿。
+4. send→status-write 崩溃：**uuid=f(receiptId,kind) 服务端幂等**（DD5），exactly-once 定稿，不留 Open Point。
+5. 三平台测试：**mock adapter + 平台条件单元测试**；live 仅当前平台（Linux）success + 隔离 fixture failure。真三平台 CI 不在 v1 范围。
+6. new bridge 读 marker 时序：**channel.connect 成功后**（DD4）。已定稿。
+7. deployRevision：**v1 optional**（有则回显，无则不发）。
 
 ## Review Gate
 
-本 Plan 需由独立 SubAgent（小P）对照 confirmed Spec（`b906c8b`）与 live code review。结论 PASS（或所有阻塞项修订并复审通过）后小C 才开始 Unit 1。Plan Writer 不自判 GO。Unit 1-5 完成后另由云上C总 独立 Code Review，GO 后才进 Unit 6 实机自部署。
+本 Plan 经小P R1 Review 为 CHANGES REQUIRED，已按 6 项修订重写（见 Review History）。修订后需小P 复审：结论 PASS（或所有阻塞项修订并复审通过）后小C 才开始 Unit 1。Plan Writer 不自判 GO。Unit 1-5 完成后另由云上C总 独立 Code Review，GO 后才进 Unit 6。
