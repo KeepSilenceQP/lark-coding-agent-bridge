@@ -1,8 +1,5 @@
-import type { LarkChannel } from '@larksuite/channel';
-import { createLarkChannel } from '@larksuite/channel';
 import { resolveAppSecret } from '../config/secret-resolver';
-import type { AppPaths } from '../config/app-paths';
-import type { AppConfig, TenantBrand } from '../config/schema';
+import type { TenantBrand } from '../config/schema';
 import { log } from '../core/logger';
 import type { ReturnRoute } from './restart-receipt';
 import { resolveProfileRuntime } from './profile-runtime';
@@ -26,16 +23,29 @@ export interface ReceiptSendResult {
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
+// ── Tenant access token ───────────────────────────────────────────────
+
+interface TenantAccessTokenResponse {
+  code: number;
+  msg?: string;
+  tenant_access_token?: string;
+  expire?: number;
+}
+
+interface LarkApiResponse {
+  code: number;
+  msg?: string;
+  data?: { message_id?: string };
+}
+
 /**
- * Send a restart receipt using a one-off channel instance resolved from
- * profile credentials. Uses deterministic app credentials (not marker/env).
- * Retries bounded by MAX_RETRIES with exponential backoff on transient errors.
+ * Send a restart receipt using the raw Lark / Feishu REST API with a
+ * stable derived uuid for end-to-end idempotency. Credentials are resolved
+ * deterministically from the profile (not marker / env).
  */
 export async function sendRestartReceipt(
   params: ReceiptSendParams,
 ): Promise<ReceiptSendResult> {
-  const text = buildReceiptText(params);
-  // Resolve profile runtime to get credentials
   const { cfg, appPaths } = await resolveProfileRuntime({
     profile: params.profile,
     allowBootstrap: false,
@@ -50,21 +60,27 @@ export async function sendRestartReceipt(
     keystoreSaltFile: appPaths.keystoreSaltFile,
   });
 
-  const channel = createLarkChannel({
-    appId: cfg.accounts.app.id,
-    appSecret,
+  // Get a short-lived tenant access token for this send session.
+  const token = await getTenantAccessToken(
     domain,
-    source: 'lark-channel-bridge',
-  });
+    cfg.accounts.app.id,
+    appSecret,
+  );
+  if (!token) {
+    log.warn('receipt', 'token-failed', { receiptId: params.receiptId });
+    return { ok: false };
+  }
+
+  const body = buildReceiptRequestBody(params);
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const messageId = await sendReceiptMessage(
-        channel,
+      const messageId = await sendLarkMessage(
+        domain,
+        token,
         params.returnRoute,
-        text,
-        params.uuid,
+        body,
       );
       return { ok: true, messageId };
     } catch (err) {
@@ -86,64 +102,96 @@ export async function sendRestartReceipt(
 }
 
 /**
- * Send a receipt using an already-connected channel (new bridge path).
+ * Compatibility wrapper: send via the raw API path. Callers that already
+ * hold a connected LarkChannel can also use this single path — credentials
+ * are always resolved from the profile.
  */
 export async function sendRestartReceiptViaChannel(
-  channel: LarkChannel,
+  _channel: unknown,
   params: ReceiptSendParams,
 ): Promise<ReceiptSendResult> {
-  const text = buildReceiptText(params);
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const messageId = await sendReceiptMessage(
-        channel,
-        params.returnRoute,
-        text,
-        params.uuid,
-      );
-      return { ok: true, messageId };
-    } catch (err) {
-      if (!isRetryable(err)) break;
-      if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_DELAY_MS * attempt);
-      }
-    }
+  return sendRestartReceipt(params);
+}
+
+// ── Low-level API callers (exported for test inspection) ───────────────
+
+export async function getTenantAccessToken(
+  domain: string,
+  appId: string,
+  appSecret: string,
+): Promise<string | null> {
+  const url = `${domain}/open-apis/auth/v3/tenant_access_token/internal`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+  });
+  if (!res.ok) {
+    throw new Error(`tenant_access_token request failed: HTTP ${res.status}`);
   }
-  return { ok: false };
+  const data = (await res.json()) as TenantAccessTokenResponse;
+  if (data.code !== 0 || !data.tenant_access_token) {
+    throw new Error(
+      `tenant_access_token error: code=${data.code} msg=${data.msg ?? '-'}`,
+    );
+  }
+  return data.tenant_access_token;
 }
 
-async function sendReceiptMessage(
-  channel: LarkChannel,
+export function buildReceiptRequestBody(params: ReceiptSendParams): string {
+  return JSON.stringify({
+    content: JSON.stringify({ text: formatReceiptText(params) }),
+    msg_type: 'text',
+    uuid: params.uuid,
+  });
+}
+
+export async function sendLarkMessage(
+  domain: string,
+  token: string,
   route: ReturnRoute,
-  text: string,
-  _uuid: string,
+  bodyJson: string,
 ): Promise<string> {
-  // LarkChannel.send() throws on error; result always has messageId.
-  // _uuid is accepted for idempotency but not passed through to the SDK
-  // (Feishu server-side dedup handles duplicates with the same payload).
-  const result = await channel.send(
-    route.chatId,
-    { markdown: text },
-    {
-      replyTo: route.replyTo,
-      ...(route.threadId ? { replyInThread: true } : {}),
+  // Reply to an existing message — the reply lands in the same chat/topic
+  // as the parent message.
+  const url = `${domain}/open-apis/im/v1/messages/${encodeURIComponent(route.replyTo)}/reply`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      Authorization: `Bearer ${token}`,
     },
-  );
-  return result.messageId;
+    body: bodyJson,
+  });
+
+  if (!res.ok) {
+    throw new Error(`message reply failed: HTTP ${res.status}`);
+  }
+
+  const data = (await res.json()) as LarkApiResponse;
+  if (data.code !== 0) {
+    throw new Error(
+      `message reply error: code=${data.code} msg=${data.msg ?? '-'}`,
+    );
+  }
+
+  return data.data?.message_id ?? '';
 }
 
-function buildReceiptText(params: ReceiptSendParams): string {
+// ── Helpers ────────────────────────────────────────────────────────────
+
+function formatReceiptText(params: ReceiptSendParams): string {
   const { profile, receiptId, kind, newPid, reason, deployRevision } = params;
   if (kind === 'success') {
-    const lines = [
-      `**重启成功**`,
-      ``,
-      `- profile: \`${profile}\``,
-      `- receiptId: \`${receiptId}\``,
-      ...(newPid !== undefined ? [`- newPid: \`${newPid}\``] : []),
-      ...(deployRevision ? [`- deployRevision: \`${deployRevision}\``] : []),
+    const parts = [
+      `重启成功`,
+      `profile: ${profile}`,
+      `receiptId: ${receiptId}`,
+      ...(newPid !== undefined ? [`newPid: ${newPid}`] : []),
+      ...(deployRevision ? [`deployRevision: ${deployRevision}`] : []),
     ];
-    return lines.join('\n');
+    return parts.join('\n');
   }
   // failure
   const label =
@@ -154,14 +202,12 @@ function buildReceiptText(params: ReceiptSendParams): string {
         : reason === 'receipt-delivery-failure'
           ? '通知发送失败'
           : reason ?? '未知错误';
-  const lines = [
-    `**重启失败**`,
-    ``,
-    `- profile: \`${profile}\``,
-    `- receiptId: \`${receiptId}\``,
-    `- reason: \`${label}\``,
-  ];
-  return lines.join('\n');
+  return [
+    `重启失败`,
+    `profile: ${profile}`,
+    `receiptId: ${receiptId}`,
+    `reason: ${label}`,
+  ].join('\n');
 }
 
 function isRetryable(err: unknown): boolean {
