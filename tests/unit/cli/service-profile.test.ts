@@ -535,11 +535,13 @@ describe('profile-aware service commands', () => {
       profile: process.env.LARK_CHANNEL_PROFILE,
       home: process.env.LARK_CHANNEL_HOME,
       bridgePid: process.env.LARK_CHANNEL_BRIDGE_PID,
+      routeId: process.env.LARK_CHANNEL_ROUTE_ID,
     };
     process.env.LARK_CHANNEL = '1';
     process.env.LARK_CHANNEL_PROFILE = 'codex-dev';
     process.env.LARK_CHANNEL_HOME = root;
     process.env.LARK_CHANNEL_BRIDGE_PID = '1234';
+    delete process.env.LARK_CHANNEL_ROUTE_ID;
 
     try {
       await runServiceRestart({ profile: 'codex-dev' });
@@ -558,6 +560,7 @@ describe('profile-aware service commands', () => {
       restoreEnv('LARK_CHANNEL_PROFILE', previous.profile);
       restoreEnv('LARK_CHANNEL_HOME', previous.home);
       restoreEnv('LARK_CHANNEL_BRIDGE_PID', previous.bridgePid);
+      restoreEnv('LARK_CHANNEL_ROUTE_ID', previous.routeId);
       await rm(root, { recursive: true, force: true });
     }
   });
