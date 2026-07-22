@@ -893,7 +893,10 @@ function runBootstrapLarkCliJson(args: string[], larkCliEnv: NodeJS.ProcessEnv):
       clearTimeout(timer);
       reject(err);
     });
-    child.once('exit', (code) => {
+    // `exit` may fire before stdout/stderr have fully drained. Wait for
+    // `close`, which is emitted after the stdio streams are closed, so JSON
+    // output cannot be parsed while it is still incomplete.
+    child.once('close', (code) => {
       clearTimeout(timer);
       if (code === 0) {
         resolve(stdout);
