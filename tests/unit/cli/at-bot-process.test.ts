@@ -309,128 +309,126 @@ exit 0
 
 // ═══════════════════════════════════════════════════════
 // Windows real fixtures
+//
+// Structure (applies to both tests):
+//  1. writeFixture creates a single tmp dir with known pidfile paths.
+//  2. Fixture writes wrapper.pid + child.pid into that same tmp dir.
+//  3. Test awaits runner, then reads PIDs from pidfiles.
+//  4. finally: unconditional tree-kill + cleanup (PIDs from files).
+//  5. Assertions come last — cleanup happens regardless of outcome.
 // ═══════════════════════════════════════════════════════
 
 describe('at-bot process-tree runner (real spawn, Windows)', () => {
   const isWin = process.platform === 'win32';
 
-  /** Write a JS fixture file; return {file, cleanup}. Caller MUST await
-   *  cleanup() in finally to avoid CI residue. */
-  async function writeFixture(body: string): Promise<{ file: string; cleanup: () => Promise<void> }> {
-    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+  interface WinFixture {
+    file: string;
+    tmpDir: string;
+    readPid(name: string): number;
+    cleanup(): Promise<void>;
+  }
+
+  async function writeFixture(body: (tmpDir: string) => string): Promise<WinFixture> {
+    const { readFileSync, writeFileSync, mkdtempSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
-    const tmp = await mkdtemp(join(tmpdir(), 'bridge-fix-'));
-    const file = join(tmp, 'fixture.js');
-    await writeFile(file, body, 'utf8');
-    return { file, cleanup: () => rm(tmp, { recursive: true, force: true }) };
+    const { rm } = await import('node:fs/promises');
+    const tmpDir = mkdtempSync(join(tmpdir(), 'bridge-winfix-'));
+    const file = join(tmpDir, 'fixture.js');
+    writeFileSync(file, body(tmpDir), 'utf8');
+    return {
+      file, tmpDir,
+      readPid: (name: string) => {
+        try { return Number(readFileSync(join(tmpDir, name), 'utf8').trim()); } catch { return 0; }
+      },
+      cleanup: () => rm(tmpDir, { recursive: true, force: true }),
+    };
   }
 
-  /** Windows tree kill via taskkill (best-effort). Uses statically
-   *  imported spawnSync (not require) for ESM compatibility. */
   function winTreeKill(pid: number): void {
     if (pid <= 0) return;
-    try {
-      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 5000 });
-    } catch { /* best-effort — taskkill may fail if tree already gone */ }
+    try { spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 5000 }); } catch { /* tree gone */ }
   }
 
-  // ── live-wrapper: Node heartbeat child, continuous output, taskkill tree ──
+  // ── live-wrapper ──
 
-  (isWin ? it : it.skip)('live-wrapper: Node heartbeat child, continuous heartbeat, timeout kills tree, both PIDs dead', async () => {
-    const fix = await writeFixture(`
+  (isWin ? it : it.skip)('live-wrapper: Node heartbeat child, timeout kills tree, both PIDs dead', async () => {
+    const fix = await writeFixture((tmpDir) => `
       const { spawn } = require('child_process');
       const { writeFileSync } = require('fs');
-      const { join } = require('path');
-      const { tmpdir } = require('os');
-      // Persist PIDs so the test can clean up even on assertion failure.
-      const pidDir = join(tmpdir(), 'bridge-live-' + process.pid);
-      try { require('fs').mkdirSync(pidDir, { recursive: true }); } catch(e) {}
-      // Heartbeat is a Node child that inherits wrapper stderr → runner pipe.
+      const pd = ${JSON.stringify(tmpDir)};
       const hb = spawn(process.execPath, ['-e',
         'var p=String(process.pid);process.stderr.write("CHILD:"+p+"\\n");setInterval(function(){process.stderr.write(".")},50)'
       ], { stdio: ['ignore', 'ignore', 'inherit'] });
-      writeFileSync(join(pidDir, 'wrapper.pid'), String(process.pid));
-      writeFileSync(join(pidDir, 'child.pid'), '0'); // placeholder; poll fills actual
+      writeFileSync(require('path').join(pd, 'wrapper.pid'), String(process.pid));
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
       var iv = setInterval(function() {
         if (hb.pid) {
-          writeFileSync(join(pidDir, 'child.pid'), String(hb.pid));
+          writeFileSync(require('path').join(pd, 'child.pid'), String(hb.pid));
           process.stdout.write('CHILD:' + hb.pid + '\\n');
           clearInterval(iv);
         }
       }, 10);
-      // Wrapper keeps writing w to prove it is alive for taskkill.
       setInterval(function() { process.stdout.write('w'); }, 200);
     `);
-    let wp = 0, cp = 0;
+
+    let wp = 0, cp = 0, r: any = null;
     try {
-      const r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 4000, maxOutputBytes: 64_000 });
-
-      expect(r.settled).toBe('timeout');
-      const pids: Record<string, number> = {};
-      for (const m of r.stdout.matchAll(/([A-Z]+):(\d+)/g)) pids[m[1]!] = Number(m[2]!);
-      wp = pids.WRAPPER ?? 0;
-      cp = pids.CHILD ?? 0;
-      expect(wp).toBeGreaterThan(0);
-      expect(cp).toBeGreaterThan(0);
-      // Heartbeat evidence: stderr capture should contain dots from child.
-      expect(r.stderr).toContain('.');
-
-      await new Promise((res) => setTimeout(res, 300));
-      expect(pidDead(wp)).toBe(true);
-      expect(pidDead(cp)).toBe(true);
+      r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 4000, maxOutputBytes: 64_000 });
+      wp = fix.readPid('wrapper.pid');
+      cp = fix.readPid('child.pid');
     } finally {
-      // Out-of-band: kill any surviving tree regardless of assertion outcome.
-      if (wp > 0 && !pidDead(wp)) winTreeKill(wp);
-      if (cp > 0 && !pidDead(cp)) winTreeKill(cp);
+      if (wp > 0) winTreeKill(wp);
+      if (cp > 0) winTreeKill(cp);
+      await new Promise((res) => setTimeout(res, 200));
+      if (wp > 0) expect(pidDead(wp)).toBe(true);
+      if (cp > 0) expect(pidDead(cp)).toBe(true);
       await fix.cleanup();
     }
+    expect(r).toBeTruthy();
+    expect(r.settled).toBe('timeout');
+    expect(wp).toBeGreaterThan(0);
+    expect(cp).toBeGreaterThan(0);
+    expect(r.stderr).toContain('.');
   }, 20000);
 
-  // ── early-exit: wrapper exits, child orphan, termination-unconfirmed ──
+  // ── early-exit ──
 
   (isWin ? it : it.skip)('early-exit: wrapper exits, child orphan, termination-unconfirmed, out-of-band tree cleanup', async () => {
-    const fix = await writeFixture(`
+    const fix = await writeFixture((tmpDir) => `
       const { spawn } = require('child_process');
-      const { writeFileSync, mkdirSync } = require('fs');
-      const { join } = require('path');
-      const pidDir = join(require('os').tmpdir(), 'bridge-early-' + process.pid);
-      mkdirSync(pidDir, { recursive: true });
-      // Spawn Node heartbeat child that writes its own PID to pidfile,
-      // then writes dots. Child inherits wrapper stderr → runner pipe.
+      const { writeFileSync } = require('fs');
+      const pd = ${JSON.stringify(tmpDir)};
       const hb = spawn(process.execPath, ['-e',
-        'var fs=require("fs");var p=String(process.pid);' +
-        'fs.writeFileSync("' + pidDir.replace(/\\\\/g, '\\\\\\\\') + '/child.pid",p);' +
+        'var fs=require("fs"),p=String(process.pid);' +
+        'fs.writeFileSync("' + tmpDir.replace(/\\\\/g, '\\\\\\\\') + '/child.pid",p);' +
         'process.stderr.write("CHILD:"+p+"\\n");' +
         'setInterval(function(){process.stderr.write(".")},50)'
       ], { stdio: ['ignore', 'ignore', 'inherit'] });
-      writeFileSync(join(pidDir, 'wrapper.pid'), String(process.pid));
+      writeFileSync(require('path').join(pd, 'wrapper.pid'), String(process.pid));
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
       var iv = setInterval(function() {
         if (hb.pid) { process.stdout.write('CHILD:' + hb.pid + '\\n'); clearInterval(iv); }
       }, 10);
-      // Exit after child started — child holds pipe.
       setTimeout(function() { process.exit(0); }, 60);
     `);
-    let childPid = 0;
-    try {
-      const r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 3500, maxOutputBytes: 64_000 });
-      expect(r.settled).toBe('termination-unconfirmed');
 
-      // Mandatory: extract CHILD PID from stdout.
-      const cm = r.stdout.match(/CHILD:(\d+)/);
-      expect(cm).toBeTruthy();
-      childPid = Number(cm![1]);
-      expect(childPid).toBeGreaterThan(0);
+    let wp = 0, cp = 0, r: any = null;
+    try {
+      r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 3500, maxOutputBytes: 64_000 });
+      wp = fix.readPid('wrapper.pid');
+      cp = fix.readPid('child.pid');
     } finally {
-      // Unconditional cleanup: kill tree if child PID was captured.
-      if (childPid > 0) {
-        winTreeKill(childPid);
-        await new Promise((res) => setTimeout(res, 200));
-        expect(pidDead(childPid)).toBe(true);
-      }
+      if (wp > 0) winTreeKill(wp);
+      if (cp > 0) winTreeKill(cp);
+      await new Promise((res) => setTimeout(res, 200));
+      if (wp > 0) expect(pidDead(wp)).toBe(true);
+      if (cp > 0) expect(pidDead(cp)).toBe(true);
       await fix.cleanup();
     }
+    expect(r).toBeTruthy();
+    expect(r.settled).toBe('termination-unconfirmed');
+    expect(wp).toBeGreaterThan(0);
+    expect(cp).toBeGreaterThan(0);
   }, 15000);
 });
