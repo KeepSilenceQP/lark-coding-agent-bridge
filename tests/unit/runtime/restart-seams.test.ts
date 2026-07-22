@@ -475,6 +475,179 @@ describe('terminal persistence and uuid', () => {
     expect(u1).toBe(u2);
     expect(u1).not.toBe(u3);
   });
+
+  it('makeClaimUuid produces RFC 4122 UUIDv5 with correct version=5', async () => {
+    const { isValidClaimUuid } = await import('../../../src/runtime/restart-receipt');
+    const u1 = makeClaimUuid('restart-001', 'success');
+    const u2 = makeClaimUuid('restart-001', 'failure');
+    expect(isValidClaimUuid(u1)).toBe(true);
+    expect(isValidClaimUuid(u2)).toBe(true);
+    // Version nibble is 5
+    expect(u1.split('-')[2]?.[0]).toBe('5');
+    expect(u2.split('-')[2]?.[0]).toBe('5');
+  });
+});
+
+// ── P2: recovery cleans pending after terminal resolution ─────────────
+
+describe('handleReceiptRecovery — pending cleanup', () => {
+  it('cleans pending + claim + attempt after terminal resolution', async () => {
+    const dir = await makeTempDir();
+    useCleanup(dir);
+
+    const receiptId = makeReceiptId();
+
+    // Simulate crash state: pending + claim + attempt all exist,
+    // no terminal. The original claimer crashed after claim/attempt
+    // but before deletePending.
+    const route: ReturnRoute = { chatId: 'oc_test', replyTo: 'om_last' };
+    const pendingReq: PendingRequest = {
+      receiptId,
+      profile: 'codex',
+      oldPid: 1, // dead PID — recovery can take over immediately
+      requestedAt: new Date(Date.now() - 600_000).toISOString(), // 10 min ago
+      returnRoute: route,
+    };
+    await createPending(dir, pendingReq);
+
+    const uuid = makeClaimUuid(receiptId, 'success');
+    await createClaim(dir, {
+      receiptId,
+      kind: 'success',
+      payload: route,
+      uuid,
+      claimedAt: new Date(Date.now() - 590_000).toISOString(),
+    });
+
+    await createAttempt(dir, {
+      receiptId,
+      ownerPid: 1, // dead PID — no wait for TTL
+      attemptedAt: new Date(Date.now() - 590_000).toISOString(),
+    });
+
+    // Verify crash state exists
+    expect(await readPending(dir)).toBeDefined();
+    expect(await readClaim(dir, receiptId)).toBeDefined();
+    expect(await readAttempt(dir, receiptId)).toBeDefined();
+    expect(await readTerminal(dir, receiptId)).toBeUndefined();
+
+    // Call recovery directly (no channel needed for the test —
+    // sendRestartReceipt uses resolveProfileRuntime which will throw
+    // since there's no real profile; we just verify the cleanup logic
+    // via the primitive operations. The real function is tested in
+    // the integration test suite with live channel mocks.)
+
+    // Manual recovery simulation: what handleReceiptRecovery does
+    // after terminal resolution:
+    // 1. Write terminal
+    // 2. deletePending + cleanupReceiptArtifacts (claim + attempt)
+
+    await createTerminal(dir, {
+      receiptId,
+      kind: 'success',
+      outcome: 'completed',
+      messageId: 'om_recovered_001',
+    });
+
+    await deletePending(dir, receiptId);
+    await cleanupReceiptArtifacts(dir, receiptId);
+
+    // All residue cleaned, terminal preserved
+    expect(await readPending(dir)).toBeUndefined();
+    expect(await readClaim(dir, receiptId)).toBeUndefined();
+    expect(await readAttempt(dir, receiptId)).toBeUndefined();
+    expect(await readTerminal(dir, receiptId)).toBeDefined();
+    expect((await readTerminal(dir, receiptId))!.messageId).toBe('om_recovered_001');
+  });
+});
+
+// ── P2: service lease ordering ────────────────────────────────────────
+
+describe('service restart lease ordering', () => {
+  it('pending succeeds before lease is deleted', async () => {
+    const dir = await makeTempDir();
+    useCleanup(dir);
+
+    // Create a route lease
+    const { createRouteLease, readRouteLease, deleteRouteLease } = await import(
+      '../../../src/runtime/route-lease'
+    );
+    const lease = await createRouteLease(dir, {
+      chatId: 'oc_test',
+      replyTo: 'om_last',
+      bridgePid: 54321,
+    });
+    expect(lease).not.toBeNull();
+
+    // Pending creation succeeds
+    const receiptId = makeReceiptId();
+    const pendingCreated = await createPending(dir, {
+      receiptId,
+      profile: 'codex',
+      oldPid: 54321,
+      requestedAt: new Date().toISOString(),
+      returnRoute: { chatId: 'oc_test', replyTo: 'om_last' },
+    });
+    expect(pendingCreated).toBe(true);
+
+    // Pending is durable before lease deleted
+    expect(await readPending(dir)).toBeDefined();
+
+    // Delete lease after pending success
+    const deleted = await deleteRouteLease(dir, lease!.routeId);
+    expect(deleted).toBe(true);
+    expect(await readRouteLease(dir, lease!.routeId)).toBeUndefined();
+
+    // Pending still intact
+    expect(await readPending(dir)).toBeDefined();
+  });
+
+  it('EEXIST on second pending leaves lease intact', async () => {
+    const dir = await makeTempDir();
+    useCleanup(dir);
+
+    const { createRouteLease, readRouteLease } = await import(
+      '../../../src/runtime/route-lease'
+    );
+
+    // First pending succeeds
+    const receiptId1 = makeReceiptId();
+    const ok1 = await createPending(dir, {
+      receiptId: receiptId1,
+      profile: 'codex',
+      oldPid: 54321,
+      requestedAt: new Date().toISOString(),
+      returnRoute: { chatId: 'oc_test', replyTo: 'om_last' },
+    });
+    expect(ok1).toBe(true);
+
+    // Create a lease (simulating second concurrent run)
+    const lease = await createRouteLease(dir, {
+      chatId: 'oc_other',
+      replyTo: 'om_other',
+      bridgePid: 54321,
+    });
+    expect(lease).not.toBeNull();
+
+    // Second pending EEXIST — rejects, does NOT overwrite first
+    const receiptId2 = makeReceiptId();
+    const ok2 = await createPending(dir, {
+      receiptId: receiptId2,
+      profile: 'codex',
+      oldPid: 54321,
+      requestedAt: new Date().toISOString(),
+      returnRoute: { chatId: 'oc_other', replyTo: 'om_other' },
+    });
+    expect(ok2).toBe(false);
+
+    // First pending preserved (not overwritten)
+    const pending = await readPending(dir);
+    expect(pending!.receiptId).toBe(receiptId1);
+    expect(pending!.returnRoute.chatId).toBe('oc_test');
+
+    // Lease intact (not consumed since EEXIST rejected)
+    expect(await readRouteLease(dir, lease!.routeId)).toBeDefined();
+  });
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────

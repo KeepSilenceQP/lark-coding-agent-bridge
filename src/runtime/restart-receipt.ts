@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { link, open } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -330,11 +330,59 @@ export function makeReceiptId(): string {
   return `restart-${randomUUID()}`;
 }
 
+// ── Deterministic UUIDv5 ────────────────────────────────────────────────
+//
+// RFC 4122 §4.3 UUIDv5: SHA-1(namespace || name) → set version=5,
+// variant=10xx. Same receiptId+kind always produces the same UUID.
+// Success and failure claims for the same receiptId get different UUIDs
+// because the kind differs. Recovery preserves the descriptor's uuid
+// so resends use the identical value.
+
+const UUID_NAMESPACE_BYTES = hexToBytes(
+  'a1b2c3d4e5f64789ab01cdef01234567', // Custom namespace for lark-channel-bridge receipts.
+);
+
 export function makeClaimUuid(receiptId: string, kind: ReceiptKind): string {
-  // Deterministic per receiptId+kind for idempotent resend.
-  // Use a simple hash prefix + kind to ensure same uuid for same receipt.
-  // This allows Feishu dedup on resend.
-  return `${receiptId}-${kind}-v1`;
+  const name = `${receiptId}:${kind}`;
+  return uuidV5(UUID_NAMESPACE_BYTES, name);
+}
+
+export function isValidClaimUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function uuidV5(namespace: Uint8Array, name: string): string {
+  const nameBytes = Buffer.from(name, 'utf8');
+  const hash = createHash('sha1')
+    .update(Buffer.from(namespace))
+    .update(nameBytes)
+    .digest();
+
+  // Take first 16 bytes of SHA-1 output.
+  const bytes = new Uint8Array(hash.buffer, hash.byteOffset, 16);
+
+  // Set version nibble to 5 (byte index 6, high nibble = 0101).
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+
+  // Set variant bits to 10 (byte index 8, top 2 bits = 10).
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+
+  return uuidString(bytes);
+}
+
+function uuidString(bytes: Uint8Array): string {
+  const hex = Buffer.from(bytes).toString('hex');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join('-');
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  return new Uint8Array(Buffer.from(hex, 'hex'));
 }
 
 // ── Orphan cleanup ─────────────────────────────────────────────────────

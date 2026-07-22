@@ -241,7 +241,7 @@ function formatReceiptText(params: ReceiptSendParams): string {
 
 function isRetryable(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /timeout|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|5\d\d/i.test(msg);
+  return /timeout|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|429|5\d\d/i.test(msg);
 }
 
 function sleep(ms: number): Promise<void> {

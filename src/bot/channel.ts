@@ -3034,6 +3034,9 @@ export async function handleNewBridgePendingReceipt(
   // Check if already claimed
   const existingClaim = await readClaim(profileDir, pending.receiptId);
   if (existingClaim) {
+    // Claim exists → recovery is responsible. Clean pending to unblock
+    // future restarts; recovery will handle terminal + residue.
+    await deletePending(profileDir, pending.receiptId).catch(() => {});
     log.info('receipt', 'skip-already-claimed', { receiptId: pending.receiptId });
     return;
   }
@@ -3131,7 +3134,10 @@ export async function handleReceiptRecovery(
   const scans = await scanReceipts(profileDir);
   for (const scan of scans) {
     if (scan.hasTerminal) {
-      // Terminal exists — clean residue
+      // Terminal exists — clean all residue including pending (which
+      // may have been left behind if claimer crashed after claim/attempt
+      // but before deletePending).
+      await deletePending(profileDir, scan.receiptId).catch(() => {});
       await cleanupReceiptArtifacts(profileDir, scan.receiptId).catch(() => {});
       continue;
     }
@@ -3210,6 +3216,10 @@ export async function handleReceiptRecovery(
       });
     }
 
+    // Clean pending, claim, and attempt after terminal resolution.
+    // Pending may still exist if the original claimer crashed after
+    // claim/attempt but before deletePending.
+    await deletePending(profileDir, scan.receiptId).catch(() => {});
     await cleanupReceiptArtifacts(profileDir, scan.receiptId).catch(() => {});
   }
 }

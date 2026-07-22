@@ -24,6 +24,7 @@ import {
   quarantineStalePending,
   makeReceiptId,
   makeClaimUuid,
+  isValidClaimUuid,
   isEexist,
   isMissingFile,
   type PendingRequest,
@@ -720,12 +721,35 @@ describe('UUID helpers', () => {
     const uuid1 = makeClaimUuid('restart-001', 'success');
     const uuid2 = makeClaimUuid('restart-001', 'success');
     expect(uuid1).toBe(uuid2);
+    // Must be a valid RFC 4122 UUIDv5
+    expect(isValidClaimUuid(uuid1)).toBe(true);
   });
 
   it('makeClaimUuid differs for different kind', () => {
     const uuidSuccess = makeClaimUuid('restart-001', 'success');
     const uuidFailure = makeClaimUuid('restart-001', 'failure');
     expect(uuidSuccess).not.toBe(uuidFailure);
+    expect(isValidClaimUuid(uuidSuccess)).toBe(true);
+    expect(isValidClaimUuid(uuidFailure)).toBe(true);
+  });
+
+  it('makeClaimUuid produces RFC 4122 UUIDv5 with correct version nibble', () => {
+    const uuid = makeClaimUuid('restart-abc', 'success');
+    // UUIDv5: xxxxxxxx-xxxx-5xxx-yxxx-xxxxxxxxxxxx
+    expect(uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
+  it('makeClaimUuid differs for different receiptId same kind', () => {
+    const uuid1 = makeClaimUuid('restart-001', 'success');
+    const uuid2 = makeClaimUuid('restart-002', 'success');
+    expect(uuid1).not.toBe(uuid2);
+  });
+
+  it('same inputs produce exact same UUID across calls (recovery resend)', () => {
+    const uuid1 = makeClaimUuid('restart-xyz', 'failure');
+    const uuid2 = makeClaimUuid('restart-xyz', 'failure');
+    expect(uuid1).toBe(uuid2);
+    expect(uuid1).toMatch(/^[0-9a-f-]{36}$/i);
   });
 });
 
