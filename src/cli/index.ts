@@ -24,6 +24,7 @@ import {
   runServiceUnregister,
 } from './commands/service';
 import { runStart } from './commands/start';
+import { runAtBotCli } from './commands/at-bot';
 
 const program = new Command();
 
@@ -239,6 +240,20 @@ secrets
   .option('--profile <name>', 'profile name (defaults to active profile)')
   .action(async (opts: { appId: string; profile?: string }) => {
     await runSecretsRemove(opts.appId, { profile: opts.profile });
+  });
+
+program
+  .command('at-bot')
+  .description('Send a native Feishu structured mention to a target Bot in the current group')
+  .requiredOption('--chat-id <id>', 'target group chat_id (oc_...)')
+  .requiredOption('--bot-id <id>', 'target Bot open_id (ou_...)')
+  .requiredOption('--message <text>', 'non-empty plain text body')
+  .action(async (opts: { chatId: string; botId: string; message: string }) => {
+    await runAtBotCli({
+      chatId: opts.chatId,
+      botId: opts.botId,
+      message: opts.message,
+    });
   });
 
 program.parseAsync(process.argv).catch((err: unknown) => {
