@@ -23,7 +23,7 @@ import {
   type PendingRequest,
   type ReturnRoute,
 } from '../../../src/runtime/restart-receipt';
-import { createRouteLease, cleanupExpiredLeases, routeLeaseDir } from '../../../src/runtime/route-lease';
+import { createRouteLease, readRouteLease, cleanupExpiredLeases, routeLeaseDir } from '../../../src/runtime/route-lease';
 import type { ServiceAdapter } from '../../../src/daemon/service-adapter';
 import type { ProcessEntry } from '../../../src/runtime/registry';
 
@@ -488,29 +488,26 @@ describe('terminal persistence and uuid', () => {
   });
 });
 
-// ── P2: recovery cleans pending after terminal resolution ─────────────
+// ── P2: handleReceiptRecovery integration (real function, injected sender) ─
 
-describe('handleReceiptRecovery — pending cleanup', () => {
-  it('cleans pending + claim + attempt after terminal resolution', async () => {
+describe('handleReceiptRecovery — real call with injected sendReceipt', () => {
+  it('calls sender with exact claim kind+UUID, writes terminal, cleans all residue', async () => {
     const dir = await makeTempDir();
     useCleanup(dir);
 
     const receiptId = makeReceiptId();
-
-    // Simulate crash state: pending + claim + attempt all exist,
-    // no terminal. The original claimer crashed after claim/attempt
-    // but before deletePending.
     const route: ReturnRoute = { chatId: 'oc_test', replyTo: 'om_last' };
-    const pendingReq: PendingRequest = {
+    const uuid = makeClaimUuid(receiptId, 'success');
+    const deadPid = 999999; // definitely-does-not-exist on any realistic system
+
+    // Crash state: pending + claim + stale attempt, no terminal.
+    await createPending(dir, {
       receiptId,
       profile: 'codex',
-      oldPid: 1, // dead PID — recovery can take over immediately
-      requestedAt: new Date(Date.now() - 600_000).toISOString(), // 10 min ago
+      oldPid: deadPid,
+      requestedAt: new Date(Date.now() - 600_000).toISOString(),
       returnRoute: route,
-    };
-    await createPending(dir, pendingReq);
-
-    const uuid = makeClaimUuid(receiptId, 'success');
+    });
     await createClaim(dir, {
       receiptId,
       kind: 'success',
@@ -518,46 +515,90 @@ describe('handleReceiptRecovery — pending cleanup', () => {
       uuid,
       claimedAt: new Date(Date.now() - 590_000).toISOString(),
     });
-
     await createAttempt(dir, {
       receiptId,
-      ownerPid: 1, // dead PID — no wait for TTL
+      ownerPid: deadPid,
       attemptedAt: new Date(Date.now() - 590_000).toISOString(),
     });
 
-    // Verify crash state exists
     expect(await readPending(dir)).toBeDefined();
     expect(await readClaim(dir, receiptId)).toBeDefined();
     expect(await readAttempt(dir, receiptId)).toBeDefined();
     expect(await readTerminal(dir, receiptId)).toBeUndefined();
 
-    // Call recovery directly (no channel needed for the test —
-    // sendRestartReceipt uses resolveProfileRuntime which will throw
-    // since there's no real profile; we just verify the cleanup logic
-    // via the primitive operations. The real function is tested in
-    // the integration test suite with live channel mocks.)
-
-    // Manual recovery simulation: what handleReceiptRecovery does
-    // after terminal resolution:
-    // 1. Write terminal
-    // 2. deletePending + cleanupReceiptArtifacts (claim + attempt)
-
-    await createTerminal(dir, {
-      receiptId,
-      kind: 'success',
-      outcome: 'completed',
-      messageId: 'om_recovered_001',
+    // Inject sender so we can assert without a real channel.
+    const sendCalls: Array<Record<string, unknown>> = [];
+    const injectedSender = vi.fn(async (params: Record<string, unknown>) => {
+      sendCalls.push(params);
+      return { ok: true, messageId: 'om_recovered_001' };
     });
 
-    await deletePending(dir, receiptId);
-    await cleanupReceiptArtifacts(dir, receiptId);
+    const { handleReceiptRecovery } = await import('../../../src/bot/channel');
 
-    // All residue cleaned, terminal preserved
+    await handleReceiptRecovery(
+      null as unknown as import('@larksuite/channel').LarkChannel,
+      'codex',
+      dir,
+      { sendReceipt: injectedSender as any },
+    );
+
+    // Sender called exactly once with claim's kind + uuid
+    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls[0]!.kind).toBe('success');
+    expect(sendCalls[0]!.uuid).toBe(uuid);
+    expect(sendCalls[0]!.receiptId).toBe(receiptId);
+
+    // Terminal written with recovered messageId
+    const terminal = await readTerminal(dir, receiptId);
+    expect(terminal).toBeDefined();
+    expect(terminal!.outcome).toBe('completed');
+    expect(terminal!.messageId).toBe('om_recovered_001');
+
+    // All residue cleaned
     expect(await readPending(dir)).toBeUndefined();
     expect(await readClaim(dir, receiptId)).toBeUndefined();
     expect(await readAttempt(dir, receiptId)).toBeUndefined();
+  });
+
+  it('terminal-already-exists branch: deletes pending without calling sender', async () => {
+    const dir = await makeTempDir();
+    useCleanup(dir);
+
+    const receiptId = makeReceiptId();
+    const route: ReturnRoute = { chatId: 'oc_test', replyTo: 'om_last' };
+    const uuid = makeClaimUuid(receiptId, 'success');
+
+    // Terminal already set (previous recovery completed)
+    await createTerminal(dir, { receiptId, kind: 'success', outcome: 'completed', messageId: 'om_prior' });
+    // Residue from the same receipt still on disk
+    await createPending(dir, {
+      receiptId,
+      profile: 'codex',
+      oldPid: 999999,
+      requestedAt: new Date(Date.now() - 600_000).toISOString(),
+      returnRoute: route,
+    });
+    await createClaim(dir, {
+      receiptId, kind: 'success', payload: route, uuid,
+      claimedAt: new Date().toISOString(),
+    });
+
+    const sendCalls: Array<unknown> = [];
+    const { handleReceiptRecovery } = await import('../../../src/bot/channel');
+
+    await handleReceiptRecovery(
+      null as unknown as import('@larksuite/channel').LarkChannel,
+      'codex',
+      dir,
+      { sendReceipt: vi.fn(async () => { sendCalls.push(1); return { ok: true, messageId: 'x' }; }) as any },
+    );
+
+    // Sender NOT called — terminal already exists
+    expect(sendCalls).toHaveLength(0);
+    // Pending + claim cleaned, terminal preserved
+    expect(await readPending(dir)).toBeUndefined();
+    expect(await readClaim(dir, receiptId)).toBeUndefined();
     expect(await readTerminal(dir, receiptId)).toBeDefined();
-    expect((await readTerminal(dir, receiptId))!.messageId).toBe('om_recovered_001');
   });
 });
 
@@ -648,6 +689,94 @@ describe('service restart lease ordering', () => {
     // Lease intact (not consumed since EEXIST rejected)
     expect(await readRouteLease(dir, lease!.routeId)).toBeDefined();
   });
+
+  it('EEXIST through runServiceRestart: lease survives, process.exit(1)', async () => {
+    const dir = await makeTempDir();
+    useCleanup(dir);
+
+    // Set up profile directory
+    const profileDir = join(dir, 'profiles', 'codex-dev');
+    await mkdir(profileDir, { recursive: true });
+
+    // First pending already exists (simulating prior restart request)
+    const firstReceiptId = makeReceiptId();
+    await createPending(profileDir, {
+      receiptId: firstReceiptId,
+      profile: 'codex-dev',
+      oldPid: 54321,
+      requestedAt: new Date().toISOString(),
+      returnRoute: { chatId: 'oc_test', replyTo: 'om_last' },
+    });
+
+    // Create a new route lease for the second restart attempt
+    const lease = await createRouteLease(profileDir, {
+      chatId: 'oc_second',
+      replyTo: 'om_second',
+      bridgePid: 54321,
+    });
+    expect(lease).not.toBeNull();
+
+    // Mock process.exit to capture and prevent termination
+    const exitCodes: number[] = [];
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((code?: string | number | null) => {
+      exitCodes.push(Number(code ?? -1));
+      throw new Error(`exit:${code}`);
+    });
+
+    // Capture console.error
+    const errors: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation((line?: unknown) => {
+      errors.push(String(line));
+    });
+
+    const prev = {
+      channel: process.env.LARK_CHANNEL,
+      profile: process.env.LARK_CHANNEL_PROFILE,
+      home: process.env.LARK_CHANNEL_HOME,
+      bridgePid: process.env.LARK_CHANNEL_BRIDGE_PID,
+      routeId: process.env.LARK_CHANNEL_ROUTE_ID,
+    };
+    process.env.LARK_CHANNEL = '1';
+    process.env.LARK_CHANNEL_PROFILE = 'codex-dev';
+    process.env.LARK_CHANNEL_HOME = dir;
+    process.env.LARK_CHANNEL_BRIDGE_PID = '54321';
+    process.env.LARK_CHANNEL_ROUTE_ID = lease!.routeId;
+
+    const mocks = await setupRestartMocks();
+    mockRefs.rootDir = dir;
+
+    try {
+      const { runServiceRestart } = await import('../../../src/cli/commands/service');
+      await runServiceRestart({ profile: 'codex-dev' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // exit:1 is expected on EEXIST
+      if (!msg.includes('exit:1')) throw err;
+    } finally {
+      restoreEnv('LARK_CHANNEL', prev.channel);
+      restoreEnv('LARK_CHANNEL_PROFILE', prev.profile);
+      restoreEnv('LARK_CHANNEL_HOME', prev.home);
+      restoreEnv('LARK_CHANNEL_BRIDGE_PID', prev.bridgePid);
+      restoreEnv('LARK_CHANNEL_ROUTE_ID', prev.routeId);
+      exitSpy.mockRestore();
+      consoleSpy.mockRestore();
+      vi.restoreAllMocks();
+    }
+
+    // EEXIST: process.exit(1) was called
+    expect(exitCodes).toContain(1);
+    // Error message about pending restart already exists
+    const errorText = errors.join('\n');
+    expect(errorText).toContain('已有待处理的重启请求');
+
+    // Lease NOT consumed — EEXIST path doesn't delete the lease
+    expect(await readRouteLease(profileDir, lease!.routeId)).toBeDefined();
+
+    // First pending preserved — EEXIST doesn't overwrite
+    const pending = await readPending(profileDir);
+    expect(pending).toBeDefined();
+    expect(pending!.receiptId).toBe(firstReceiptId);
+  });
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -703,9 +832,12 @@ async function setupRestartMocks(): Promise<RestartMocks> {
     }),
   }));
 
-  vi.mock('../../../src/runtime/registry', () => ({
-    readAndPrune: vi.fn(() => []),
-  }));
+  vi.mock('../../../src/runtime/registry', async () => {
+    const actual = await vi.importActual<typeof import('../../../src/runtime/registry')>(
+      '../../../src/runtime/registry',
+    );
+    return { ...actual, readAndPrune: vi.fn(() => []) };
+  });
 
   vi.mock('../../../src/runtime/locks', () => ({
     checkRuntimeLock: vi.fn().mockResolvedValue({ locked: false }),

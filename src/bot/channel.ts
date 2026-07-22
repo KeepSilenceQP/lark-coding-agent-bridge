@@ -3130,7 +3130,14 @@ export async function handleReceiptRecovery(
   channel: LarkChannel,
   profile: string,
   profileDir: string,
+  deps?: {
+    sendReceipt?: (params: import('../runtime/restart-receipt-sender').ReceiptSendParams) =>
+      Promise<import('../runtime/restart-receipt-sender').ReceiptSendResult>;
+  },
 ): Promise<void> {
+  const sendReceipt = deps?.sendReceipt ??
+    ((params) => sendRestartReceiptViaChannel(channel, params));
+
   const scans = await scanReceipts(profileDir);
   for (const scan of scans) {
     if (scan.hasTerminal) {
@@ -3187,7 +3194,7 @@ export async function handleReceiptRecovery(
     }
 
     // Re-send with same kind+uuid (immutable claim → no flip)
-    const result = await sendRestartReceiptViaChannel(channel, {
+    const result = await sendReceipt({
       profile,
       returnRoute: claim.payload,
       receiptId: claim.receiptId,
