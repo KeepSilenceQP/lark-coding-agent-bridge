@@ -139,11 +139,16 @@ export async function getTenantAccessToken(
 }
 
 export function buildReceiptRequestBody(params: ReceiptSendParams): string {
-  return JSON.stringify({
+  const hasThread = Boolean(params.returnRoute.threadId);
+  const body: Record<string, unknown> = {
     content: JSON.stringify({ text: formatReceiptText(params) }),
     msg_type: 'text',
     uuid: params.uuid,
-  });
+  };
+  if (hasThread) {
+    body.reply_in_thread = true;
+  }
+  return JSON.stringify(body);
 }
 
 export async function sendLarkMessage(
@@ -176,7 +181,13 @@ export async function sendLarkMessage(
     );
   }
 
-  return data.data?.message_id ?? '';
+  if (!data.data?.message_id) {
+    throw new Error(
+      `message reply protocol error: API returned code=0 but data.message_id is missing (msg=${data.msg ?? '-'})`,
+    );
+  }
+
+  return data.data.message_id;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────

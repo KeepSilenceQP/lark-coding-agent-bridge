@@ -97,6 +97,27 @@ describe('buildReceiptRequestBody', () => {
     expect(text).toContain('重启失败');
     expect(text).toContain('启动超时');
   });
+
+  it('includes reply_in_thread:true when route has threadId', () => {
+    const body = buildReceiptRequestBody(
+      makeParams({
+        returnRoute: { chatId: 'oc_test', threadId: 'omt_topic1', replyTo: 'om_last' },
+      }),
+    );
+    const parsed = JSON.parse(body);
+    expect(parsed.reply_in_thread).toBe(true);
+  });
+
+  it('omits reply_in_thread when route has no threadId', () => {
+    const body = buildReceiptRequestBody(
+      makeParams({
+        returnRoute: { chatId: 'oc_test', replyTo: 'om_last' },
+      }),
+    );
+    const parsed = JSON.parse(body);
+    expect(parsed.reply_in_thread).toBeUndefined();
+    expect('reply_in_thread' in parsed).toBe(false);
+  });
 });
 
 // ── Outbound API call captures uuid ────────────────────────────────────
@@ -171,6 +192,81 @@ describe('sendLarkMessage — uuid end-to-end', () => {
         buildReceiptRequestBody(makeParams()),
       ),
     ).rejects.toThrow(/HTTP 500/);
+  });
+
+  it('throws on code=0 but missing data.message_id', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      // API returns success code but no message_id — protocol error
+      fakeJsonResponse({ code: 0, msg: 'success', data: {} }),
+    ) as typeof fetch;
+
+    await expect(
+      sendLarkMessage(
+        'https://open.feishu.cn',
+        't',
+        makeRoute(),
+        buildReceiptRequestBody(makeParams()),
+      ),
+    ).rejects.toThrow(/data\.message_id is missing/);
+  });
+
+  it('returns message_id when present in response', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      fakeJsonResponse({ code: 0, data: { message_id: 'om_actual_123' } }),
+    ) as typeof fetch;
+
+    const messageId = await sendLarkMessage(
+      'https://open.feishu.cn',
+      't',
+      makeRoute(),
+      buildReceiptRequestBody(makeParams()),
+    );
+
+    expect(messageId).toBe('om_actual_123');
+  });
+
+  it('sends reply_in_thread:true in body for topic route (threadId present)', async () => {
+    const bodies: string[] = [];
+    globalThis.fetch = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      bodies.push(init?.body as string);
+      return fakeJsonResponse({ code: 0, data: { message_id: 'om_x' } });
+    }) as typeof fetch;
+
+    const topicRoute = makeRoute({ threadId: 'omt_topic123', replyTo: 'om_parent' });
+    const params = makeParams({
+      uuid: 'u-topic',
+      returnRoute: topicRoute,
+    });
+    const body = buildReceiptRequestBody(params);
+
+    await sendLarkMessage('https://open.feishu.cn', 't', topicRoute, body);
+
+    expect(bodies).toHaveLength(1);
+    const parsed = JSON.parse(bodies[0]!);
+    expect(parsed.reply_in_thread).toBe(true);
+    expect(parsed.uuid).toBe('u-topic');
+  });
+
+  it('omits reply_in_thread in body for non-topic route (no threadId)', async () => {
+    const bodies: string[] = [];
+    globalThis.fetch = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      bodies.push(init?.body as string);
+      return fakeJsonResponse({ code: 0, data: { message_id: 'om_x' } });
+    }) as typeof fetch;
+
+    const plainRoute = makeRoute({ threadId: undefined, replyTo: 'om_parent' });
+    const params = makeParams({
+      uuid: 'u-notopic',
+      returnRoute: plainRoute,
+    });
+    const body = buildReceiptRequestBody(params);
+
+    await sendLarkMessage('https://open.feishu.cn', 't', plainRoute, body);
+
+    expect(bodies).toHaveLength(1);
+    const parsed = JSON.parse(bodies[0]!);
+    expect(parsed.reply_in_thread).toBeUndefined();
+    expect('reply_in_thread' in parsed).toBe(false);
   });
 });
 
