@@ -187,6 +187,7 @@ describe('at-bot process-tree runner (mock)', () => {
     ['128', () => ({ status: 128, pid: 0, output: [], stdout: '', stderr: '', signal: null } as SpawnSyncReturns<string>)],
     ['nonzero', () => ({ status: 5, pid: 0, output: [], stdout: '', stderr: '', signal: null } as SpawnSyncReturns<string>)],
     ['throw', () => { throw new Error('not found'); }],
+    ['timeout', () => { throw new Error('ETIMEDOUT'); }],
   ])('Windows: taskkill %s → termination-unconfirmed', async (_label, factory) => {
     const child = makeChild();
     const deps = win32Deps({ spawn: vi.fn(() => child as unknown as ChildProcess), spawnSync: vi.fn(factory) });
@@ -312,77 +313,113 @@ exit 0
 describe('at-bot process-tree runner (real spawn, Windows)', () => {
   const isWin = process.platform === 'win32';
 
-  async function writeFixture(body: string): Promise<string> {
-    const { mkdtemp, writeFile } = await import('node:fs/promises');
+  /** Write a JS fixture file; return {file, cleanup}. Caller MUST await
+   *  cleanup() in finally to avoid CI residue. */
+  async function writeFixture(body: string): Promise<{ file: string; cleanup: () => Promise<void> }> {
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
     const tmp = await mkdtemp(join(tmpdir(), 'bridge-fix-'));
     const file = join(tmp, 'fixture.js');
     await writeFile(file, body, 'utf8');
-    return file;
+    return { file, cleanup: () => rm(tmp, { recursive: true, force: true }) };
   }
 
-  // ── live-wrapper ──
+  /** Windows tree kill via taskkill (best-effort). */
+  function winTreeKill(pid: number): void {
+    if (pid <= 0) return;
+    try {
+      const { spawnSync } = require('child_process') as typeof import('child_process');
+      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 5000 });
+    } catch { /* best-effort */ }
+  }
 
-  (isWin ? it : it.skip)('live-wrapper: timeout kills tree, both WRAPPER and CHILD PIDs dead', async () => {
-    const file = await writeFixture(`
+  // ── live-wrapper: Node heartbeat child, continuous output, taskkill tree ──
+
+  (isWin ? it : it.skip)('live-wrapper: Node heartbeat child, continuous heartbeat, timeout kills tree, both PIDs dead', async () => {
+    const fix = await writeFixture(`
       const { spawn } = require('child_process');
-      // Child inherits stderr from wrapper → writes to runner pipe via stderr.
-      const hb = spawn('cmd', ['/c', 'echo CHILD:%RANDOM% && timeout /t 60 /nobreak > nul'], {
-        stdio: ['ignore', 'inherit', 'inherit'],
-      });
+      // Heartbeat is a Node child that inherits wrapper stderr → runner pipe.
+      // Writes CHILD:<pid>, then dots every 50ms.
+      const hb = spawn(process.execPath, ['-e',
+        'var p=String(process.pid);process.stderr.write("CHILD:"+p+"\\n");setInterval(function(){process.stderr.write(".")},50)'
+      ], { stdio: ['ignore', 'ignore', 'inherit'] });
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
-      // Poll child PID and write it.
-      const iv = setInterval(function() {
+      // Poll to capture child PID.
+      var iv = setInterval(function() {
         if (hb.pid) { process.stdout.write('CHILD:' + hb.pid + '\\n'); clearInterval(iv); }
       }, 10);
-      // Keep wrapper alive so taskkill /T can find the tree root.
-      setInterval(function() {}, 1000);
+      // Wrapper keeps writing w to prove it is alive for taskkill.
+      setInterval(function() { process.stdout.write('w'); }, 200);
     `);
-    const r = await runBoundedProcess(process.execPath, [file], { timeoutMs: 4000, maxOutputBytes: 64_000 });
+    try {
+      const r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 4000, maxOutputBytes: 64_000 });
 
-    expect(r.settled).toBe('timeout');
-    const pids: Record<string, number> = {};
-    for (const m of r.stdout.matchAll(/([A-Z]+):(\d+)/g)) pids[m[1]!] = Number(m[2]!);
-    expect(pids.WRAPPER).toBeGreaterThan(0);
-    expect(pids.CHILD).toBeGreaterThan(0);
+      expect(r.settled).toBe('timeout');
+      const pids: Record<string, number> = {};
+      for (const m of r.stdout.matchAll(/([A-Z]+):(\d+)/g)) pids[m[1]!] = Number(m[2]!);
+      expect(pids.WRAPPER).toBeGreaterThan(0);
+      expect(pids.CHILD).toBeGreaterThan(0);
+      // Heartbeat evidence: stderr capture should contain dots from child.
+      expect(r.stderr).toContain('.');
 
-    await new Promise((res) => setTimeout(res, 300));
-    // Both PIDs must be dead after taskkill /T /F.
-    expect(pidDead(pids.WRAPPER!)).toBe(true);
-    expect(pidDead(pids.CHILD!)).toBe(true);
+      await new Promise((res) => setTimeout(res, 300));
+      expect(pidDead(pids.WRAPPER!)).toBe(true);
+      expect(pidDead(pids.CHILD!)).toBe(true);
+    } finally {
+      await fix.cleanup();
+    }
   }, 20000);
 
-  // ── early-exit ──
+  // ── early-exit: wrapper exits, child orphan, termination-unconfirmed ──
 
-  (isWin ? it : it.skip)('early-exit: wrapper exits, child survives, termination-unconfirmed', async () => {
-    let childPid = 0;
-    const file = await writeFixture(`
+  (isWin ? it : it.skip)('early-exit: wrapper exits, child orphan, termination-unconfirmed, out-of-band tree cleanup', async () => {
+    const fix = await writeFixture(`
       const { spawn } = require('child_process');
-      // Child inherits stderr → holds runner pipe open after wrapper exit.
-      const hb = spawn('cmd', ['/c', 'timeout /t 60 /nobreak > nul'], {
-        stdio: ['ignore', 'inherit', 'inherit'],
-      });
+      const { writeFileSync } = require('fs');
+      const { join } = require('path');
+      const { tmpdir } = require('os');
+      // Write child PID to a pidfile for mandatory out-of-band cleanup.
+      const pidfile = join(tmpdir(), 'bridge-fix-child-' + process.pid + '.pid');
+      const hb = spawn(process.execPath, ['-e',
+        'var fs=require("fs");var p=String(process.pid);' +
+        'fs.writeFileSync("' + pidfile.replace(/\\\\/g, '\\\\\\\\') + '","CHILD:"+p);' +
+        'process.stderr.write("CHILD:"+p+"\\n");' +
+        'setInterval(function(){process.stderr.write(".")},50)'
+      ], { stdio: ['ignore', 'ignore', 'inherit'] });
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
-      const iv = setInterval(function() {
+      // Poll to also output child PID to stdout for runner capture.
+      var iv = setInterval(function() {
         if (hb.pid) { process.stdout.write('CHILD:' + hb.pid + '\\n'); clearInterval(iv); }
       }, 10);
-      // Exit immediately — child holds pipe. On Windows the extinct PID
-      // prevents taskkill tree discovery → termination-unconfirmed.
       setTimeout(function() { process.exit(0); }, 50);
     `);
-    const r = await runBoundedProcess(process.execPath, [file], { timeoutMs: 3000, maxOutputBytes: 64_000 });
-    expect(r.settled).toBe('termination-unconfirmed');
 
-    // Extract child PID for out-of-band cleanup proof.
-    const cm = r.stdout.match(/CHILD:(\d+)/);
-    if (cm) childPid = Number(cm[1]);
+    let childPid = 0;
+    let settled = false;
+    try {
+      const r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 3500, maxOutputBytes: 64_000 });
+      settled = true;
+      expect(r.settled).toBe('termination-unconfirmed');
 
-    // If child PID was captured, clean it up out-of-band and verify no residue.
-    if (childPid > 0) {
-      try { process.kill(childPid, 'SIGKILL'); } catch { /* already dead */ }
-      await new Promise((res) => setTimeout(res, 200));
-      expect(pidDead(childPid)).toBe(true);
+      // Mandatory: CHILD PID must be present in output.
+      const cm = r.stdout.match(/CHILD:(\d+)/);
+      expect(cm).toBeTruthy();
+      childPid = Number(cm![1]);
+      expect(childPid).toBeGreaterThan(0);
+    } finally {
+      // Out-of-band tree cleanup: kill child + its descendants.
+      if (childPid > 0) {
+        winTreeKill(childPid);
+        await new Promise((res) => setTimeout(res, 200));
+      }
+      // Verify no residue.
+      if (childPid > 0) {
+        expect(pidDead(childPid)).toBe(true);
+      }
+      await fix.cleanup();
+      // Sanity: runner did not claim success.
+      if (settled) { /* termination-unconfirmed already asserted above */ }
     }
   }, 15000);
 });
