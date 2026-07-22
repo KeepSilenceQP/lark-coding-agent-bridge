@@ -1,4 +1,4 @@
-import { type ChildProcess, type SpawnSyncReturns } from 'node:child_process';
+import { spawnSync, type ChildProcess, type SpawnSyncReturns } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -180,7 +180,8 @@ describe('at-bot process-tree runner (mock)', () => {
     child.emit('close', null, 'SIGKILL');
     const r = await p;
     expect(r.settled).toBe('timeout');
-    expect(spawnSync).toHaveBeenCalledWith('taskkill', ['/PID', String(child.pid), '/T', '/F'], expect.any(Object));
+    expect(spawnSync).toHaveBeenCalledWith('taskkill', ['/PID', String(child.pid), '/T', '/F'],
+      expect.objectContaining({ timeout: 5000, maxBuffer: 16384, encoding: 'utf8' }));
   });
 
   it.each([
@@ -325,13 +326,13 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
     return { file, cleanup: () => rm(tmp, { recursive: true, force: true }) };
   }
 
-  /** Windows tree kill via taskkill (best-effort). */
+  /** Windows tree kill via taskkill (best-effort). Uses statically
+   *  imported spawnSync (not require) for ESM compatibility. */
   function winTreeKill(pid: number): void {
     if (pid <= 0) return;
     try {
-      const { spawnSync } = require('child_process') as typeof import('child_process');
       spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 5000 });
-    } catch { /* best-effort */ }
+    } catch { /* best-effort — taskkill may fail if tree already gone */ }
   }
 
   // ── live-wrapper: Node heartbeat child, continuous output, taskkill tree ──
@@ -339,34 +340,50 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
   (isWin ? it : it.skip)('live-wrapper: Node heartbeat child, continuous heartbeat, timeout kills tree, both PIDs dead', async () => {
     const fix = await writeFixture(`
       const { spawn } = require('child_process');
+      const { writeFileSync } = require('fs');
+      const { join } = require('path');
+      const { tmpdir } = require('os');
+      // Persist PIDs so the test can clean up even on assertion failure.
+      const pidDir = join(tmpdir(), 'bridge-live-' + process.pid);
+      try { require('fs').mkdirSync(pidDir, { recursive: true }); } catch(e) {}
       // Heartbeat is a Node child that inherits wrapper stderr → runner pipe.
-      // Writes CHILD:<pid>, then dots every 50ms.
       const hb = spawn(process.execPath, ['-e',
         'var p=String(process.pid);process.stderr.write("CHILD:"+p+"\\n");setInterval(function(){process.stderr.write(".")},50)'
       ], { stdio: ['ignore', 'ignore', 'inherit'] });
+      writeFileSync(join(pidDir, 'wrapper.pid'), String(process.pid));
+      writeFileSync(join(pidDir, 'child.pid'), '0'); // placeholder; poll fills actual
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
-      // Poll to capture child PID.
       var iv = setInterval(function() {
-        if (hb.pid) { process.stdout.write('CHILD:' + hb.pid + '\\n'); clearInterval(iv); }
+        if (hb.pid) {
+          writeFileSync(join(pidDir, 'child.pid'), String(hb.pid));
+          process.stdout.write('CHILD:' + hb.pid + '\\n');
+          clearInterval(iv);
+        }
       }, 10);
       // Wrapper keeps writing w to prove it is alive for taskkill.
       setInterval(function() { process.stdout.write('w'); }, 200);
     `);
+    let wp = 0, cp = 0;
     try {
       const r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 4000, maxOutputBytes: 64_000 });
 
       expect(r.settled).toBe('timeout');
       const pids: Record<string, number> = {};
       for (const m of r.stdout.matchAll(/([A-Z]+):(\d+)/g)) pids[m[1]!] = Number(m[2]!);
-      expect(pids.WRAPPER).toBeGreaterThan(0);
-      expect(pids.CHILD).toBeGreaterThan(0);
+      wp = pids.WRAPPER ?? 0;
+      cp = pids.CHILD ?? 0;
+      expect(wp).toBeGreaterThan(0);
+      expect(cp).toBeGreaterThan(0);
       // Heartbeat evidence: stderr capture should contain dots from child.
       expect(r.stderr).toContain('.');
 
       await new Promise((res) => setTimeout(res, 300));
-      expect(pidDead(pids.WRAPPER!)).toBe(true);
-      expect(pidDead(pids.CHILD!)).toBe(true);
+      expect(pidDead(wp)).toBe(true);
+      expect(pidDead(cp)).toBe(true);
     } finally {
+      // Out-of-band: kill any surviving tree regardless of assertion outcome.
+      if (wp > 0 && !pidDead(wp)) winTreeKill(wp);
+      if (cp > 0 && !pidDead(cp)) winTreeKill(cp);
       await fix.cleanup();
     }
   }, 20000);
@@ -376,50 +393,44 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
   (isWin ? it : it.skip)('early-exit: wrapper exits, child orphan, termination-unconfirmed, out-of-band tree cleanup', async () => {
     const fix = await writeFixture(`
       const { spawn } = require('child_process');
-      const { writeFileSync } = require('fs');
+      const { writeFileSync, mkdirSync } = require('fs');
       const { join } = require('path');
-      const { tmpdir } = require('os');
-      // Write child PID to a pidfile for mandatory out-of-band cleanup.
-      const pidfile = join(tmpdir(), 'bridge-fix-child-' + process.pid + '.pid');
+      const pidDir = join(require('os').tmpdir(), 'bridge-early-' + process.pid);
+      mkdirSync(pidDir, { recursive: true });
+      // Spawn Node heartbeat child that writes its own PID to pidfile,
+      // then writes dots. Child inherits wrapper stderr → runner pipe.
       const hb = spawn(process.execPath, ['-e',
         'var fs=require("fs");var p=String(process.pid);' +
-        'fs.writeFileSync("' + pidfile.replace(/\\\\/g, '\\\\\\\\') + '","CHILD:"+p);' +
+        'fs.writeFileSync("' + pidDir.replace(/\\\\/g, '\\\\\\\\') + '/child.pid",p);' +
         'process.stderr.write("CHILD:"+p+"\\n");' +
         'setInterval(function(){process.stderr.write(".")},50)'
       ], { stdio: ['ignore', 'ignore', 'inherit'] });
+      writeFileSync(join(pidDir, 'wrapper.pid'), String(process.pid));
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
-      // Poll to also output child PID to stdout for runner capture.
       var iv = setInterval(function() {
         if (hb.pid) { process.stdout.write('CHILD:' + hb.pid + '\\n'); clearInterval(iv); }
       }, 10);
-      setTimeout(function() { process.exit(0); }, 50);
+      // Exit after child started — child holds pipe.
+      setTimeout(function() { process.exit(0); }, 60);
     `);
-
     let childPid = 0;
-    let settled = false;
     try {
       const r = await runBoundedProcess(process.execPath, [fix.file], { timeoutMs: 3500, maxOutputBytes: 64_000 });
-      settled = true;
       expect(r.settled).toBe('termination-unconfirmed');
 
-      // Mandatory: CHILD PID must be present in output.
+      // Mandatory: extract CHILD PID from stdout.
       const cm = r.stdout.match(/CHILD:(\d+)/);
       expect(cm).toBeTruthy();
       childPid = Number(cm![1]);
       expect(childPid).toBeGreaterThan(0);
     } finally {
-      // Out-of-band tree cleanup: kill child + its descendants.
+      // Unconditional cleanup: kill tree if child PID was captured.
       if (childPid > 0) {
         winTreeKill(childPid);
         await new Promise((res) => setTimeout(res, 200));
-      }
-      // Verify no residue.
-      if (childPid > 0) {
         expect(pidDead(childPid)).toBe(true);
       }
       await fix.cleanup();
-      // Sanity: runner did not claim success.
-      if (settled) { /* termination-unconfirmed already asserted above */ }
     }
   }, 15000);
 });
