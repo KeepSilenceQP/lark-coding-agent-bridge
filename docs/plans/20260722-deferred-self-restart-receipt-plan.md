@@ -1,7 +1,7 @@
 # Deferred Self-Restart And Post-Restart Receipt Coding Plan
 
 Date: 2026-07-22
-Status: Plan Review PASS (R6) — implementation pending
+Status: Implementation rework — UUID transport + docs blocker before Code Review
 Authority: `docs/specs/20260722-deferred-self-restart-receipt.md` (confirmed by Qin Peng, commit `b906c8b`)
 Branch: `fix/lark-bridge-followup`
 Implementer: 小C
@@ -32,6 +32,7 @@ Plan Reviewer: 小P
 - **R5（CHANGES REQUIRED，单点文字/测试修正，R4 核心已关闭）**：attempt 接管条件前后不一致——要求/摘要是 AND（owner crash + lease TTL + owner-dead），DD1 recovery 实际写成 OR（"ownerPid 死 或 TTL 超时"），会让 owner 仍活但发送超 TTL 时被第二 actor 抢占，破坏唯一发送权。统一为严格 AND：只有 `lease TTL 已超时 && ownerPid 已确认死亡` 才允许删旧 attempt 并原子接管；任一不满足等待/不接管；ownerPid 检测不确定/EPERM 按仍存活 fail-closed。补测试：TTL 超时但 owner alive 不接管；owner dead 但 TTL 未到不接管；二者同时满足才唯一接管。
 - **R5 修订**：DD1 recovery OR→严格 AND + fail-closed；同步 DD1 attempt 文件描述、crash 表、DD3/DD4/DD5 接管措辞、Unit 1 接管测试。Plan Writer 未自判 GO。
 - **R6（小P，PASS）**：R1-R5 findings 全部关闭。confirmed Spec、live code 落点、per-run route lease、唯一 pending、claim/attempt/terminal 原子状态、strict-AND recovery、Bridge System Prompt、三平台自动化与隔离 failure/live success 验收链一致；无剩余 Plan blocker。允许小C进入 Unit 1-5，实现完成后仍须经过云上C总独立 Code Review，方可进入 Unit 6。
+- **Implementation handoff（小C，`7a992ff`，返修中）**：Unit 1-5 首版已提交并报告全量测试/typecheck/build/diff-check 通过；Coordinator 检查发现 receipt sender 虽生成稳定 UUID，但通过不支持 UUID 的 `channel.send` 发送，UUID 未进入飞书 create/reply 请求，不能满足 DD5 exactly-once；同时 README.md/README.zh.md 未按 Unit 5 更新。已退回小C补齐真实 UUID API 传递、出站请求断言/同 UUID 重试测试及文档，修复完成前不勾选 Unit 1-5、不进入独立 Code Review。
 
 ## Current Evidence
 
