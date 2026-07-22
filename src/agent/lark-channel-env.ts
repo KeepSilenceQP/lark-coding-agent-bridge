@@ -7,6 +7,8 @@ export interface LarkChannelEnvContext {
   configPath?: string;
   larkCliConfigDir?: string;
   larkCliSourceConfigFile?: string;
+  /** Opaque route ID for deferred self-restart. Only routeId goes to env — never chatId. */
+  routeId?: string;
 }
 
 export function buildLarkChannelEnv(context?: LarkChannelEnvContext): NodeJS.ProcessEnv {
@@ -19,6 +21,9 @@ export function buildLarkChannelEnv(context?: LarkChannelEnvContext): NodeJS.Pro
   if (context?.bridgePid && context.bridgePid > 0) {
     env.LARK_CHANNEL_BRIDGE_PID = String(context.bridgePid);
   }
+
+  const routeId = nonEmpty(context?.routeId);
+  if (routeId) env.LARK_CHANNEL_ROUTE_ID = routeId;
 
   const rootDir = nonEmpty(context?.rootDir);
   if (rootDir) env.LARK_CHANNEL_HOME = rootDir;

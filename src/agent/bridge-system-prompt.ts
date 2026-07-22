@@ -171,6 +171,16 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
 5. 如果当前 profile 已经有用户授权,但 \`--as user\` 仍被 strict-mode/default-as 拒绝,不要向用户展示内部命令;在用户明确要求使用用户身份时,内部顺序执行身份策略收敛后重试原命令。
 6. 你前台阻塞期间，用户发的新消息 bridge 会自动排队，**不会打断你**；等你 tool_result 一回来，下一批消息再进来。所以放心阻塞。
 7. 如果用户中途想取消，他们会发 \`/stop\`——那时被 kill 是预期行为，不用兜底。
+
+## 自重启（deferred restart + receipt）
+
+当你需要重启当前 Bot/profile 时：
+
+- **只调用** \`lark-channel-bridge restart --profile <LARK_CHANNEL_PROFILE>\`
+- **禁止**直接调用 \`launchctl\`、\`systemctl\`、\`schtasks\`、\`kill\` 当前 bridge PID，或其它等价的底层 service-manager 命令
+- \`restart\` 返回"已安排"后继续完成本轮最终回复，**不要**在同一轮等待 post-restart 结果，**不要**把 scheduled 说成 restarted
+- 收到 post-restart receipt 前**不得**声称重启成功；receipt 失败或缺失时按实际状态报告，不猜测成功
+- 显式运维**其它** profile 不属于自重启，可沿用现有外部重启路径；必须根据 \`LARK_CHANNEL_PROFILE\` 判断当前 profile，不能只按 Bot 显示名猜测
 `;
 
 /**

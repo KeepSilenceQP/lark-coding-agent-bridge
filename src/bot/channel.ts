@@ -55,6 +55,33 @@ import {
   launchDeferredServiceRestart,
   requestDeferredServiceRestart,
 } from '../runtime/deferred-service-restart';
+import {
+  createRouteLease,
+  deleteRouteLease,
+  routeLeaseDir,
+} from '../runtime/route-lease';
+import {
+  createPending,
+  readPending,
+  deletePending,
+  createClaim,
+  readClaim,
+  createAttempt,
+  readAttempt,
+  deleteAttempt,
+  createTerminal,
+  readTerminal,
+  cleanupReceiptArtifacts,
+  scanReceipts,
+  makeReceiptId,
+  makeClaimUuid,
+  receiptDir,
+  type PendingRequest,
+  type ClaimDescriptor,
+  type ReceiptKind,
+} from '../runtime/restart-receipt';
+import { sendRestartReceiptViaChannel } from '../runtime/restart-receipt-sender';
+import { isAlive } from '../runtime/registry';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type {
@@ -672,15 +699,23 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     // event loop. Put the request back and let the final active batch consume
     // it, so a restart can never cut across a newly-started reply.
     if (activeBatchCount !== 0) {
-      await requestDeferredServiceRestart(profileDir, {
-        profile: controls.profile,
-        bridgePid: process.pid,
-        requestedAt: new Date().toISOString(),
-      });
+      // For new format: pending.json already exists, no need to re-write.
+      // For old format: re-write the marker since consume deleted it.
+      if (requested.format === 'old') {
+        await requestDeferredServiceRestart(profileDir, {
+          profile: controls.profile,
+          bridgePid: process.pid,
+          requestedAt: new Date().toISOString(),
+        });
+      }
       return;
     }
     deferredRestartLaunching = true;
-    log.info('service', 'deferred-restart-launch', { profile: controls.profile });
+    log.info('service', 'deferred-restart-launch', {
+      profile: controls.profile,
+      format: requested.format,
+      ...(requested.format === 'new' ? { receiptId: requested.receiptId } : {}),
+    });
     (deps.launchDeferredRestart ?? launchDeferredServiceRestart)(controls.profile);
   };
 
@@ -814,6 +849,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           lastRunModelByScope,
           scope,
           mode,
+          profileDir: deps.appPaths?.profileDir,
         });
       } catch (err) {
         log.fail('flush', err);
@@ -1013,6 +1049,18 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     procId: controls.processId,
   });
   console.log('正在监听消息。按 Ctrl+C 退出。\n');
+
+  // ── New bridge: send success receipt for pending restart ──────────
+  const profileDir = deps.appPaths?.profileDir;
+  if (profileDir) {
+    await handleNewBridgePendingReceipt(channel, controls.profile, profileDir).catch((err) =>
+      log.fail('receipt', err, { step: 'new-bridge-success-receipt' }),
+    );
+    // Recovery: scan for claim.* files without terminal and attempt takeover.
+    await handleReceiptRecovery(channel, controls.profile, profileDir).catch((err) =>
+      log.fail('receipt', err, { step: 'receipt-recovery' }),
+    );
+  }
 
   // App-level keepalive: 15s probe + wake-up detection + HTTP reachability.
   // Defense-in-depth — the SDK's pingTimeout watchdog handles half-dead WS,
@@ -1301,6 +1349,7 @@ interface RunBatchDeps {
   lastRunModelByScope: Map<string, string>;
   scope: string;
   mode: ChatMode;
+  profileDir?: string;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -1466,6 +1515,24 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     chatType: firstMsg.chatType,
     ...(threadId ? { threadId } : {}),
   };
+  // Create a per-run route lease for deferred self-restart. Only routeId is
+  // exposed to the agent environment — never chatId. The restart CLI validates
+  // the lease by bridgePid and consumes it to create a pending receipt.
+  let routeLeaseId: string | undefined;
+  if (deps.profileDir) {
+    const lease = await createRouteLease(deps.profileDir, {
+      chatId,
+      threadId,
+      replyTo: lastMsg.messageId,
+      bridgePid: process.pid,
+      runId: `${scope}:${Date.now()}`,
+    });
+    if (lease) {
+      routeLeaseId = lease.routeId;
+      log.info('route-lease', 'created', { routeId: routeLeaseId, chatId });
+    }
+  }
+
   const startFlow = (
     stage: 'submit' | 'startup-retry',
     reuseDecision?: PromptSessionDecision,
@@ -1493,6 +1560,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       executor,
       now: Date.now(),
       stopGraceMs: getAgentStopGraceMs(controls.cfg),
+      routeId: routeLeaseId,
       observability: {
         profile: controls.profile,
         agent: capability.agentId,
@@ -1502,6 +1570,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     });
   const flow = await startFlow('submit');
   if (!flow.ok) {
+    // Clean up route lease if flow is rejected — no agent run will happen.
+    if (routeLeaseId && deps.profileDir) {
+      await deleteRouteLease(deps.profileDir, routeLeaseId).catch(() => {});
+    }
     log.info('run-flow', 'rejected', { scope, code: flow.rejectReason.code });
     if (flow.rejectReason.code === 'run-interrupted') return;
     log.warn('policy', 'denied', {
@@ -2889,4 +2961,214 @@ function parseJsonOrRaw(input: string): unknown {
 
 function isDefined<T>(value: T | undefined): value is T {
   return value !== undefined;
+}
+
+// ── New bridge: pending receipt handler ──────────────────────────────
+
+const ATTEMPT_LEASE_TTL_MS = 120_000; // 2 min — attempt lease validity
+
+async function handleNewBridgePendingReceipt(
+  channel: LarkChannel,
+  profile: string,
+  profileDir: string,
+): Promise<void> {
+  const pending = await readPending(profileDir);
+  if (!pending) return;
+
+  // Verify this is a legit pending request: oldPid must be a prior bridge.
+  if (pending.oldPid === process.pid) {
+    log.info('receipt', 'skip-self-pending', { receiptId: pending.receiptId });
+    return;
+  }
+
+  // oldPid should be dead (this is a new bridge after restart).
+  if (isAlive(pending.oldPid)) {
+    log.info('receipt', 'skip-oldpid-alive', {
+      receiptId: pending.receiptId,
+      oldPid: pending.oldPid,
+    });
+    return;
+  }
+
+  // Check if already claimed
+  const existingClaim = await readClaim(profileDir, pending.receiptId);
+  if (existingClaim) {
+    log.info('receipt', 'skip-already-claimed', { receiptId: pending.receiptId });
+    return;
+  }
+
+  // Check terminal
+  const existingTerminal = await readTerminal(profileDir, pending.receiptId);
+  if (existingTerminal) {
+    // Terminal already set — clean up pending
+    await deletePending(profileDir, pending.receiptId).catch(() => {});
+    await cleanupReceiptArtifacts(profileDir, pending.receiptId).catch(() => {});
+    return;
+  }
+
+  const kind: ReceiptKind = 'success';
+  const uuid = makeClaimUuid(pending.receiptId, kind);
+
+  // Primitive A: claim (immutable)
+  const claimed = await createClaim(profileDir, {
+    receiptId: pending.receiptId,
+    kind,
+    payload: pending.returnRoute,
+    uuid,
+    claimedAt: new Date().toISOString(),
+  });
+  if (!claimed) {
+    log.info('receipt', 'claim-eeexist', { receiptId: pending.receiptId });
+    return;
+  }
+
+  // Primitive A: attempt lease
+  const attempted = await createAttempt(profileDir, {
+    receiptId: pending.receiptId,
+    ownerPid: process.pid,
+    attemptedAt: new Date().toISOString(),
+  });
+  if (!attempted) {
+    log.info('receipt', 'attempt-eeexist', { receiptId: pending.receiptId });
+    return;
+  }
+
+  // Primitive C: delete pending (verified)
+  await deletePending(profileDir, pending.receiptId);
+
+  // Read terminal one more time before sending (defense-in-depth)
+  if (await readTerminal(profileDir, pending.receiptId)) {
+    await cleanupReceiptArtifacts(profileDir, pending.receiptId).catch(() => {});
+    return;
+  }
+
+  // Send success receipt
+  const result = await sendRestartReceiptViaChannel(channel, {
+    profile,
+    returnRoute: pending.returnRoute,
+    receiptId: pending.receiptId,
+    kind,
+    uuid,
+    newPid: process.pid,
+    deployRevision: pending.deployRevision,
+  });
+
+  if (result.ok && result.messageId) {
+    // Primitive A: terminal(completed)
+    await createTerminal(profileDir, {
+      receiptId: pending.receiptId,
+      kind,
+      outcome: 'completed',
+      messageId: result.messageId,
+    });
+    log.info('receipt', 'sent-success', {
+      receiptId: pending.receiptId,
+      messageId: result.messageId,
+    });
+  } else {
+    // Deterministic failure
+    await createTerminal(profileDir, {
+      receiptId: pending.receiptId,
+      kind,
+      outcome: 'delivery-failed',
+      reason: 'receipt-delivery-failure',
+    });
+    log.warn('receipt', 'delivery-failed', { receiptId: pending.receiptId });
+  }
+
+  // Clean up claim + attempt
+  await cleanupReceiptArtifacts(profileDir, pending.receiptId).catch(() => {});
+}
+
+// ── Recovery: scan claim.* without terminal, attempt takeover ─────────
+
+async function handleReceiptRecovery(
+  channel: LarkChannel,
+  profile: string,
+  profileDir: string,
+): Promise<void> {
+  const scans = await scanReceipts(profileDir);
+  for (const scan of scans) {
+    if (scan.hasTerminal) {
+      // Terminal exists — clean residue
+      await cleanupReceiptArtifacts(profileDir, scan.receiptId).catch(() => {});
+      continue;
+    }
+    if (!scan.hasClaim) continue;
+
+    // claim exists, no terminal — recovery needed
+    const claim = await readClaim(profileDir, scan.receiptId);
+    if (!claim) continue;
+
+    // Check attempt lease
+    const attempt = await readAttempt(profileDir, scan.receiptId);
+    if (attempt) {
+      // Attempt exists — check strict-AND takeover conditions
+      const ttlExpired =
+        Date.now() - new Date(attempt.attemptedAt).getTime() > ATTEMPT_LEASE_TTL_MS;
+      const ownerDead = !isAlive(attempt.ownerPid);
+
+      if (!ttlExpired || !ownerDead) {
+        // Cannot take over — both conditions must be satisfied
+        log.info('receipt', 'recovery-attempt-not-takeover', {
+          receiptId: scan.receiptId,
+          ttlExpired,
+          ownerDead,
+        });
+        continue;
+      }
+
+      // Delete stale attempt (primitive C)
+      await deleteAttempt(profileDir, scan.receiptId).catch(() => {});
+    }
+
+    // Try to take over attempt
+    const taken = await createAttempt(profileDir, {
+      receiptId: scan.receiptId,
+      ownerPid: process.pid,
+      attemptedAt: new Date().toISOString(),
+    });
+    if (!taken) {
+      log.info('receipt', 'recovery-attempt-eeexist', { receiptId: scan.receiptId });
+      continue;
+    }
+
+    // Read terminal again (defense-in-depth)
+    if (await readTerminal(profileDir, scan.receiptId)) {
+      await cleanupReceiptArtifacts(profileDir, scan.receiptId).catch(() => {});
+      continue;
+    }
+
+    // Re-send with same kind+uuid (immutable claim → no flip)
+    const result = await sendRestartReceiptViaChannel(channel, {
+      profile,
+      returnRoute: claim.payload,
+      receiptId: claim.receiptId,
+      kind: claim.kind,
+      uuid: claim.uuid,
+    });
+
+    if (result.ok && result.messageId) {
+      await createTerminal(profileDir, {
+        receiptId: claim.receiptId,
+        kind: claim.kind,
+        outcome: 'completed',
+        messageId: result.messageId,
+      });
+      log.info('receipt', 'recovery-sent', {
+        receiptId: claim.receiptId,
+        kind: claim.kind,
+        messageId: result.messageId,
+      });
+    } else {
+      await createTerminal(profileDir, {
+        receiptId: claim.receiptId,
+        kind: claim.kind,
+        outcome: 'delivery-failed',
+        reason: 'receipt-delivery-failure',
+      });
+    }
+
+    await cleanupReceiptArtifacts(profileDir, scan.receiptId).catch(() => {});
+  }
 }
