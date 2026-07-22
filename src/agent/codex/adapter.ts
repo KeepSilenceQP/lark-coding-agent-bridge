@@ -124,7 +124,10 @@ export class CodexAdapter implements AgentAdapter {
       );
     }
     if (!opts) return;
-    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
+    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv({
+      ...this.larkChannel,
+      routeId: opts?.routeId,
+    });
     if (this.codexHome) {
       envOverrides.CODEX_HOME = this.codexHome;
     } else if (!this.inheritCodexHome) {
@@ -219,7 +222,10 @@ export class CodexAdapter implements AgentAdapter {
       opts.systemPromptAddendum ?? '',
       `developer_instructions=${JSON.stringify(developerInstructions)}`,
     ]);
-    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
+    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv({
+      ...this.larkChannel,
+      routeId: opts.routeId,
+    });
     if (this.codexHome) {
       envOverrides.CODEX_HOME = this.codexHome;
     } else if (!this.inheritCodexHome) {
