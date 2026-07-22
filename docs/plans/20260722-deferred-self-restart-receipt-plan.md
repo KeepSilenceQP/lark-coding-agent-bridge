@@ -1,7 +1,7 @@
 # Deferred Self-Restart And Post-Restart Receipt Coding Plan
 
 Date: 2026-07-22
-Status: revised after R4 CHANGES REQUIRED Plan Re-review — awaiting re-review
+Status: revised after R5 CHANGES REQUIRED Plan Re-review — awaiting re-review
 Authority: `docs/specs/20260722-deferred-self-restart-receipt.md` (confirmed by Qin Peng, commit `b906c8b`)
 Branch: `fix/lark-bridge-followup`
 Implementer: 小C
@@ -28,7 +28,9 @@ Plan Reviewer: 小P
 - **R2（CHANGES REQUIRED，R1 已关闭）**：6 项（route=lastMsg.messageId、并发 EEXIST、唯一 recovery、stale quarantine、文件名权威、botName 回填时序）。已修订。
 - **R3（CHANGES REQUIRED，最后阻塞点候选，R2 已关闭）**：状态迁移原语自相矛盾（rename 不能固化 immutable 内容）。定稿原语 A/B/C + crash 表。已修订。
 - **R4（CHANGES REQUIRED，仅原子终态一致性，R3 已关闭）**：R3 原语仍允许矛盾终态——`completed.<id>` 与 `delivery-failed.<id>` 是两个独立 target，两 recoverer 可分别写出（原语 B 幂等只对同路径）；新 bridge 扫描 claim.* 无独占 recovery owner，多 recoverer 可并发裁定不同结果。要求：每 receiptId 单一权威 `terminal.<id>.json`（outcome=completed|delivery-failed，原语 A 独占；completed messageId/failed reason 同 schema 同 target；terminal 已存在则所有 actor 以它为准）；recovery 加唯一 `attempt.<id>` lease/owner（只有一个 recoverer 可发送/裁定；owner crash 需 lease TTL+owner-dead 才可由下一 actor 原子接管，仍同 kind+uuid 重试）；所有路径先读 terminal，terminal 出现后不再发送、清 claim/attempt 残留；crash 表与测试同步（success vs deterministic-failure 并发只产生一个 terminal；两 recovery 只有一个拥有发送权）。
-- **R4 修订（本次）**：DD1 单一 terminal + attempt lease + 读 terminal 优先 + crash 表；DD3/DD4/DD5 引用；Unit 1/2/4 同步测试。Status awaiting re-review。Plan Writer 不自判 GO。
+- **R4 修订**：DD1 单一 terminal + attempt lease + 读 terminal 优先 + crash 表；DD3/DD4/DD5 引用；Unit 1/2/4 同步测试。
+- **R5（CHANGES REQUIRED，单点文字/测试修正，R4 核心已关闭）**：attempt 接管条件前后不一致——要求/摘要是 AND（owner crash + lease TTL + owner-dead），DD1 recovery 实际写成 OR（"ownerPid 死 或 TTL 超时"），会让 owner 仍活但发送超 TTL 时被第二 actor 抢占，破坏唯一发送权。统一为严格 AND：只有 `lease TTL 已超时 && ownerPid 已确认死亡` 才允许删旧 attempt 并原子接管；任一不满足等待/不接管；ownerPid 检测不确定/EPERM 按仍存活 fail-closed。补测试：TTL 超时但 owner alive 不接管；owner dead 但 TTL 未到不接管；二者同时满足才唯一接管。
+- **R5 修订（本次）**：DD1 recovery OR→严格 AND + fail-closed；同步 DD1 attempt 文件描述、crash 表、DD3/DD4/DD5 接管措辞、Unit 1 接管测试。Status awaiting re-review。Plan Writer 不自判 GO。
 
 ## Current Evidence
 
@@ -63,7 +65,7 @@ Plan Reviewer: 小P
 
 - `pending.json` — 唯一待处理。内容 `{receiptId, profile, oldPid, requestedAt, returnRoute, deployRevision}`。原语 A（EEXIST → 拒绝新请求）。
 - `claim.<receiptId>.json` — claim descriptor。内容 `{receiptId, kind, payload=returnRoute, uuid, claimedAt}`（**原语 A 一次性固化，immutable**；kind+uuid 永不变）。原语 A（EEXIST → 已 claim）。
-- `attempt.<receiptId>.json` — **唯一发送/裁定 lease**。内容 `{receiptId, ownerPid, attemptedAt}`。原语 A（EEXIST → 已有 owner）。owner crash + lease TTL → 下一 actor 原子接管（见 recovery）。
+- `attempt.<receiptId>.json` — **唯一发送/裁定 lease**。内容 `{receiptId, ownerPid, attemptedAt}`。原语 A（EEXIST → 已有 owner）。仅当 `lease TTL 已超时 && ownerPid 已确认死亡`（严格 AND）→ 下一 actor 原子接管（见 recovery，fail-closed）。
 - `terminal.<receiptId>.json` — **唯一权威终态**。内容 `{receiptId, kind, outcome:'completed'|'delivery-failed', messageId?, reason?}`（completed 的 messageId 与 delivery-failed 的 reason **同一 schema、同一 target**）。原语 A（EEXIST → 终态已定，所有 actor 以它为准）。
 - `abandoned.<receiptId>.json` — stale pending quarantine（未 claim 的 pending 过期）。原语 R。
 
@@ -77,7 +79,7 @@ Plan Reviewer: 小P
 
 **recovery（唯一 owner）：**
 - 触发：发现 `claim.<receiptId>.json` 存在但无 `terminal.<receiptId>.json`。
-- 接管 attempt：读 `attempt.<receiptId>.json`；ownerPid 仍活且未 TTL → 等待（他人持有）；ownerPid 死 或 TTL 超时 → 原语 C 删 stale attempt → 原语 A 创建新 `attempt.<receiptId>.json`（owner=自己）。原语 A 保证**唯一接管者**。
+- 接管 attempt（严格 AND）：读 `attempt.<receiptId>.json`；仅当 `lease TTL 已超时 && ownerPid 已确认死亡` → 原语 C 删 stale attempt → 原语 A 创建新 `attempt.<receiptId>.json`（owner=自己）。任一不满足 → 等待/不接管。**fail-closed**：ownerPid 检测不确定/EPERM 按仍存活（不接管）。原语 A 保证**唯一接管者**。
 - 接管后：从 `claim.<receiptId>.json` 读 kind+uuid（immutable，**不翻转**）→ 先读 terminal（已存在则清残留退出）→ send 同 uuid → 原语 A `terminal` → 原语 C 删 attempt+claim。
 - 两 recoverer：原语 A attempt 唯一 owner；原语 A terminal 唯一终态。**只有一个 recoverer 拥有发送权。**
 
@@ -89,7 +91,7 @@ Plan Reviewer: 小P
 | link pending 后、删 lease 前 | pending + lease 孤儿 | 照常处理；lease TTL 清 |
 | link claim 后、attempt 前 | claim（无 attempt/terminal） | recovery 接管 attempt |
 | link attempt 后、删 pending 前 | claim + attempt + pending | claim/attempt 权威；pending 冗余删 |
-| send 后、terminal 前 | claim + attempt，无 terminal | recovery 接管 attempt（owner 死）→ 同 uuid 重发去重 → terminal |
+| send 后、terminal 前 | claim + attempt，无 terminal | recovery 接管 attempt（仅 TTL 超时 && ownerPid 确认死亡，严格 AND）→ 同 uuid 重发去重 → terminal |
 | terminal 后、清 attempt/claim 前 | terminal（权威）+ claim/attempt | 任意 actor 读 terminal → 清残留 |
 | 确定性 send 失败、terminal 前 | claim + attempt | recovery → 仍确定性失败 → terminal(delivery-failed) |
 
@@ -121,7 +123,7 @@ Plan Reviewer: 小P
   3. `waitForServiceConnect(appId, profile, beforePids, timeout)` 观察新 bridge（不以 adapter exit 0 判成功，以新 PID+botName 出现为准）。超时 → failure 判定前先 **final 短复查**：新 bridge 已上来 → 不发 failure（让新 bridge 发 success）；仍 down → reason=`startup-timeout`。
   4. 新 bridge 连接成功（registry botName 回填后 helper 观察到）→ helper 退出不发。
   5. failure → **原语 A** `claim.<receiptId>.json`（immutable descriptor：kind=failure/uuid=f(receiptId,'failure')/claimedAt）→ **原语 A** `attempt.<receiptId>.json`（owner=helper pid）→ **原语 C** 删 pending → **先读 terminal**（已存在则清残留退出）→ 有界重试 `sendRestartReceipt(kind='failure', reason)` → 成功 → **原语 A** `terminal.<receiptId>.json`（outcome=completed, messageId）；确定性凭据/API 失败 → **原语 A** `terminal`（outcome=delivery-failed, reason）→ **原语 C** 删 attempt+claim + 日志。
-- **崩溃恢复（唯一语义）**：`claim.<receiptId>.json` immutable（原语 A 一次性固化 kind+uuid，不改）。本 sender 有界重试。send 不确定或 send→terminal 间崩溃 → recovery 从 claim descriptor 恢复，接管 attempt（owner 死+TTL），以同 kind+uuid 重发（Feishu 去重），**不翻转**。确定性凭据/API 失败 → terminal outcome=delivery-failed。
+- **崩溃恢复（唯一语义）**：`claim.<receiptId>.json` immutable（原语 A 一次性固化 kind+uuid，不改）。本 sender 有界重试。send 不确定或 send→terminal 间崩溃 → recovery 从 claim descriptor 恢复，接管 attempt（仅 lease TTL 超时 && ownerPid 确认死亡，严格 AND），以同 kind+uuid 重发（Feishu 去重），**不翻转**。确定性凭据/API 失败 → terminal outcome=delivery-failed。
 - **recovery 互斥与触发**：recovery 由"claim 存在但无 terminal"触发。新 bridge 启动扫描 `claim.*`：按 claim 的 kind+uuid + 接管 attempt（原语 A 唯一 owner）恢复，不翻转。helper 自身 claim 后有界重试。两 recoverer：attempt 原语 A 唯一 owner；terminal 原语 A 唯一终态。helper 重入/重复：claim/attempt/terminal 已存在 → 不再发、不再重启。
 
 ### DD4 — 新 Bridge success receipt（channel.connect 成功后 claim；botName 回填时序修正）
@@ -131,12 +133,12 @@ Plan Reviewer: 小P
 - 已 claim/attempt/terminal → 不补发（若 claim 为 failure kind，新 bridge 不翻转，按 failure recovery）。
 - 无 returnRoute（旧格式）→ 不发，同 receiptId cleanup。oldPid 不匹配/陈旧 → 不发，同 receiptId cleanup 或 stale quarantine。
 - receipt sender 回传 messageId → 写 `terminal.<receiptId>.json` 作为验收证据。
-- **recovery**：新 bridge 启动扫描 `claim.*` 无 terminal → 接管 attempt（原语 A 唯一 owner，owner 死+TTL）→ 同 kind+uuid 重发 → terminal → 清残留。
+- **recovery**：新 bridge 启动扫描 `claim.*` 无 terminal → 接管 attempt（原语 A 唯一 owner；仅 lease TTL 超时 && ownerPid 确认死亡，严格 AND + fail-closed）→ 同 kind+uuid 重发 → terminal → 清残留。
 
 ### DD5 — exactly-once：单一 terminal + 唯一 attempt owner + Feishu uuid（不留 Open Point）
 
 - **单一权威 terminal（R4）**：`terminal.<receiptId>.json` 原语 A 独占，每 receiptId 唯一；completed/delivery-failed 同 schema 同 target，**不能同时存在**。success vs deterministic-failure 并发：原语 A 只有一个赢家 → 一个 terminal。
-- **唯一 attempt owner（R4）**：`attempt.<receiptId>.json` 原语 A 独占，只有一个 recoverer/sender 拥有发送权；owner crash + lease TTL + owner-dead → 下一 actor 原子接管（原语 C 删 stale + 原语 A 创建新），仍同 kind+uuid 重试。两 recoverer 只有一个拥有发送权。
+- **唯一 attempt owner（R4/R5）**：`attempt.<receiptId>.json` 原语 A 独占，只有一个 recoverer/sender 拥有发送权；**仅当 `lease TTL 已超时 && ownerPid 已确认死亡`（严格 AND；fail-closed：检测不确定/EPERM 按仍存活）** → 下一 actor 原子接管（原语 C 删 stale + 原语 A 创建新），仍同 kind+uuid 重试。两 recoverer 只有一个拥有发送权。
 - **claim immutable**：kind+uuid 原语 A 一次性固化，recovery 不翻转。
 - **Feishu 服务端幂等**：每条 send 带 `uuid=f(receiptId,kind)`；重复 send（同 uuid）→ Feishu 返回同一 messageId，不产生重复用户可见消息。
 - **所有路径先读 terminal**：terminal 出现后不再发送，清 claim/attempt 残留。
@@ -166,7 +168,7 @@ Files：`tests/unit/runtime/deferred-service-restart.test.ts`、`tests/unit/cli/
 Add failing coverage：
 - 原语：原语 A 独占（并发 link → 唯一赢家，EEXIST 输家）、全内容原子（target 出现即完整，无空锁）、temp 孤儿 TTL 清；原语 R rename quarantine；原语 C 删前校验同 receiptId。
 - 单一 terminal：`terminal.<id>` 原语 A 独占；completed（messageId）与 delivery-failed（reason）同 schema 同 target；**success vs deterministic-failure 并发只能产生一个 terminal，不能同时 completed+delivery-failed**；terminal 已存在 → 所有 actor 不发送、清 claim/attempt 残留。
-- 唯一 attempt owner：`attempt.<id>` 原语 A 唯一 owner；owner crash + lease TTL + owner-dead → 下一 actor 原子接管（原语 C 删 stale + 原语 A 创建新）；**两 recovery 只有一个拥有发送权**；接管后同 kind+uuid 重试。
+- 唯一 attempt owner：`attempt.<id>` 原语 A 唯一 owner；**接管严格 AND**：TTL 超时但 owner alive → 不接管；owner dead 但 TTL 未到 → 不接管；TTL 超时 && owner dead → 唯一接管（原语 C 删 stale + 原语 A 创建新）；ownerPid 检测 EPERM/不确定 → 按仍存活不接管（fail-closed）；**两 recovery 只有一个拥有发送权**；接管后同 kind+uuid 重试。
 - claim immutable：kind+uuid 创建后不变；recovery 不翻转（success claim 不改 failure，反之）。
 - 状态机（文件存在=状态）：pending 唯一（原语 A，二次 EEXIST reject）；同 receiptId cleanup；跨 receiptId cleanup 拒绝；stale pending（TTL+oldPid 死）→ quarantine `abandoned.<id>`；oldPid 仍活不 quarantine；损坏 quarantine；旧格式降级仅重启。
 - **crash-point recovery**：link pending 后删 lease 前 → pending durable + lease 孤儿；link claim 后 attempt 前 → recovery 接管 attempt；link attempt 后删 pending 前 → claim/attempt 权威 + pending 冗余删；send 后 terminal 前 → 同 uuid 重发去重 → terminal；terminal 后清残留前 → 读 terminal 清残留；确定性失败 → terminal(delivery-failed)。
