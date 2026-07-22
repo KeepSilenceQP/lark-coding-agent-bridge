@@ -405,36 +405,45 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
 
   // ── early-exit: heartbeat-file-based child survival proof ──
 
+  // Placeholder replaced with actual tmpDir when writeFixture runs.
+  const FIX_DIR_PLACEHOLDER = '<<<FIXDIR>>>';
+
+  const childCodeTemplate = [
+      'var fs=require("fs"),path=require("path");',
+      'var dir="' + FIX_DIR_PLACEHOLDER + '";',
+      'var hbFile=path.join(dir,"heartbeat.txt");',
+      'var pidFile=path.join(dir,"child.pid");',
+      'fs.writeFileSync(hbFile,"0");',
+      'fs.writeFileSync(pidFile,String(process.pid));',
+      'var n=0;',
+      'setInterval(function(){n++;fs.writeFileSync(hbFile,String(n))},80);',
+    ].join('');
+
   (isWin ? it : it.skip)('early-exit: wrapper exits, child survives (heartbeat file), out-of-band cleanup', async () => {
-    // Child stdio is fully decoupled from the wrapper (all 'ignore') so
-    // the child has zero dependency on the wrapper lifecycle.  Child
-    // writes a heartbeat counter to a known file every ~80ms.  After
-    // runner settles, the test reads the counter, waits for at least
-    // one more cycle, then verifies the counter advanced — proving the
-    // child was alive and running independently after wrapper exit.
-    const fix = await writeFixture((tmpDir) => `
-      const { spawn } = require('child_process');
-      const { writeFileSync } = require('fs');
-      const pd = ${JSON.stringify(tmpDir)};
-      const hbFile = require('path').join(pd, 'heartbeat.txt');
-      writeFileSync(hbFile, '0'); // seed
-      const hb = spawn(process.execPath, ['-e',
-        'var fs=require("fs"),file=' + JSON.stringify(hbFile) + ',n=0,p=String(process.pid);' +
-        'fs.writeFileSync(require("path").join(' + JSON.stringify(tmpDir) + ',"child.pid"),p);' +
-        'setInterval(function(){n++;fs.writeFileSync(file,String(n))},80)'
-      ], { stdio: 'ignore', detached: true });
-      hb.unref();
-      writeFileSync(require('path').join(pd, 'wrapper.pid'), String(process.pid));
-      process.stdout.write('WRAPPER:' + process.pid + '\\n');
-      // Poll until child PID appears on disk, then exit.
-      var iv = setInterval(function() {
-        try {
-          var cp = require('fs').readFileSync(require('path').join(pd, 'child.pid'), 'utf8').trim();
-          if (cp) { process.stdout.write('CHILD:' + cp + '\\n'); clearInterval(iv); }
-        } catch(e) {}
-      }, 5);
-      setTimeout(function() { process.exit(0); }, 80);
-    `);
+    const fix = await writeFixture((tmpDir) => {
+      const finalChildCode = childCodeTemplate.split(FIX_DIR_PLACEHOLDER).join(tmpDir);
+      return `
+        const { spawn } = require('child_process');
+        const { writeFileSync } = require('fs');
+        const pd = ${JSON.stringify(tmpDir)};
+        // FIRST: write wrapper PID synchronously so any crash still leaves it.
+        writeFileSync(require('path').join(pd, 'wrapper.pid'), String(process.pid));
+        process.stdout.write('WRAPPER:' + process.pid + '\\n');
+        // Seed heartbeat so readPid works even if child hasn't started yet.
+        writeFileSync(require('path').join(pd, 'heartbeat.txt'), '0');
+        // Spawn detached child — survives wrapper exit.
+        var hb = spawn(process.execPath, ['-e', ${JSON.stringify(finalChildCode)}], { stdio: 'ignore', detached: true });
+        hb.unref();
+        // Poll until child PID appears, then exit.
+        var iv = setInterval(function() {
+          try {
+            var cp = require('fs').readFileSync(require('path').join(pd, 'child.pid'), 'utf8').trim();
+            if (cp) { process.stdout.write('CHILD:' + cp + '\\n'); clearInterval(iv); }
+          } catch(e) {}
+        }, 5);
+        setTimeout(function() { process.exit(0); }, 100);
+      `;
+    });
 
     let wp = 0, cp = 0, hbBefore = -1, hbAfter = -1;
     let cpWasAlive = false, wpDead = false, cpDead = false, r: any = null;
@@ -443,15 +452,10 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
     } finally {
       wp = fix.readPid('wrapper.pid');
       cp = fix.readPid('child.pid');
-      // Liveness: PID alive AND heartbeat file advances.
       if (cp > 0) cpWasAlive = !pidDead(cp);
-      try {
-        hbBefore = fix.readPid('heartbeat.txt'); // current count
-      } catch { hbBefore = -1; }
-      // If alive, wait for heartbeat to prove continued execution.
+      try { hbBefore = fix.readPid('heartbeat.txt'); } catch { hbBefore = -1; }
       if (cpWasAlive) await new Promise((res) => setTimeout(res, 200));
       try { hbAfter = fix.readPid('heartbeat.txt'); } catch { hbAfter = -1; }
-      // Kill tree.
       try {
         if (wp > 0) { winTreeKill(wp); await new Promise((r) => setTimeout(r, 200)); wpDead = pidDead(wp); }
         if (cp > 0) { winTreeKill(cp); await new Promise((r) => setTimeout(r, 200)); cpDead = pidDead(cp); }
@@ -459,11 +463,12 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
         await fix.cleanup();
       }
     }
-    expect(r).toBeTruthy();
+    // Diagnostics: wrapper must have exited cleanly.
+    expect(r.exitCode).toBe(0);
     expect(r.settled).toBe('exit');
     expect(wp).toBeGreaterThan(0);
+    expect(wpDead).toBe(true);
     expect(cp).toBeGreaterThan(0);
-    // Child was alive at cleanup time AND heartbeat advanced.
     expect(cpWasAlive).toBe(true);
     if (cpWasAlive) {
       expect(hbAfter).toBeGreaterThan(hbBefore);
