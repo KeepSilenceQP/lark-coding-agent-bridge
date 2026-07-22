@@ -405,21 +405,24 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
 
   // ── early-exit ──
 
-  (isWin ? it : it.skip)('early-exit: wrapper exits, child survives, runner close=exit, out-of-band cleanup', async () => {
-    // Windows Node closes inherited pipes on process.exit(). The runner
-    // cannot distinguish normal exit from orphan survival at close time
-    // (exit→close is the normal lifecycle). This is an acknowledged
-    // observational boundary per Plan DD1.  The fixture verifies:
-    //   1. Child PID captured and child IS alive before cleanup.
-    //   2. Runner returns exit (normal close path — expected on Windows).
-    //   3. Child is killed out-of-band by finally cleanup.
+  (isWin ? it : it.skip)('early-exit: wrapper exits, child survives (detached), runner close=exit, out-of-band cleanup', async () => {
+    // On Windows, Node closes inherited pipes on process.exit(), so the
+    // runner's close fires on the normal exit→close lifecycle and returns
+    // exit. To prove the child truly survives wrapper exit, the heartbeat
+    // spawn uses detached:true — the child gets its own process group and
+    // is not terminated with the wrapper. The fixture verifies:
+    //   1. Child PID captured and child IS alive (!pidDead) before cleanup.
+    //   2. Runner returns exit (normal close path on Windows).
+    //   3. Child is killed out-of-band via taskkill and verified dead.
     const fix = await writeFixture((tmpDir) => `
       const { spawn } = require('child_process');
       const { writeFileSync } = require('fs');
       const pd = ${JSON.stringify(tmpDir)};
+      // detached:true keeps the child alive after wrapper exit on Windows.
       const hb = spawn(process.execPath, ['-e',
         'var p=String(process.pid);process.stderr.write("CHILD:"+p+"\\n");setInterval(function(){process.stderr.write(".")},50)'
-      ], { stdio: ['ignore', 'ignore', 'inherit'] });
+      ], { stdio: ['ignore', 'ignore', 'inherit'], detached: true });
+      hb.unref(); // wrapper can exit without waiting for child
       writeFileSync(require('path').join(pd, 'wrapper.pid'), String(process.pid));
       writeFileSync(require('path').join(pd, 'child.pid'), String(hb.pid));
       process.stdout.write('WRAPPER:' + process.pid + '\\n');
@@ -434,6 +437,7 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
       wp = fix.readPid('wrapper.pid');
       cp = fix.readPid('child.pid');
       // Prove child was alive before cleanup (not just spawned with PID).
+      // signal 0 liveness probe must succeed on the detached survivor.
       if (cp > 0) cpWasAlive = !pidDead(cp);
       try {
         if (wp > 0) { winTreeKill(wp); await new Promise((res) => setTimeout(res, 200)); wpDead = pidDead(wp); }
@@ -443,8 +447,6 @@ describe('at-bot process-tree runner (real spawn, Windows)', () => {
       }
     }
     expect(r).toBeTruthy();
-    // Windows observational boundary: runner cannot distinguish orphan
-    // survival from normal exit at close time. Accept exit.
     expect(r.settled).toBe('exit');
     expect(wp).toBeGreaterThan(0);
     expect(cp).toBeGreaterThan(0);

@@ -1,7 +1,7 @@
 # Bot-to-Bot Native Mention Primitive Coding Plan
 
 Date: 2026-07-22
-Status: reviewed — R8 independent Plan Review PASS
+Status: revised after R14 CONDITIONAL — Windows detached-child survival, Plan consistency, concurrency, and observational boundary applied; awaiting re-review (R8 PASS baseline; R12/R13/R14 revisions need independent verification)
 Authority: `docs/specs/20260722-bot-at-primitive.md` (`confirmed — R7 independent review PASS`)
 Bridge branch: `feat/bot-at-primitive` from `a6185f9`
 Companion repository: `/Users/bytedance/repo/sayToLittleP` (`main@2efbb50`, clean at planning time)
@@ -456,4 +456,4 @@ Runtime readback commands and service operations are resolved from the live prof
 
 ## Review Gate
 
-This Plan was written by 小P and independently reviewed through R8. R8 returned `PASS` with no remaining P0/P1/P2, so Unit 0 may begin when implementation is authorized. This review does not itself commit files, modify runtime code, deploy artifacts, or start the sayToLittleP Harness.
+This Plan was written by 小P and independently reviewed through R8 (R8 returned `PASS` with no remaining P0/P1/P2). The Plan was subsequently revised in R12 (Windows observational boundary), R13 (Plan consistency across all sections), and R14 (Windows detached-child survival evidence). These post-R8 revisions address new evidence from real Windows CI runs and must be independently re-verified before the Plan can be considered current. This review does not itself commit files, modify runtime code, deploy artifacts, or start the sayToLittleP Harness.
