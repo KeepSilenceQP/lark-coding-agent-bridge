@@ -8,9 +8,9 @@
  * confirmed send with a real message_id.
  */
 
+import { platform } from 'node:os';
 import {
   runBoundedProcess,
-  type BoundedProcessResult,
 } from './at-bot-process';
 
 // ── public types ──
@@ -30,20 +30,34 @@ export interface AtBotSuccess {
 }
 
 interface BotListItem {
-  bot_id?: string;
-  bot_name?: string;
+  bot_id?: unknown;
+  bot_name?: unknown;
 }
 
 interface LarkCliEnvelope {
-  ok?: boolean;
-  code?: number | string;
-  msg?: string;
-  identity?: string;
+  ok?: unknown;
+  code?: unknown;
+  msg?: unknown;
+  identity?: unknown;
   data?: unknown;
   error?: {
     code?: number;
     message?: string;
   };
+}
+
+// ── lark-cli resolution ──
+
+/**
+ * The bridge-bound environment puts lark-cli on PATH. Use the bare
+ * command name so the child process inherits the full bridge env
+ * (LARK_CHANNEL_HOME, LARK_CHANNEL_PROFILE, …).
+ *
+ * On Windows the Node wrapper is a .cmd file resolved by shell:false
+ * cross-spawn; the .cmd extension is implied.
+ */
+function larkCliCommand(): string {
+  return platform() === 'win32' ? 'lark-cli.cmd' : 'lark-cli';
 }
 
 // ── error categories ──
@@ -58,17 +72,6 @@ function makeError(code: string, message: string, apiCode?: number): AtBotError 
   err.code = code;
   if (apiCode !== undefined) err.apiCode = apiCode;
   return err;
-}
-
-class RunError extends Error {
-  code: string;
-  apiCode?: number;
-  constructor(code: string, message: string, apiCode?: number) {
-    super(message);
-    this.name = 'RunError';
-    this.code = code;
-    this.apiCode = apiCode;
-  }
 }
 
 const UNBOUND_MARKER = 'lark-channel context detected but not bound';
@@ -98,7 +101,6 @@ function formatError(code: string, apiCode?: number): string {
 
 function redact(source: string): string {
   if (!source) return source;
-  // If the source contains the known unbound marker, return the fixed instruction.
   if (source.includes(UNBOUND_MARKER)) {
     return 'at-bot/context-unbound: restart the Bridge or run doctor/preflight';
   }
@@ -112,6 +114,61 @@ function scanForUnbound(...sources: string[]): string | undefined {
   return undefined;
 }
 
+// ── strict envelope validation (shared by discovery + send) ──
+
+function requireNonzeroExit(result: { exitCode: number | null }, category: string, invalidCategory: string): void {
+  if (result.exitCode !== null && result.exitCode !== 0) {
+    throw makeError(category, formatError(category));
+  }
+}
+
+function validateEnvelopeOk(parsed: LarkCliEnvelope, invalidCategory: string): void {
+  // ok must be strictly true (boolean).
+  if (parsed.ok !== true) {
+    const code = typeof parsed.code === 'number' ? parsed.code : undefined;
+    throw makeError(invalidCategory, formatError(invalidCategory, code));
+  }
+}
+
+function validateEnvelopeIdentity(parsed: LarkCliEnvelope, invalidCategory: string): void {
+  // identity must be strictly 'bot' (string).
+  if (parsed.identity !== 'bot') {
+    throw makeError(invalidCategory, formatError(invalidCategory));
+  }
+}
+
+function validateEnvelopeCode(parsed: LarkCliEnvelope, invalidCategory: string): void {
+  if (parsed.code !== undefined) {
+    // code must be absent or exactly number 0.  String "0" is rejected.
+    if (typeof parsed.code !== 'number') {
+      throw makeError(invalidCategory, formatError(invalidCategory));
+    }
+    if (!Number.isFinite(parsed.code) || parsed.code !== 0) {
+      throw makeError(
+        invalidCategory,
+        formatError(invalidCategory, parsed.code),
+      );
+    }
+  }
+}
+
+function parseNestedApiCode(parsed: LarkCliEnvelope): number | undefined {
+  if (parsed.error && typeof parsed.error.code === 'number') {
+    return parsed.error.code;
+  }
+  return undefined;
+}
+
+function parseEnvelopeJSON(stdout: string, invalidCategory: string): LarkCliEnvelope {
+  let parsed: LarkCliEnvelope;
+  try {
+    parsed = JSON.parse(stdout) as LarkCliEnvelope;
+  } catch {
+    throw makeError(invalidCategory, formatError(invalidCategory));
+  }
+  return parsed;
+}
+
 // ── validation ──
 
 function validateArgs(opts: AtBotOptions): void {
@@ -120,34 +177,35 @@ function validateArgs(opts: AtBotOptions): void {
     throw makeError('at-bot/context-missing', formatError('at-bot/context-missing'));
   }
   if (!opts.chatId || !opts.chatId.startsWith('oc_')) {
-    throw makeError(
-      'at-bot/invalid-argument',
-      formatError('at-bot/invalid-argument'),
-    );
+    throw makeError('at-bot/invalid-argument', formatError('at-bot/invalid-argument'));
   }
   if (!opts.botId || !opts.botId.startsWith('ou_')) {
-    throw makeError(
-      'at-bot/invalid-argument',
-      formatError('at-bot/invalid-argument'),
-    );
+    throw makeError('at-bot/invalid-argument', formatError('at-bot/invalid-argument'));
   }
   if (!opts.message || !opts.message.trim()) {
-    throw makeError(
-      'at-bot/invalid-argument',
-      formatError('at-bot/invalid-argument'),
-    );
+    throw makeError('at-bot/invalid-argument', formatError('at-bot/invalid-argument'));
   }
 }
 
 // ── discovery ──
 
+function validateBotItem(item: BotListItem): { bot_id: string; bot_name: string } {
+  if (typeof item.bot_id !== 'string' || !item.bot_id) {
+    throw makeError('at-bot/discovery-invalid', formatError('at-bot/discovery-invalid'));
+  }
+  if (typeof item.bot_name !== 'string' || !item.bot_name.trim()) {
+    throw makeError('at-bot/discovery-invalid', formatError('at-bot/discovery-invalid'));
+  }
+  return { bot_id: item.bot_id, bot_name: item.bot_name.trim() };
+}
+
 async function discoverBots(
   chatId: string,
   env: NodeJS.ProcessEnv,
-): Promise<BotListItem[]> {
+): Promise<Array<{ bot_id: string; bot_name: string }>> {
   const result = await runBoundedProcess(
-    process.execPath,
-    ['lark-cli', 'im', 'chat.members', 'bots',
+    larkCliCommand(),
+    ['im', 'chat.members', 'bots',
       '--params', JSON.stringify({ chat_id: chatId }),
       '--as', 'bot',
       '--format', 'json'],
@@ -160,83 +218,56 @@ async function discoverBots(
     throw makeError('at-bot/context-unbound', unbound);
   }
 
-  // Classify settle cause.
+  // Classify settle cause (before exitCode check because timeout/overflow
+  // may have nonzero exit that is already covered by the settle category).
   if (result.settled === 'unavailable') {
-    throw makeError('at-bot/discovery-unavailable',
-      formatError('at-bot/discovery-unavailable'));
+    throw makeError('at-bot/discovery-unavailable', formatError('at-bot/discovery-unavailable'));
   }
   if (result.settled === 'timeout') {
-    throw makeError('at-bot/discovery-timeout',
-      formatError('at-bot/discovery-timeout'));
+    throw makeError('at-bot/discovery-timeout', formatError('at-bot/discovery-timeout'));
   }
   if (result.settled === 'overflow') {
-    throw makeError('at-bot/discovery-invalid',
-      formatError('at-bot/discovery-invalid'));
+    throw makeError('at-bot/discovery-invalid', formatError('at-bot/discovery-invalid'));
   }
   if (result.settled === 'termination-unconfirmed') {
-    throw makeError('at-bot/termination-unconfirmed',
-      formatError('at-bot/termination-unconfirmed'));
+    throw makeError('at-bot/termination-unconfirmed', formatError('at-bot/termination-unconfirmed'));
   }
 
-  // Parse JSON output.
-  let parsed: LarkCliEnvelope;
-  try {
-    parsed = JSON.parse(result.stdout) as LarkCliEnvelope;
-  } catch {
-    throw makeError('at-bot/discovery-invalid',
-      formatError('at-bot/discovery-invalid'));
-  }
+  // On normal exit, check the subprocess exit code.
+  requireNonzeroExit(result, 'at-bot/discovery-invalid', 'at-bot/discovery-invalid');
 
-  // Strict envelope validation.
-  if (parsed.ok !== true) {
-    const code = typeof parsed.code === 'number' ? parsed.code : undefined;
-    throw makeError('at-bot/discovery-invalid',
-      formatError('at-bot/discovery-invalid', code));
-  }
-  if (parsed.identity !== 'bot') {
-    throw makeError('at-bot/discovery-invalid',
-      formatError('at-bot/discovery-invalid'));
-  }
-  if (parsed.code !== undefined) {
-    const code = Number(parsed.code);
-    if (!Number.isFinite(code) || code !== 0) {
-      throw makeError('at-bot/discovery-invalid',
-        formatError('at-bot/discovery-invalid', Number.isFinite(code) ? code : undefined));
-    }
-  }
+  const parsed = parseEnvelopeJSON(result.stdout, 'at-bot/discovery-invalid');
+  validateEnvelopeOk(parsed, 'at-bot/discovery-invalid');
+  validateEnvelopeIdentity(parsed, 'at-bot/discovery-invalid');
+  validateEnvelopeCode(parsed, 'at-bot/discovery-invalid');
 
   const data = parsed.data as { items?: BotListItem[] } | undefined;
   if (!data || !Array.isArray(data.items)) {
-    throw makeError('at-bot/discovery-invalid',
-      formatError('at-bot/discovery-invalid'));
+    throw makeError('at-bot/discovery-invalid', formatError('at-bot/discovery-invalid'));
   }
 
-  return data.items;
+  return data.items.map(validateBotItem);
 }
 
 // ── target validation ──
 
 function validateTarget(
-  items: BotListItem[],
+  items: Array<{ bot_id: string; bot_name: string }>,
   botId: string,
 ): { bot_id: string; bot_name: string } {
-  const match = items.find(
-    (item) => item.bot_id === botId,
-  );
+  const match = items.find((item) => item.bot_id === botId);
   if (!match) {
-    throw makeError('at-bot/target-not-in-group',
-      formatError('at-bot/target-not-in-group'));
+    throw makeError('at-bot/target-not-in-group', formatError('at-bot/target-not-in-group'));
   }
-  if (!match.bot_name || !match.bot_name.trim()) {
-    throw makeError('at-bot/target-not-in-group',
-      formatError('at-bot/target-not-in-group'));
-  }
-  return { bot_id: match.bot_id!, bot_name: match.bot_name!.trim() };
+  return match;
 }
 
 // ── canonical post ──
 
-function buildCanonicalPost(target: { bot_id: string; bot_name: string }, message: string): object {
+function buildCanonicalPost(
+  target: { bot_id: string; bot_name: string },
+  message: string,
+): object {
   return {
     zh_cn: {
       title: '',
@@ -259,8 +290,8 @@ async function sendMessage(
 ): Promise<string> {
   const contentStr = JSON.stringify(postContent);
   const result = await runBoundedProcess(
-    process.execPath,
-    ['lark-cli', 'im', '+messages-send',
+    larkCliCommand(),
+    ['im', '+messages-send',
       '--chat-id', chatId,
       '--msg-type', 'post',
       '--content', contentStr,
@@ -269,61 +300,42 @@ async function sendMessage(
     { timeoutMs: 20_000, maxOutputBytes: 1_048_576 },
   );
 
-  // Check for unbound marker first.
   const unbound = scanForUnbound(result.stdout, result.stderr);
   if (unbound) {
     throw makeError('at-bot/context-unbound', unbound);
   }
 
-  // Classify settle cause.
   if (result.settled === 'unavailable') {
-    throw makeError('at-bot/send-unavailable',
-      formatError('at-bot/send-unavailable'));
+    throw makeError('at-bot/send-unavailable', formatError('at-bot/send-unavailable'));
   }
   if (result.settled === 'timeout') {
-    throw makeError('at-bot/send-timeout',
-      formatError('at-bot/send-timeout'));
+    throw makeError('at-bot/send-timeout', formatError('at-bot/send-timeout'));
   }
   if (result.settled === 'overflow') {
-    throw makeError('at-bot/send-invalid',
-      formatError('at-bot/send-invalid'));
+    throw makeError('at-bot/send-invalid', formatError('at-bot/send-invalid'));
   }
   if (result.settled === 'termination-unconfirmed') {
-    throw makeError('at-bot/termination-unconfirmed',
-      formatError('at-bot/termination-unconfirmed'));
+    throw makeError('at-bot/termination-unconfirmed', formatError('at-bot/termination-unconfirmed'));
   }
 
-  // Parse JSON output.
-  let parsed: LarkCliEnvelope;
-  try {
-    parsed = JSON.parse(result.stdout) as LarkCliEnvelope;
-  } catch {
-    throw makeError('at-bot/send-invalid',
-      formatError('at-bot/send-invalid'));
+  requireNonzeroExit(result, 'at-bot/send-invalid', 'at-bot/send-invalid');
+
+  const parsed = parseEnvelopeJSON(result.stdout, 'at-bot/send-invalid');
+
+  // If ok is false with a nested error code, surface it.
+  if (parsed.ok === false) {
+    const apiCode = parseNestedApiCode(parsed) ??
+      (typeof parsed.code === 'number' ? parsed.code : undefined);
+    throw makeError('at-bot/send-rejected', formatError('at-bot/send-rejected', apiCode), apiCode);
   }
 
-  // Strict envelope validation.
-  if (parsed.ok !== true) {
-    const code = typeof parsed.code === 'number' ? parsed.code : undefined;
-    throw makeError('at-bot/send-rejected',
-      formatError('at-bot/send-rejected', code));
-  }
-  if (parsed.identity !== 'bot') {
-    throw makeError('at-bot/send-invalid',
-      formatError('at-bot/send-invalid'));
-  }
-  if (parsed.code !== undefined) {
-    const code = Number(parsed.code);
-    if (!Number.isFinite(code) || code !== 0) {
-      throw makeError('at-bot/send-invalid',
-        formatError('at-bot/send-invalid', Number.isFinite(code) ? code : undefined));
-    }
-  }
+  validateEnvelopeOk(parsed, 'at-bot/send-invalid');
+  validateEnvelopeIdentity(parsed, 'at-bot/send-invalid');
+  validateEnvelopeCode(parsed, 'at-bot/send-invalid');
 
-  const data = parsed.data as { message_id?: string } | undefined;
-  if (!data?.message_id || !data.message_id.startsWith('om_')) {
-    throw makeError('at-bot/send-invalid',
-      formatError('at-bot/send-invalid'));
+  const data = parsed.data as { message_id?: unknown } | undefined;
+  if (!data || typeof data.message_id !== 'string' || !data.message_id.startsWith('om_')) {
+    throw makeError('at-bot/send-invalid', formatError('at-bot/send-invalid'));
   }
 
   return data.message_id;
@@ -338,24 +350,20 @@ export async function runAtBot(opts: AtBotOptions): Promise<AtBotSuccess> {
   validateArgs(opts);
 
   // 2. Discover group bots.
-  let items: BotListItem[];
+  let validatedItems: Array<{ bot_id: string; bot_name: string }>;
   try {
-    items = await discoverBots(opts.chatId, env);
+    validatedItems = await discoverBots(opts.chatId, env);
   } catch (err) {
     if ((err as AtBotError).code) throw err;
-    // Spawn errors: classify and throw.
     const msg = String((err as Error).message ?? '');
-    // Scan for unbound marker in spawn error too.
     if (msg.includes(UNBOUND_MARKER)) {
-      throw makeError('at-bot/context-unbound',
-        formatError('at-bot/context-unbound'));
+      throw makeError('at-bot/context-unbound', formatError('at-bot/context-unbound'));
     }
-    throw makeError('at-bot/discovery-unavailable',
-      formatError('at-bot/discovery-unavailable'));
+    throw makeError('at-bot/discovery-unavailable', formatError('at-bot/discovery-unavailable'));
   }
 
   // 3. Validate target.
-  const target = validateTarget(items, opts.botId);
+  const target = validateTarget(validatedItems, opts.botId);
 
   // 4. Build canonical post.
   const post = buildCanonicalPost(target, opts.message);
@@ -368,11 +376,9 @@ export async function runAtBot(opts: AtBotOptions): Promise<AtBotSuccess> {
     if ((err as AtBotError).code) throw err;
     const msg = String((err as Error).message ?? '');
     if (msg.includes(UNBOUND_MARKER)) {
-      throw makeError('at-bot/context-unbound',
-        formatError('at-bot/context-unbound'));
+      throw makeError('at-bot/context-unbound', formatError('at-bot/context-unbound'));
     }
-    throw makeError('at-bot/send-unavailable',
-      formatError('at-bot/send-unavailable'));
+    throw makeError('at-bot/send-unavailable', formatError('at-bot/send-unavailable'));
   }
 
   return {

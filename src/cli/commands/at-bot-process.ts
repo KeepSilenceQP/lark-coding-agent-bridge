@@ -1,9 +1,8 @@
 /**
  * Bounded process-tree runner for the at-bot command.
  *
- * Each lark-cli invocation spawns through a Node wrapper that in turn spawns
- * a native child. Plain spawnSync timeout semantics can kill only the wrapper
- * while the request subprocess survives. This module therefore:
+ * Each lark-cli invocation spawns through a Node wrapper that in turn
+ * spawns a native child. This module therefore:
  *
  * - spawns with detached:true (POSIX) so wrapper + native child share a
  *   process group;
@@ -11,9 +10,8 @@
  * - kills the whole group on timeout or output overflow;
  * - on Windows, uses taskkill /T /F only while the wrapper PID is live;
  *   returns termination-unconfirmed otherwise.
- *
- * The exported function is the testable seam: production passes the real
- * cross-spawn, tests inject a mock.
+ * - on POSIX, kill failure (process group or direct child) upgrades to
+ *   termination-unconfirmed.
  */
 
 import { type ChildProcess, type SpawnOptions } from 'node:child_process';
@@ -29,9 +27,7 @@ export interface BoundedProcessResult {
 }
 
 export interface BoundedProcessOptions {
-  /** Execution timeout in ms. Default 20_000 (20 seconds). */
   timeoutMs?: number;
-  /** Max bytes per stdout or stderr stream. Default 1_048_576 (1 MiB). */
   maxOutputBytes?: number;
 }
 
@@ -43,15 +39,6 @@ const TASKKILL_OUTPUT_BYTES = 16_384;
 
 type SettleCause = BoundedProcessResult['settled'];
 
-/**
- * Spawn a child with bounded execution, output, and process-tree cleanup.
- *
- * On POSIX the child runs in its own process group (detached:true).
- * On Windows a synchronous `taskkill /T /F` is used while the wrapper PID
- * is still alive; after wrapper exit the runner returns
- * termination-unconfirmed rather than pretending it can tree-kill through
- * an extinct PID.
- */
 export function runBoundedProcess(
   command: string,
   args: readonly string[],
@@ -76,7 +63,7 @@ export function runBoundedProcess(
     let execTimer: ReturnType<typeof setTimeout> | null = null;
     let closeConfirmTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const cleanup = () => {
+    const clearAllTimers = () => {
       if (execTimer) { clearTimeout(execTimer); execTimer = null; }
       if (closeConfirmTimer) { clearTimeout(closeConfirmTimer); closeConfirmTimer = null; }
     };
@@ -85,13 +72,27 @@ export function runBoundedProcess(
       if (settled) return;
       settled = true;
       cause = finalCause;
-      cleanup();
+      clearAllTimers();
+
+      // On termination-unconfirmed: destroy local pipes and unref the
+      // child so the CLI can return the stronger blocker. The caller
+      // must not retry automatically because an external side effect
+      // remains possible.
+      if (finalCause === 'termination-unconfirmed' && child) {
+        try {
+          if (child.stdout) { child.stdout.destroy(); }
+          if (child.stderr) { child.stderr.destroy(); }
+          child.unref();
+          child.removeAllListeners();
+        } catch { /* best-effort */ }
+      }
+
       resolve({
         exitCode,
         signalCode,
         stdout: Buffer.concat(stdoutChunks).toString('utf8'),
         stderr: Buffer.concat(stderrChunks).toString('utf8'),
-        settled: cause,
+        settled: cause!,
       });
     };
 
@@ -113,7 +114,14 @@ export function runBoundedProcess(
               encoding: 'utf8',
             },
           );
-          if (result.status !== 0 && result.status !== 128) {
+          // taskkill exit status: 0 = success, 128 = process not found
+          // (already exited). Neither means we confirmed tree cleanup.
+          // Status 128 means the PID was already gone — termination-unconfirmed.
+          if (result.status === 128) {
+            settle('termination-unconfirmed');
+            return;
+          }
+          if (result.status !== 0) {
             settle('termination-unconfirmed');
             return;
           }
@@ -123,13 +131,26 @@ export function runBoundedProcess(
         }
       } else {
         // POSIX: kill the process group.
+        let killOk = false;
         if (child.pid !== undefined) {
           try {
             process.kill(-child.pid, 'SIGKILL');
+            killOk = true;
           } catch {
             // Process group may already be gone; try direct child.
-            try { child.kill('SIGKILL'); } catch { /* ignore */ }
+            try {
+              child.kill('SIGKILL');
+              killOk = true;
+            } catch {
+              /* neither worked */
+            }
           }
+        }
+        if (!killOk) {
+          // Neither group nor direct kill succeeded — cannot confirm
+          // process-tree cleanup.
+          settle('termination-unconfirmed');
+          return;
         }
       }
       // Wait for original close after kill.
@@ -150,7 +171,7 @@ export function runBoundedProcess(
     let childProcess: ChildProcess;
     try {
       childProcess = spawnProcess(command, [...args], spawnOpts);
-    } catch (err) {
+    } catch {
       // Spawn threw synchronously (no PID).
       settle('unavailable');
       return;
@@ -166,14 +187,12 @@ export function runBoundedProcess(
       }
     }, timeoutMs);
 
-    child.on('error', (err: NodeJS.ErrnoException) => {
-      // spawn error after the constructor returned (rare path with PID).
+    child.on('error', () => {
       if (!cause) {
         cause = 'unavailable';
         if (hasPid) {
           killTree();
         } else {
-          // No PID, wait briefly for close then settle.
           closeConfirmTimer = setTimeout(() => settle('unavailable'), CLOSE_CONFIRM_MS);
         }
       }
@@ -182,12 +201,13 @@ export function runBoundedProcess(
     child.on('exit', (code, sig) => {
       exitCode = code;
       signalCode = sig;
+      // On Windows the wrapper PID is no longer a reliable tree root
+      // after exit. Invalidate hasPid so future killTree calls don't
+      // attempt taskkill on an extinct PID.
       if (platform() === 'win32') {
-        // On Windows the wrapper PID is no longer a reliable tree root
-        // after exit. If we haven't already terminated, we'll handle it
-        // at close.
+        hasPid = false;
       }
-      // Do NOT clear execTimer — Plan requires timer stays armed until close.
+      // Do NOT clear execTimer — timer stays armed until close.
     });
 
     child.on('close', () => {

@@ -19,7 +19,7 @@ export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 
 - \`senderType\`：发送者是人（\`user\`）还是另一个 bot（\`bot\`）；缺省表示未知
 - \`botOpenId\`：**你自己**的 open_id
-- \`mentions\`：这条消息 @ 到的账号列表（含 open_id 和 isBot），需要 @ 某人/某 bot 时从这里取 id
+- \`mentions\`：这条消息实际 @ 到的账号列表（含 open_id 和 isBot）。通常 @ 的是被唤醒的 Bot 自己——不要默认从这里取回传目标。回传目标按 bot-at-bot 节的规则确定。
 
 多条消息在短时间内合并送达时，\`user_input\` 里每段会带 \`[名字 (user|bot)]:\` 行首标注以区分发送者——这是 bridge 注入的展示格式，**你回复时不要模仿这种标注**。这些都是 bridge 注入的元数据，**不要照抄、不要在你的回复里渲染**——它对用户不可见。
 
