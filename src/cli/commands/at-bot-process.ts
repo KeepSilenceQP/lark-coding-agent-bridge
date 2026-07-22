@@ -150,10 +150,12 @@ export function runBoundedProcess(
             killOk = true;
           } catch {
             // Process group already gone; try direct child.
-            const ok = child.kill('SIGKILL');
-            // Node ChildProcess.kill returns false when the signal was not
-            // delivered. Must treat return-false as kill failure.
-            if (ok) killOk = true;
+            try {
+              const ok = child.kill('SIGKILL');
+              if (ok) killOk = true;
+            } catch {
+              // child.kill itself threw — both methods failed.
+            }
           }
         }
         if (!killOk) {
