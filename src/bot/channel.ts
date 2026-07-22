@@ -1965,25 +1965,33 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           });
           return result;
         });
-      await awaitRenderAwareStream({
-        mode: replyMode,
-        streamDone,
-        renderDone,
-        producerStarted: () => producerStarted,
-        verifyFinal: async (streamValue, state) =>
-          verifyMarkdownFinalReadback(
-            channel,
-            streamValue,
-            renderMarkdownStreamText(filterForPrefs(state)),
-          ),
-        fallback: async (state) => {
-          if (controls.profileConfig.agentKind === 'codex') return;
-          const body = renderText(filterForPrefs(state));
-          if (body.trim()) {
-            await channel.send(chatId, { markdown: body }, sendOpts);
-          }
-        },
-      });
+      try {
+        await awaitRenderAwareStream({
+          mode: replyMode,
+          streamDone,
+          renderDone,
+          producerStarted: () => producerStarted,
+          verifyFinal: async (streamValue, state) =>
+            verifyMarkdownFinalReadback(
+              channel,
+              streamValue,
+              renderMarkdownStreamText(filterForPrefs(state)),
+            ),
+          fallback: async (state) => {
+            if (controls.profileConfig.agentKind === 'codex') return;
+            const body = renderText(filterForPrefs(state));
+            if (body.trim()) {
+              await channel.send(chatId, { markdown: body }, sendOpts);
+            }
+          },
+        });
+      } catch (err) {
+        if (controls.profileConfig.agentKind !== 'codex') throw err;
+        log.fail('stream', err, {
+          mode: replyMode,
+          step: 'progress-stream',
+        });
+      }
       await recallIfEmptyStreamedReply(channel, streamDone, filterForPrefs(latestState), scope);
       if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
