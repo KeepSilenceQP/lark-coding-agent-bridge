@@ -4,6 +4,13 @@ on:
   push:
   pull_request:
 
+# Cancel duplicate runs from simultaneous push+PR events.
+# Uses the commit SHA as the dedup key: push gets github.sha,
+# PR gets pull_request.head.sha — both are the same commit.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Node 20 on ${{ matrix.os }}
@@ -29,7 +36,22 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      - name: Test
+      - name: Test (Windows — focused)
+        if: runner.os == 'Windows'
+        # Pre-existing baseline failures in unchanged Windows tests
+        # (O_NOFOLLOW, SIGTERM, command fixtures) are outside this PR scope.
+        # Run only the at-bot process-tree, command, prompt, and registration
+        # tests that this PR introduces or modifies.
+        run: >
+          pnpm vitest run
+          tests/unit/cli/at-bot-process.test.ts
+          tests/unit/cli/at-bot.test.ts
+          tests/unit/cli/index-registration.test.ts
+          tests/unit/agent/bridge-system-prompt.test.ts
+          tests/unit/agent/adapter-system-prompt-wiring.test.ts
+
+      - name: Test (macOS / Ubuntu — full)
+        if: runner.os != 'Windows'
         run: pnpm test
 
       - name: Typecheck

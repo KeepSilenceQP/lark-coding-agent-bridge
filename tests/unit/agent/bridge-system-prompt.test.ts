@@ -43,6 +43,81 @@ describe('bridge system prompt bot collaboration rules', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toContain('[名字 (user|bot)]');
     expect(BRIDGE_SYSTEM_PROMPT).toContain('不要模仿');
   });
+
+  // ── at-bot primitive contract (RED: will fail until Unit 3 updates prompt) ──
+
+  it('teaches the agent to use lark-channel-bridge at-bot for Bot handoffs', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('lark-channel-bridge at-bot');
+  });
+
+  it('maps @, mention, 通知, 转交, Return to, 完成后回给 to at-bot', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('@');
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/通知|转交/);
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('Return to');
+  });
+
+  it('gives the exact three-argument argv template', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('--chat-id');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('--bot-id');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('--message');
+  });
+
+  it('maps bridge_context.chatId to --chat-id parameter', () => {
+    // The template shows them on separate lines in a code block.
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/bridge_context\.chatId[\s\S]*--chat-id/);
+  });
+
+  it('explains that senderId is a candidate only when senderType=bot', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/senderId.*candidate|senderType.*bot/);
+  });
+
+  it('explains that explicit mention openId is only a candidate', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('openId');
+  });
+
+  it('gives the bot-identity bot-list discovery command', () => {
+    // Must use --as bot, not --as user
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('chat.members bots');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('--as bot');
+  });
+
+  it('requires unique NFC-normalized full-name match for name-based discovery', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/NFC|全名|精确匹配/);
+  });
+
+  it('blocks on zero or multiple name matches', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/停止|block|不能猜测/);
+  });
+
+  it('forbids using botOpenId as a target', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('botOpenId');
+  });
+
+  it('forbids defaulting mentions[0] or own mention as return target', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/mentions\[0\]|mentions 第一项|不能.*默认/);
+  });
+
+  it('states that plain @名字 text is not notification', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/不算通知|不是通知|不算已经通知/);
+  });
+
+  // ── old manual guidance must be absent ──
+
+  it('no longer teaches direct lark-cli +messages-send for Bot notification', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).not.toMatch(/\+messages-send.*--as bot|messages-send.*at user_id/);
+  });
+
+  it('no longer contains hand-built <at user_id= mention XML', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('<at user_id=');
+  });
+
+  it('no longer contains hand-built tag:"at" post JSON', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('"tag":"at"');
+  });
+
+  it('no longer suggests --as user for bot-list discovery', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).not.toMatch(/chat\.members bots.*--as user/);
+  });
 });
 
 describe('buildBridgeSystemPrompt', () => {
