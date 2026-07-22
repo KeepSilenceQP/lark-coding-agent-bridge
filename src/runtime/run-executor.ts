@@ -25,6 +25,7 @@ export interface SubmitRunInput {
   images?: readonly string[];
   stopGraceMs?: number;
   nowait?: boolean;
+  routeId?: string;
   reservation?: RunReservation;
   observability?: {
     profile: string;
@@ -133,6 +134,7 @@ export class RunExecutor {
       sandbox: input.policy.sandbox,
       permissionMode: input.policy.permissionMode,
       stopGraceMs: input.stopGraceMs,
+      routeId: input.routeId,
     };
     let run: AgentRun;
     try {

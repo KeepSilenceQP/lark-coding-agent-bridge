@@ -112,6 +112,23 @@ lark-channel-bridge restart --profile codex
 lark-channel-bridge status --profile codex
 ```
 
+### Deferred self-restart and receipt
+
+When the bot restarts its own profile (same profile it's running under), the bridge uses a **deferred restart** flow:
+
+1. The agent calls `lark-channel-bridge restart --profile <current-profile>`.
+2. The bridge records a pending restart request and lets the agent finish its current reply.
+3. After the final reply is delivered and all active runs drain, a detached helper executes the OS-level service restart.
+4. The helper waits for the new bridge instance to connect. If the new bridge connects within the timeout, **the new bridge sends a success receipt** to the original chat.
+5. If the service action fails or the new bridge does not appear within the timeout, **the helper sends a failure receipt** with a specific reason (`service-action-failure` or `startup-timeout`).
+
+This guarantees:
+- The agent's final reply is never interrupted mid-stream.
+- Exactly one receipt (success or failure) is delivered per restart request, with a stable idempotency key (`uuid`).
+- Directly calling `launchctl`, `systemctl`, `schtasks`, or `kill` on the bridge PID is prohibited for same-profile self-restarts — the deferred path must be used.
+
+External restarts of **other** profiles (and standard `start` / `stop` operations) are unaffected and follow the normal service-manager path.
+
 ## Commands
 
 ### Host CLI

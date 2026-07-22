@@ -19,6 +19,25 @@ import { preFlightChecks } from '../preflight';
 import { promptAndStopActiveBridgeMigrationConflict } from './migrate';
 import { stopProcessEntry, type StopProcessEntryResult } from './ps';
 import { requestDeferredServiceRestart } from '../../runtime/deferred-service-restart';
+import {
+  createPending,
+  readPending,
+  deletePending,
+  createClaim,
+  readClaim,
+  createAttempt,
+  createTerminal,
+  readTerminal,
+  cleanupReceiptArtifacts,
+  makeReceiptId,
+  makeClaimUuid,
+} from '../../runtime/restart-receipt';
+import {
+  validateRouteLease,
+  deleteRouteLease,
+  returnRouteFromLease,
+} from '../../runtime/route-lease';
+import { sendRestartReceipt } from '../../runtime/restart-receipt-sender';
 
 export interface ServiceStartOptions {
   profile?: string;
@@ -381,6 +400,35 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
   ) {
     const appPaths = resolveAppPaths({ rootDir: paths.rootDir, profile });
     const bridgePid = positiveInt(process.env.LARK_CHANNEL_BRIDGE_PID);
+    const routeId = process.env.LARK_CHANNEL_ROUTE_ID?.trim() || undefined;
+
+    // If a route lease is available, use the new receipt system.
+    if (routeId && bridgePid) {
+      const validation = await validateRouteLease(appPaths.profileDir, routeId, bridgePid);
+      if (!validation.ok) {
+        console.error(`✗ 无法安排重启: ${validation.reason}`);
+        process.exit(1);
+      }
+      const returnRoute = returnRouteFromLease(validation.lease);
+      const receiptId = makeReceiptId();
+      const pendingCreated = await createPending(appPaths.profileDir, {
+        receiptId,
+        profile,
+        oldPid: bridgePid,
+        requestedAt: new Date().toISOString(),
+        returnRoute,
+      });
+      if (!pendingCreated) {
+        console.error('✗ 已有待处理的重启请求。请等当前完成后重试。');
+        process.exit(1);
+      }
+      // Delete lease only AFTER pending is created
+      await deleteRouteLease(appPaths.profileDir, routeId);
+      console.log('✓ 已安排在当前任务完成后重启；本次回复完成前不会中断 bridge。');
+      return;
+    }
+
+    // Fall back to old marker (no route lease available).
     await requestDeferredServiceRestart(appPaths.profileDir, {
       profile,
       ...(bridgePid ? { bridgePid } : {}),
@@ -390,6 +438,13 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
     return;
   }
   if (adapter.isRunning()) {
+    // Helper mode: if we were spawned by the deferred restart drain, handle
+    // the failure receipt path. The helper strips LARK_CHANNEL so the
+    // bridge-bound branch above doesn't fire.
+    if (!process.env.LARK_CHANNEL || process.env.LARK_CHANNEL !== '1') {
+      await helperRestartAndWait(profile, adapter, resolveAppPaths({ rootDir: paths.rootDir, profile }));
+      return;
+    }
     await reportConnectAfter('restarted', profile, adapter.restart);
     return;
   }
@@ -462,6 +517,212 @@ export async function runServiceUnregister(opts: ServiceProfileOptions = {}): Pr
   await adapter.deleteFile();
   console.log('✓ 已清除后台运行注册');
   console.log(`  (配置 / 日志 / 会话保留在 ${paths.rootDir})`);
+}
+
+/**
+ * Helper mode: execute the restart and observe the new bridge. If the new
+ * bridge doesn't appear within the timeout, send a failure receipt via the
+ * receipt state machine. This is the detached coordinator from DD3.
+ *
+ * Optional `deps` exposes IO boundaries for test injection. In production
+ * all deps default to the real implementations.
+ */
+export async function helperRestartAndWait(
+  profile: string,
+  adapter: ServiceAdapter,
+  appPaths: ReturnType<typeof resolveAppPaths>,
+  deps?: {
+    resolveRuntime?: typeof import('../../runtime/profile-runtime').resolveProfileRuntime;
+    readRegistry?: typeof import('../../runtime/registry').readAndPrune;
+    sendFailureReceipt?: typeof sendHelperFailureReceipt;
+    exit?: (code: number) => never;
+    waitTimeoutMs?: number;
+  },
+): Promise<void> {
+  const resolveRuntime = deps?.resolveRuntime ??
+    (await import('../../runtime/profile-runtime')).resolveProfileRuntime;
+  const readRegistry = deps?.readRegistry ??
+    (await import('../../runtime/registry')).readAndPrune;
+  const sendFailure = deps?.sendFailureReceipt ?? sendHelperFailureReceipt;
+  const doExit = deps?.exit ?? ((code: number) => { process.exit(code); });
+
+  // Read pending to get receipt info
+  const pending = await readPending(appPaths.profileDir);
+  if (!pending) {
+    // No pending receipt — fall back to old restart behavior
+    await reportConnectAfter('restarted', profile, adapter.restart);
+    return;
+  }
+
+  // Snapshot running PIDs before restart
+  const { cfg } = await resolveRuntime({
+    profile,
+    allowBootstrap: false,
+  });
+  const appId = cfg.accounts?.app?.id ?? '';
+  const beforePids = new Set(
+    readRegistry()
+      .filter((e) => e.appId === appId && e.profileName === profile)
+      .map((e) => e.pid),
+  );
+
+  // Execute restart
+  const r = await adapter.restart();
+  if (!r.ok) {
+    // Service action failure → claim failure + send
+    await sendFailure(
+      profile,
+      appPaths,
+      pending.receiptId,
+      pending.returnRoute,
+      'service-action-failure',
+    );
+    console.error(`✗ 重启失败 (service action): ${formatServiceStderr(r.stderr)}`);
+    doExit(1);
+  }
+
+  // Wait for new bridge to register
+  console.log('正在等待新 bot 连接...');
+  const timeoutMs = deps?.waitTimeoutMs ?? 30_000;
+  const deadline = Date.now() + timeoutMs;
+  let newEntry: ReturnType<typeof readRegistry>[number] | undefined;
+
+  while (Date.now() < deadline) {
+    const live = readRegistry();
+    newEntry = live.find(
+      (e) =>
+        e.appId === appId &&
+        e.profileName === profile &&
+        !beforePids.has(e.pid) &&
+        Boolean(e.botName),
+    );
+    if (newEntry) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  if (newEntry) {
+    // New bridge connected — helper exits silently (new bridge sends success)
+    console.log(`✓ 新 bot ${newEntry.botName} 已连接 (pid ${newEntry.pid})，由新进程发送成功通知。`);
+    return;
+  }
+
+  // Final short复查: check one more time with a shorter window.
+  // Scaled proportionally to the main timeout; floor 0 for test injection.
+  const finalWindowMs = timeoutMs === 0 ? 0 : Math.min(5_000, Math.max(500, Math.floor(timeoutMs / 6)));
+  console.log('⚠ 30 秒内未观察到新 bot 连接，进行最终复查...');
+  const finalDeadline = Date.now() + finalWindowMs;
+  while (Date.now() < finalDeadline) {
+    const live = readRegistry();
+    newEntry = live.find(
+      (e) =>
+        e.appId === appId &&
+        e.profileName === profile &&
+        !beforePids.has(e.pid) &&
+        Boolean(e.botName),
+    );
+    if (newEntry) {
+      console.log(`✓ 最终复查: 新 bot ${newEntry.botName} 已连接 (pid ${newEntry.pid})，由新进程发送成功通知。`);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  // Still no new bridge → send failure receipt
+  await sendFailure(
+    profile,
+    appPaths,
+    pending.receiptId,
+    pending.returnRoute,
+    'startup-timeout',
+  );
+  console.error('✗ 重启失败 (startup-timeout): 新 bot 未在超时时间内连接。');
+  doExit(1);
+}
+
+/**
+ * Send a failure receipt from the helper. Uses the receipt state machine
+ * to ensure exactly-once delivery.
+ */
+export async function sendHelperFailureReceipt(
+  profile: string,
+  appPaths: ReturnType<typeof resolveAppPaths>,
+  receiptId: string,
+  returnRoute: { chatId: string; threadId?: string; replyTo: string },
+  reason: 'service-action-failure' | 'startup-timeout',
+): Promise<void> {
+  const kind = 'failure' as const;
+  const uuid = makeClaimUuid(receiptId, kind);
+
+  // Check terminal — if already exists, don't send
+  if (await readTerminal(appPaths.profileDir, receiptId)) {
+    await cleanupReceiptArtifacts(appPaths.profileDir, receiptId).catch(() => {});
+    return;
+  }
+
+  // Primitive A: claim (immutable)
+  const claimed = await createClaim(appPaths.profileDir, {
+    receiptId,
+    kind,
+    payload: returnRoute,
+    uuid,
+    claimedAt: new Date().toISOString(),
+  });
+  if (!claimed) {
+    // Already claimed — check if by us or another
+    const existing = await readClaim(appPaths.profileDir, receiptId);
+    if (existing && existing.kind !== kind) {
+      // Another actor claimed with a different kind — don't flip
+      return;
+    }
+  }
+
+  // Primitive A: attempt lease
+  const attempted = await createAttempt(appPaths.profileDir, {
+    receiptId,
+    ownerPid: process.pid,
+    attemptedAt: new Date().toISOString(),
+  });
+  if (!attempted) return; // another actor owns the attempt
+
+  // Primitive C: delete pending
+  await deletePending(appPaths.profileDir, receiptId);
+
+  // Read terminal again
+  if (await readTerminal(appPaths.profileDir, receiptId)) {
+    await cleanupReceiptArtifacts(appPaths.profileDir, receiptId).catch(() => {});
+    return;
+  }
+
+  // Send failure receipt
+  const result = await sendRestartReceipt({
+    profile,
+    returnRoute,
+    receiptId,
+    kind,
+    uuid,
+    reason,
+  });
+
+  if (result.ok && result.messageId) {
+    await createTerminal(appPaths.profileDir, {
+      receiptId,
+      kind,
+      outcome: 'completed',
+      messageId: result.messageId,
+    });
+    console.log(`✓ 已发送失败通知: ${reason}`);
+  } else {
+    await createTerminal(appPaths.profileDir, {
+      receiptId,
+      kind,
+      outcome: 'delivery-failed',
+      reason,
+    });
+    console.error(`✗ 发送失败通知失败: ${reason}`);
+  }
+
+  // Clean up
+  await cleanupReceiptArtifacts(appPaths.profileDir, receiptId).catch(() => {});
 }
 
 async function resolveServiceProfile(explicitProfile: string | undefined): Promise<string> {

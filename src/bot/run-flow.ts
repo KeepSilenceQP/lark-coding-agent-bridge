@@ -51,6 +51,8 @@ export interface StartRunFlowInput {
   executor: RunExecutor;
   now: number;
   stopGraceMs?: number;
+  /** Opaque route ID for deferred self-restart. Bridge-internal, passed to AgentRunOptions. */
+  routeId?: string;
   observability?: {
     profile: string;
     agent: string;
@@ -267,6 +269,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
               .filter((path): path is string => Boolean(path))
           : undefined,
       stopGraceMs: input.stopGraceMs,
+      routeId: input.routeId,
       observability: input.observability,
       reservation,
     });

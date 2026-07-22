@@ -112,6 +112,23 @@ lark-channel-bridge restart --profile codex
 lark-channel-bridge status --profile codex
 ```
 
+### 延后自重启与回执（deferred self-restart + receipt）
+
+当 bot 重启自身所在的 profile 时（同 profile 自重启），bridge 采用**延后重启**流程：
+
+1. Agent 调用 `lark-channel-bridge restart --profile <当前 profile>`。
+2. Bridge 记录一条待处理重启请求，让 agent 先完成本轮回复。
+3. 所有活跃任务排空、最终回复发送完毕后，detached helper 执行操作系统层面的服务重启。
+4. Helper 等待新 bridge 实例连接成功。若新 bridge 在超时内连接，**由新 bridge 在原会话中发送成功回执**。
+5. 若服务操作失败或新 bridge 超时未出现，**由 helper 发送失败回执**，并注明具体原因（`service-action-failure` / `startup-timeout`）。
+
+以上保证：
+- Agent 的最终回复不会被中断。
+- 每次重启请求只会收到恰好一条回执（成功或失败），通过稳定幂等键（`uuid`）去重。
+- 同 profile 自重启**禁止**直接调用 `launchctl`、`systemctl`、`schtasks` 或 `kill` bridge PID，必须走延后路径。
+
+对**其它** profile 的外部重启（以及常规 `start` / `stop` 操作）不受影响，仍走原有 service-manager 路径。
+
 ## 命令速查
 
 ### 宿主 CLI

@@ -58,6 +58,7 @@ const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 rl.on('line', (line) => {
   const request = JSON.parse(line);
   requests.push({ method: request.method, params: request.params });
+  persist();
   if (request.method === 'initialize') {
     process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + '\\n');
   }

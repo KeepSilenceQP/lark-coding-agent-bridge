@@ -39,6 +39,13 @@ export interface AgentRunOptions {
   sandbox?: CodexSandboxMode;
   permissionMode?: ClaudePermissionMode;
   /**
+   * Opaque route ID for deferred self-restart. When set, the agent
+   * environment receives LARK_CHANNEL_ROUTE_ID so the restart CLI can
+   * resolve the return route. Bridge-internal only — never exposed to
+   * the model as chatId.
+   */
+  routeId?: string;
+  /**
    * Grace period (ms) between SIGTERM and SIGKILL when stop() is called on
    * the returned run. Lets the agent (and any subprocess it spawned, e.g.
    * lark-cli mid-OAuth) clean up before the kernel reaps the tree.

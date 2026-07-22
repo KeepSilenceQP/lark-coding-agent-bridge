@@ -30,15 +30,18 @@ describe('deferred service restart', () => {
       await readFile(join(profileDir, '.deferred-service-restart.json'), 'utf8'),
     ) as Record<string, unknown>;
     expect(marker).toMatchObject({ profile: 'codex', bridgePid: 1234 });
-    expect(await consumeDeferredServiceRestart(profileDir, 9999)).toBe(false);
+    expect(await consumeDeferredServiceRestart(profileDir, 9999)).toBeUndefined();
 
     await requestDeferredServiceRestart(profileDir, {
       profile: 'codex',
       bridgePid: 1234,
       requestedAt: '2026-07-14T10:00:00.000Z',
     });
-    expect(await consumeDeferredServiceRestart(profileDir, 1234)).toBe(true);
-    expect(await consumeDeferredServiceRestart(profileDir, 1234)).toBe(false);
+    expect(await consumeDeferredServiceRestart(profileDir, 1234)).toMatchObject({
+      format: 'old',
+      profile: 'codex',
+    });
+    expect(await consumeDeferredServiceRestart(profileDir, 1234)).toBeUndefined();
   });
 
   it('launches a detached restart helper without bridge-bound environment', () => {
