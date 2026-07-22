@@ -1,7 +1,7 @@
 # Deferred Self-Restart And Post-Restart Receipt Coding Plan
 
 Date: 2026-07-22
-Status: revised after R5 CHANGES REQUIRED Plan Re-review — awaiting re-review
+Status: Plan Review PASS (R6) — implementation pending
 Authority: `docs/specs/20260722-deferred-self-restart-receipt.md` (confirmed by Qin Peng, commit `b906c8b`)
 Branch: `fix/lark-bridge-followup`
 Implementer: 小C
@@ -30,7 +30,8 @@ Plan Reviewer: 小P
 - **R4（CHANGES REQUIRED，仅原子终态一致性，R3 已关闭）**：R3 原语仍允许矛盾终态——`completed.<id>` 与 `delivery-failed.<id>` 是两个独立 target，两 recoverer 可分别写出（原语 B 幂等只对同路径）；新 bridge 扫描 claim.* 无独占 recovery owner，多 recoverer 可并发裁定不同结果。要求：每 receiptId 单一权威 `terminal.<id>.json`（outcome=completed|delivery-failed，原语 A 独占；completed messageId/failed reason 同 schema 同 target；terminal 已存在则所有 actor 以它为准）；recovery 加唯一 `attempt.<id>` lease/owner（只有一个 recoverer 可发送/裁定；owner crash 需 lease TTL+owner-dead 才可由下一 actor 原子接管，仍同 kind+uuid 重试）；所有路径先读 terminal，terminal 出现后不再发送、清 claim/attempt 残留；crash 表与测试同步（success vs deterministic-failure 并发只产生一个 terminal；两 recovery 只有一个拥有发送权）。
 - **R4 修订**：DD1 单一 terminal + attempt lease + 读 terminal 优先 + crash 表；DD3/DD4/DD5 引用；Unit 1/2/4 同步测试。
 - **R5（CHANGES REQUIRED，单点文字/测试修正，R4 核心已关闭）**：attempt 接管条件前后不一致——要求/摘要是 AND（owner crash + lease TTL + owner-dead），DD1 recovery 实际写成 OR（"ownerPid 死 或 TTL 超时"），会让 owner 仍活但发送超 TTL 时被第二 actor 抢占，破坏唯一发送权。统一为严格 AND：只有 `lease TTL 已超时 && ownerPid 已确认死亡` 才允许删旧 attempt 并原子接管；任一不满足等待/不接管；ownerPid 检测不确定/EPERM 按仍存活 fail-closed。补测试：TTL 超时但 owner alive 不接管；owner dead 但 TTL 未到不接管；二者同时满足才唯一接管。
-- **R5 修订（本次）**：DD1 recovery OR→严格 AND + fail-closed；同步 DD1 attempt 文件描述、crash 表、DD3/DD4/DD5 接管措辞、Unit 1 接管测试。Status awaiting re-review。Plan Writer 不自判 GO。
+- **R5 修订**：DD1 recovery OR→严格 AND + fail-closed；同步 DD1 attempt 文件描述、crash 表、DD3/DD4/DD5 接管措辞、Unit 1 接管测试。Plan Writer 未自判 GO。
+- **R6（小P，PASS）**：R1-R5 findings 全部关闭。confirmed Spec、live code 落点、per-run route lease、唯一 pending、claim/attempt/terminal 原子状态、strict-AND recovery、Bridge System Prompt、三平台自动化与隔离 failure/live success 验收链一致；无剩余 Plan blocker。允许小C进入 Unit 1-5，实现完成后仍须经过云上C总独立 Code Review，方可进入 Unit 6。
 
 ## Current Evidence
 
@@ -263,4 +264,6 @@ git diff --check
 
 ## Review Gate
 
-本 Plan 经小P R1→R2→R3→R4 四轮 review（R4 仅原子终态一致性，R3 已关闭），已按 R4 单一 terminal + 唯一 attempt owner 修订（见 Review History）。修订后需小P 复审：结论 PASS（或所有阻塞项修订并复审通过）后小C 才开始 Unit 1。Plan Writer 不自判 GO。Unit 1-5 完成后另由云上C总 独立 Code Review，GO 后才进 Unit 6。
+### Plan Review Gate  Owner: 小P  ☑
+
+R6 PASS。R1-R5 findings 已全部关闭；小C可以开始 Unit 1-5。Plan Writer 未自判 GO。Unit 1-5 完成后仍由云上C总独立 Code Review，GO 后才进 Unit 6。
