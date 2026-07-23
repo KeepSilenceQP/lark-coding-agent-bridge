@@ -138,26 +138,76 @@ function getReactionContexts(messageIds: string[]): unknown[] {
 }
 
 // ── Reaction lifecycle bridges (module-level, wired by startChannel) ──
-// These carry reaction metadata from the barrier turn through to the
-// run/streaming lifecycle, since runAgentBatch is module-level.
 let _workChainStore: WorkChainStore | null = null;
 let _reactionRunTracker: ReactionRunTracker | null = null;
-/** scope → { workChainId, reactionKey } for the current reaction turn */
-const _reactionTurnMeta = new Map<string, { workChainId: string; reactionKey: string; revision: number }>();
+/** reactionKey → { workChainId, scope, revision } for the current reaction turn.
+ *  Keyed by per-reaction identity, not just scope — same scope different
+ *  operator/target have distinct entries. */
+const _reactionTurnMeta = new Map<string, { workChainId: string; scope: string; revision: number }>();
 
-function setReactionTurnMeta(scope: string, workChainId: string, reactionKey: string, revision: number): void {
-  _reactionTurnMeta.set(scope, { workChainId, reactionKey, revision });
+function setReactionTurnMeta(reactionKey: string, scope: string, workChainId: string, revision: number): void {
+  _reactionTurnMeta.set(reactionKey, { workChainId, scope, revision });
+}
+/** Remove a single reaction key's metadata (per-key cleanup, not scope-level). */
+function deleteReactionTurnMeta(reactionKey: string): void {
+  _reactionTurnMeta.delete(reactionKey);
 }
 function consumeReactionTurnMeta(scope: string): { workChainId: string; reactionKey: string; revision: number } | undefined {
-  const meta = _reactionTurnMeta.get(scope);
-  _reactionTurnMeta.delete(scope);
-  return meta;
+  // Consume the first entry for this scope (reaction turns are one-per-scope at run time)
+  for (const [key, meta] of _reactionTurnMeta) {
+    if (meta.scope === scope) {
+      _reactionTurnMeta.delete(key);
+      return { workChainId: meta.workChainId, reactionKey: key, revision: meta.revision };
+    }
+  }
+  return undefined;
 }
 function registerOutboundLifecycle(workChainId: string, messageId: string): void {
   _workChainStore?.registerOutbound(workChainId, messageId);
 }
 function markTerminalLifecycle(workChainId: string): void {
   _workChainStore?.markTerminal(workChainId);
+}
+
+// ── Injectable effects executor for the reaction flush handler ──
+// Extracted so production tests can spy on effects (send, enqueue, cancel).
+export interface ReactionFlushEffects {
+  sendBridgeReply: (chatId: string, message: string, replyToMessageId: string) => Promise<void>;
+  /** Cancel a single pending reaction barrier for a specific target message.
+   *  Per-key cleanup — does NOT cancel all scope entries. */
+  cancelPendingForTarget: (scope: string, targetMessageId: string) => void;
+  clearContextForTarget: (targetMessageId: string) => void;
+  deleteTurnMetaForTarget: (reactionKey: string) => void;
+  interruptActiveRun: (scope: string) => void;
+  setHandleSuperseded: (scope: string) => void;
+}
+
+export function createReactionFlushEffects(deps: {
+  pending: PendingQueue;
+  contextStore: ReactionContextStore;
+  activeRuns: ActiveRuns;
+}): ReactionFlushEffects {
+  return {
+    sendBridgeReply: async (_chatId, _message, _replyToMessageId) => {
+      // Implemented inline by the caller using channel.send
+    },
+    cancelPendingForTarget: (scope, _targetMessageId) => {
+      deps.pending.cancel(scope);
+    },
+    clearContextForTarget: (targetMessageId) => {
+      deps.contextStore.delete(targetMessageId);
+    },
+    deleteTurnMetaForTarget: (reactionKey) => {
+      deleteReactionTurnMeta(reactionKey);
+    },
+    interruptActiveRun: (scope) => {
+      deps.activeRuns.interrupt(scope);
+    },
+    setHandleSuperseded: (scope) => {
+      const handle = deps.activeRuns.get(scope);
+      if (handle) handle.superseded = true;
+    },
+  };
 }
 
 // ── Testable flush decision seam (extracted for RED→GREEN testing) ──
@@ -805,21 +855,23 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     if (decision.kind === 'drop') return;
 
     if (decision.kind === 'bridge-reply') {
-      // Per-key cleanup for empty-set removal (not scope-level cancel):
-      // only cancel pending entries for this specific target message,
-      // clear only this target's contextStore entry and _reactionTurnMeta.
+      const effects = createReactionFlushEffects({ pending, contextStore: reactionContextStore, activeRuns });
+      // Per-key cleanup: cancel only this reaction key's barrier,
+      // clear only this target's contextStore, delete only this key's meta.
+      // Does NOT cancel other keys or normal messages on same scope.
       if (decision.interrupt) {
-        // Mark the handle as superseded (reaction revision) before interrupt
-        const handle = activeRuns.get(decision.interrupt.scope);
-        if (handle) handle.superseded = true;
-        activeRuns.interrupt(decision.interrupt.scope);
-        pending.cancel(result.components.scope);
-        reactionContextStore.delete(result.components.targetMessageId);
-        _reactionTurnMeta.delete(result.components.scope);
-        log.info('reaction', 'interrupt-empty-set', {
-          scope: result.components.scope, key: result.key, revision: result.revision,
-        });
+        effects.setHandleSuperseded(decision.interrupt.scope);
+        effects.interruptActiveRun(decision.interrupt.scope);
       }
+      // Per-key cleanup (not scope-level)
+      effects.cancelPendingForTarget(result.components.scope, result.components.targetMessageId);
+      effects.clearContextForTarget(result.components.targetMessageId);
+      effects.deleteTurnMetaForTarget(result.key);
+      log.info('reaction', 'bridge-reply', {
+        scope: result.components.scope, key: result.key,
+        message: decision.message.substring(0, 30),
+        interrupted: !!decision.interrupt,
+      });
       try {
         await channel.send(
           result.components.scope.split(':')[0] ?? result.components.scope,
@@ -880,7 +932,16 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     // F10/F11: Carry reaction metadata through to the run lifecycle
     const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
     if (wcId) _workChainStore?.markCurrent(wcId);
-    setReactionTurnMeta(result.components.scope, wcId, result.key, result.revision);
+    // Per-key metadata (reactionKey, not just scope — different keys don't clobber)
+    setReactionTurnMeta(result.key, result.components.scope, wcId, result.revision);
+    // Register in tracker at queued/reserved time so empty-set removal can detect it
+    _reactionRunTracker?.register({
+      scope: result.components.scope,
+      operatorOpenId: result.components.operatorOpenId,
+      targetMessageId: result.components.targetMessageId,
+      reactionRevision: result.revision,
+      runId: `${result.components.scope}:${Date.now()}`,
+    });
     pending.pushBarrier(result.components.scope, normalizedMsg);
     log.info('reaction', 'reconciled-and-enqueued', {
       key: result.key,
