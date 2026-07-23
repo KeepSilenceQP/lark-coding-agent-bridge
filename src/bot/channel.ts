@@ -189,10 +189,11 @@ export function createReactionFlushEffects(deps: {
 }): ReactionFlushEffects {
   return {
     sendBridgeReply: async (_chatId, _message, _replyToMessageId) => {
-      // Implemented inline by the caller using channel.send
+      // Bridge reply sent inline by caller using channel.send
     },
-    cancelPendingForTarget: (scope, _targetMessageId) => {
-      deps.pending.cancel(scope);
+    cancelPendingForTarget: (scope, targetMessageId) => {
+      // Per-key cancel: remove only this specific barrier message, not whole scope
+      deps.pending.cancelMessage(scope, targetMessageId);
     },
     clearContextForTarget: (targetMessageId) => {
       deps.contextStore.delete(targetMessageId);
@@ -855,23 +856,24 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     if (decision.kind === 'drop') return;
 
     if (decision.kind === 'bridge-reply') {
-      const effects = createReactionFlushEffects({ pending, contextStore: reactionContextStore, activeRuns });
-      // Per-key cleanup: cancel only this reaction key's barrier,
-      // clear only this target's contextStore, delete only this key's meta.
-      // Does NOT cancel other keys or normal messages on same scope.
-      if (decision.interrupt) {
-        effects.setHandleSuperseded(decision.interrupt.scope);
-        effects.interruptActiveRun(decision.interrupt.scope);
+      // Effects policy: only cleanup on empty-set/removal, NOT on reconciliationFailed.
+      // reconciliationFailed → ledger unchanged, no cancel, no context clear.
+      const isEmptySetRemoval = result.effectiveReactionSet.length === 0;
+      if (isEmptySetRemoval) {
+        const effects = createReactionFlushEffects({ pending, contextStore: reactionContextStore, activeRuns });
+        if (decision.interrupt) {
+          effects.setHandleSuperseded(decision.interrupt.scope);
+          effects.interruptActiveRun(decision.interrupt.scope);
+        }
+        effects.cancelPendingForTarget(result.components.scope, result.components.targetMessageId);
+        effects.clearContextForTarget(result.components.targetMessageId);
+        effects.deleteTurnMetaForTarget(result.key);
+        log.info('reaction', 'bridge-reply-removal', {
+          scope: result.components.scope, key: result.key,
+          message: decision.message.substring(0, 30),
+          interrupted: !!decision.interrupt,
+        });
       }
-      // Per-key cleanup (not scope-level)
-      effects.cancelPendingForTarget(result.components.scope, result.components.targetMessageId);
-      effects.clearContextForTarget(result.components.targetMessageId);
-      effects.deleteTurnMetaForTarget(result.key);
-      log.info('reaction', 'bridge-reply', {
-        scope: result.components.scope, key: result.key,
-        message: decision.message.substring(0, 30),
-        interrupted: !!decision.interrupt,
-      });
       try {
         await channel.send(
           result.components.scope.split(':')[0] ?? result.components.scope,

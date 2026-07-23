@@ -76,6 +76,29 @@ export class PendingQueue {
     return entry.messages;
   }
 
+  /**
+   * Per-key cancel: remove only messages matching a specific messageId
+   * within a scope. Does NOT cancel other keys or regular messages
+   * in the same scope.
+   */
+  cancelMessage(scope: string, messageId: string): NormalizedMessage[] {
+    const entry = this.map.get(scope);
+    if (!entry) return [];
+    const before = entry.messages.length;
+    entry.messages = entry.messages.filter((m) => m.messageId !== messageId);
+    if (entry.messages.length === 0) {
+      if (entry.timer) clearTimeout(entry.timer);
+      this.map.delete(scope);
+    } else if (before > entry.messages.length && !this.blocked.has(scope)) {
+      // Reset quiet window if we removed some but not all
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.timer = this.armTimer(scope);
+    }
+    return before > entry.messages.length
+      ? [{ messageId, chatId: '', chatType: 'group' as const, senderId: '', content: '', rawContentType: 'text' as const, resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: 0 }]
+      : [];
+  }
+
   cancelAll(): void {
     for (const entry of this.map.values()) {
       if (entry.timer) clearTimeout(entry.timer);
