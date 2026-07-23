@@ -132,7 +132,7 @@ describe('WorkChainStore', () => {
 
     // All 20 should still be current and findable
     for (let i = 0; i < 20; i++) {
-      expect(store.isCurrent(chainIds[i])).toBe(true);
+      expect(store.isCurrent(chainIds[i]!)).toBe(true);
       expect(store.resolveCurrentChain(`om_out_${i}`)).toBe(chainIds[i]);
     }
   });

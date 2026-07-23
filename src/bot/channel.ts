@@ -934,6 +934,18 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     reaction: async (evt) => {
       await withTrace({ chatId: evt.messageId }, async () => {
         try {
+          // Self-operator guard (Spec §Agent Input Contract 2, DD2):
+          // Silently drop reactions added by THIS bot/app itself, including
+          // Typing work-state reactions, before any side effect.
+          const raw = evt.raw as Record<string, unknown> | undefined;
+          if (
+            evt.operator.openId === channel.botIdentity?.openId ||
+            evt.operator.openId === cfg.accounts.app.id ||
+            raw?.operator_type === 'app'
+          ) {
+            return;
+          }
+
           const r = await channel.rawClient.im.v1.message.get({
             path: { message_id: evt.messageId },
           });
