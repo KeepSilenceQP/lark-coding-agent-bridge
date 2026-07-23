@@ -59,3 +59,49 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+  package-smoke:
+    name: npm package clean-install smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Prepare npm release layout
+        run: npm install --install-links=true
+
+      - name: Pack
+        id: pack
+        shell: bash
+        run: |
+          pack_output="$(npm pack --silent)"
+          printf '%s\n' "$pack_output"
+          pack_file="$(printf '%s\n' "$pack_output" | tail -n 1)"
+          echo "tarball=$PWD/$pack_file" >> "$GITHUB_OUTPUT"
+
+      - name: Install and start packed CLI
+        shell: bash
+        run: |
+          verify_dir="$(mktemp -d)"
+          npm install \
+            --prefix "$verify_dir" \
+            --install-links=true \
+            --ignore-scripts \
+            "${{ steps.pack.outputs.tarball }}"
+          installed="$verify_dir/node_modules/@penn.qp/lark-channel-bridge"
+          expected="$(node -p 'require("./package.json").version')"
+          actual="$(node "$installed/dist/cli.js" --version)"
+          test "$actual" = "$expected"
+          node -e '
+            const root = process.argv[1];
+            const channel = require(`${root}/node_modules/@larksuite/channel/package.json`);
+            const sdk = require(`${root}/node_modules/@larksuiteoapi/node-sdk/package.json`);
+            if (channel.version !== "0.4.0-qp.1") throw new Error(`unexpected channel ${channel.version}`);
+            if (!sdk.version) throw new Error("missing channel SDK");
+          ' "$installed"

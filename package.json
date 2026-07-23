@@ -1,6 +1,6 @@
 {
   "name": "@penn.qp/lark-channel-bridge",
-  "version": "0.5.9-qp.2",
+  "version": "0.5.9-qp.3",
   "description": "Bridge Feishu/Lark messenger with local CLI coding agents",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -44,6 +44,7 @@
     "test:process": "vitest run tests/process --passWithNoTests",
     "ci:local": "git diff --check && pnpm test && pnpm typecheck && pnpm build",
     "ci:platform": "pnpm test && pnpm typecheck && pnpm build",
+    "prepack": "node tools/check-npm-bundle.mjs",
     "prepare": "npm run build",
     "prepublishOnly": "pnpm typecheck && pnpm build"
   },
