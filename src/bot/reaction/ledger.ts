@@ -124,6 +124,17 @@ import type { CanonicalReactionRecord } from './types';
  *    byte order — no reliance on JSON.stringify key insertion order).
  * 5. SHA-256 hash of the serialized representation.
  */
+/** Byte-order comparison (F8): compares strings by UTF-16 code units,
+ *  producing the same order on any platform/locale. */
+function byteCompare(a: string, b: string): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const ca = a.charCodeAt(i);
+    const cb = b.charCodeAt(i);
+    if (ca !== cb) return ca - cb;
+  }
+  return a.length - b.length;
+}
+
 export function computeCanonicalFingerprint(records: CanonicalReactionRecord[]): string {
   // Primary dedup: by reaction_id when available
   const seenIds = new Set<string>();
@@ -147,9 +158,11 @@ export function computeCanonicalFingerprint(records: CanonicalReactionRecord[]):
   const sorted = deduped
     .map((r) => ({ operator_type: r.operator_type, operator_id: r.operator_id, emoji_type: r.emoji_type }))
     .sort((a, b) => {
-      const cmpId = a.operator_id.localeCompare(b.operator_id);
+      // F8: Use code-unit/byte comparator (not localeCompare) for
+      // cross-platform deterministic ordering regardless of locale.
+      const cmpId = byteCompare(a.operator_id, b.operator_id);
       if (cmpId !== 0) return cmpId;
-      return a.emoji_type.localeCompare(b.emoji_type);
+      return byteCompare(a.emoji_type, b.emoji_type);
     });
 
   // Cross-platform deterministic serialization (F8): explicit field order

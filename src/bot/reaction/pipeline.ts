@@ -34,7 +34,8 @@ export const GUARD_DENY_GROUP_RESPONSE: ReactionGuardDenyReason = 'group-respons
 export type ReactionPipelineAction =
   | { kind: 'drop'; reason: string }
   | {
-      kind: 'enqueue-reaction';
+      kind: 'buffer-reaction';
+      key: ReactionKey;
       scope: string;
       chatId: string;
       chatType: 'p2p' | 'group';
@@ -42,11 +43,10 @@ export type ReactionPipelineAction =
       operatorOpenId: string;
       targetMessageId: string;
       normalizedMsg: NormalizedMessage;
-      reactionContext: ReactionContext;
       workChainId: string;
     }
-  | { kind: 'stop-added-reply'; scope: string; chatId: string; message: string; targetMessageId: string }
-  | { kind: 'stop-removed-reply'; scope: string; chatId: string; message: string; targetMessageId: string };
+  | { kind: 'stop-added-reply'; scope: string; chatId: string; message: string; targetMessageId: string; operatorOpenId: string; emojiType: string; actionTime?: number; stableId?: string }
+  | { kind: 'stop-removed-reply'; scope: string; chatId: string; message: string; targetMessageId: string; operatorOpenId: string; emojiType: string; actionTime?: number; stableId?: string };
 
 // ── Pipeline deps ──
 
@@ -61,12 +61,8 @@ export interface ReactionPipelineCallbacks {
   checkAccess: (chatType: 'p2p' | 'group', chatId: string, senderId: string) => { ok: boolean; reason: string };
   /** Apply decideGroupResponse for reaction (mentionedBot=false, mentionCount=0, mentionAll=false). */
   checkGroupResponse: (chatType: string, chatId: string, senderId: string) => { accept: boolean; reason: string };
-  /** Check if scope has current work (for stop control). */
-  hasCurrentWork: (scope: string) => boolean;
-  /** Validate stop target against current workChainId. */
-  validateStopTarget: (targetMessageId: string, scope: string) => boolean;
-  /** Execute stop: interrupt active run + cancel pending queue. Returns true if a run was interrupted. */
-  executeStop: (scope: string) => Promise<boolean>;
+  /** Resolve chatMode/chatType for a chatId (F2: no oc_/ou_ guessing). */
+  resolveChatMode: (chatId: string) => Promise<'p2p' | 'group' | 'topic'>;
   /** Allocate or inherit a workChainId for this reaction turn. */
   resolveWorkChain: (scope: string, replyToMessageId?: string) => string;
 }
@@ -97,21 +93,14 @@ async function resolveRoute(channel: LarkChannel, messageId: string) {
   return r?.data?.items?.[0];
 }
 
-// ── Pipeline entry point (F1: production wiring) ──
+// ── Pipeline entry point ──
 
 /**
- * Process a reaction event through the full pipeline.
+ * Guards pipeline for a reaction event: self-operator → route → own-message →
+ * permission → stop fast-path / buffer.
  *
- * Order (Spec §Permission Contract, §Stop Reaction Control Contract):
- * 1. Self-operator guard → drop if self
- * 2. Resolve target message routing (chatId, threadId, sender)
- * 3. Own-message filter → only reactions on THIS bot's messages
- * 4. Permission gates (F2): canUseDm/canUseGroup → decideGroupResponse
- *    (mentionedBot=false, mentionCount=0, mentionAll=false)
- * 5. For stop emojis → control plane (stop added/removed)
- * 6. For non-stop → build NormalizedMessage + ReactionContext → enqueue
- *
- * Errors are caught and logged — never crash the bridge queue (DD19).
+ * This does NOT do reconciliation — that's handled by the buffer's flush
+ * handler which calls messageReaction.list → reconciler → ledger.
  */
 export async function handleReactionEvent(
   evt: ReactionEvent,
@@ -140,74 +129,50 @@ export async function handleReactionEvent(
       return { kind: 'drop', reason: 'not-own-message' };
     }
 
-    // Resolve scope
+    // 4. Resolve chatMode (F2: use channel's chatModeCache, not oc_/ou_ prefix guessing)
+    const chatMode = await callbacks.resolveChatMode(chatId);
     const threadId = item?.thread_id as string | undefined;
-    const scope = threadId ? `${chatId}:${threadId}` : chatId;
+    const scope = (chatMode === 'topic' && threadId) ? `${chatId}:${threadId}` : chatId;
+    const chatType: 'p2p' | 'group' = chatMode === 'p2p' ? 'p2p' : 'group';
 
-    // The caller (channel.ts) resolves chatMode and chatType.
-    // We pass the raw chatId and let the caller finalize scope/chatType.
-    // For now, assume chatType based on chat_id prefix (will be overridden by caller).
-    // The pipeline returns scope/chatId and the caller applies final scope logic.
-
-    // 4. Permission gates (F2): access control + group response for Reaction
-    // Reaction has no structured @ → mentionedBot:false, mentionCount:0, mentionAll:false.
-    // This makes Reaction equivalent to a non-@ message from the same operator.
-    const accessResult = callbacks.checkAccess(
-      chatId.startsWith('ou_') ? 'p2p' : 'group',
-      chatId,
-      evt.operator.openId,
-    );
+    // 5. Permission gates (F2): access control + group response
+    const accessResult = callbacks.checkAccess(chatType, chatId, evt.operator.openId);
     if (!accessResult.ok) {
       log.info('reaction', 'deny-access', { scope, operator: evt.operator.openId.slice(-6), reason: accessResult.reason });
       return { kind: 'drop', reason: `access-${accessResult.reason}` };
     }
 
-    // chatType determination — the caller provides final scope via chatMode lookup.
-    // Here we use a heuristic; the caller overrides in the enqueue-reaction action.
-    const chatType: 'p2p' | 'group' = chatId.startsWith('ou_') ? 'p2p' : 'group';
-
-    const groupRespResult = callbacks.checkGroupResponse(chatType, chatId, evt.operator.openId);
-    if (!groupRespResult.accept) {
-      log.info('reaction', 'deny-group-response', { scope, operator: evt.operator.openId.slice(-6), reason: groupRespResult.reason });
-      return { kind: 'drop', reason: 'group-response' };
+    if (chatType === 'group' || chatMode === 'topic') {
+      const groupRespResult = callbacks.checkGroupResponse(chatType, chatId, evt.operator.openId);
+      if (!groupRespResult.accept) {
+        log.info('reaction', 'deny-group-response', { scope, operator: evt.operator.openId.slice(-6), reason: groupRespResult.reason });
+        return { kind: 'drop', reason: 'group-response' };
+      }
     }
 
-    // 5. Stop emoji → control plane fast path
+    // 6. Stop emoji → control plane fast path (return event info so caller can persist)
     if (isStopEmoji(evt.emojiType)) {
-      return handleStopReaction(evt, scope, chatId, callbacks);
+      const rawHeader = (evt.raw as Record<string, unknown> | undefined)?.['header'] as Record<string, unknown> | undefined;
+      if (evt.action === 'added') {
+        return {
+          kind: 'stop-added-reply',
+          scope, chatId, targetMessageId: evt.messageId,
+          message: '', // caller fills based on hasCurrentWork/validateStopTarget
+          operatorOpenId: evt.operator.openId, emojiType: evt.emojiType,
+          actionTime: evt.actionTime, stableId: rawHeader?.['event_id'] as string | undefined,
+        };
+      }
+      return {
+        kind: 'stop-removed-reply',
+        scope, chatId, targetMessageId: evt.messageId,
+        message: '', // caller fills
+        operatorOpenId: evt.operator.openId, emojiType: evt.emojiType,
+        actionTime: evt.actionTime, stableId: rawHeader?.['event_id'] as string | undefined,
+      };
     }
 
-    // 6. Non-stop: build ReactionContext and NormalizedMessage for enqueue
-    const sem = lookupReactionSemantics(evt.emojiType);
-    const reactionContext: ReactionContext = {
-      operatorOpenId: evt.operator.openId,
-      reactionRevision: 1, // Updated by reconciler before agent sees it
-      triggerReactions: [{
-        action: evt.action,
-        emojiType: evt.emojiType,
-        emojiDisplay: sem.emojiDisplay,
-        emojiMeaning: 'emojiMeaning' in sem ? sem.emojiMeaning : undefined,
-        semanticKey: 'semanticKey' in sem ? sem.semanticKey : undefined,
-        emojiMeaningSource: sem.emojiMeaningSource,
-        actionTime: evt.actionTime ?? Date.now(),
-      }],
-      effectiveReactionSet: [{
-        emojiType: evt.emojiType,
-        emojiDisplay: sem.emojiDisplay,
-        emojiMeaning: 'emojiMeaning' in sem ? sem.emojiMeaning : undefined,
-        semanticKey: 'semanticKey' in sem ? sem.semanticKey : undefined,
-        emojiMeaningSource: sem.emojiMeaningSource,
-      }],
-      targetMessage: {
-        available: true,
-        messageId: evt.messageId,
-        senderId: messageSenderId,
-        createdAt: item?.create_time ? new Date(Number(item.create_time)).toISOString() : undefined,
-        rawContentType: item?.msg_type ?? 'text',
-      },
-    };
-
-    // Resolve workChainId for this reaction (F10: inherit from target message's chain)
+    // 7. Non-stop: build NormalizedMessage and buffer key → enqueue via buffer
+    const key = makeReactionKey(scope, evt.operator.openId, evt.messageId);
     const workChainId = callbacks.resolveWorkChain(scope, evt.messageId);
 
     // Build NormalizedMessage for PendingQueue compatibility
@@ -227,71 +192,15 @@ export async function handleReactionEvent(
     };
 
     return {
-      kind: 'enqueue-reaction',
-      scope,
-      chatId,
-      chatType,
-      threadId,
+      kind: 'buffer-reaction',
+      key, scope, chatId, chatType, threadId,
       operatorOpenId: evt.operator.openId,
       targetMessageId: evt.messageId,
       normalizedMsg,
-      reactionContext,
       workChainId,
     };
   } catch (err) {
     log.fail('reaction', err);
     return { kind: 'drop', reason: 'pipeline-error' };
   }
-}
-
-// ── Stop reaction control plane handler ──
-
-async function handleStopReaction(
-  evt: ReactionEvent,
-  scope: string,
-  chatId: string,
-  callbacks: ReactionPipelineCallbacks,
-): Promise<ReactionPipelineAction> {
-  if (evt.action === 'added') {
-    // ①: scope has NO current work → idempotent reply
-    if (!callbacks.hasCurrentWork(scope)) {
-      return {
-        kind: 'stop-added-reply',
-        scope,
-        chatId,
-        message: '当前没有需要停止的任务。',
-        targetMessageId: evt.messageId,
-      };
-    }
-
-    // ②: scope has current work → validate target against workChainId
-    if (!callbacks.validateStopTarget(evt.messageId, scope)) {
-      return {
-        kind: 'stop-added-reply',
-        scope,
-        chatId,
-        message: '该 Reaction 未停止当前任务，如需停止请使用 /stop 命令。',
-        targetMessageId: evt.messageId,
-      };
-    }
-
-    // ③: association passed → interrupt + cancel pending (F11)
-    const stopped = await callbacks.executeStop(scope);
-    return {
-      kind: 'stop-added-reply',
-      scope,
-      chatId,
-      message: stopped ? '已停止当前任务。' : '当前没有需要停止的任务。',
-      targetMessageId: evt.messageId,
-    };
-  }
-
-  // action === 'removed': only reply if matching stop-added was consumed (F6/F7)
-  return {
-    kind: 'stop-removed-reply',
-    scope,
-    chatId,
-    message: '撤回停止 Reaction 不会自动恢复工作。如需继续，请发送新的消息。',
-    targetMessageId: evt.messageId,
-  };
 }

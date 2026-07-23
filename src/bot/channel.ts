@@ -110,8 +110,16 @@ import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quo
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { handleReactionEvent } from './reaction/pipeline';
-import { isStopEmoji } from './reaction/semantics';
+import { isStopEmoji, lookupReactionSemantics } from './reaction/semantics';
 import { WorkChainStore } from './reaction/work-chain';
+import { ReactionContextStore } from './reaction/context-store';
+import { ReactionBuffer } from './reaction/buffer';
+import { reconcile } from './reaction/reconciler';
+import { loadReactionLedger } from './reaction/ledger';
+import type { ReactionLedger } from './reaction/ledger';
+import { loadStopControlLedger, stopEventFingerprint } from './reaction/control-ledger';
+import type { StopControlLedger } from './reaction/control-ledger';
+import { ReactionRunTracker } from './reaction/run-tracker';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -120,6 +128,12 @@ import {
   CotPublisher,
   finalAnswerOnlyState,
 } from './cot';
+
+// ── Reaction context store (module-level, set by startChannel) ──
+let _reactionContextStore: ReactionContextStore | null = null;
+function getReactionContexts(messageIds: string[]): unknown[] {
+  return _reactionContextStore ? _reactionContextStore.consume(messageIds) : [];
+}
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
@@ -689,6 +703,71 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // WorkChainStore: maps message→workChainId for stop reaction validation (DD15).
   // In-memory store — restart fail-closed (all historical associations lost).
   const workChainStore = new WorkChainStore();
+  // ReactionContextStore: keyed store carrying reconciled reaction contexts
+  // from pipeline to buildPrompt (F1).
+  const reactionContextStore = new ReactionContextStore();
+  _reactionContextStore = reactionContextStore;
+  // ReactionRunTracker: tracks active reaction runs by reaction key (F23).
+  const reactionRunTracker = new ReactionRunTracker();
+  // Ledgers: lazily loaded when profileDir is available (F3/F12).
+  let reactionLedger: ReactionLedger | null = null;
+  let stopControlLedger: StopControlLedger | null = null;
+  // ReactionBuffer: buffers non-stop events before reconciliation (F4/F5).
+  const reactionBuffer = new ReactionBuffer(async (key, events) => {
+    if (!reactionLedger) return;
+    const result = await reconcile(key, events, {
+      channel,
+      ledger: reactionLedger,
+      botOpenId: channel.botIdentity?.openId,
+      appId: cfg.accounts.app.id,
+    });
+
+    if (result.reconciliationFailed) {
+      // Reply to retry
+      try {
+        await channel.send(result.components.scope.split(':')[0] ?? result.components.scope,
+          { markdown: '本次 Reaction 暂时无法确认，请重试。' },
+          { replyTo: result.components.targetMessageId });
+      } catch { /* best-effort */ }
+      return;
+    }
+    if (result.noOp) return; // No state change, no reply
+
+    // Build ReactionContext from reconciliation result
+    const sem = lookupReactionSemantics(events[0]?.emojiType ?? '');
+    const reactionContext = {
+      operatorOpenId: result.components.operatorOpenId,
+      reactionRevision: result.revision,
+      triggerReactions: result.triggerReactions,
+      effectiveReactionSet: result.effectiveReactionSet,
+      targetMessage: {
+        available: true as const,
+        messageId: result.components.targetMessageId,
+      },
+    };
+
+    // Store in contextStore and enqueue via pushBarrier
+    reactionContextStore.set(result.components.targetMessageId, [reactionContext]);
+    const normalizedMsg = {
+      messageId: result.components.targetMessageId,
+      chatId: result.components.scope.split(':')[0] ?? result.components.scope,
+      chatType: 'group' as const,
+      senderId: result.components.operatorOpenId,
+      content: `[reaction] ${events.map(e => e.emojiType).join(', ')}`,
+      rawContentType: 'reaction' as never,
+      resources: [] as never[],
+      mentions: [] as never[],
+      mentionAll: false,
+      mentionedBot: false,
+      createTime: Date.now(),
+    } satisfies import('@larksuite/channel').NormalizedMessage;
+    pending.pushBarrier(result.components.scope, normalizedMsg);
+    log.info('reaction', 'reconciled-and-enqueued', {
+      key: result.key,
+      revision: result.revision,
+      netZero: result.netZeroConsumed,
+    });
+  });
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
   const chatModeCache = new ChatModeCache();
@@ -743,6 +822,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         nonceStore: callbackNonceStore,
       })
     : undefined;
+  // F3/F12: Load reaction and stop-control ledgers when profileDir is available.
+  if (deps.appPaths?.profileDir) {
+    reactionLedger = await loadReactionLedger(deps.appPaths.profileDir);
+    stopControlLedger = await loadStopControlLedger(deps.appPaths.profileDir);
+  }
+
   const activePolicyFingerprints = new Map<string, string>();
   // Per-scope record of the model used on the last run, so a `/config` model
   // switch can inject a one-time "model changed" note into the next (resumed)
@@ -940,8 +1025,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     reaction: async (evt) => {
       await withTrace({ chatId: evt.messageId }, async () => {
         try {
-          // Delegate to pipeline (F1): self-operator → route → own-message →
-          // permission → stop control / enqueue.
+          // F1/F2: Guards pipeline: self-operator → route → own-message →
+          // permission (using chatModeCache for chatType, not oc_/ou_ guessing).
           const pipelineResult = await handleReactionEvent(evt, {
             channel,
             botOpenId: channel.botIdentity?.openId,
@@ -951,7 +1036,6 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
               if (chatType === 'p2p') {
                 return canUseDm(controls.profileConfig, controls, senderId);
               }
-              // For group: don't use shouldBypassDeniedChatForInviteGroup
               return canUseGroup(controls.profileConfig, controls, chatId, senderId);
             },
             checkGroupResponse: (_chatType, chatId, senderId) => {
@@ -969,35 +1053,65 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
               });
               return decision;
             },
-            hasCurrentWork: (scope) => {
-              return activeRuns.get(scope) !== undefined;
-            },
-            validateStopTarget: (targetMessageId, scope) => {
-              // scope param available for future use
-              void scope;
-              return workChainStore.resolveCurrentChain(targetMessageId) !== undefined;
-            },
-            executeStop: async (scope) => {
-              const hadActive = activeRuns.interrupt(scope);
-              const cancelled = pending.cancel(scope);
-              return hadActive || cancelled.length > 0;
+            resolveChatMode: async (chatId) => {
+              return chatModeCache.resolve(channel, chatId);
             },
             resolveWorkChain: (scope, replyToMessageId) => {
               return workChainStore.resolveOrAllocate(scope, replyToMessageId);
             },
           });
 
-          if (pipelineResult.kind === 'drop') {
-            // Silently dropped — guard/access/group-response denied
+          if (pipelineResult.kind === 'drop') return;
+
+          // F1/F4/F5: Non-stop → push into buffer for reconciliation
+          if (pipelineResult.kind === 'buffer-reaction') {
+            reactionBuffer.push(pipelineResult.key, evt);
+            log.info('reaction', 'buffered', {
+              key: pipelineResult.key,
+              emojiType: evt.emojiType,
+              action: evt.action,
+            });
             return;
           }
 
+          // F3/F6/F7/F11/F12: Stop control plane with persistent ledger
           if (pipelineResult.kind === 'stop-added-reply') {
-            // F11/F12: Stop control plane executes interrupt + cancel via pipeline.
-            // Control ledger persistence will be wired when profileDir is available.
-            // Send bridge reply
+            const fp = stopEventFingerprint(
+              pipelineResult.operatorOpenId, pipelineResult.targetMessageId,
+              pipelineResult.emojiType, 'added',
+              pipelineResult.actionTime, pipelineResult.stableId,
+            );
+
+            // F3/F12: isConsumed check before any action
+            if (stopControlLedger?.isConsumed(fp)) return;
+
+            // F11: Determine result based on current state
+            let message: string;
+            let replyKind: 'no-work' | 'stopped' | 'fail-closed';
+
+            if (activeRuns.get(pipelineResult.scope) === undefined) {
+              message = '当前没有需要停止的任务。';
+              replyKind = 'no-work';
+            } else if (workChainStore.resolveCurrentChain(pipelineResult.targetMessageId) === undefined) {
+              message = '该 Reaction 未停止当前任务，如需停止请使用 /stop 命令。';
+              replyKind = 'fail-closed';
+            } else {
+              // F11: Real interrupt + cancel pending
+              activeRuns.interrupt(pipelineResult.scope);
+              pending.cancel(pipelineResult.scope);
+              message = '已停止当前任务。';
+              replyKind = 'stopped';
+            }
+
+            // F12: Persist consumed state
+            if (stopControlLedger) {
+              await stopControlLedger.record(fp, 'added',
+                pipelineResult.operatorOpenId, pipelineResult.targetMessageId,
+                pipelineResult.emojiType, replyKind);
+            }
+
             try {
-              await channel.send(pipelineResult.chatId, { markdown: pipelineResult.message }, {
+              await channel.send(pipelineResult.chatId, { markdown: message }, {
                 replyTo: pipelineResult.targetMessageId,
               });
             } catch (err) {
@@ -1007,26 +1121,30 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           }
 
           if (pipelineResult.kind === 'stop-removed-reply') {
-            // F6/F7: Bridge replies to removed stop Reaction.
-            // Control ledger matching will be wired when profileDir is available.
-            try {
-              await channel.send(pipelineResult.chatId, { markdown: pipelineResult.message }, {
-                replyTo: pipelineResult.targetMessageId,
-              });
-            } catch (err) {
-              log.warn('reaction', 'stop-removed-reply-failed', { err: String(err) });
+            const fp = stopEventFingerprint(
+              pipelineResult.operatorOpenId, pipelineResult.targetMessageId,
+              pipelineResult.emojiType, 'removed',
+              pipelineResult.actionTime, pipelineResult.stableId,
+            );
+
+            // F6/F7: Only reply if matching stop-added was consumed
+            if (stopControlLedger && !stopControlLedger.isConsumed(fp)) {
+              const match = stopControlLedger.findMatchingAdded(
+                pipelineResult.operatorOpenId, pipelineResult.targetMessageId, pipelineResult.emojiType);
+              if (match) {
+                await stopControlLedger.record(fp, 'removed',
+                  pipelineResult.operatorOpenId, pipelineResult.targetMessageId, pipelineResult.emojiType);
+                try {
+                  await channel.send(pipelineResult.chatId, {
+                    markdown: '撤回停止 Reaction 不会自动恢复工作。如需继续，请发送新的消息。',
+                  }, { replyTo: pipelineResult.targetMessageId });
+                } catch (err) {
+                  log.warn('reaction', 'stop-removed-reply-failed', { err: String(err) });
+                }
+              }
+              // F7: No matching added → silent no-op
             }
             return;
-          }
-
-          if (pipelineResult.kind === 'enqueue-reaction') {
-            // F1: Push through pushBarrier (batch isolation), not regular push
-            pending.pushBarrier(pipelineResult.scope, pipelineResult.normalizedMsg);
-            log.info('reaction', 'enqueued', {
-              scope: pipelineResult.scope,
-              emojiType: evt.emojiType,
-              action: evt.action,
-            });
           }
         } catch (err) {
           log.fail('reaction', err);
@@ -1523,12 +1641,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       ]
     : undefined;
 
-  // F1: Detect reaction batches and collect their reactionContexts
+  // F1: Detect reaction batches and collect reactionContexts via internal store
   const isReactionBatch = lastMsg.rawContentType === ('reaction' as never);
-  const reactionContexts = isReactionBatch
-    ? (batch[0] as NormalizedMessage & { _reactionContext?: unknown })?.['_reactionContext' as keyof NormalizedMessage]
-      ? [(batch[0] as NormalizedMessage & { _reactionContext?: unknown })._reactionContext]
-      : undefined
+  const reactionContexts: unknown[] | undefined = isReactionBatch
+    ? getReactionContexts(batch.map(m => m.messageId))
     : undefined;
 
   const prompt = buildPrompt(
@@ -1538,7 +1654,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     topicContext,
     channel.botIdentity,
     extraInstructions,
-    reactionContexts as unknown[] | undefined,
+    (reactionContexts && reactionContexts.length > 0) ? reactionContexts : undefined,
   );
   log.info('prompt', 'built', {
     promptChars: prompt.length,

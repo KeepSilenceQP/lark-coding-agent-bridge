@@ -18,7 +18,7 @@ describe('ReactionRunTracker', () => {
       reactionRevision: 1,
       runId: 'run-1',
     });
-    expect(tracker.get('oc_scope')?.reactionRevision).toBe(1);
+    expect(tracker.get('oc_scope', 'ou_user', 'om_target')?.reactionRevision).toBe(1);
   });
 
   it('unregisters a completed run', () => {
@@ -30,8 +30,8 @@ describe('ReactionRunTracker', () => {
       reactionRevision: 1,
       runId: 'run-1',
     });
-    tracker.unregister('oc_scope');
-    expect(tracker.get('oc_scope')).toBeUndefined();
+    tracker.unregister('oc_scope', 'ou_user', 'om_target');
+    expect(tracker.get('oc_scope', 'ou_user', 'om_target')).toBeUndefined();
   });
 
   it('shouldInterrupt returns true when same key + higher revision', () => {
@@ -174,7 +174,7 @@ describe('revision invalidation contract', () => {
     expect(shouldInterrupt).toBe(true);
 
     // After interrupt, old run is unregistered
-    tracker.unregister('oc_scope');
+    tracker.unregister('oc_scope', 'ou_user', 'om_target');
 
     // New run with revision 2 is registered
     tracker.register({
@@ -186,7 +186,7 @@ describe('revision invalidation contract', () => {
     });
 
     // New run should be findable, old run gone
-    expect(tracker.get('oc_scope')?.reactionRevision).toBe(2);
+    expect(tracker.get('oc_scope', 'ou_user', 'om_target')?.reactionRevision).toBe(2);
   });
 
   it('old revision with streamed reply → marked superseded, new revision separate reply', () => {
@@ -218,10 +218,10 @@ describe('revision invalidation contract', () => {
       reactionRevision: 1,
       runId: 'run-1',
     });
-    tracker.unregister('oc_scope');
+    tracker.unregister('oc_scope', 'ou_user', 'om_target');
 
     // A new 'removed' event comes in — should not trigger interrupt
-    expect(tracker.get('oc_scope')).toBeUndefined();
+    expect(tracker.get('oc_scope', 'ou_user', 'om_target')).toBeUndefined();
     // No Agent turn should be started
   });
 
