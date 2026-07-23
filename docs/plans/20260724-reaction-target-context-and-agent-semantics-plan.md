@@ -25,6 +25,7 @@ Implementer: 小C
 - 2026-07-24 云上C总：基于 `e7e178f` 全文读取 Spec + 全量源码勘察，产出本 Plan 草稿。Plan Writer 不自审。
 - 2026-07-24 小P 复核 + 云上C总 修订（第 2 版）：DD17/B1 原结论「`/stop` 不取消 pending」误判——经 `src/bot/channel.ts:1304-1331` 复核，`intakeMessage` 对 `tryHandleCommand` 返回 `handled=true` 的命令统一 `pending.cancel(scope)`，`/stop` 已含取消 pending。stop 控制面改为复用现有 `/stop`「interrupt + pending.cancel」复合语义，不比 `/stop` 严格，无 `/stop` 对齐改动；B1 撤回。
 - 2026-07-24 小P Plan Review 结论 BLOCKED（6 项 finding 有效）+ 云上C总 修订（第 3 版，基于 Spec `d18322c`）：①`Get` 不新增为第 12 个预埋 alias，v1 仍 11 个，示例用 `JIAYI`，`Get` 走 unmapped 透传；②单数 `triggerReaction` 改为按 action time+到达顺序排列的 `triggerReactions[]`，保留 `effectiveReactionSet`，补"启动前快速新增两个不同 Reaction"与"同 buffer 一增一减且最终非空"测试；③stop added 顺序改为门禁+防重后先判 scope 完全无 work→回无任务，仅 scope 有 current work 时才做 target→current workChain 关联（历史/无关→fail closed）；④定义 canonical fingerprint 稳定字段/去重/确定性排序，跨页/返回顺序打乱不产生 revision；⑤补 context-builder→fetchQuotedContext→reaction_contexts 卡片/合并转发真实内容 wiring 测试；⑥workChainId 给出明确 TTL/容量/淘汰规则与边界测试。
+- 2026-07-24 小P Plan v3 复审：前 5 项 CLOSED；第 6 项 TTL/LRU 方向成立但 DD15 引入 1 个 BLOCKER（16/256 作总 Map 硬上限与 current 不淘汰、PendingQueue 无背压三者冲突；current outbound mapping 不能被 TTL 淘汰，否则长任务丢 stop 关联）。云上C总 修订（第 4 版）：16/256 重定义为 historical cache 上限（非总 Map 硬上限），current chains 及其 outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，terminal 后才进入 30min historical retention 并按 LRU 裁剪；总边界表述为 current workload references + bounded historical cache；不引入 pending admission/drop/backpressure；Unit6 补 a/b/c 三测试。
 - 待 小P：Plan Review Gate（见文末）。
 
 ## Current Evidence（当前代码现状，file:line）
@@ -183,7 +184,10 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
   - pending unit、run reservation、active run 都携带 `workChainId`；Bot outbound message ID 一旦创建立即登记为该 run 的 `workChainId`；发起当前 work 的 Bot 确认/方案消息属于被继续的同一 chain。
   - chain 仍有 queued/reserved/active work = current；全部 terminal = historical。后续有效回复/Reaction 可继承该 ID 重新继续此 chain，但在它重新产生 queued/reserved/active work 前不能停止另一个 current chain。
 - **仅当**当前 scope 存在 active/reserved/queued work 时，停止 Reaction 的目标 message ID 才需映射到其中某个 current `workChainId` 以允许执行 stop 控制动作；active/reserved chain 或 pending sibling chain 都属 current。目标只属 historical chain、映射过期、或重启后无法恢复关联 → fail closed（DD16）。该 fail-closed 分支**不得**覆盖 DD16「scope 完全无 work → 幂等回复无任务」的前置分支。
-- 重启后旧关联可整体失效，**不**据会话文本猜测重建。每次 outbound 登记、chain lifecycle 变化、fail-closed reason 写受限结构化日志。存储为内存 Map（**有界**，非可选）：每个 scope 至多保留 `MAX_CHAINS_PER_SCOPE=16` 条 chain 记录、`MAX_OUTBOUND_MAP_PER_SCOPE=256` 条 outbound→chain 映射；chain 进入 historical 后保留 `HISTORICAL_CHAIN_TTL_MS=1_800_000`（30 min）以供后续 Reaction 继承/关联，超时淘汰；outbound→chain 映射同 TTL 淘汰；容量满时按 LRU 淘汰最久未访问的 historical chain（current chain 不淘汰）；被淘汰/过期的 chain 再次被 stop Reaction 指向即按 fail closed 处理。重启 fail closed。常量为 Plan 定义默认值，小C 实现时可同量级调整。
+- 重启后旧关联可整体失效，**不**据会话文本猜测重建。每次 outbound 登记、chain lifecycle 变化、fail-closed reason 写受限结构化日志。存储为内存 Map，**有界性 = current workload references + bounded historical cache**：
+  - **current chains 及其 outbound mappings 不参与 TTL/LRU**：只要 chain 仍有 queued/reserved/active work（current），其 chain 记录与全部关联 outbound→chain 映射都原样保留，不受 `HISTORICAL_CHAIN_TTL_MS` 与 historical cap 约束（长任务不丢失 stop 关联）。PendingQueue 无容量/背压，active 期间可累积任意数量 current chain，**不**引入 pending admission/drop/backpressure。
+  - **historical retention**：chain 全部进入 terminal 后才转为 historical，保留 `HISTORICAL_CHAIN_TTL_MS=1_800_000`（30 min）以供后续 Reaction 继承/关联；historical chain 记录数超过 `MAX_CHAINS_PER_SCOPE=16`、historical outbound→chain 映射数超过 `MAX_OUTBOUND_MAP_PER_SCOPE=256` 时，按 LRU 淘汰最久未访问的 historical 项；TTL 到期或被 LRU 淘汰的 historical 项再次被 stop Reaction 指向即按 fail closed 处理。
+  - `MAX_CHAINS_PER_SCOPE`/`MAX_OUTBOUND_MAP_PER_SCOPE` 是 **historical cache 上限，不是总 Map 硬上限**；总 Map 大小 = current workload references（无上限）+ bounded historical cache（≤ cap）。重启 fail closed。常量为 Plan 定义默认值，小C 实现时可同量级调整。
 
 ### DD16 — `stop_current_work` 独立控制面（added/removed 独立持久 ledger，不走 Agent 链路）
 
@@ -274,7 +278,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 
 - [ ] `work-chain.ts`：分配/继承（回复或 Reaction 指向已关联 Bot 消息时继承）/outbound message ID 登记/terminal 生命周期；current vs historical；停止目标 message ID → current chain 映射；重启失效 fail closed；受限日志。
 - [ ] pending unit / reservation / active run 携带 `workChainId`；outbound message ID 创建即登记。
-- [ ] RED：`tests/unit/bot/reaction-work-chain.test.ts` 覆盖：input/pending/reservation/active/outbound/terminal 全生命周期关联、目标确认消息被 Reaction 继续（继承 chain）、sibling queued unit、重启后未知关联 fail closed、historical chain 目标 fail closed、outbound 登记后可匹配 active chain；**有界边界**：historical chain TTL 过期 → 该目标 stop Reaction fail closed、容量满 LRU 淘汰最久未访问 historical chain → 被淘汰目标 fail closed、current chain 在 active/queued 期间不被淘汰、淘汰/过期后 chain 可被新普通消息重新开启。
+- [ ] RED：`tests/unit/bot/reaction-work-chain.test.ts` 覆盖：input/pending/reservation/active/outbound/terminal 全生命周期关联、目标确认消息被 Reaction 继续（继承 chain）、sibling queued unit、重启后未知关联 fail closed、historical chain 目标 fail closed、outbound 登记后可匹配 active chain；**有界边界（historical cache 语义）**：a) 同 scope >16 个 queued/current chains 均不被淘汰（current 不参与 LRU/cap），全部 terminal 后 historical 才收敛至 `MAX_CHAINS_PER_SCOPE=16`（LRU 裁剪最旧）；b) current chain 的 outbound mapping 超 30min 仍可 stop 关联（current 不参与 TTL），terminal 后转 historical、过 `HISTORICAL_CHAIN_TTL_MS` 才 fail closed；c) historical outbound→chain 映射超 `MAX_OUTBOUND_MAP_PER_SCOPE=256` 按 LRU 淘汰、被淘汰目标 stop fail closed；淘汰/过期后 chain 可被新普通消息重新开启。**不得**引入 pending admission/drop/backpressure。
 - Depends: 无（可与前面并行；但 DD12/DD16 集成需它）。
 - Spec 覆盖：§Stop Reaction Control Contract（workChainId 关联）；Acceptance「目标确认消息被 Reaction 继续」「sibling queued unit」「重启后未知关联 fail closed」「当前 run 已产生 Bot 输出，停止 Reaction 指向该输出」。
 
@@ -353,7 +357,10 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 | approve_continue 启动新 run 后 stop 仍指确认消息 | 6、9 |
 | stop 指向 current chain + sibling queued | 9 |
 | 重启后旧 Bot 消息 stop → fail closed | 6、9 |
-| workChainId TTL 过期/LRU 淘汰 → fail closed 边界 | 6 |
+| workChainId historical TTL/LRU 淘汰 → fail closed（current 不参与） | 6 |
+| 同 scope >16 current chains 不淘汰，terminal 后 historical 收敛至 cap | 6 |
+| current outbound mapping 超30min 仍可 stop，terminal 后过 TTL 才 fail closed | 6 |
+| historical outbound map >256 按 LRU 淘汰 | 6 |
 | stop added 顺序：scope 完全无 work → 无任务（分支单独测试） | 9 |
 | stop added：scope 有 current work + 目标→current chain → interrupt | 9 |
 | stop added：历史目标 + 另一 current chain → fail closed | 9 |
@@ -442,7 +449,7 @@ pnpm -s test
 - **B4（实现注意）**：`ReactionEvent` 无稳定 event_id；stop 控制 ledger 与普通 ledger 防重 fingerprint 优先用 `evt.raw.header.event_id`（若可达），否则用规范化字段 + action time（Spec §Stop 已允许）。
 - **B5（实现注意）**：`NormalizedMessage` 为 vendored SDK 类型不易扩展；Reaction turn 经 `PendingQueue` barrier 条目携带 `ReactionTurn` 而非扩展 `NormalizedMessage`（DD11），`<reaction_contexts>` 数据经侧信道 plumbed 到 `buildAgentPrompt`。
 - **B6（实现注意）**：`ActiveRuns` 仅按 scope 键，无 per-run (operator,target,revision,workChainId) 元数据；DD12/DD15 需在其外加 per-run 元数据注册或扩展 `RunHandle`，注意与现有 `interrupt`/`unregister` 生命周期一致。
-- **B7（实现注意，第 3 版）**：DD15 的 `workChainId` TTL/容量常量（`MAX_CHAINS_PER_SCOPE=16`、`MAX_OUTBOUND_MAP_PER_SCOPE=256`、`HISTORICAL_CHAIN_TTL_MS=1_800_000`）为 Plan 定义默认值，小C 实现时可同量级调整；淘汰/过期后按 fail closed 处理。
+- **B7（实现注意，第 3 版；v4 修订）**：DD15 的 `workChainId` 常量（`MAX_CHAINS_PER_SCOPE=16`、`MAX_OUTBOUND_MAP_PER_SCOPE=256`、`HISTORICAL_CHAIN_TTL_MS=1_800_000`）为 Plan 定义默认值，小C 实现时可同量级调整。**16/256 是 historical cache 上限，非总 Map 硬上限**；current chains 及其 outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，仅 terminal 后进入 historical retention 并按 LRU/TTL 裁剪；不引入 pending admission/drop/backpressure。
 
 ## Plan Review Gate  Owner: 小P
 
