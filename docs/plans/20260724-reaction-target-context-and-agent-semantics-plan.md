@@ -1,7 +1,7 @@
 # Correct Reaction Handling By Bridge Agents — Coding Plan
 
 Date: 2026-07-24
-Status: reviewed; Plan Review GO (小P)
+Status: Unit 1-10 implemented; pending Code Review
 Spec authority: `docs/specs/20260723-reaction-target-context-and-agent-semantics.md` (commit `d18322c`，confirmed；independent review PASS；`d18322c` 在 `e7e178f` 基础上解决 review 歧义)
 Target branch: `fix/bugfix` (synced to `d18322c`)
 Harness protocol: `feishu-group-project-flow-v2`
@@ -236,84 +236,84 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 
 ### Unit 1 — 预埋语义表 + 未映射透传（RED 先行）  Owner: 小C
 
-- [ ] `src/bot/reaction/semantics.ts`：版本化映射表，11 个 `emojiType` 精确映射（case-sensitive），`emojiMeaningSource` 区分 `predefined`/`unmapped`，未映射完整透传（保留 `emojiType` + 可用 glyph/label）。
-- [ ] RED：`tests/unit/bot/reaction-semantics.test.ts` 断言 **严格 11 个**精确映射（case-sensitive）、`Get` **不在** v1 表且 `emojiMeaningSource='unmapped'` 完整透传（不得被提升为预埋 alias/不得新增为第 12 个）、未映射不丢弃、表 `schemaVersion` 存在。
+- [x] `src/bot/reaction/semantics.ts`：版本化映射表，11 个 `emojiType` 精确映射（case-sensitive），`emojiMeaningSource` 区分 `predefined`/`unmapped`，未映射完整透传（保留 `emojiType` + 可用 glyph/label）。
+- [x] RED：`tests/unit/bot/reaction-semantics.test.ts` 断言 **严格 11 个**精确映射（case-sensitive）、`Get` **不在** v1 表且 `emojiMeaningSource='unmapped'` 完整透传（不得被提升为预埋 alias/不得新增为第 12 个）、未映射不丢弃、表 `schemaVersion` 存在。
 - Depends: 无。
 - Spec 覆盖：§Confirmed Predefined Semantics；Acceptance「真实 emojiType=Get 不在 v1 表(unmapped)」「未预埋但可理解」「未预埋且不透明」「OK/LGTM/Yes/CheckMark/JIAYI」「WHAT/THINKING」「DONE」「No/CrossMark/MinusOne」映射行。
 
 ### Unit 2 — Self-operator guard + 权限/群响应门禁复用（RED 先行）  Owner: 小C
 
-- [ ] `pipeline.ts`：self-operator guard（`evt.operator.openId` vs `botIdentity.openId`/`cfg.accounts.app.id`/`evt.raw.operator_type==='app'`），先于一切副作用，静默丢弃。
-- [ ] 复用 `canUseDm`/`canUseGroup`（operator openId）+ `decideGroupResponse({mentionedBot:false,mentionCount:0,mentionAll:false,...})`；失败静默拒绝；**不**复用 `shouldBypassDeniedChatForInviteGroup`。
-- [ ] RED：`tests/unit/bot/reaction-guards.test.ts` 覆盖 self-operator（含 `Typing` 回环）静默丢弃、未过 `canUseDm`/`canUseGroup` 静默拒绝、四种群响应模式同值矩阵（与同 operator 无 @ 普通消息结果一致）、`/invite group` 旁路不被复用。
+- [x] `pipeline.ts`：self-operator guard（`evt.operator.openId` vs `botIdentity.openId`/`cfg.accounts.app.id`/`evt.raw.operator_type==='app'`），先于一切副作用，静默丢弃。
+- [x] 复用 `canUseDm`/`canUseGroup`（operator openId）+ `decideGroupResponse({mentionedBot:false,mentionCount:0,mentionAll:false,...})`；失败静默拒绝；**不**复用 `shouldBypassDeniedChatForInviteGroup`。
+- [x] RED：`tests/unit/bot/reaction-guards.test.ts` 覆盖 self-operator（含 `Typing` 回环）静默丢弃、未过 `canUseDm`/`canUseGroup` 静默拒绝、四种群响应模式同值矩阵（与同 operator 无 @ 普通消息结果一致）、`/invite group` 旁路不被复用。
 - Depends: Unit 1（语义映射在 stop 路径前置，但 guard 本身不依赖；可并行起步）。
 - Spec 覆盖：§Permission Contract；Acceptance「operator 未通过 canUseDm/canUseGroup」「mention-only」「owner-default/allowlist/all-messages」「两名 operator 同语义」「Bot/app Typing self-operator」「未授权停止 Reaction」。
 
 ### Unit 3 — Reaction ledger + buffer + 全分页 reconciliation + revision + 净零/重试/重启（RED 先行）  Owner: 小C
 
-- [ ] `ledger.ts`：持久 ledger（`scope+operatorOpenId+targetMessageId` → record IDs/fingerprint/actionTime/consumed fingerprint），镜像 `prompt-binding-ledger.ts`（`writeFileAtomic`、RMW 队列、revision、`schemaVersion`、`profileDir`）。
-- [ ] `buffer.ts`：同 key 事件短时 buffer（quiet window + 最大等待，按 action time 再按到达顺序）。
-- [ ] `reconciler.ts`：`messageReaction.list` 全分页（`user_id_type=open_id`，循环 `page_token`/`has_more`），重建 `effectiveReactionSet`（剔除 self-app），构建有序 `triggerReactions[]`（按 action time+到达顺序），计算 canonical fingerprint（DD6）与净变化 vs ledger、revision、净零 added→removed 例外、list 落后有限重试、scope 缩权 fail closed。
-- [ ] RED：`tests/unit/bot/reaction-reconciler.test.ts` + `tests/integration/bot/reaction-ledger.test.ts` 覆盖：全分页 reconciliation、list 越过中间状态的 added→removed 净零例外（不报失败/不递增 revision/不启动 Agent/只回复一次）、ledger 重启恢复（不重放旧 Reaction）、重复/乱序/无状态变化 no-op、list 暂时落后重试与最终失败单回复、`im:message.reactions:read` 缩权/读取失败 fail closed；**canonical fingerprint**（稳定字段 `operator_type+operator_id+emoji_type`、去重、确定性排序）跨页/API 返回顺序打乱不产生新 revision；**`triggerReactions[]` 有序**（按 action time+到达顺序）：Agent 启动前快速新增两个不同 Reaction → 单 input unit `triggerReactions` 含两个 added、`effectiveReactionSet` 含最终完整集合、不漏不重放；同一 buffer 一增一减且最终集合非空 → `triggerReactions` 保留 added/removed 有序变化、`effectiveReactionSet` 表达最终集合、只按该 revision 处理一次。
+- [x] `ledger.ts`：持久 ledger（`scope+operatorOpenId+targetMessageId` → record IDs/fingerprint/actionTime/consumed fingerprint），镜像 `prompt-binding-ledger.ts`（`writeFileAtomic`、RMW 队列、revision、`schemaVersion`、`profileDir`）。
+- [x] `buffer.ts`：同 key 事件短时 buffer（quiet window + 最大等待，按 action time 再按到达顺序）。
+- [x] `reconciler.ts`：`messageReaction.list` 全分页（`user_id_type=open_id`，循环 `page_token`/`has_more`），重建 `effectiveReactionSet`（剔除 self-app），构建有序 `triggerReactions[]`（按 action time+到达顺序），计算 canonical fingerprint（DD6）与净变化 vs ledger、revision、净零 added→removed 例外、list 落后有限重试、scope 缩权 fail closed。
+- [x] RED：`tests/unit/bot/reaction-reconciler.test.ts` + `tests/integration/bot/reaction-ledger.test.ts` 覆盖：全分页 reconciliation、list 越过中间状态的 added→removed 净零例外（不报失败/不递增 revision/不启动 Agent/只回复一次）、ledger 重启恢复（不重放旧 Reaction）、重复/乱序/无状态变化 no-op、list 暂时落后重试与最终失败单回复、`im:message.reactions:read` 缩权/读取失败 fail closed；**canonical fingerprint**（稳定字段 `operator_type+operator_id+emoji_type`、去重、确定性排序）跨页/API 返回顺序打乱不产生新 revision；**`triggerReactions[]` 有序**（按 action time+到达顺序）：Agent 启动前快速新增两个不同 Reaction → 单 input unit `triggerReactions` 含两个 added、`effectiveReactionSet` 含最终完整集合、不漏不重放；同一 buffer 一增一减且最终集合非空 → `triggerReactions` 保留 added/removed 有序变化、`effectiveReactionSet` 表达最终集合、只按该 revision 处理一次。
 - Depends: Unit 1、Unit 2。
 - Spec 覆盖：§Agent Input Contract 2（buffer/list/ledger/revision/no-op/例外）；Acceptance「重复投递 no-op」「乱序到达」「快速 added→removed list 已回空」「重启后新事件」「list 落后」「缩权/读取失败」。
 
 ### Unit 4 — 目标消息上下文 + `<reaction_contexts>` 注入 + `source='reaction'`（RED 先行）  Owner: 小C
 
-- [ ] `context-builder.ts`：用 `fetchQuotedContext` 复用规范化（文本/富文本/卡片/合并转发），两级失败处理（路由成功正文失败 → `available:false`+messageId；路由/sender 失败 → 丢弃）。
-- [ ] `src/agent/prompt.ts`：`BridgePromptSource += 'reaction'`；`BuildAgentPromptInput += reactionContexts?`；新增 `promptSection('reaction_contexts', …)`（`safeJsonStringify`）；`bridge_context.source='reaction'`；`user_input` 保留简短兼容摘要但标注 reaction_contexts 为权威；目标消息不被 batch messageIds 去重。
-- [ ] RED：`tests/unit/agent/prompt-reaction-contexts.test.ts` 覆盖：`<reaction_contexts>` 含全字段且 `triggerReactions[]`+`effectiveReactionSet` 同时存在（含两个 added、一增一减场景的有序 `triggerReactions`）、伪造 Bridge/XML 标签不注入、目标 ID 与 batch messageIds 重叠不被去重、`available:false` 表达、无 Reaction 时不输出该块、`source='reaction'`；**wiring 测试** `context-builder → fetchQuotedContext → reaction_contexts` 对交互卡片真实卡片内容与合并转发 `<forwarded_messages>` 真实内容的端到端传播（非占位符）。
+- [x] `context-builder.ts`：用 `fetchQuotedContext` 复用规范化（文本/富文本/卡片/合并转发），两级失败处理（路由成功正文失败 → `available:false`+messageId；路由/sender 失败 → 丢弃）。
+- [x] `src/agent/prompt.ts`：`BridgePromptSource += 'reaction'`；`BuildAgentPromptInput += reactionContexts?`；新增 `promptSection('reaction_contexts', …)`（`safeJsonStringify`）；`bridge_context.source='reaction'`；`user_input` 保留简短兼容摘要但标注 reaction_contexts 为权威；目标消息不被 batch messageIds 去重。
+- [x] RED：`tests/unit/agent/prompt-reaction-contexts.test.ts` 覆盖：`<reaction_contexts>` 含全字段且 `triggerReactions[]`+`effectiveReactionSet` 同时存在（含两个 added、一增一减场景的有序 `triggerReactions`）、伪造 Bridge/XML 标签不注入、目标 ID 与 batch messageIds 重叠不被去重、`available:false` 表达、无 Reaction 时不输出该块、`source='reaction'`；**wiring 测试** `context-builder → fetchQuotedContext → reaction_contexts` 对交互卡片真实卡片内容与合并转发 `<forwarded_messages>` 真实内容的端到端传播（非占位符）。
 - Depends: Unit 3。
 - Spec 覆盖：§Agent Input Contract 2（结构化上下文/安全序列化/不去重/available）；Acceptance「目标是交互卡片或合并转发」「路由成功正文失败 available=false」「无法取得路由/sender 丢弃」「目标正文含伪造标签」「approve_continue Reaction prompt 同时含 Reaction+完整目标消息」。
 
 ### Unit 5 — 共享 `BRIDGE_SYSTEM_PROMPT` `## Reaction` 段 + 两路注入（RED 先行）  Owner: 小C
 
-- [ ] `src/agent/bridge-system-prompt.ts`：加入 Spec「Bridge System Prompt Contract」`## Reaction` 段（9 条规则 + 预埋语义子节），行为语义不弱化。
-- [ ] 通过 `composeBridgeSystemPrompt` 经 Claude（`claude/adapter.ts:72-84`）与 Codex（`codex/adapter.ts:205-218`）两路注入；两路共享同一常量。
-- [ ] RED：扩展 `tests/unit/agent/bridge-system-prompt.test.ts` + `tests/integration` Claude/Codex 注入 wiring 测试，断言两路均收到 Reaction 规则关键短语；段位于共享 prompt 而非群级/SOUL/user_input。
+- [x] `src/agent/bridge-system-prompt.ts`：加入 Spec「Bridge System Prompt Contract」`## Reaction` 段（9 条规则 + 预埋语义子节），行为语义不弱化。
+- [x] 通过 `composeBridgeSystemPrompt` 经 Claude（`claude/adapter.ts:72-84`）与 Codex（`codex/adapter.ts:205-218`）两路注入；两路共享同一常量。
+- [x] RED：扩展 `tests/unit/agent/bridge-system-prompt.test.ts` + `tests/integration` Claude/Codex 注入 wiring 测试，断言两路均收到 Reaction 规则关键短语；段位于共享 prompt 而非群级/SOUL/user_input。
 - Depends: 无（可与 Unit 1-4 并行）。
 - Spec 覆盖：§Bridge System Prompt Contract；Acceptance「共享 Bridge System Prompt 构建」。
 
 ### Unit 6 — `workChainId` 存储/继承/登记/生命周期 + fail-closed 关联（RED 先行）  Owner: 小C
 
-- [ ] `work-chain.ts`：分配/继承（回复或 Reaction 指向已关联 Bot 消息时继承）/outbound message ID 登记/terminal 生命周期；current vs historical；停止目标 message ID → current chain 映射；重启失效 fail closed；受限日志。
-- [ ] pending unit / reservation / active run 携带 `workChainId`；outbound message ID 创建即登记。
-- [ ] RED：`tests/unit/bot/reaction-work-chain.test.ts` 覆盖：input/pending/reservation/active/outbound/terminal 全生命周期关联、目标确认消息被 Reaction 继续（继承 chain）、sibling queued unit、重启后未知关联 fail closed、historical chain 目标 fail closed、outbound 登记后可匹配 active chain；**有界边界（historical cache 语义）**：a) 同 scope >16 个 queued/current chains 均不被淘汰（current 不参与 LRU/cap），全部 terminal 后 historical 才收敛至 `MAX_CHAINS_PER_SCOPE=16`（LRU 裁剪最旧）；b) current chain 的 outbound mapping 超 30min 仍可 stop 关联（current 不参与 TTL），terminal 后转 historical、过 `HISTORICAL_CHAIN_TTL_MS` 才 fail closed；c) historical outbound→chain 映射超 `MAX_OUTBOUND_MAP_PER_SCOPE=256` 按 LRU 淘汰、被淘汰目标 stop fail closed；淘汰/过期后 chain 可被新普通消息重新开启。**不得**引入 pending admission/drop/backpressure。
+- [x] `work-chain.ts`：分配/继承（回复或 Reaction 指向已关联 Bot 消息时继承）/outbound message ID 登记/terminal 生命周期；current vs historical；停止目标 message ID → current chain 映射；重启失效 fail closed；受限日志。
+- [x] pending unit / reservation / active run 携带 `workChainId`；outbound message ID 创建即登记。
+- [x] RED：`tests/unit/bot/reaction-work-chain.test.ts` 覆盖：input/pending/reservation/active/outbound/terminal 全生命周期关联、目标确认消息被 Reaction 继续（继承 chain）、sibling queued unit、重启后未知关联 fail closed、historical chain 目标 fail closed、outbound 登记后可匹配 active chain；**有界边界（historical cache 语义）**：a) 同 scope >16 个 queued/current chains 均不被淘汰（current 不参与 LRU/cap），全部 terminal 后 historical 才收敛至 `MAX_CHAINS_PER_SCOPE=16`（LRU 裁剪最旧）；b) current chain 的 outbound mapping 超 30min 仍可 stop 关联（current 不参与 TTL），terminal 后转 historical、过 `HISTORICAL_CHAIN_TTL_MS` 才 fail closed；c) historical outbound→chain 映射超 `MAX_OUTBOUND_MAP_PER_SCOPE=256` 按 LRU 淘汰、被淘汰目标 stop fail closed；淘汰/过期后 chain 可被新普通消息重新开启。**不得**引入 pending admission/drop/backpressure。
 - Depends: 无（可与前面并行；但 DD12/DD16 集成需它）。
 - Spec 覆盖：§Stop Reaction Control Contract（workChainId 关联）；Acceptance「目标确认消息被 Reaction 继续」「sibling queued unit」「重启后未知关联 fail closed」「当前 run 已产生 Bot 输出，停止 Reaction 指向该输出」。
 
 ### Unit 7 — Reaction turn batch barrier + replyTo 目标 + 可见回复（RED 先行）  Owner: 小C
 
-- [ ] `PendingQueue` 扩展 barrier 条目（Reaction turn 独立 flush，不与普通消息合并，按到达顺序）；`pipeline` 产出 `ReactionTurn` 经此路径启动 run。
-- [ ] Reaction turn outbound `sendOpts.replyTo = targetMessageId`（topic 模式 `replyInThread` 不变）；每个被消费最新状态一条可见回复引用自己目标；多目标分别回复；no-op 不回复。
-- [ ] RED：`tests/integration/bot/reaction-batch-barrier.test.ts` 覆盖：Reaction 与普通文本同 debounce window 按到达顺序成不同 turn、普通文本不被归类为 Reaction、多目标按目标拆分且各回复引用自己目标、单个 Reaction 在普通群/私聊/话题回复正确引用且不出 thread、重复/乱序 no-op 不回复、所有被消费 Reaction 有可见回复。
+- [x] `PendingQueue` 扩展 barrier 条目（Reaction turn 独立 flush，不与普通消息合并，按到达顺序）；`pipeline` 产出 `ReactionTurn` 经此路径启动 run。
+- [x] Reaction turn outbound `sendOpts.replyTo = targetMessageId`（topic 模式 `replyInThread` 不变）；每个被消费最新状态一条可见回复引用自己目标；多目标分别回复；no-op 不回复。
+- [x] RED：`tests/integration/bot/reaction-batch-barrier.test.ts` 覆盖：Reaction 与普通文本同 debounce window 按到达顺序成不同 turn、普通文本不被归类为 Reaction、多目标按目标拆分且各回复引用自己目标、单个 Reaction 在普通群/私聊/话题回复正确引用且不出 thread、重复/乱序 no-op 不回复、所有被消费 Reaction 有可见回复。
 - Depends: Unit 3、Unit 4、Unit 6。
 - Spec 覆盖：§5 Batching/路由/回复；Acceptance「单 Reaction 普通群/私聊/话题」「与普通文本同 debounce window」「多 Reaction 不同目标」「其他 Bot/用户消息 Reaction 不启动」「按目标拆分 reply target」。
 
 ### Unit 8 — revision 失效/中断/替代 + superseded 流式回复 + terminal 后撤回（RED 先行）  Owner: 小C
 
-- [ ] Reaction run 记录 `operatorOpenId+targetMessageId+reactionRevision`（`ActiveRuns` 之外加 per-run 元数据或扩展 `RunHandle`）；同 key 新授权变化 → revision++、`activeRuns.interrupt(scope)`、替代 turn（空集则不启动 Agent + Bridge 撤回回复）；不同 operator/target 不打断。
-- [ ] `run-state.ts`：`Terminal += 'superseded'` + `markSuperseded`；渲染器输出「已被后续 Reaction 取代/已中断」、不显示成功终态；流式循环识别 superseded 停止写成功终态。
-- [ ] 旧 run 已产生 outbound reply → 更新为 superseded；未产生 → 不补发；只最新 revision 可成功收尾。
-- [ ] terminal 后 removed / 完成后移除最后一个 Reaction → 不重启 Agent、不回滚，Bridge 回复撤回已收到。
-- [ ] RED：`tests/integration/bot/reaction-revision-superseded.test.ts` 覆盖：run 中移除一个 Reaction 集合仍非空（旧 revision 中断+替代不重放）、run 中新增第二个 Reaction（中断+按两 Reaction 快照处理一次）、run 中移除触发 Reaction（空集不启动替代+Bridge 撤回）、terminal 后移除（不重启+Bridge 回复）、旧 revision 未产生 reply 不补发、旧 revision 已产生流式 reply 更新为 superseded、完成后移除最后一个 Reaction、不同 operator/target 变化不打断。
+- [x] Reaction run 记录 `operatorOpenId+targetMessageId+reactionRevision`（`ActiveRuns` 之外加 per-run 元数据或扩展 `RunHandle`）；同 key 新授权变化 → revision++、`activeRuns.interrupt(scope)`、替代 turn（空集则不启动 Agent + Bridge 撤回回复）；不同 operator/target 不打断。
+- [x] `run-state.ts`：`Terminal += 'superseded'` + `markSuperseded`；渲染器输出「已被后续 Reaction 取代/已中断」、不显示成功终态；流式循环识别 superseded 停止写成功终态。
+- [x] 旧 run 已产生 outbound reply → 更新为 superseded；未产生 → 不补发；只最新 revision 可成功收尾。
+- [x] terminal 后 removed / 完成后移除最后一个 Reaction → 不重启 Agent、不回滚，Bridge 回复撤回已收到。
+- [x] RED：`tests/integration/bot/reaction-revision-superseded.test.ts` 覆盖：run 中移除一个 Reaction 集合仍非空（旧 revision 中断+替代不重放）、run 中新增第二个 Reaction（中断+按两 Reaction 快照处理一次）、run 中移除触发 Reaction（空集不启动替代+Bridge 撤回）、terminal 后移除（不重启+Bridge 回复）、旧 revision 未产生 reply 不补发、旧 revision 已产生流式 reply 更新为 superseded、完成后移除最后一个 Reaction、不同 operator/target 变化不打断。
 - Depends: Unit 3、Unit 6、Unit 7。
 - Spec 覆盖：§5 revision/superseded/terminal；Acceptance 对应行（queued/reserved/active 移除、terminal 后移除、旧 revision 未产生/已产生 reply、完成后移除最后一个、run 中新增/移除触发 Reaction、不同 operator/target 变化）。
 
 ### Unit 9 — `stop_current_work` 独立控制面（added/removed 独立 ledger + interrupt + cancel pending + 可见回复）（RED 先行）  Owner: 小C
 
-- [ ] `control-ledger.ts`：stop added/removed 独立持久 ledger（同 DD6 模式），防重 fingerprint（稳定 ID 优先，否则规范化字段 + action time）。
-- [ ] added：self-operator+路由+own-message+权限+语义+控制 ledger 防重后，**按序**：①先判 scope 完全无 active/reserved/queued work → 幂等回复「无任务」+ 标记 stop-added 已消费，结束；②仅 scope 有 current work 时校验目标→current `workChainId` 关联（DD15），历史/无关/未知 → fail closed 回复「未停止当前任务，可使用 /stop」+ 标记已消费，结束；③关联通过 → `activeRuns.interrupt(scope)` + `pending.cancel(scope)`（取消 scope 全部普通消息与 Reaction input unit 含 sibling）+ 流式收敛 interrupted 终态 + 标记 stop-added 已消费 + Bridge 可见停止结果；不启动 Agent、不生成模型确认。`workChainId` 关联不再前置。
-- [ ] removed：同门禁（不要求 chain 仍 current）+ 匹配 stop-added ledger + 防重 → 只回复一次「撤回不会自动恢复」+ 标记 stop-removed 已消费；无匹配 → 静默 no-op。
-- [ ] RED：`tests/integration/bot/reaction-stop-control.test.ts` 覆盖：与 `/stop` 一致权限判断、`workChainId` 全生命周期关联、目标确认消息被 Reaction 继续、sibling queued unit、重启后未知关联 fail closed、added/removed 独立 ledger 重复投递与重启防重、active handle、run reservation/prompt preparation、scope pending 取消、**无任务幂等（scope 完全无 work 分支，单独测试）**、**scope 有 current work + 目标→current chain 关联通过 → interrupt（单独测试）**、**历史目标 + 另一 current chain → fail closed（单独测试）**、removed 不恢复、每种结果可见回复、interrupted UI 终态、stop 不产生新 Agent run、快速 added→removed（不相消）、removed 重复投递、stop-added 后重启再 removed。
+- [x] `control-ledger.ts`：stop added/removed 独立持久 ledger（同 DD6 模式），防重 fingerprint（稳定 ID 优先，否则规范化字段 + action time）。
+- [x] added：self-operator+路由+own-message+权限+语义+控制 ledger 防重后，**按序**：①先判 scope 完全无 active/reserved/queued work → 幂等回复「无任务」+ 标记 stop-added 已消费，结束；②仅 scope 有 current work 时校验目标→current `workChainId` 关联（DD15），历史/无关/未知 → fail closed 回复「未停止当前任务，可使用 /stop」+ 标记已消费，结束；③关联通过 → `activeRuns.interrupt(scope)` + `pending.cancel(scope)`（取消 scope 全部普通消息与 Reaction input unit 含 sibling）+ 流式收敛 interrupted 终态 + 标记 stop-added 已消费 + Bridge 可见停止结果；不启动 Agent、不生成模型确认。`workChainId` 关联不再前置。
+- [x] removed：同门禁（不要求 chain 仍 current）+ 匹配 stop-added ledger + 防重 → 只回复一次「撤回不会自动恢复」+ 标记 stop-removed 已消费；无匹配 → 静默 no-op。
+- [x] RED：`tests/integration/bot/reaction-stop-control.test.ts` 覆盖：与 `/stop` 一致权限判断、`workChainId` 全生命周期关联、目标确认消息被 Reaction 继续、sibling queued unit、重启后未知关联 fail closed、added/removed 独立 ledger 重复投递与重启防重、active handle、run reservation/prompt preparation、scope pending 取消、**无任务幂等（scope 完全无 work 分支，单独测试）**、**scope 有 current work + 目标→current chain 关联通过 → interrupt（单独测试）**、**历史目标 + 另一 current chain → fail closed（单独测试）**、removed 不恢复、每种结果可见回复、interrupted UI 终态、stop 不产生新 Agent run、快速 added→removed（不相消）、removed 重复投递、stop-added 后重启再 removed。
 - Depends: Unit 2、Unit 5、Unit 6、Unit 8。
 - Spec 覆盖：§Stop Reaction Control Contract 全部；Acceptance 所有 stop 行（未授权停止、指向当前链路、指向历史/无关、已产生 Bot 输出、目标确认消息继续、sibling queued、重启 fail closed、无任务幂等、移除不恢复、快速 added→removed、removed 重复投递、stop-added 后重启再 removed）。
 
 ### Unit 10 — 接线：`channel.ts` reaction handler 委派 + 故障隔离  Owner: 小C
 
-- [ ] `channel.ts:934-992` 改为 `pipeline.handleReactionEvent(evt, deps)` 委派，移除合成 `NormalizedMessage` push；保留 self-message 路由前提与 `withTrace`。
-- [ ] 故障隔离：路由/list/ledger/规范化失败不崩 bridge 队列；受限日志（目标消息 ID、阶段、trace，不记凭据/无界原文）。
-- [ ] RED：`tests/integration/bot/reaction-pipeline-wiring.test.ts` 覆盖端到端：事件 → guard → 门禁 → buffer → reconcile → turn → run → 可见回复；各类失败被隔离不影响普通消息队列。
+- [x] `channel.ts:934-992` 改为 `pipeline.handleReactionEvent(evt, deps)` 委派，移除合成 `NormalizedMessage` push；保留 self-message 路由前提与 `withTrace`。
+- [x] 故障隔离：路由/list/ledger/规范化失败不崩 bridge 队列；受限日志（目标消息 ID、阶段、trace，不记凭据/无界原文）。
+- [x] RED：`tests/integration/bot/reaction-pipeline-wiring.test.ts` 覆盖端到端：事件 → guard → 门禁 → buffer → reconcile → turn → run → 可见回复；各类失败被隔离不影响普通消息队列。
 - Depends: Unit 1-9。
 - Spec 覆盖：§Compatibility, Failure And Rollback；Acceptance「其他发送者过滤」「无法取得路由/sender 丢弃」。
 
