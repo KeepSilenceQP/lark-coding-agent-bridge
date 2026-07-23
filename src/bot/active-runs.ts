@@ -3,6 +3,8 @@ import type { AgentRun } from '../agent/types';
 export interface RunHandle {
   run: AgentRun;
   interrupted: boolean;
+  /** Set when interrupted due to reaction revision supersede (not /stop). */
+  superseded?: boolean;
 }
 
 export interface RunReservation {

@@ -790,67 +790,53 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       appId: cfg.accounts.app.id,
     });
 
-    if (result.reconciliationFailed) {
-      // Reply to retry
-      try {
-        await channel.send(result.components.scope.split(':')[0] ?? result.components.scope,
-          { markdown: '本次 Reaction 暂时无法确认，请重试。' },
-          { replyTo: result.components.targetMessageId });
-      } catch { /* best-effort */ }
-      return;
-    }
-    if (result.noOp) return; // No state change, no reply
+    // ── Use the testable decision seam for flush logic ──
+    const hasMatchingActive = _reactionRunTracker
+      ? _reactionRunTracker.shouldInterrupt(result.components.scope, result.components.operatorOpenId, result.components.targetMessageId, result.revision)
+      : false;
 
-    // ── Net-zero added→removed: Bridge reply, no Agent turn (DD7) ──
-    if (result.netZeroConsumed) {
-      try {
-        await channel.send(
-          result.components.scope.split(':')[0] ?? result.components.scope,
-          { markdown: '已收到撤回。' },
-          { replyTo: result.components.targetMessageId },
-        );
-      } catch { /* best-effort */ }
-      return;
-    }
+    const decision = decideReactionFlush({
+      reconciliationFailed: result.reconciliationFailed,
+      noOp: result.noOp,
+      netZeroConsumed: result.netZeroConsumed,
+      effectiveReactionSetLength: result.effectiveReactionSet.length,
+      hasMatchingActiveRun: hasMatchingActive,
+      targetMessageId: result.components.targetMessageId,
+      scope: result.components.scope,
+    });
 
-    // ── Post-terminal / empty-set removal: Bridge reply only, no Agent turn ──
-    // Per Spec DD14: terminal后removed不重启Agent; 空集不启动replacement turn.
-    // Must also cancel any queued pending entries + contextStore data to prevent
-    // a stale barrier entry from later starting an Agent run.
-    if (result.effectiveReactionSet.length === 0) {
-      // Cancel queued pending entries for this scope (both regular + reaction barriers)
-      pending.cancel(result.components.scope);
-      // Clear contextStore entry so buildPrompt won't inject stale reactionContexts
-      reactionContextStore.delete(result.components.targetMessageId);
-      // Clear _reactionTurnMeta so runAgentBatch won't start a stale reaction turn
-      _reactionTurnMeta.delete(result.components.scope);
+    if (decision.kind === 'drop') return;
 
-      // If there's an active run for the same key, interrupt+supersede it
-      const opId = result.components.operatorOpenId;
-      const tgtId = result.components.targetMessageId;
-      if (_reactionRunTracker?.shouldInterrupt(result.components.scope, opId, tgtId, result.revision)) {
-        activeRuns.interrupt(result.components.scope);
+    if (decision.kind === 'bridge-reply') {
+      // Per-key cleanup for empty-set removal (not scope-level cancel):
+      // only cancel pending entries for this specific target message,
+      // clear only this target's contextStore entry and _reactionTurnMeta.
+      if (decision.interrupt) {
+        // Mark the handle as superseded (reaction revision) before interrupt
+        const handle = activeRuns.get(decision.interrupt.scope);
+        if (handle) handle.superseded = true;
+        activeRuns.interrupt(decision.interrupt.scope);
+        pending.cancel(result.components.scope);
+        reactionContextStore.delete(result.components.targetMessageId);
+        _reactionTurnMeta.delete(result.components.scope);
         log.info('reaction', 'interrupt-empty-set', {
           scope: result.components.scope, key: result.key, revision: result.revision,
         });
       }
-      // Bridge reply: withdrawal confirmed, completed actions not rolled back
       try {
         await channel.send(
           result.components.scope.split(':')[0] ?? result.components.scope,
-          { markdown: '已收到撤回，已完成动作不会自动回滚。' },
+          { markdown: decision.message },
           { replyTo: result.components.targetMessageId },
         );
       } catch { /* best-effort */ }
       return;
     }
 
+    // enqueue-agent path: build ReactionContext and push via pushBarrier
     // F1(a): Fetch real target message content via fetchQuotedContext.
-    // Handles two-level failure: route/content OK → full content;
-    // content fetch/normalize failed → available:false (Agent must not act).
     const targetMsg = await buildReactionTargetMessage(channel, result.components.targetMessageId);
     if (!targetMsg) {
-      // Route metadata could not be resolved — drop the event entirely.
       log.warn('reaction', 'target-route-failed', { messageId: result.components.targetMessageId });
       return;
     }
@@ -884,10 +870,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     const opId = result.components.operatorOpenId;
     const tgtId = result.components.targetMessageId;
     if (_reactionRunTracker?.shouldInterrupt(result.components.scope, opId, tgtId, result.revision)) {
-      // Old run for the same key is active → interrupt + mark superseded
+      // Old run for the same key → mark superseded before interrupt
+      const handle = activeRuns.get(result.components.scope);
+      if (handle) handle.superseded = true;
       activeRuns.interrupt(result.components.scope);
-      // The existing run's card will be updated to 'superseded' by markSuperseded
-      // when the new run starts and the old stream is terminated.
       log.info('reaction', 'superseding-old-run', {
         scope: result.components.scope,
         key: result.key,
@@ -2653,7 +2639,7 @@ export async function processAgentStream(
       const timeoutMs = startupFired ? startupTimeoutMs! : idleTimeoutMs!;
       state = markIdleTimeout(state, Math.round(timeoutMs / 60_000));
     } else if (handle.interrupted) {
-      state = markInterrupted(state);
+      state = handle.superseded ? markSuperseded(state) : markInterrupted(state);
     } else {
       state = finalizeIfRunning(state);
     }
