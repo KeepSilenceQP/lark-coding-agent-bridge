@@ -12,7 +12,6 @@ export class CodexJsonlTranslator {
   private threadId: string | undefined;
   private terminal = false;
   private lastNonTerminalError: string | undefined;
-  private pendingAgentMessage: string | undefined;
   private readonly startedItems = new Set<string>();
   private drift: ProtocolDriftState = {
     unknownEvents: 0,
@@ -32,7 +31,7 @@ export class CodexJsonlTranslator {
       case 'turn.started':
         return [];
       case 'item.started':
-        return this.prependPendingText(this.translateItemStarted(raw));
+        return this.translateItemStarted(raw);
       case 'item.completed':
         return this.translateItemCompleted(raw);
       case 'agent_message':
@@ -40,9 +39,7 @@ export class CodexJsonlTranslator {
       case 'turn.completed':
         return this.translateTurnCompleted(raw);
       case 'turn.failed':
-        return this.prependPendingText(
-          this.translateTerminalError(raw, 'codex turn failed'),
-        );
+        return this.translateTerminalError(raw, 'codex turn failed');
       case 'error':
         return this.translateNonTerminalError(raw, 'codex error');
       default:
@@ -57,49 +54,15 @@ export class CodexJsonlTranslator {
     this.terminal = true;
     if (reason === 'failed') {
       const detail = this.lastNonTerminalError ? `: ${this.lastNonTerminalError}` : '';
-      return this.prependPendingText([
+      return [
         {
           type: 'error',
           message: truncate(`codex stream ended before a terminal event${detail}`, 4096),
           terminationReason: 'failed',
         },
-      ]);
+      ];
     }
-    return this.prependPendingText([
-      { type: 'done', threadId: this.threadId, terminationReason: reason },
-    ]);
-  }
-
-  /**
-   * Close a stream whose terminal event was recovered from Codex's persisted
-   * turn state. A queued stdout agent message is the final answer when it
-   * matches the persisted text; otherwise it remains progress and the
-   * persisted answer becomes the dedicated final reply.
-   */
-  finishRecovered(finalText?: string): AgentEvent[] {
-    if (this.terminal) return [];
-    this.terminal = true;
-    const events: AgentEvent[] = [];
-    if (this.pendingAgentMessage && this.pendingAgentMessage !== finalText) {
-      events.push({ type: 'text', delta: this.pendingAgentMessage });
-    }
-    const answer = finalText ?? this.pendingAgentMessage;
-    this.pendingAgentMessage = undefined;
-    if (answer) events.push({ type: 'final_text', content: answer });
-    events.push({ type: 'done', threadId: this.threadId, terminationReason: 'normal' });
-    return events;
-  }
-
-  hasPendingAgentMessage(): boolean {
-    return this.pendingAgentMessage !== undefined;
-  }
-
-  fail(message: string): AgentEvent[] {
-    if (this.terminal) return [];
-    this.terminal = true;
-    return this.prependPendingText([
-      { type: 'error', message: truncate(message, 4096), terminationReason: 'failed' },
-    ]);
+    return [{ type: 'done', threadId: this.threadId, terminationReason: reason }];
   }
 
   protocolDrift(): ProtocolDriftState {
@@ -146,7 +109,7 @@ export class CodexJsonlTranslator {
     if (!item) return [];
     if (item.type === 'agent_message') {
       const message = stringValue(item.text ?? item.message);
-      return message ? this.queueAgentMessage(message) : [];
+      return message ? [{ type: 'text', delta: message }] : [];
     }
     if (item.type !== 'command_execution') return [];
     const id = stringValue(item.id);
@@ -159,29 +122,25 @@ export class CodexJsonlTranslator {
     }
     this.startedItems.delete(id);
     const exitCode = numberValue(item.exit_code);
-    return this.prependPendingText([
+    return [
       {
         type: 'tool_result',
         id,
         output: stringValue(item.output ?? item.aggregated_output ?? item.stdout) ?? '',
         isError: exitCode !== undefined && exitCode !== 0,
       },
-    ]);
+    ];
   }
 
   private translateAgentMessage(raw: Record<string, unknown>): AgentEvent[] {
     const message = stringValue(raw.message ?? raw.text);
     if (!message) return [];
-    return this.queueAgentMessage(message);
+    return [{ type: 'text', delta: message }];
   }
 
   private translateTurnCompleted(raw: Record<string, unknown>): AgentEvent[] {
     this.terminal = true;
     const events: AgentEvent[] = [];
-    if (this.pendingAgentMessage) {
-      events.push({ type: 'final_text', content: this.pendingAgentMessage });
-      this.pendingAgentMessage = undefined;
-    }
     const usage = recordValue(raw.usage);
     if (usage) {
       events.push({
@@ -196,21 +155,6 @@ export class CodexJsonlTranslator {
     }
     events.push({ type: 'done', threadId: this.threadId, terminationReason: 'normal' });
     return events;
-  }
-
-  private queueAgentMessage(message: string): AgentEvent[] {
-    const events = this.pendingAgentMessage
-      ? [{ type: 'text' as const, delta: this.pendingAgentMessage }]
-      : [];
-    this.pendingAgentMessage = message;
-    return events;
-  }
-
-  private prependPendingText(events: AgentEvent[]): AgentEvent[] {
-    if (events.length === 0 || !this.pendingAgentMessage) return events;
-    const pending = this.pendingAgentMessage;
-    this.pendingAgentMessage = undefined;
-    return [{ type: 'text', delta: pending }, ...events];
   }
 
   private translateTerminalError(raw: Record<string, unknown>, fallback: string): AgentEvent[] {
