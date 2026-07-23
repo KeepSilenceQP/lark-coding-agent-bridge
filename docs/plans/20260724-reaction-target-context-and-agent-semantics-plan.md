@@ -23,6 +23,7 @@ Implementer: 小C
 ## Review History
 
 - 2026-07-24 云上C总：基于 `e7e178f` 全文读取 Spec + 全量源码勘察，产出本 Plan 草稿。Plan Writer 不自审。
+- 2026-07-24 小P 复核 + 云上C总 修订（第 2 版）：DD17/B1 原结论「`/stop` 不取消 pending」误判——经 `src/bot/channel.ts:1304-1331` 复核，`intakeMessage` 对 `tryHandleCommand` 返回 `handled=true` 的命令统一 `pending.cancel(scope)`，`/stop` 已含取消 pending。stop 控制面改为复用现有 `/stop`「interrupt + pending.cancel」复合语义，不比 `/stop` 严格，无 `/stop` 对齐改动；B1 撤回。
 - 待 小P：Plan Review Gate（见文末）。
 
 ## Current Evidence（当前代码现状，file:line）
@@ -38,7 +39,7 @@ Reaction 入站现状（核心 gap 所在）：
 - 普通消息权限链（可复用）：`canUseDm`/`canUseGroup`（`src/policy/access.ts:33-58`）+ `decideGroupResponse`（`src/bot/group-response-policy.ts:26-55`），普通消息在 `channel.ts:1253-1302` 调用；flush 时二次 access 校验在 `channel.ts:1514-1517`（不重算 `decideGroupResponse`）。`/invite group` denied-chat 旁路 `shouldBypassDeniedChatForInviteGroup`（`channel.ts:1337-1351`），**Reaction 不得复用**。
 - Pending 队列：`src/bot/pending-queue.ts`，按 `scope` 单键 debounce（`DEBOUNCE_MS=600`，`channel.ts:121`），同 scope 消息在 quiet window 内合并为一个 batch；`block`/`unblock`（`pending-queue.ts:66-86`）保证同 scope 至多一个 run 在飞。`cancel(scope)`（`pending-queue.ts:49-55`，返回被丢弃消息）与 `cancelAll()` 存在。
 - ActiveRuns：`src/bot/active-runs.ts`，按 `scope` 键；`reserve`/`register`/`interrupt(scope):boolean`/`unblock`/`stopAll`。`interrupt` 既 abort reservation（prompt-prep/pool-wait 阶段）也 `run.stop()` 已启动 run（`active-runs.ts:98-115`）。
-- `/stop`：`handleStop`（`src/commands/index.ts:1567-1590`）**只调** `ctx.activeRuns.interrupt(scope)`，**不调** `pending.cancel(scope)`。中断后 `onFlush` finally 的 `pending.unblock(scope)`（`channel.ts` ~860）会重新 arm timer，使排队消息自动启动新 run。
+- `/stop`：`handleStop`（`src/commands/index.ts:1567-1590`）本体只调 `ctx.activeRuns.interrupt(scope)`；但其调用方 `intakeMessage`（`src/bot/channel.ts:1304-1331`）对 `tryHandleCommand` 返回 `handled=true` 的所有命令统一执行 `pending.cancel(scope)` 再 `return`。`/stop` 是被识别命令（`handled=true`），故当前 `/stop` 实际效果 = `interrupt(scope)` + `pending.cancel(scope)`：中断 active run 并丢弃 scope 已排队消息，`unblock` 后无 pending 条目即不会重启旧队列。
 - Run 启动：`startRunFlow`（`src/bot/run-flow.ts:102`）→ `executor.reserveScope`/`submit`；`AgentRunOptions`（`src/agent/types.ts:30-56`）携带 `prompt`/`systemPromptAddendum`/`routeId` 等。`buildPrompt` 调用点 `channel.ts:1483-1490`；outbound `sendOpts.replyTo = lastMsg.messageId`（`channel.ts:1502,1543`）。
 - Prompt builder：`buildAgentPrompt`（`src/agent/prompt.ts:75-111`），section 数组扁平、按 truthy 过滤；`promptSection`/`safeJsonStringify`（`prompt.ts:113-124`）对所有块做 `<`/`>`/`&` 转义。`BridgePromptSource = 'im'|'card'|'comment'`（`prompt.ts:1`），无 `'reaction'`。
 - 共享 System Prompt：`BRIDGE_SYSTEM_PROMPT`（`src/agent/bridge-system-prompt.ts:3-184`，单一来源）；`composeBridgeSystemPrompt(identity, addendum?)`（`:192-214`）。Claude 注入 `src/agent/claude/adapter.ts:72-84`（temp file + `--append-system-prompt-file`）；Codex 注入 `src/agent/codex/adapter.ts:205-218`（`developerInstructions`）。两路共享同一常量。无版本号/哈希；现有测试用 `toContain` 内容断言（`tests/unit/agent/bridge-system-prompt.test.ts`）。
@@ -186,16 +187,16 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 
 `stop_current_work` 的 added 与 removed 都不依赖「普通 Reaction → buffer → pending → Agent run」链路。`control-ledger.ts` 维护独立、持久控制事件 ledger（同 DD6 模式）。
 
-- **added**：完成 self-operator（DD2）、安全路由、own-message、权限门禁（DD3）、语义映射（DD4）、`workChainId` 关联（DD15）后，立即执行一次控制动作并持久标记 stop-added 已消费；**不**等普通 quiet window，**不**与紧随其后的 removed 相消。控制动作 = `activeRuns.interrupt(scope)`（中断 active/reserved run）+ `pending.cancel(scope)`（取消该 scope 尚未开始的全部普通消息与 Reaction input unit，含 sibling queued unit，防止旧队列自动重启，见 DD17）+ 流式卡片/文本收敛为 interrupted 终态（不复用成功终态）。stop 本身不启动新 Agent run、不生成「是否真的停止」模型确认；interrupt 收敛后由 Bridge 回复可见停止结果。当前 scope 无 active/reserved/queued work → 幂等结束，不启动 Agent，回复「当前没有需要停止的任务」。
+- **added**：完成 self-operator（DD2）、安全路由、own-message、权限门禁（DD3）、语义映射（DD4）、`workChainId` 关联（DD15）后，立即执行一次控制动作并持久标记 stop-added 已消费；**不**等普通 quiet window，**不**与紧随其后的 removed 相消。控制动作 = `activeRuns.interrupt(scope)`（中断 active/reserved run）+ `pending.cancel(scope)`（取消该 scope 尚未开始的全部普通消息与 Reaction input unit，含 sibling queued unit，防止旧队列自动重启；与现有 `/stop` 复合语义一致，见 DD17）+ 流式卡片/文本收敛为 interrupted 终态（不复用成功终态）。stop 本身不启动新 Agent run、不生成「是否真的停止」模型确认；interrupt 收敛后由 Bridge 回复可见停止结果。当前 scope 无 active/reserved/queued work → 幂等结束，不启动 Agent，回复「当前没有需要停止的任务」。
 - **removed**：先通过 self-operator、路由、own-message、权限门禁（**不**要求 chain 此刻仍 current）；据同 operator/target/emoji 的 stop-added ledger 只回复一次「撤回停止 Reaction 不会自动恢复工作」，持久标记 stop-removed 已消费；不撤销 interrupt、不恢复队列、不启动 Agent；无匹配 stop-added 记录 → 静默 no-op。
 - added/removed 都优先用 reaction/event 可用稳定 ID 生成防重 fingerprint；缺稳定 ID 时用规范化事件字段 + action time。重复投递/乱序/重启后已消费事件 = 静默 no-op。
 - 权限判断与当前 scope `/stop` 一致；`workChainId` 只用于防历史/无关目标误触发，**不**把 `/stop` 改造成局部取消。
 
-### DD17 — stop 控制面 vs 当前 `/stop` 的 pending 取消差异（已知问题，需 reviewer 确认）
+### DD17 — stop 控制面复用现有 `/stop` 复合语义（interrupt + pending.cancel）
 
-**事实**：当前 `handleStop`（`commands/index.ts:1567-1590`）只调 `activeRuns.interrupt(scope)`，**不**调 `pending.cancel(scope)`；中断后 `pending.unblock(scope)` 会让排队消息自动启动新 run。Spec（§Stop Reaction Control Contract 3）要求 stop Reaction 效果「与当前 scope `/stop` 一致」且「取消该 scope 尚未开始的全部普通消息和 Reaction input units …… 防止停止后又自动启动旧队列」。
+**事实（已复核 `src/bot/channel.ts:1304-1331`）**：`handleStop`（`commands/index.ts:1567-1590`）本体只调 `activeRuns.interrupt(scope)`；但其调用方 `intakeMessage` 对 `tryHandleCommand` 返回 `handled=true` 的所有命令统一执行 `pending.cancel(scope)` 再 `return`。`/stop` 是被识别命令（`handled=true`），故当前 `/stop` 实际效果已是 `interrupt(scope)` + `pending.cancel(scope)`：中断 active run、丢弃 scope 已排队消息，`unblock` 后无 pending 条目即不会重启旧队列。
 
-**Plan 裁定（供 reviewer 确认）**：stop 控制面 = `activeRuns.interrupt(scope)` + `pending.cancel(scope)`（`pending-queue.ts:49-55` 已支持，返回被丢弃消息）。即 stop 控制面在「取消 pending」上**严格于**当前 `/stop`。`/stop` 本身**不**在本 Spec 修改范围（Spec 明示「不把 `/stop` 改造成局部取消」）。若 reviewer 要求 `/stop` 也对齐取消 pending，那是另一处独立改动，不属本 Plan。此差异列入「Known Issues / Blockers」。
+**Plan 裁定**：stop Reaction 控制面**复用/抽取**现有 `/stop` 的「interrupt + 命令后 pending.cancel」复合语义——即 stop 控制面直接调用 `activeRuns.interrupt(scope)` + `pending.cancel(scope)`（`pending-queue.ts:49-55`），效果与当前 `/stop` **一致**，**不**比 `/stop` 更严格，**无需**另开 `/stop` 对齐改动。`/stop` 本身不在本 Spec 修改范围（Spec 明示「不把 `/stop` 改造成局部取消」）。原 B1 基于只读 `handleStop` 本体、未追 `intakeMessage` 调用方的误判，已撤回（见 Known Issues）。
 
 ### DD18 — 全部有效 Reaction 的可见回复契约
 
@@ -309,7 +310,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 ### Code Review Gate  Owner: 小P
 
 - [ ] 小P 对 Unit 1-10 实现 + 测试做 Code Review（Plan Writer 云上C总 不自审）。
-- [ ] 确认 DD17（stop vs `/stop` pending 取消差异）裁定；确认是否需 `/stop` 对齐独立改动。
+- [x] DD17/B1 已澄清：当前 `/stop` 经 `intakeMessage`（`channel.ts:1304-1331`）已 `interrupt + pending.cancel`；stop 控制面复用该复合语义，不比 `/stop` 严格，无 `/stop` 对齐改动。
 - [ ] 确认未静默缩减 Spec 验收；覆盖矩阵全绿。
 
 ### Unit 11 — 自动化全量 + live-model 对照验收（两路）  Owner: 小C（live profile 协调 小P）
@@ -418,11 +419,11 @@ pnpm -s test
 - **RD5**：Reaction 为 batch barrier，`PendingQueue` 扩展 barrier 条目（DD11）。
 - **RD6**：superseded 新增 `Terminal`（DD13）。
 - **RD7**：`workChainId` 有界运行期元数据，重启 fail closed，不交给模型（DD15）。
-- **RD8**：stop 控制面 = `interrupt(scope)` + `pending.cancel(scope)`；`/stop` 不改（DD16/DD17，待 reviewer 确认）。
+- **RD8**：stop 控制面复用现有 `/stop` 复合语义 = `interrupt(scope)` + `pending.cancel(scope)`（`channel.ts:1304-1331`）；效果与 `/stop` 一致，不比其严格，`/stop` 不改，无需另开对齐改动（DD16/DD17）。原 B1 撤回。
 
 ## Known Issues / Blockers
 
-- **B1（需 reviewer 确认，非 Plan 形成阻塞）**：当前 `handleStop`（`commands/index.ts:1567-1590`）**不取消 pending queue**，与 Spec §Stop Reaction Control Contract 3「效果与 `/stop` 一致 + 取消 pending + 防止旧队列自动重启」存在差异。本 Plan 裁定 stop 控制面额外调用 `pending.cancel(scope)`（DD17）。若 reviewer 认为 `/stop` 也应对齐，需另开独立改动（不在本 Spec 范围）。
+- **B1（已撤回，原误判）**：原结论「当前 `/stop` 不取消 pending queue」基于只读 `handleStop`（`commands/index.ts:1567-1590`）本体、未追调用方。经复核 `src/bot/channel.ts:1304-1331`，`intakeMessage` 对所有 `tryHandleCommand` 返回 `handled=true` 的命令统一 `pending.cancel(scope)`，`/stop` 已含取消 pending。故 stop 控制面复用该复合语义即可，不比 `/stop` 严格，无需 `/stop` 对齐改动（见 DD17/RD8）。
 - **B2（实现注意）**：`operator_type`（`'app'`/`'user'`）被 SDK `normalizeReaction` 丢弃，self-operator guard 的「operator 是当前 app」判定需解析 `evt.raw`（`includeRawEvent:true` 已开）。
 - **B3（live 验收前置）**：`messageReaction.list` 需 Bot 身份具 `im:message.reactions:read` scope；若当前 app 未授权，live 验收前需补授权（非代码阻塞）。
 - **B4（实现注意）**：`ReactionEvent` 无稳定 event_id；stop 控制 ledger 与普通 ledger 防重 fingerprint 优先用 `evt.raw.header.event_id`（若可达），否则用规范化字段 + action time（Spec §Stop 已允许）。
@@ -432,6 +433,6 @@ pnpm -s test
 ## Plan Review Gate  Owner: 小P
 
 - [ ] 小P 确认本 Plan 覆盖 Spec 全部必做单元（权限/self-operator 门禁、buffer/权威快照/ledger/revision、动态 Reaction 上下文、共享 System Prompt、可见回复、stop 控制面）。
-- [ ] 确认 DD17/B1 裁定（stop 控制面取消 pending；`/stop` 不改）。
+- [x] DD17/B1 已澄清：`/stop` 经 `intakeMessage`（`channel.ts:1304-1331`）已 `interrupt + pending.cancel`；stop 控制面复用该语义，不比 `/stop` 严格，无 `/stop` 对齐改动。
 - [ ] 确认未静默缩减 Spec 验收，覆盖矩阵完整。
 - [ ] GO 后交 小C 实施；Plan Review 前不修改运行代码。
