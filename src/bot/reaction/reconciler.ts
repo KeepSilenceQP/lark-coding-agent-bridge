@@ -23,14 +23,18 @@ import { parseReactionKey } from './types';
 export const RECONCILE_MAX_RETRIES = 3;
 export const RECONCILE_RETRY_DELAY_MS = 800;
 
-// ── List API types ──
+// ── List API types (real Feishu im.reactions.list response shape) ──
 
 interface ReactionListItem {
   reaction_id?: string;
-  operator_type?: string;
-  operator_id?: string;
-  emoji_type?: string;
-  timestamp?: string;
+  action_time?: string;
+  operator?: {
+    operator_id?: string;
+    operator_type?: string; // 'user' | 'app'
+  };
+  reaction_type?: {
+    emoji_type?: string;
+  };
 }
 
 interface ReactionListResponse {
@@ -242,14 +246,19 @@ async function fetchAllReactions(
 
     const items = res?.data?.items ?? [];
     for (const item of items) {
-      // Exclude self-app reactions
+      // Read nested operator/reaction_type per real Feishu API contract
+      const opType = item.operator?.operator_type ?? 'user';
+      const opId = item.operator?.operator_id ?? '';
+      const emoji = item.reaction_type?.emoji_type ?? '';
+
+      // Exclude self-app reactions (nested operator check)
       if (isSelfApp(item, deps)) continue;
 
       collected.push({
         reaction_id: item.reaction_id,
-        operator_type: item.operator_type ?? 'user',
-        operator_id: item.operator_id ?? '',
-        emoji_type: item.emoji_type ?? '',
+        operator_type: opType,
+        operator_id: opId,
+        emoji_type: emoji,
       });
     }
 
@@ -260,9 +269,11 @@ async function fetchAllReactions(
 }
 
 function isSelfApp(item: ReactionListItem, deps: ReconcilerDeps): boolean {
-  if (item.operator_type === 'app') return true;
-  if (deps.botOpenId && item.operator_id === deps.botOpenId) return true;
-  if (deps.appId && item.operator_id === deps.appId) return true;
+  const opType = item.operator?.operator_type;
+  const opId = item.operator?.operator_id;
+  if (opType === 'app') return true;
+  if (deps.botOpenId && opId === deps.botOpenId) return true;
+  if (deps.appId && opId === deps.appId) return true;
   return false;
 }
 

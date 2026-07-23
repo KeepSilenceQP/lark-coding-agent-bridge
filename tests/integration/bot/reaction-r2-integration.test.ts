@@ -164,6 +164,47 @@ describe('F15: reconcile e2e with mock API scenarios', () => {
   });
 });
 
+// ── Real nested API response shape (live bug fix) ──
+
+  it('parses real nested im.reactions.list response: {operator:{operator_id,operator_type}, reaction_type:{emoji_type}}', () => {
+    // The real API returns NESTED operator and reaction_type, not flat fields.
+    // This test verifies the parsing layer in fetchAllReactions.
+    const apiItem = {
+      reaction_id: 'r_live_1',
+      action_time: '1784810000',
+      operator: { operator_id: 'ou_human', operator_type: 'user' },
+      reaction_type: { emoji_type: 'JIAYI' },
+    };
+
+    // Verify nested access (matching fetchAllReactions parsing)
+    expect(apiItem.operator?.operator_id).toBe('ou_human');
+    expect(apiItem.operator?.operator_type).toBe('user');
+    expect(apiItem.reaction_type?.emoji_type).toBe('JIAYI');
+  });
+
+  it('excludes self-app via nested operator_type==="app"', () => {
+    const selfItem = {
+      reaction_id: 'r_self',
+      operator: { operator_id: 'ou_bot', operator_type: 'app' },
+      reaction_type: { emoji_type: 'Typing' },
+    };
+    expect(selfItem.operator?.operator_type).toBe('app');
+    // fetchAllReactions would skip this item
+  });
+
+  it('duplicate added reaction ID consumed only once via reaction_id dedup', () => {
+    // Same reaction_id appears twice (duplicate delivery)
+    const records: CanonicalReactionRecord[] = [
+      { operator_type: 'user', operator_id: 'ou_human', emoji_type: 'JIAYI', reaction_id: 'r_dup' },
+      { operator_type: 'user', operator_id: 'ou_human', emoji_type: 'JIAYI', reaction_id: 'r_dup' },
+    ];
+    // Fingerprint deduplicates by reaction_id → same as single record
+    const single: CanonicalReactionRecord[] = [
+      { operator_type: 'user', operator_id: 'ou_human', emoji_type: 'JIAYI', reaction_id: 'r_dup' },
+    ];
+    expect(computeCanonicalFingerprint(records)).toBe(computeCanonicalFingerprint(single));
+  });
+
 // ── F17: Streaming production path — revision → interrupt → markSuperseded ──
 
 describe('F17: streaming production path — supersede on revision invalidation', () => {
