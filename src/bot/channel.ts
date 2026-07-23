@@ -26,6 +26,7 @@ import {
   initialState,
   markIdleTimeout,
   markInterrupted,
+  markSuperseded,
   reduce,
   type RunState,
 } from '../card/run-state';
@@ -133,6 +134,29 @@ import {
 let _reactionContextStore: ReactionContextStore | null = null;
 function getReactionContexts(messageIds: string[]): unknown[] {
   return _reactionContextStore ? _reactionContextStore.consume(messageIds) : [];
+}
+
+// ── Reaction lifecycle bridges (module-level, wired by startChannel) ──
+// These carry reaction metadata from the barrier turn through to the
+// run/streaming lifecycle, since runAgentBatch is module-level.
+let _workChainStore: WorkChainStore | null = null;
+let _reactionRunTracker: ReactionRunTracker | null = null;
+/** scope → { workChainId, reactionKey } for the current reaction turn */
+const _reactionTurnMeta = new Map<string, { workChainId: string; reactionKey: string; revision: number }>();
+
+function setReactionTurnMeta(scope: string, workChainId: string, reactionKey: string, revision: number): void {
+  _reactionTurnMeta.set(scope, { workChainId, reactionKey, revision });
+}
+function consumeReactionTurnMeta(scope: string): { workChainId: string; reactionKey: string; revision: number } | undefined {
+  const meta = _reactionTurnMeta.get(scope);
+  _reactionTurnMeta.delete(scope);
+  return meta;
+}
+function registerOutboundLifecycle(workChainId: string, messageId: string): void {
+  _workChainStore?.registerOutbound(workChainId, messageId);
+}
+function markTerminalLifecycle(workChainId: string): void {
+  _workChainStore?.markTerminal(workChainId);
 }
 
 const DEBOUNCE_MS = 600;
@@ -707,8 +731,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // from pipeline to buildPrompt (F1).
   const reactionContextStore = new ReactionContextStore();
   _reactionContextStore = reactionContextStore;
+  _workChainStore = workChainStore;
   // ReactionRunTracker: tracks active reaction runs by reaction key (F23).
   const reactionRunTracker = new ReactionRunTracker();
+  _reactionRunTracker = reactionRunTracker;
   // Ledgers: lazily loaded when profileDir is available (F3/F12).
   let reactionLedger: ReactionLedger | null = null;
   let stopControlLedger: StopControlLedger | null = null;
@@ -761,6 +787,24 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       mentionedBot: false,
       createTime: Date.now(),
     } satisfies import('@larksuite/channel').NormalizedMessage;
+    // F10/F11/F18: Check for revision invalidation — supersede old run if same key
+    const opId = result.components.operatorOpenId;
+    const tgtId = result.components.targetMessageId;
+    if (_reactionRunTracker?.shouldInterrupt(result.components.scope, opId, tgtId, result.revision)) {
+      // Old run for the same key is active → interrupt + mark superseded
+      activeRuns.interrupt(result.components.scope);
+      // The existing run's card will be updated to 'superseded' by markSuperseded
+      // when the new run starts and the old stream is terminated.
+      log.info('reaction', 'superseding-old-run', {
+        scope: result.components.scope,
+        key: result.key,
+        newRevision: result.revision,
+      });
+    }
+    // F10/F11: Carry reaction metadata through to the run lifecycle
+    const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
+    if (wcId) _workChainStore?.markCurrent(wcId);
+    setReactionTurnMeta(result.components.scope, wcId, result.key, result.revision);
     pending.pushBarrier(result.components.scope, normalizedMsg);
     log.info('reaction', 'reconciled-and-enqueued', {
       key: result.key,
@@ -1778,6 +1822,26 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const promptAdmissions = flow.promptSession ? [flow.promptSession.admission] : [];
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
+
+  // ── Reaction lifecycle: consume metadata from barrier turn, wire into run ──
+  const reactionTurnMeta = consumeReactionTurnMeta(scope);
+  if (reactionTurnMeta) {
+    _workChainStore?.markCurrent(reactionTurnMeta.workChainId);
+    _reactionRunTracker?.register({
+      scope,
+      operatorOpenId: reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
+      targetMessageId: reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '',
+      reactionRevision: reactionTurnMeta.revision,
+      runId: `${scope}:${Date.now()}`,
+    });
+  }
+  // Register outbound on stream result
+  const _registerOutboundOnStream = (result: unknown): void => {
+    if (reactionTurnMeta && result && typeof result === 'object' && 'messageId' in result) {
+      registerOutboundLifecycle(reactionTurnMeta.workChainId, (result as { messageId: string }).messageId);
+    }
+  };
+
   const eventStream = execution.subscribe();
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
@@ -1964,7 +2028,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             reason: cotPublisher.degradedReason,
           });
         }
-        await sendFinalReply({
+        const cotResult = await sendFinalReply({
           channel,
           chatId,
           scope,
@@ -1973,6 +2037,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
           cardRenderOptions,
         });
+        _registerOutboundOnStream(cotResult);
+        if (reactionTurnMeta) {
+          markTerminalLifecycle(reactionTurnMeta.workChainId);
+          _reactionRunTracker?.unregister(scope,
+            reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
+            reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '');
+        }
         return;
       }
       log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
@@ -2020,13 +2091,22 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         renderDone,
         producerStarted: () => producerStarted,
         fallback: async (state) => {
+          // F18: If this reaction run was superseded, mark the card state
+          const fallbackState = reactionTurnMeta ? markSuperseded(state) : state;
           await channel.send(
             chatId,
-            { card: renderCard(filterForPrefs(state), cardRenderOptions) },
+            { card: renderCard(filterForPrefs(fallbackState), cardRenderOptions) },
             sendOpts,
           );
         },
       });
+      // Reaction lifecycle: mark terminal after render+stream complete
+      if (reactionTurnMeta) {
+        markTerminalLifecycle(reactionTurnMeta.workChainId);
+        _reactionRunTracker?.unregister(scope,
+          reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
+          reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '');
+      }
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let latestMarkdown = renderMarkdownStreamText(latestState);
@@ -2107,6 +2187,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
         )
         .then((result) => {
+          _registerOutboundOnStream(result);
           log.info('stream', 'markdown-terminal-resolved', {
             chars: latestMarkdown.length,
             flushes: markdownFlushes,
@@ -2135,6 +2216,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           }
         },
       });
+      // Reaction lifecycle: mark terminal after render+stream complete
+      if (reactionTurnMeta) {
+        markTerminalLifecycle(reactionTurnMeta.workChainId);
+        _reactionRunTracker?.unregister(scope,
+          reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
+          reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '');
+      }
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -2149,7 +2237,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         async () => {},
         recoverStartupTimeout,
       );
-      await sendFinalReply({
+      const sendResult = await sendFinalReply({
         channel,
         chatId,
         scope,
@@ -2158,6 +2246,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         sendOpts,
         cardRenderOptions,
       });
+      // Reaction lifecycle: register outbound for text mode
+      _registerOutboundOnStream(sendResult);
+      if (reactionTurnMeta) {
+        markTerminalLifecycle(reactionTurnMeta.workChainId);
+        _reactionRunTracker?.unregister(scope,
+          reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
+          reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '');
+      }
     }
   } catch (err) {
     log.fail('stream', err);
@@ -2176,20 +2272,21 @@ async function sendFinalReply(input: {
   replyMode: ReturnType<typeof getMessageReplyMode>;
   sendOpts: { replyTo: string; replyInThread?: boolean };
   cardRenderOptions: { signCallback?: (action: string) => string };
-}): Promise<void> {
+}): Promise<unknown> {
   const body = renderText(input.state);
+  let lastResult: unknown;
 
   if (input.replyMode === 'card') {
-    const result = await input.channel.send(
+    lastResult = await input.channel.send(
       input.chatId,
       { card: renderCard(input.state, input.cardRenderOptions) },
       input.sendOpts,
     );
-    log.info('outbound', 'sent', outboundLogFields(input, 'card', body, result));
+    log.info('outbound', 'sent', outboundLogFields(input, 'card', body, lastResult as { messageId?: string } | undefined));
   } else if (input.replyMode === 'markdown') {
     if (body.trim()) {
       try {
-        await input.channel.stream(
+        lastResult = await input.channel.stream(
           input.chatId,
           {
             markdown: async (ctrl) => {
@@ -2198,27 +2295,28 @@ async function sendFinalReply(input: {
           },
           input.sendOpts,
         );
-        log.info('outbound', 'sent', outboundLogFields(input, 'markdown-stream', body));
+        log.info('outbound', 'sent', outboundLogFields(input, 'markdown-stream', body, lastResult as { messageId?: string } | undefined));
       } catch (err) {
         log.warn('outbound', 'markdown-stream-fallback', {
           err: err instanceof Error ? err.message : String(err),
         });
-        const result = await input.channel.send(
+        lastResult = await input.channel.send(
           input.chatId,
           { markdown: body },
           input.sendOpts,
         );
-        log.info('outbound', 'sent', outboundLogFields(input, 'markdown', body, result));
+        log.info('outbound', 'sent', outboundLogFields(input, 'markdown', body, lastResult as { messageId?: string } | undefined));
       }
     }
   } else if (body.trim()) {
-    const result = await input.channel.send(
+    lastResult = await input.channel.send(
       input.chatId,
       { markdown: body },
       input.sendOpts,
     );
-    log.info('outbound', 'sent', outboundLogFields(input, 'text', body, result));
+    log.info('outbound', 'sent', outboundLogFields(input, 'text', body, lastResult as { messageId?: string } | undefined));
   }
+  return lastResult;
 }
 
 async function sendCotDegradedNotice(input: {
