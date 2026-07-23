@@ -760,6 +760,41 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     }
     if (result.noOp) return; // No state change, no reply
 
+    // ── Net-zero added→removed: Bridge reply, no Agent turn (DD7) ──
+    if (result.netZeroConsumed) {
+      try {
+        await channel.send(
+          result.components.scope.split(':')[0] ?? result.components.scope,
+          { markdown: '已收到撤回。' },
+          { replyTo: result.components.targetMessageId },
+        );
+      } catch { /* best-effort */ }
+      return;
+    }
+
+    // ── Post-terminal / empty-set removal: Bridge reply only, no Agent turn ──
+    // Per Spec DD14: terminal后removed不重启Agent; 空集不启动replacement turn.
+    if (result.effectiveReactionSet.length === 0) {
+      // If there's an active run for the same key, interrupt+supersede it
+      const opId = result.components.operatorOpenId;
+      const tgtId = result.components.targetMessageId;
+      if (_reactionRunTracker?.shouldInterrupt(result.components.scope, opId, tgtId, result.revision)) {
+        activeRuns.interrupt(result.components.scope);
+        log.info('reaction', 'interrupt-empty-set', {
+          scope: result.components.scope, key: result.key, revision: result.revision,
+        });
+      }
+      // Bridge reply: withdrawal confirmed, completed actions not rolled back
+      try {
+        await channel.send(
+          result.components.scope.split(':')[0] ?? result.components.scope,
+          { markdown: '已收到撤回，已完成动作不会自动回滚。' },
+          { replyTo: result.components.targetMessageId },
+        );
+      } catch { /* best-effort */ }
+      return;
+    }
+
     // F1(a): Fetch real target message content via fetchQuotedContext.
     // Handles two-level failure: route/content OK → full content;
     // content fetch/normalize failed → available:false (Agent must not act).

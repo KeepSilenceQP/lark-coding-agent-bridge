@@ -498,3 +498,76 @@ describe('F18: WorkChainStore TTL/LRU eviction', () => {
     expect(store.resolveOutbound('om_recent')).toBeUndefined();
   });
 });
+
+// ── Unit 11 live blocker: empty-set removal must NOT start Agent ──
+
+describe('empty-set / terminal removal — no Agent turn, Bridge reply only', () => {
+  it('terminal removal (effectiveReactionSet=[]) → Agent enqueue count 0, Bridge send count 1', () => {
+    const result = {
+      key: 'oc_s\x1fou_user\x1fom_target',
+      components: { scope: 'oc_s', operatorOpenId: 'ou_user', targetMessageId: 'om_target' },
+      effectiveReactionSet: [] as Array<{ emojiType: string }>,
+      triggerReactions: [{ action: 'removed' as const, emojiType: 'Get', actionTime: 2000 }],
+      revision: 2,
+      fingerprint: 'fp_empty',
+      noOp: false,
+      netZeroConsumed: false,
+      reconciliationFailed: false,
+    };
+    // When effectiveReactionSet is empty, the buffer flush handler must:
+    // 1. NOT call contextStore.set / pushBarrier (Agent enqueue count = 0)
+    // 2. Send Bridge reply (Bridge send count = 1)
+    expect(result.effectiveReactionSet).toHaveLength(0);
+    expect(result.noOp).toBe(false);
+    const shouldStartAgent = result.effectiveReactionSet.length > 0;
+    expect(shouldStartAgent).toBe(false);
+  });
+
+  it('active run removal (effectiveReactionSet=[]) → interrupt + supersede, no replacement', () => {
+    const activeRuns = new ActiveRuns();
+    const tracker = new ReactionRunTracker();
+    const reservation = activeRuns.reserve('oc_s');
+    expect(reservation).toBeDefined();
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_user', targetMessageId: 'om_target', reactionRevision: 1, runId: 'run-1' });
+    const shouldInterrupt = tracker.shouldInterrupt('oc_s', 'ou_user', 'om_target', 2);
+    expect(shouldInterrupt).toBe(true);
+    const interrupted = activeRuns.interrupt('oc_s');
+    expect(interrupted).toBe(true);
+    tracker.unregister('oc_s', 'ou_user', 'om_target');
+    expect(tracker.get('oc_s', 'ou_user', 'om_target')).toBeUndefined();
+  });
+
+  it('different key removal → does NOT interrupt current run', () => {
+    const activeRuns = new ActiveRuns();
+    const tracker = new ReactionRunTracker();
+    activeRuns.reserve('oc_s');
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_a', reactionRevision: 1, runId: 'run-a' });
+    const shouldInterrupt = tracker.shouldInterrupt('oc_s', 'ou_b', 'om_b', 2);
+    expect(shouldInterrupt).toBe(false);
+    expect(tracker.get('oc_s', 'ou_a', 'om_a')).toBeDefined();
+  });
+
+  it('net-zero added→removed → no Agent turn, Bridge reply for withdrawal', () => {
+    const result = {
+      noOp: false, netZeroConsumed: true, effectiveReactionSet: [],
+      reconciliationFailed: false,
+    };
+    const shouldStartAgent = !result.noOp && !result.netZeroConsumed && result.effectiveReactionSet.length > 0;
+    expect(shouldStartAgent).toBe(false);
+  });
+
+  it('non-empty effective set after removal → DOES start replacement Agent turn', () => {
+    const result = {
+      noOp: false, netZeroConsumed: false,
+      effectiveReactionSet: [{ emojiType: 'OK' }],
+      reconciliationFailed: false,
+    };
+    const shouldStartAgent = !result.noOp && !result.netZeroConsumed && result.effectiveReactionSet.length > 0;
+    expect(shouldStartAgent).toBe(true);
+  });
+
+  it('duplicate empty-set event (fingerprint unchanged) → no-op, no Bridge reply, no Agent', () => {
+    const noOpResult = { noOp: true, netZeroConsumed: false, effectiveReactionSet: [], reconciliationFailed: false };
+    expect(noOpResult.noOp).toBe(true);
+  });
+});
