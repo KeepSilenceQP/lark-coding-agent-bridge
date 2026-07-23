@@ -368,6 +368,23 @@ the valid snapshot as stale and replied “本次 Reaction 暂时无法确认，
 Unit 3 reconciliation and the coverage gate are reopened; Unit 11 is paused
 until Fix, independent Code Review, rebuilt live install, and restart readback.
 
+Progress update (2026-07-24): nested-response fix `2069bee` plus real
+`reconcile()` coverage `cfc2242` passed independent review and was redeployed.
+Codex live cases `approve_continue`, `explain_more`,
+`user_step_completed`, and unmapped `Get` passed. Terminal removal then
+failed on target `om_x100b691339de2ca0df9d5ca91c42890`: removing `Get`
+correctly produced revision 2 with one `removed` trigger and an empty
+`effectiveReactionSet`, but still started an Agent turn. Production
+`channel.ts` unconditionally stores Reaction context, calls
+`setReactionTurnMeta`, and `pending.pushBarrier` for every non-no-op
+reconciliation result; it has no empty-set/terminal-removal Bridge branch.
+The existing “post-terminal removal does not restart Agent” test only
+asserts tracker state and comments what the pipeline should do, so it never
+exercises this production seam. Unit 8, Unit 10 wiring coverage, and the Code
+Review coverage gate are reopened. Unit 11 is paused before stop testing
+until the fix has a production-wiring regression test, independent review,
+redeploy, and live retry.
+
 ## Acceptance Coverage Matrix（Spec 验收行 → Unit）
 
 | Spec 验收场景 | 覆盖 Unit |
@@ -486,6 +503,11 @@ pnpm -s test
 - **B5（实现注意）**：`NormalizedMessage` 为 vendored SDK 类型不易扩展；Reaction turn 经 `PendingQueue` barrier 条目携带 `ReactionTurn` 而非扩展 `NormalizedMessage`（DD11），`<reaction_contexts>` 数据经侧信道 plumbed 到 `buildAgentPrompt`。
 - **B6（实现注意）**：`ActiveRuns` 仅按 scope 键，无 per-run (operator,target,revision,workChainId) 元数据；DD12/DD15 需在其外加 per-run 元数据注册或扩展 `RunHandle`，注意与现有 `interrupt`/`unregister` 生命周期一致。
 - **B7（实现注意，第 3 版；v4 修订）**：DD15 的 `workChainId` 常量（`MAX_CHAINS_PER_SCOPE=16`、`MAX_OUTBOUND_MAP_PER_SCOPE=256`、`HISTORICAL_CHAIN_TTL_MS=1_800_000`）为 Plan 定义默认值，小C 实现时可同量级调整。**16/256 是 historical cache 上限，非总 Map 硬上限**；current chains 及其 outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，仅 terminal 后进入 historical retention 并按 LRU/TTL 裁剪；不引入 pending admission/drop/backpressure。
+- **B8（Unit 11 live blocker）**：普通 Reaction reconciliation 产生空
+  `effectiveReactionSet` 时，生产 buffer flush 当前仍无条件 enqueue Agent
+  turn。修复必须在真实 `channel.ts` wiring seam 证明 terminal 后 removed
+  只由 Bridge 回复且不启动 Agent；in-flight/queued removal 使旧 revision
+  失效、空集合不启动替代 turn；净零和重复投递仍各自遵守 DD7/DD14 防重。
 
 ## Plan Review Gate  Owner: 小P
 
