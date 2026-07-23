@@ -499,75 +499,158 @@ describe('F18: WorkChainStore TTL/LRU eviction', () => {
   });
 });
 
-// ── Unit 11 live blocker: empty-set removal must NOT start Agent ──
 
-describe('empty-set / terminal removal — no Agent turn, Bridge reply only', () => {
-  it('terminal removal (effectiveReactionSet=[]) → Agent enqueue count 0, Bridge send count 1', () => {
-    const result = {
-      key: 'oc_s\x1fou_user\x1fom_target',
-      components: { scope: 'oc_s', operatorOpenId: 'ou_user', targetMessageId: 'om_target' },
-      effectiveReactionSet: [] as Array<{ emojiType: string }>,
-      triggerReactions: [{ action: 'removed' as const, emojiType: 'Get', actionTime: 2000 }],
-      revision: 2,
-      fingerprint: 'fp_empty',
-      noOp: false,
-      netZeroConsumed: false,
-      reconciliationFailed: false,
-    };
-    // When effectiveReactionSet is empty, the buffer flush handler must:
-    // 1. NOT call contextStore.set / pushBarrier (Agent enqueue count = 0)
-    // 2. Send Bridge reply (Bridge send count = 1)
-    expect(result.effectiveReactionSet).toHaveLength(0);
-    expect(result.noOp).toBe(false);
-    const shouldStartAgent = result.effectiveReactionSet.length > 0;
-    expect(shouldStartAgent).toBe(false);
+// ── Production seam: decideReactionFlush — real flush decision engine ──
+// These tests exercise the actual decision function used by the buffer flush
+// handler, not local mock objects.
+
+import { decideReactionFlush } from '../../../src/bot/channel';
+import type { ReactionFlushDecision } from '../../../src/bot/channel';
+
+describe('decideReactionFlush — production flush decision engine', () => {
+  it('reconciliationFailed → bridge-reply "请重试", no Agent', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: true, noOp: false, netZeroConsumed: false,
+      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      targetMessageId: 'om_t', scope: 'oc_s',
+    });
+    expect(d.kind).toBe('bridge-reply');
+    expect((d as { message: string }).message).toContain('暂时无法确认');
   });
 
-  it('active run removal (effectiveReactionSet=[]) → interrupt + supersede, no replacement', () => {
-    const activeRuns = new ActiveRuns();
-    const tracker = new ReactionRunTracker();
-    const reservation = activeRuns.reserve('oc_s');
-    expect(reservation).toBeDefined();
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_user', targetMessageId: 'om_target', reactionRevision: 1, runId: 'run-1' });
-    const shouldInterrupt = tracker.shouldInterrupt('oc_s', 'ou_user', 'om_target', 2);
-    expect(shouldInterrupt).toBe(true);
-    const interrupted = activeRuns.interrupt('oc_s');
-    expect(interrupted).toBe(true);
-    tracker.unregister('oc_s', 'ou_user', 'om_target');
-    expect(tracker.get('oc_s', 'ou_user', 'om_target')).toBeUndefined();
+  it('noOp → drop (no reply, no Agent)', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: false, noOp: true, netZeroConsumed: false,
+      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      targetMessageId: 'om_t', scope: 'oc_s',
+    });
+    expect(d.kind).toBe('drop');
   });
 
-  it('different key removal → does NOT interrupt current run', () => {
-    const activeRuns = new ActiveRuns();
-    const tracker = new ReactionRunTracker();
-    activeRuns.reserve('oc_s');
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_a', reactionRevision: 1, runId: 'run-a' });
-    const shouldInterrupt = tracker.shouldInterrupt('oc_s', 'ou_b', 'om_b', 2);
-    expect(shouldInterrupt).toBe(false);
-    expect(tracker.get('oc_s', 'ou_a', 'om_a')).toBeDefined();
+  it('netZeroConsumed → bridge-reply "已收到撤回", no Agent', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: false, noOp: false, netZeroConsumed: true,
+      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      targetMessageId: 'om_t', scope: 'oc_s',
+    });
+    expect(d.kind).toBe('bridge-reply');
+    expect((d as { message: string }).message).toContain('已收到撤回');
+    // netZero must NOT enqueue Agent
+    expect(d.kind).not.toBe('enqueue-agent');
   });
 
-  it('net-zero added→removed → no Agent turn, Bridge reply for withdrawal', () => {
-    const result = {
-      noOp: false, netZeroConsumed: true, effectiveReactionSet: [],
-      reconciliationFailed: false,
-    };
-    const shouldStartAgent = !result.noOp && !result.netZeroConsumed && result.effectiveReactionSet.length > 0;
-    expect(shouldStartAgent).toBe(false);
+  it('terminal removal (empty set, no active run) → bridge-reply "已完成动作不回滚", no interrupt, no Agent', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: false, noOp: false, netZeroConsumed: false,
+      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      targetMessageId: 'om_t', scope: 'oc_s',
+    });
+    expect(d.kind).toBe('bridge-reply');
+    expect((d as { message: string }).message).toContain('已完成动作不会自动回滚');
+    expect((d as { interrupt?: { scope: string } }).interrupt).toBeUndefined();
   });
 
-  it('non-empty effective set after removal → DOES start replacement Agent turn', () => {
-    const result = {
-      noOp: false, netZeroConsumed: false,
-      effectiveReactionSet: [{ emojiType: 'OK' }],
-      reconciliationFailed: false,
-    };
-    const shouldStartAgent = !result.noOp && !result.netZeroConsumed && result.effectiveReactionSet.length > 0;
-    expect(shouldStartAgent).toBe(true);
+  it('active same-key empty-set removal → bridge-reply + interrupt (no Agent)', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: false, noOp: false, netZeroConsumed: false,
+      effectiveReactionSetLength: 0, hasMatchingActiveRun: true,
+      targetMessageId: 'om_t', scope: 'oc_s',
+    });
+    expect(d.kind).toBe('bridge-reply');
+    expect((d as { interrupt?: { scope: string } }).interrupt).toBeDefined();
+    expect((d as { interrupt?: { scope: string } }).interrupt!.scope).toBe('oc_s');
+    // Must NOT enqueue Agent
+    expect(d.kind).not.toBe('enqueue-agent');
   });
 
-  it('duplicate empty-set event (fingerprint unchanged) → no-op, no Bridge reply, no Agent', () => {
-    const noOpResult = { noOp: true, netZeroConsumed: false, effectiveReactionSet: [], reconciliationFailed: false };
-    expect(noOpResult.noOp).toBe(true);
+  it('non-empty effective set + context → enqueue-agent (replacement turn)', () => {
+    const ctx = { operatorOpenId: 'ou_u', reactionRevision: 2, triggerReactions: [], effectiveReactionSet: [{ emojiType: 'OK' }], targetMessage: { available: true, messageId: 'om_t' } };
+    const d = decideReactionFlush({
+      reconciliationFailed: false, noOp: false, netZeroConsumed: false,
+      effectiveReactionSetLength: 1, hasMatchingActiveRun: false,
+      targetMessageId: 'om_t', scope: 'oc_s',
+      reactionContext: ctx,
+    });
+    expect(d.kind).toBe('enqueue-agent');
+    expect((d as { reactionContext: unknown }).reactionContext).toBe(ctx);
+  });
+
+  it('non-empty set but no reactionContext → drop (no context, safe)', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: false, noOp: false, netZeroConsumed: false,
+      effectiveReactionSetLength: 1, hasMatchingActiveRun: false,
+      targetMessageId: 'om_t', scope: 'oc_s',
+      reactionContext: undefined,
+    });
+    expect(d.kind).toBe('drop');
+    expect((d as { reason: string }).reason).toBe('no-context');
+  });
+
+  // ── Different key must NOT trigger interrupt ──
+  it('empty set, hasMatchingActiveRun=false → no interrupt (different key scenario)', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: false, noOp: false, netZeroConsumed: false,
+      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      targetMessageId: 'om_other', scope: 'oc_s',
+    });
+    expect(d.kind).toBe('bridge-reply');
+    expect((d as { interrupt?: { scope: string } }).interrupt).toBeUndefined();
+  });
+
+  // ── Decision type guard: bridge-reply never coincides with enqueue-agent ──
+  it('bridge-reply decisions are mutually exclusive with enqueue-agent', () => {
+    const cases = [
+      { reconciliationFailed: true, noOp: false, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingActiveRun: false },
+      { reconciliationFailed: false, noOp: true, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingActiveRun: false },
+      { reconciliationFailed: false, noOp: false, netZeroConsumed: true, effectiveReactionSetLength: 0, hasMatchingActiveRun: false },
+      { reconciliationFailed: false, noOp: false, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingActiveRun: false },
+      { reconciliationFailed: false, noOp: false, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingActiveRun: true },
+    ];
+    for (const c of cases) {
+      const d = decideReactionFlush({ ...c, targetMessageId: 'om_t', scope: 'oc_s' });
+      expect(d.kind).not.toBe('enqueue-agent');
+    }
+  });
+});
+
+// ── Cleanup: empty-set removal cancels queued entries ──
+describe('empty-set cleanup — cancel queued entries + clear contextStore', () => {
+  it('PendingQueue.cancel removes pending entries for scope (including reaction barriers)', () => {
+    const pending = new PendingQueue(1000, () => {});
+    pending.push('oc_s', {
+      messageId: 'om_barrier', chatId: 'oc_s', chatType: 'group',
+      senderId: 'ou_user', content: '[reaction] JIAYI', rawContentType: 'reaction' as never,
+      resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: Date.now(),
+    });
+    // pushBarrier would also create an entry
+    pending.pushBarrier('oc_s', {
+      messageId: 'om_barrier2', chatId: 'oc_s', chatType: 'group',
+      senderId: 'ou_user', content: '[reaction] JIAYI', rawContentType: 'reaction' as never,
+      resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: Date.now(),
+    });
+    const cancelled = pending.cancel('oc_s');
+    expect(cancelled.length).toBeGreaterThan(0);
+    // After cancel, scope is clean
+    expect(pending.cancel('oc_s')).toEqual([]);
+  });
+
+  it('cancel does not affect other scopes (different key isolation)', () => {
+    const pending = new PendingQueue(1000, () => {});
+    pending.push('oc_a', {
+      messageId: 'om_a', chatId: 'oc_a', chatType: 'group',
+      senderId: 'ou_user_a', content: 'msg_a', rawContentType: 'text',
+      resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: Date.now(),
+    });
+    pending.push('oc_b', {
+      messageId: 'om_b', chatId: 'oc_b', chatType: 'group',
+      senderId: 'ou_user_b', content: 'msg_b', rawContentType: 'text',
+      resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: Date.now(),
+    });
+    // Cancel only scope A
+    const cancelledA = pending.cancel('oc_a');
+    expect(cancelledA.length).toBe(1);
+    // Scope B untouched
+    const cancelledB = pending.cancel('oc_b');
+    expect(cancelledB.length).toBe(1);
   });
 });

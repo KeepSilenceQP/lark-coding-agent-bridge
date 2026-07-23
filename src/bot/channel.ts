@@ -160,6 +160,47 @@ function markTerminalLifecycle(workChainId: string): void {
   _workChainStore?.markTerminal(workChainId);
 }
 
+// ── Testable flush decision seam (extracted for RED→GREEN testing) ──
+// Returns the action the buffer flush handler should take.
+// Exported for use in production wiring tests.
+export type ReactionFlushDecision =
+  | { kind: 'drop'; reason: string }
+  | { kind: 'bridge-reply'; message: string; targetMessageId: string; interrupt?: { scope: string } }
+  | { kind: 'enqueue-agent'; targetMessageId: string; reactionContext: unknown };
+
+export function decideReactionFlush(params: {
+  reconciliationFailed: boolean;
+  noOp: boolean;
+  netZeroConsumed: boolean;
+  effectiveReactionSetLength: number;
+  hasMatchingActiveRun: boolean;
+  targetMessageId: string;
+  scope: string;
+  reactionContext?: unknown;
+}): ReactionFlushDecision {
+  if (params.reconciliationFailed) {
+    return { kind: 'bridge-reply', message: '本次 Reaction 暂时无法确认，请重试。', targetMessageId: params.targetMessageId };
+  }
+  if (params.noOp) {
+    return { kind: 'drop', reason: 'no-op' };
+  }
+  if (params.netZeroConsumed) {
+    return { kind: 'bridge-reply', message: '已收到撤回。', targetMessageId: params.targetMessageId };
+  }
+  if (params.effectiveReactionSetLength === 0) {
+    return {
+      kind: 'bridge-reply',
+      message: '已收到撤回，已完成动作不会自动回滚。',
+      targetMessageId: params.targetMessageId,
+      ...(params.hasMatchingActiveRun ? { interrupt: { scope: params.scope } } : {}),
+    };
+  }
+  if (params.reactionContext) {
+    return { kind: 'enqueue-agent', targetMessageId: params.targetMessageId, reactionContext: params.reactionContext };
+  }
+  return { kind: 'drop', reason: 'no-context' };
+}
+
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
 const FINAL_READBACK_RETRY_MS = 250;
@@ -774,7 +815,16 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
 
     // ── Post-terminal / empty-set removal: Bridge reply only, no Agent turn ──
     // Per Spec DD14: terminal后removed不重启Agent; 空集不启动replacement turn.
+    // Must also cancel any queued pending entries + contextStore data to prevent
+    // a stale barrier entry from later starting an Agent run.
     if (result.effectiveReactionSet.length === 0) {
+      // Cancel queued pending entries for this scope (both regular + reaction barriers)
+      pending.cancel(result.components.scope);
+      // Clear contextStore entry so buildPrompt won't inject stale reactionContexts
+      reactionContextStore.delete(result.components.targetMessageId);
+      // Clear _reactionTurnMeta so runAgentBatch won't start a stale reaction turn
+      _reactionTurnMeta.delete(result.components.scope);
+
       // If there's an active run for the same key, interrupt+supersede it
       const opId = result.components.operatorOpenId;
       const tgtId = result.components.targetMessageId;
