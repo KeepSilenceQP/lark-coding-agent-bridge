@@ -350,6 +350,14 @@ replace the shared global package with the reviewed branch build, restart both
 profiles, and retain a rollback artifact; no live case is counted as passed
 before post-restart readback.
 
+Progress update (2026-07-24): the live blocker is cleared with explicit
+operator authorization. The previous global package is backed up under
+`~/.lark-channel/backups/bridge-live-unit11-20260724-034625`; reviewed package
+SHA-256 is `720859bbbae726cf289634f2c14bfa6ace56e2e5556e82517be2e4fa12019347`.
+Post-restart readback confirms `claude` PID 85575 and `codex` PID 86566 both
+run through the global executable whose dist contains the reviewed Reaction
+implementation. Unit 11 live cases may now begin; no case is pre-counted.
+
 ## Acceptance Coverage Matrix（Spec 验收行 → Unit）
 
 | Spec 验收场景 | 覆盖 Unit |
