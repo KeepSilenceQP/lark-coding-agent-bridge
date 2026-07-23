@@ -82,14 +82,30 @@ export async function reconcile(
   };
 
   // ── Fetch authoritative snapshot with finite retry (F4) ──
+  // Retry on: (a) fetch throw, OR (b) stale success — snapshot doesn't
+  // reflect the net change expected from buffered events.
   let records: CanonicalReactionRecord[] = [];
   let lastErr: unknown;
+  let reconciled = false;
 
-  for (let attempt = 1; attempt <= RECONCILE_MAX_RETRIES; attempt++) {
+  for (let attempt = 1; attempt <= RECONCILE_MAX_RETRIES && !reconciled; attempt++) {
     try {
       records = await fetchAllReactions(deps.channel, components.targetMessageId, deps);
       lastErr = undefined;
-      break;
+
+      // F4: Staleness check — verify snapshot is compatible with buffered
+      // events' net change. Added emoji must be in snapshot; removed must not.
+      const opRecs = records.filter(r => r.operator_id === components.operatorOpenId);
+      if (isSnapshotCompatible(events, opRecs)) {
+        reconciled = true;
+        break;
+      }
+
+      log.warn('reaction', 'reconcile-list-stale', {
+        targetMessageId: components.targetMessageId,
+        attempt,
+        maxRetries: RECONCILE_MAX_RETRIES,
+      });
     } catch (err) {
       lastErr = err;
       log.warn('reaction', 'reconcile-list-attempt-failed', {
@@ -98,16 +114,16 @@ export async function reconcile(
         maxRetries: RECONCILE_MAX_RETRIES,
         err: err instanceof Error ? err.message : String(err),
       });
-      if (attempt < RECONCILE_MAX_RETRIES) {
-        await sleep(RECONCILE_RETRY_DELAY_MS * attempt);
-      }
+    }
+    if (attempt < RECONCILE_MAX_RETRIES) {
+      await sleep(RECONCILE_RETRY_DELAY_MS * attempt);
     }
   }
 
-  if (lastErr) {
+  if (!reconciled) {
     log.warn('reaction', 'reconcile-list-failed', {
       targetMessageId: components.targetMessageId,
-      err: lastErr instanceof Error ? lastErr.message : String(lastErr),
+      err: lastErr instanceof Error ? lastErr.message : String(lastErr ?? 'stale-after-retries'),
     });
     return { ...base, reconciliationFailed: true, noOp: false };
   }
@@ -290,6 +306,41 @@ function buildTriggerReactions(events: BufferedReactionEvent[]): ReactionTrigger
     emojiMeaningSource: e.semantics.emojiMeaningSource,
     actionTime: e.actionTime,
   }));
+}
+
+// ── F4: Snapshot compatibility check ──
+
+/**
+ * Check if the list snapshot is compatible with buffered events' net change.
+ * - For each added emojiType: must be present in snapshot (or the list is stale)
+ * - For each removed emojiType: must be absent from snapshot (or the list is stale)
+ * Returns true if the snapshot is consistent with the net effect.
+ */
+export function isSnapshotCompatible(
+  events: BufferedReactionEvent[],
+  operatorRecords: CanonicalReactionRecord[],
+): boolean {
+  const snapshotEmojis = new Set(operatorRecords.map((r) => r.emoji_type));
+
+  // Net-change detection per emojiType
+  const netChange = new Map<string, number>();
+  for (const e of events) {
+    const delta = e.action === 'added' ? 1 : -1;
+    netChange.set(e.emojiType, (netChange.get(e.emojiType) ?? 0) + delta);
+  }
+
+  for (const [emojiType, net] of netChange) {
+    if (net > 0 && !snapshotEmojis.has(emojiType)) {
+      // Added event expects this emoji in snapshot, but it's absent → stale
+      return false;
+    }
+    if (net < 0 && snapshotEmojis.has(emojiType)) {
+      // Removed event expects this emoji absent, but it's still present → stale
+      return false;
+    }
+    // net === 0: no expectation either way (added+removed pair)
+  }
+  return true;
 }
 
 // ── Net-zero detection ──

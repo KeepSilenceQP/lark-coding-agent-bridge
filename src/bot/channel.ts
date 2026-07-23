@@ -121,6 +121,7 @@ import type { ReactionLedger } from './reaction/ledger';
 import { loadStopControlLedger, stopEventFingerprint } from './reaction/control-ledger';
 import type { StopControlLedger } from './reaction/control-ledger';
 import { ReactionRunTracker } from './reaction/run-tracker';
+import { buildReactionTargetMessage } from './reaction/context-builder';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -759,17 +760,24 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     }
     if (result.noOp) return; // No state change, no reply
 
-    // Build ReactionContext from reconciliation result
+    // F1(a): Fetch real target message content via fetchQuotedContext.
+    // Handles two-level failure: route/content OK → full content;
+    // content fetch/normalize failed → available:false (Agent must not act).
+    const targetMsg = await buildReactionTargetMessage(channel, result.components.targetMessageId);
+    if (!targetMsg) {
+      // Route metadata could not be resolved — drop the event entirely.
+      log.warn('reaction', 'target-route-failed', { messageId: result.components.targetMessageId });
+      return;
+    }
+
+    // Build ReactionContext from reconciliation result with real target content
     const sem = lookupReactionSemantics(events[0]?.emojiType ?? '');
     const reactionContext = {
       operatorOpenId: result.components.operatorOpenId,
       reactionRevision: result.revision,
       triggerReactions: result.triggerReactions,
       effectiveReactionSet: result.effectiveReactionSet,
-      targetMessage: {
-        available: true as const,
-        messageId: result.components.targetMessageId,
-      },
+      targetMessage: targetMsg,
     };
 
     // Store in contextStore and enqueue via pushBarrier

@@ -43,6 +43,8 @@ export class WorkChainStore {
 
   /** scope → ordered list of historical chainIds (oldest first) for LRU eviction */
   private readonly scopeHistoricalOrder = new Map<string, string[]>();
+  /** scope → ordered list of historical outbound msgIds (oldest first) for O(1) prune */
+  private readonly scopeHistoricalOutbounds = new Map<string, string[]>();
 
   // ── Allocation ──
 
@@ -67,6 +69,10 @@ export class WorkChainStore {
     if (!chain) return;
     chain.lastAccessAt = Date.now();
     this.outboundMap.set(messageId, chainId);
+    // F13/F14: Track in scoped historical list if chain is terminal, for O(1) prune
+    if (chain.terminal) {
+      this.trackHistoricalOutbound(chain.scope, messageId);
+    }
     this.pruneHistoricalOutbounds(chain.scope);
   }
 
@@ -135,7 +141,12 @@ export class WorkChainStore {
     chain.terminal = true;
     chain.lastAccessAt = Date.now();
     this.trackHistorical(chain.scope, chainId);
+    // F13/F14: Move all outbound mappings for this chain to historical tracking
+    for (const [msgId, cId] of this.outboundMap) {
+      if (cId === chainId) this.trackHistoricalOutbound(chain.scope, msgId);
+    }
     this.pruneHistoricalChains(chain.scope);
+    this.pruneHistoricalOutbounds(chain.scope);
   }
 
   /** Mark a chain as current again (e.g. re-continued via reply). */
@@ -218,23 +229,44 @@ export class WorkChainStore {
     }
   }
 
+  private trackHistoricalOutbound(scope: string, messageId: string): void {
+    let order = this.scopeHistoricalOutbounds.get(scope);
+    if (!order) {
+      order = [];
+      this.scopeHistoricalOutbounds.set(scope, order);
+    }
+    order.push(messageId);
+  }
+
+  /**
+   * F13/F14: Bounded O(K) prune where K = historical outbounds for THIS scope
+   * (capped at MAX_OUTBOUND_MAP_PER_SCOPE + small overage). Does NOT scan
+   * the global outboundMap. Also purges TTL-expired entries.
+   */
   private pruneHistoricalOutbounds(scope: string): void {
-    // Count historical outbound mappings for this scope
-    const historicalMappings: Array<{ messageId: string; chainId: string; accessTime: number }> = [];
-    for (const [msgId, chainId] of this.outboundMap) {
-      const chain = this.chains.get(chainId);
-      if (chain && chain.scope === scope && chain.terminal) {
-        historicalMappings.push({ messageId: msgId, chainId, accessTime: chain.lastAccessAt });
+    const order = this.scopeHistoricalOutbounds.get(scope);
+    if (!order) return;
+
+    // Remove TTL-expired entries (chain is gone or expired)
+    const now = Date.now();
+    let i = 0;
+    while (i < order.length) {
+      const msgId = order[i]!;
+      const chainId = this.outboundMap.get(msgId);
+      const chain = chainId ? this.chains.get(chainId) : undefined;
+      if (!chain || (chain.terminal && now - chain.lastAccessAt > HISTORICAL_CHAIN_TTL_MS)) {
+        order.splice(i, 1);
+        this.outboundMap.delete(msgId);
+        // Don't increment i — we removed the element
+        continue;
       }
+      i++;
     }
 
-    // If over cap, evict oldest (by lastAccessAt)
-    if (historicalMappings.length > MAX_OUTBOUND_MAP_PER_SCOPE) {
-      historicalMappings.sort((a, b) => a.accessTime - b.accessTime);
-      const toEvict = historicalMappings.slice(0, historicalMappings.length - MAX_OUTBOUND_MAP_PER_SCOPE);
-      for (const { messageId } of toEvict) {
-        this.outboundMap.delete(messageId);
-      }
+    // LRU evict oldest if over cap (oldest at index 0)
+    while (order.length > MAX_OUTBOUND_MAP_PER_SCOPE) {
+      const evicted = order.shift();
+      if (evicted) this.outboundMap.delete(evicted);
     }
   }
 }
