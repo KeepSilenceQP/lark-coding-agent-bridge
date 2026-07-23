@@ -164,46 +164,208 @@ describe('F15: reconcile e2e with mock API scenarios', () => {
   });
 });
 
-// ── Real nested API response shape (live bug fix) ──
+// ── Real reconcile e2e: mock messageReaction.list with nested API shape ──
 
-  it('parses real nested im.reactions.list response: {operator:{operator_id,operator_type}, reaction_type:{emoji_type}}', () => {
-    // The real API returns NESTED operator and reaction_type, not flat fields.
-    // This test verifies the parsing layer in fetchAllReactions.
-    const apiItem = {
-      reaction_id: 'r_live_1',
-      action_time: '1784810000',
-      operator: { operator_id: 'ou_human', operator_type: 'user' },
-      reaction_type: { emoji_type: 'JIAYI' },
+describe('reconcile e2e with real nested API', () => {
+  // Real nested item matching Feishu im.reactions.list response
+  function nestedItem(overrides: Record<string, unknown> = {}) {
+    return {
+      reaction_id: overrides['reaction_id'] as string ?? 'r_test',
+      operator: {
+        operator_id: (overrides['operator_id'] as string) ?? 'ou_human',
+        operator_type: (overrides['operator_type'] as string) ?? 'user',
+      },
+      reaction_type: {
+        emoji_type: (overrides['emoji_type'] as string) ?? 'JIAYI',
+      },
     };
+  }
 
-    // Verify nested access (matching fetchAllReactions parsing)
-    expect(apiItem.operator?.operator_id).toBe('ou_human');
-    expect(apiItem.operator?.operator_type).toBe('user');
-    expect(apiItem.reaction_type?.emoji_type).toBe('JIAYI');
+  function fakeChannel(listResponses: Array<{ items: ReturnType<typeof nestedItem>[]; has_more?: boolean; page_token?: string }>) {
+    let callCount = 0;
+    return {
+      callCount: () => callCount,
+      rawClient: {
+        im: {
+          v1: {
+            messageReaction: {
+              list: async () => {
+                const resp = listResponses[callCount] ?? listResponses[listResponses.length - 1];
+                callCount++;
+                return {
+                  data: {
+                    items: resp?.items ?? [],
+                    has_more: resp?.has_more ?? false,
+                    page_token: resp?.page_token,
+                  },
+                };
+              },
+            },
+          },
+        },
+      },
+    } as unknown as import('@larksuite/channel').LarkChannel;
+  }
+
+  // ── 1) human JIAYI nested → noOp=false, revision=1, ledger persisted ──
+
+  it('human JIAYI nested record → reconcile produces noOp=false, revision=1, effectiveReactionSet populated', async () => {
+    const { ReactionLedger } = await import('../../../src/bot/reaction/ledger');
+    const { reconcile } = await import('../../../src/bot/reaction/reconciler');
+    const { makeReactionKey, parseReactionKey } = await import('../../../src/bot/reaction/types');
+    const { lookupReactionSemantics } = await import('../../../src/bot/reaction/semantics');
+
+    const ch = fakeChannel([
+      { items: [nestedItem({ reaction_id: 'r_human', operator_id: 'ou_human', emoji_type: 'JIAYI' })] },
+    ]);
+    const ledger = new ReactionLedger('/tmp/test-ledger-nested.json');
+    const key = makeReactionKey('oc_scope', 'ou_human', 'om_target');
+    const semantics = lookupReactionSemantics('JIAYI');
+
+    const result = await reconcile(key, [{
+      action: 'added', emojiType: 'JIAYI', actionTime: 1000, arrivalOrder: 0,
+      semantics,
+    }], { channel: ch, ledger, botOpenId: 'ou_bot', appId: 'cli_app' });
+
+    expect(result.noOp).toBe(false);
+    expect(result.reconciliationFailed).toBe(false);
+    expect(result.revision).toBe(1);
+    expect(result.effectiveReactionSet).toHaveLength(1);
+    expect(result.effectiveReactionSet[0]!.emojiType).toBe('JIAYI');
+    expect(result.triggerReactions).toHaveLength(1);
+    expect(result.triggerReactions[0]!.action).toBe('added');
+
+    // Ledger persisted
+    const entry = ledger.get(key);
+    expect(entry).toBeDefined();
+    expect(entry!.lastRevision).toBe(1);
+    expect(entry!.fingerprint).toBe(result.fingerprint);
   });
 
-  it('excludes self-app via nested operator_type==="app"', () => {
-    const selfItem = {
-      reaction_id: 'r_self',
-      operator: { operator_id: 'ou_bot', operator_type: 'app' },
-      reaction_type: { emoji_type: 'Typing' },
-    };
-    expect(selfItem.operator?.operator_type).toBe('app');
-    // fetchAllReactions would skip this item
+  // ── 2) app/self nested filtered, human retained ──
+
+  it('filters self-app nested record, retains human JIAYI', async () => {
+    const { ReactionLedger } = await import('../../../src/bot/reaction/ledger');
+    const { reconcile } = await import('../../../src/bot/reaction/reconciler');
+    const { makeReactionKey } = await import('../../../src/bot/reaction/types');
+    const { lookupReactionSemantics } = await import('../../../src/bot/reaction/semantics');
+
+    const ch = fakeChannel([
+      { items: [
+        nestedItem({ reaction_id: 'r_app', operator_id: 'ou_bot', operator_type: 'app', emoji_type: 'Typing' }),
+        nestedItem({ reaction_id: 'r_human', operator_id: 'ou_human', operator_type: 'user', emoji_type: 'JIAYI' }),
+      ]},
+    ]);
+    const ledger = new ReactionLedger('/tmp/test-ledger-self.json');
+    const key = makeReactionKey('oc_scope', 'ou_human', 'om_target');
+    const semantics = lookupReactionSemantics('JIAYI');
+
+    const result = await reconcile(key, [{
+      action: 'added', emojiType: 'JIAYI', actionTime: 1000, arrivalOrder: 0,
+      semantics,
+    }], { channel: ch, ledger, botOpenId: 'ou_bot', appId: 'cli_app' });
+
+    // Self-app Typing filtered out; human JIAYI retained
+    expect(result.effectiveReactionSet).toHaveLength(1);
+    expect(result.effectiveReactionSet[0]!.emojiType).toBe('JIAYI');
+    expect(result.effectiveReactionSet[0]!.emojiMeaningSource).toBe('predefined');
   });
 
-  it('duplicate added reaction ID consumed only once via reaction_id dedup', () => {
-    // Same reaction_id appears twice (duplicate delivery)
-    const records: CanonicalReactionRecord[] = [
-      { operator_type: 'user', operator_id: 'ou_human', emoji_type: 'JIAYI', reaction_id: 'r_dup' },
-      { operator_type: 'user', operator_id: 'ou_human', emoji_type: 'JIAYI', reaction_id: 'r_dup' },
-    ];
-    // Fingerprint deduplicates by reaction_id → same as single record
-    const single: CanonicalReactionRecord[] = [
-      { operator_type: 'user', operator_id: 'ou_human', emoji_type: 'JIAYI', reaction_id: 'r_dup' },
-    ];
-    expect(computeCanonicalFingerprint(records)).toBe(computeCanonicalFingerprint(single));
+  // ── 3) has_more pagination: both pages merged ──
+
+  it('has_more/page_token: two pages called and merged', async () => {
+    const { ReactionLedger } = await import('../../../src/bot/reaction/ledger');
+    const { reconcile } = await import('../../../src/bot/reaction/reconciler');
+    const { makeReactionKey } = await import('../../../src/bot/reaction/types');
+    const { lookupReactionSemantics } = await import('../../../src/bot/reaction/semantics');
+
+    const ch = fakeChannel([
+      { items: [nestedItem({ reaction_id: 'r1', operator_id: 'ou_human', emoji_type: 'JIAYI' })], has_more: true, page_token: 'tok2' },
+      { items: [nestedItem({ reaction_id: 'r2', operator_id: 'ou_human', emoji_type: 'OK' })], has_more: false },
+    ]);
+    const ledger = new ReactionLedger('/tmp/test-ledger-pages.json');
+    const key = makeReactionKey('oc_scope', 'ou_human', 'om_target');
+    const semantics = lookupReactionSemantics('JIAYI');
+
+    const result = await reconcile(key, [{
+      action: 'added', emojiType: 'JIAYI', actionTime: 1000, arrivalOrder: 0,
+      semantics,
+    }], { channel: ch, ledger, botOpenId: 'ou_bot', appId: 'cli_app' });
+
+    // Both pages fetched
+    expect((ch as unknown as { callCount: () => number }).callCount()).toBe(2);
+    // Both JIAYI and OK present in effective set
+    const emojis = result.effectiveReactionSet.map(r => r.emojiType);
+    expect(emojis).toContain('JIAYI');
+    expect(emojis).toContain('OK');
   });
+
+  // ── 4) duplicate added → first revision=1, second no-op, ledger unchanged ──
+
+  it('same event reconciled twice: first revision=1, second no-op revision unchanged', async () => {
+    const { ReactionLedger } = await import('../../../src/bot/reaction/ledger');
+    const { reconcile } = await import('../../../src/bot/reaction/reconciler');
+    const { makeReactionKey } = await import('../../../src/bot/reaction/types');
+    const { lookupReactionSemantics } = await import('../../../src/bot/reaction/semantics');
+
+    const ch = fakeChannel([
+      { items: [nestedItem({ reaction_id: 'r_dup', operator_id: 'ou_human', emoji_type: 'JIAYI' })] },
+      { items: [nestedItem({ reaction_id: 'r_dup', operator_id: 'ou_human', emoji_type: 'JIAYI' })] },
+    ]);
+    const ledger = new ReactionLedger('/tmp/test-ledger-dup.json');
+    const key = makeReactionKey('oc_scope', 'ou_human', 'om_target');
+    const semantics = lookupReactionSemantics('JIAYI');
+    const events = [{ action: 'added' as const, emojiType: 'JIAYI', actionTime: 1000, arrivalOrder: 0, semantics }];
+
+    // First reconcile
+    const r1 = await reconcile(key, events, { channel: ch, ledger, botOpenId: 'ou_bot', appId: 'cli_app' });
+    expect(r1.noOp).toBe(false);
+    expect(r1.revision).toBe(1);
+
+    // Second reconcile with same fingerprint → no-op
+    const r2 = await reconcile(key, events, { channel: ch, ledger, botOpenId: 'ou_bot', appId: 'cli_app' });
+    expect(r2.noOp).toBe(true);
+    expect(r2.revision).toBe(1); // unchanged
+    expect(r2.reconciliationFailed).toBe(false);
+
+    // Ledger not duplicated
+    const entry = ledger.get(key);
+    expect(entry!.lastRevision).toBe(1);
+  });
+
+  // ── 5) stale nested snapshot → retry exhausted, ledger unchanged ──
+
+  it('stale snapshot: retry 3 times, reconciliationFailed, ledger unchanged', async () => {
+    const { ReactionLedger } = await import('../../../src/bot/reaction/ledger');
+    const { reconcile } = await import('../../../src/bot/reaction/reconciler');
+    const { makeReactionKey } = await import('../../../src/bot/reaction/types');
+    const { lookupReactionSemantics } = await import('../../../src/bot/reaction/semantics');
+
+    // All 3 responses return empty (stale — added JIAYI never appears)
+    const ch = fakeChannel([
+      { items: [] },
+      { items: [] },
+      { items: [] },
+    ]);
+    const ledger = new ReactionLedger('/tmp/test-ledger-stale.json');
+    const key = makeReactionKey('oc_scope', 'ou_human', 'om_target');
+    const semantics = lookupReactionSemantics('JIAYI');
+
+    const result = await reconcile(key, [{
+      action: 'added', emojiType: 'JIAYI', actionTime: 1000, arrivalOrder: 0,
+      semantics,
+    }], { channel: ch, ledger, botOpenId: 'ou_bot', appId: 'cli_app' });
+
+    // Stale snapshot → 3 retries → reconciliationFailed
+    expect((ch as unknown as { callCount: () => number }).callCount()).toBe(3);
+    expect(result.reconciliationFailed).toBe(true);
+    expect(result.noOp).toBe(false);
+
+    // Ledger unchanged
+    const entry = ledger.get(key);
+    expect(entry?.lastRevision ?? 0).toBe(0);
+  });
+});
 
 // ── F17: Streaming production path — revision → interrupt → markSuperseded ──
 
