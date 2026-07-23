@@ -339,6 +339,17 @@ card/merged-forward reaction-context propagation.
 - Depends: Code Review Gate 通过。
 - Spec 覆盖：§Acceptance Criteria live oracle 全部。
 
+Progress update (2026-07-24): Unit 11 automated evidence was returned at
+`db8822b`/`4855a97` (typecheck, build, 1207 pass / 33 skip). Live verification
+is blocked before execution: both `codex` and `claude` daemons currently run
+the global `0.5.9-qp.3` package at `/opt/homebrew/bin/lark-channel-bridge`,
+whose installed source revision `ab13df7` does not contain the Reaction
+implementation. Both Bot apps have independently passed a real
+`im.reactions.list` scope probe. Await explicit authorization to back up and
+replace the shared global package with the reviewed branch build, restart both
+profiles, and retain a rollback artifact; no live case is counted as passed
+before post-restart readback.
+
 ## Acceptance Coverage Matrix（Spec 验收行 → Unit）
 
 | Spec 验收场景 | 覆盖 Unit |
