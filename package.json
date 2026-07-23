@@ -1,6 +1,6 @@
 {
   "name": "@penn.qp/lark-channel-bridge",
-  "version": "0.5.6-qp.1",
+  "version": "0.5.9-qp.1",
   "description": "Bridge Feishu/Lark messenger with local CLI coding agents",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -31,7 +31,8 @@
     "README.md",
     "README.zh.md",
     "NOTICE.md",
-    "LICENSE"
+    "LICENSE",
+    "vendor"
   ],
   "scripts": {
     "dev": "tsup --watch",
@@ -48,13 +49,16 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.4.0",
-    "@larksuite/channel": "^0.3.0",
+    "@larksuite/channel": "file:vendor/larksuite-channel-0.4.0-qp.1.tgz",
     "commander": "^12.1.0",
     "cross-spawn": "^7.0.6",
     "graceful-fs": "^4.2.11",
     "proper-lockfile": "^4.1.2",
     "qrcode-terminal": "^0.12.0"
   },
+  "bundleDependencies": [
+    "@larksuite/channel"
+  ],
   "devDependencies": {
     "@types/cross-spawn": "^6.0.6",
     "@types/graceful-fs": "^4.1.9",

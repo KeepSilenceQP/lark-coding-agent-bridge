@@ -63,7 +63,7 @@ describe('CodexAdapter process contract', () => {
     expect(run.runId).toBe('run-fresh');
     expect(await collect(run.events)).toEqual([
       { type: 'system', threadId: 'thread-fresh' },
-      { type: 'text', delta: 'hello user' },
+      { type: 'final_text', content: 'hello user' },
       { type: 'done', threadId: 'thread-fresh', terminationReason: 'normal' },
     ]);
     const record = await readRecord(fake.recordPath);
@@ -386,7 +386,7 @@ describe('CodexAdapter process contract', () => {
 
     expect(await collect(run.events)).toEqual([
       { type: 'system', threadId: 'thread-retry' },
-      { type: 'text', delta: 'after retry' },
+      { type: 'final_text', content: 'after retry' },
       { type: 'done', threadId: 'thread-retry', terminationReason: 'normal' },
     ]);
   });
@@ -531,7 +531,7 @@ describe('CodexAdapter process contract', () => {
     expect(await collect(run.events)).toEqual([
       { type: 'system', threadId: 'thread-terminal-probe' },
       { type: 'text', delta: 'final answer already persisted' },
-      { type: 'text', delta: 'persisted final answer' },
+      { type: 'final_text', content: 'persisted final answer' },
       { type: 'done', threadId: 'thread-terminal-probe', terminationReason: 'normal' },
     ]);
     await run.stop();
@@ -703,7 +703,7 @@ describe('CodexAdapter process contract', () => {
 
     expect(await collect(run.events)).toEqual([
       { type: 'system', threadId: 'thread-final-dedup' },
-      { type: 'text', delta: finalText },
+      { type: 'final_text', content: finalText },
       { type: 'done', threadId: 'thread-final-dedup', terminationReason: 'normal' },
     ]);
     await run.stop();
