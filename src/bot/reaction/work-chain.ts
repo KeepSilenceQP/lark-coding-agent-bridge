@@ -193,7 +193,7 @@ export class WorkChainStore {
     // Remove TTL-expired entries
     const now = Date.now();
     while (order.length > 0) {
-      const oldest = order[0];
+      const oldest = order[0]!;
       const chain = this.chains.get(oldest);
       if (!chain || (chain.terminal && now - chain.lastAccessAt > HISTORICAL_CHAIN_TTL_MS)) {
         order.shift();

@@ -19,6 +19,13 @@ export type FlushHandler = (scope: string, batch: NormalizedMessage[]) => void;
  * `unblock(scope)`, which arms a fresh quiet window.
  *
  * Commands should bypass this queue — they're cheap and should be responsive.
+ *
+ * ## Reaction barrier (DD11)
+ *
+ * `pushBarrier(scope, msg)` flushes any currently-pending regular messages
+ * for the scope immediately, then enqueues the barrier message as its own
+ * independent entry. This ensures Reaction turns never merge with regular
+ * messages and always flush as a separate batch.
  */
 export class PendingQueue {
   private readonly map = new Map<string, PendingEntry>();
@@ -44,6 +51,21 @@ export class PendingQueue {
       timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
     });
     return 1;
+  }
+
+  /**
+   * Push a barrier entry (e.g. Reaction turn). Flushes any pending regular
+   * messages for this scope first, then enqueues this message independently
+   * so it never merges with regular text messages.
+   */
+  pushBarrier(scope: string, msg: NormalizedMessage): void {
+    // Flush any pending regular messages immediately
+    this.flushNow(scope);
+    // Enqueue the barrier message as its own batch
+    this.map.set(scope, {
+      messages: [msg],
+      timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
+    });
   }
 
   cancel(scope: string): NormalizedMessage[] {
@@ -83,6 +105,19 @@ export class PendingQueue {
     if (!entry || entry.messages.length === 0) return;
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = this.armTimer(scope);
+  }
+
+  /** Immediately flush a scope without waiting for the quiet window. */
+  private flushNow(scope: string): void {
+    const entry = this.map.get(scope);
+    if (!entry || entry.messages.length === 0) return;
+    this.map.delete(scope);
+    if (entry.timer) clearTimeout(entry.timer);
+    try {
+      this.onFlush(scope, entry.messages);
+    } catch (err) {
+      log.fail('queue', err, { scope, batchSize: entry.messages.length });
+    }
   }
 
   private armTimer(scope: string): NodeJS.Timeout {
