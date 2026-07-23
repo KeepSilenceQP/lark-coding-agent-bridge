@@ -38,9 +38,22 @@
     },
     "selected_lineage": { "type": "string" },
     "requested_action": {
-      "enum": ["fix_local", "investigate_read_only", "ask_one_question", "explain_only", "stop"]
+      "enum": [
+        "present_plan",
+        "fix_local",
+        "bits_dry_run",
+        "submit_bits",
+        "investigate_read_only",
+        "ask_one_question",
+        "explain_only",
+        "transfer_responsibility",
+        "reuse_harness",
+        "stop"
+      ]
     },
     "degraded_reason": { "type": "string" },
-    "write_intent": { "enum": ["none", "local_patch", "derived_worktree_patch"] }
+    "write_intent": {
+      "enum": ["none", "local_patch", "derived_worktree_patch", "bits_dry_run", "formal_submit"]
+    }
   }
 }

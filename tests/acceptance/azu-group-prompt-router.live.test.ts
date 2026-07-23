@@ -1,25 +1,95 @@
 import { spawn } from 'node:child_process';
 import { chmod, copyFile, mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const RUN = process.env.RUN_AZU_GROUP_PROMPT_ACCEPTANCE === '1';
 const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const FIXTURE_ROOT = join(REPO_ROOT, 'tests', 'fixtures', 'azu-group-prompt-router');
+const SENSITIVE_ACCEPTANCE_COPIES = ['codex-home/auth.json'] as const;
 const roots: string[] = [];
+const scrubbedRetainedRoots = new Set<string>();
+
+describe('retained acceptance root credential scrub', () => {
+  it('removes copied auth while preserving synthetic acceptance evidence', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'azu-group-prompt-acceptance-scrub-'));
+    try {
+      const syntheticFiles = [
+        join(root, 'scenarios', 'fixture', 'audit.json'),
+        join(root, 'scenarios', 'fixture', 'last-message.json'),
+        join(root, 'scenarios', 'fixture', '.acceptance', 'shim.jsonl'),
+        join(root, 'scenarios', 'fixture', 'scenario.json'),
+      ];
+      await Promise.all([
+        mkdir(join(root, 'codex-home'), { recursive: true, mode: 0o700 }),
+        ...syntheticFiles.map((path) => mkdir(dirname(path), { recursive: true, mode: 0o700 })),
+      ]);
+      await Promise.all([
+        writeFile(join(root, 'codex-home', 'auth.json'), 'fixture credential: never print\n', { mode: 0o600 }),
+        ...syntheticFiles.map((path) => writeFile(path, '{}\n', { mode: 0o600 })),
+      ]);
+
+      await scrubAcceptanceRoot(root);
+
+      await expect(stat(join(root, 'codex-home', 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      for (const path of syntheticFiles) expect((await stat(path)).isFile(), path).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes the entire root when pre-retention scrub fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'azu-group-prompt-acceptance-scrub-fail-'));
+    await writeFile(join(root, 'synthetic-audit.json'), '{}\n', { mode: 0o600 });
+
+    await expect(prepareAcceptanceRootRetention(root, async () => {
+      throw new Error('injected scrub failure');
+    })).rejects.toThrow(/scrub failed; root removed/u);
+    await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('rejects a non-acceptance root before scrub and preserves its sentinel', async () => {
+    const container = await mkdtemp(join(tmpdir(), 'azu-group-prompt-acceptance-path-guard-'));
+    const unrelatedRoot = join(container, 'unrelated-temp-root');
+    const sentinel = join(unrelatedRoot, 'synthetic-sentinel.json');
+    let scrubCalled = false;
+    try {
+      await mkdir(unrelatedRoot, { recursive: true, mode: 0o700 });
+      await writeFile(sentinel, '{}\n', { mode: 0o600 });
+
+      await expect(prepareAcceptanceRootRetention(unrelatedRoot, async () => {
+        scrubCalled = true;
+        throw new Error('must not run');
+      })).rejects.toThrow(/refusing to scrub a non-acceptance temp root/u);
+      expect(scrubCalled).toBe(false);
+      expect((await stat(sentinel)).isFile()).toBe(true);
+    } finally {
+      await rm(container, { recursive: true, force: true });
+    }
+  });
+});
 
 describe.skipIf(!RUN)('阿祖群 Prompt isolated live-model acceptance', () => {
   afterEach(async () => {
-    if (process.env.AZU_KEEP_ACCEPTANCE_ROOT === '1') return;
-    await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+    const pendingRoots = roots.splice(0);
+    if (process.env.AZU_KEEP_ACCEPTANCE_ROOT === '1') {
+      for (const root of pendingRoots) {
+        if (scrubbedRetainedRoots.has(root)) continue;
+        await prepareAcceptanceRootRetention(root);
+        scrubbedRetainedRoots.add(root);
+        process.stderr.write(`scrubbed acceptance root retained after early exit: ${root}\n`);
+      }
+      return;
+    }
+    await Promise.all(pendingRoots.map((root) => rm(root, { recursive: true, force: true })));
   });
 
   it('runs the reviewed scenario matrix in a dedicated allowlisted worker environment', async () => {
     const root = await mkdtemp(join(tmpdir(), 'azu-group-prompt-acceptance-'));
     roots.push(root);
-    if (process.env.AZU_KEEP_ACCEPTANCE_ROOT === '1') process.stderr.write(`acceptance root: ${root}\n`);
+    if (process.env.AZU_KEEP_ACCEPTANCE_ROOT === '1') process.stderr.write(`acceptance root created: ${root}\n`);
     const paths = {
       home: join(root, 'home'),
       codexHome: join(root, 'codex-home'),
@@ -87,15 +157,70 @@ describe.skipIf(!RUN)('阿祖群 Prompt isolated live-model acceptance', () => {
       AZU_REAL_CODEX_BINARY: realCodex,
       AZU_REAL_GIT_BINARY: realGit,
       AZU_LIVE_MEMORYDATA_ROOT: '/Users/bytedance/repo/o/memory_workspace/MemoryData',
-      ...(process.env.AZU_ACCEPTANCE_SCENARIOS
+      ...(Object.hasOwn(process.env, 'AZU_ACCEPTANCE_SCENARIOS')
         ? { AZU_ACCEPTANCE_SCENARIOS: process.env.AZU_ACCEPTANCE_SCENARIOS }
         : {}),
     };
 
     const result = await run(process.execPath, [vitest, 'run', 'tests/acceptance/azu-group-prompt-router.worker.test.ts'], env);
+    const retainRoot = process.env.AZU_KEEP_ACCEPTANCE_ROOT === '1' || result.code !== 0;
+    if (retainRoot) {
+      await prepareAcceptanceRootRetention(root);
+      scrubbedRetainedRoots.add(root);
+      process.stderr.write(`scrubbed acceptance root retained: ${root}\n`);
+    }
+    if (result.code !== 0 && process.env.AZU_KEEP_ACCEPTANCE_ROOT !== '1') {
+      const index = roots.indexOf(root);
+      if (index >= 0) roots.splice(index, 1);
+    }
     expect(result.code, result.output).toBe(0);
   }, 20 * 60_000);
 });
+
+async function scrubAcceptanceRoot(root: string): Promise<void> {
+  assertAcceptanceTempRoot(root);
+  for (const relative of SENSITIVE_ACCEPTANCE_COPIES) {
+    const path = join(root, relative);
+    await rm(path, { force: true });
+    try {
+      await stat(path);
+      throw new Error('sensitive acceptance copy still exists after scrub');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+async function prepareAcceptanceRootRetention(
+  root: string,
+  scrub: (root: string) => Promise<void> = scrubAcceptanceRoot,
+): Promise<void> {
+  assertAcceptanceTempRoot(root);
+  try {
+    await scrub(root);
+  } catch {
+    try {
+      await rm(root, { recursive: true, force: true });
+      await stat(root);
+      throw new Error('fail-closed cleanup left acceptance root behind');
+    } catch (cleanupError) {
+      if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new Error('acceptance retention scrub failed; fail-closed root cleanup also failed');
+      }
+    }
+    throw new Error('acceptance retention scrub failed; root removed');
+  }
+}
+
+function assertAcceptanceTempRoot(root: string): void {
+  const resolvedRoot = resolve(root);
+  if (
+    dirname(resolvedRoot) !== resolve(tmpdir())
+    || !basename(resolvedRoot).startsWith('azu-group-prompt-acceptance-')
+  ) {
+    throw new Error('refusing to scrub a non-acceptance temp root');
+  }
+}
 
 async function resolveCommand(command: string): Promise<string> {
   const result = await run('/usr/bin/which', [command], process.env);
