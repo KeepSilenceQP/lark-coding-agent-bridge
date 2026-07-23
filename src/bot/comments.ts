@@ -450,9 +450,6 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
             case 'text':
               answer += e.delta;
               break;
-            case 'final_text':
-              answer = e.content;
-              break;
             case 'tool_use':
             case 'tool_result':
               answer = '';
