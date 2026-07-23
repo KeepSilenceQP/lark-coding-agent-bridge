@@ -563,27 +563,22 @@ describe('decideReactionFlush — production flush decision engine', () => {
     expect(d.kind).not.toBe('enqueue-agent');
   });
 
-  it('non-empty effective set + context → enqueue-agent (replacement turn)', () => {
-    const ctx = { operatorOpenId: 'ou_u', reactionRevision: 2, triggerReactions: [], effectiveReactionSet: [{ emojiType: 'OK' }], targetMessage: { available: true, messageId: 'om_t' } };
+  it('non-empty effective set → enqueue-agent (replacement turn)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
       effectiveReactionSetLength: 1, hasMatchingActiveRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
-      reactionContext: ctx,
     });
     expect(d.kind).toBe('enqueue-agent');
-    expect((d as { reactionContext: unknown }).reactionContext).toBe(ctx);
   });
 
-  it('non-empty set but no reactionContext → drop (no context, safe)', () => {
+  it('non-empty set with hasMatchingActiveRun → enqueue-agent (supersede old run, start replacement)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 1, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 1, hasMatchingActiveRun: true,
       targetMessageId: 'om_t', scope: 'oc_s',
-      reactionContext: undefined,
     });
-    expect(d.kind).toBe('drop');
-    expect((d as { reason: string }).reason).toBe('no-context');
+    expect(d.kind).toBe('enqueue-agent');
   });
 
   // ── Different key must NOT trigger interrupt ──
@@ -726,7 +721,6 @@ describe('decideReactionFlush production caller verification', () => {
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
       effectiveReactionSetLength: 1, hasMatchingActiveRun: false,
       targetMessageId: 'om_a', scope: 'oc_s',
-      reactionContext: { operatorOpenId: 'ou_a' },
     });
     expect(dA.kind).toBe('enqueue-agent');
     // Key A's turn should NOT be cancelled by key B's bridge-reply

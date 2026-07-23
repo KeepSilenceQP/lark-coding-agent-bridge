@@ -166,7 +166,7 @@ function markTerminalLifecycle(workChainId: string): void {
 export type ReactionFlushDecision =
   | { kind: 'drop'; reason: string }
   | { kind: 'bridge-reply'; message: string; targetMessageId: string; interrupt?: { scope: string } }
-  | { kind: 'enqueue-agent'; targetMessageId: string; reactionContext: unknown };
+  | { kind: 'enqueue-agent' };
 
 export function decideReactionFlush(params: {
   reconciliationFailed: boolean;
@@ -176,7 +176,6 @@ export function decideReactionFlush(params: {
   hasMatchingActiveRun: boolean;
   targetMessageId: string;
   scope: string;
-  reactionContext?: unknown;
 }): ReactionFlushDecision {
   if (params.reconciliationFailed) {
     return { kind: 'bridge-reply', message: '本次 Reaction 暂时无法确认，请重试。', targetMessageId: params.targetMessageId };
@@ -195,10 +194,8 @@ export function decideReactionFlush(params: {
       ...(params.hasMatchingActiveRun ? { interrupt: { scope: params.scope } } : {}),
     };
   }
-  if (params.reactionContext) {
-    return { kind: 'enqueue-agent', targetMessageId: params.targetMessageId, reactionContext: params.reactionContext };
-  }
-  return { kind: 'drop', reason: 'no-context' };
+  // Non-empty effective set → enqueue Agent turn
+  return { kind: 'enqueue-agent' };
 }
 
 const DEBOUNCE_MS = 600;
