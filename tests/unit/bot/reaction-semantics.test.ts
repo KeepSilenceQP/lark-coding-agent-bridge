@@ -41,6 +41,7 @@ describe('reaction semantics table', () => {
   ])('maps %s → approve_continue (case-sensitive)', (emojiType, semanticKey) => {
     const entry = SEMANTICS_TABLE[emojiType];
     expect(entry, `missing entry for ${emojiType}`).toBeDefined();
+    if (!entry) return;
     expect(entry.semanticKey).toBe(semanticKey);
     expect(entry.emojiMeaningSource).toBe('predefined');
     expect(entry.emojiType).toBe(emojiType);
@@ -56,6 +57,7 @@ describe('reaction semantics table', () => {
   ])('maps %s → explain_more (case-sensitive)', (emojiType, semanticKey) => {
     const entry = SEMANTICS_TABLE[emojiType];
     expect(entry, `missing entry for ${emojiType}`).toBeDefined();
+    if (!entry) return;
     expect(entry.semanticKey).toBe(semanticKey);
     expect(entry.emojiMeaningSource).toBe('predefined');
   });
@@ -65,6 +67,7 @@ describe('reaction semantics table', () => {
   it('maps DONE → user_step_completed', () => {
     const entry = SEMANTICS_TABLE['DONE'];
     expect(entry).toBeDefined();
+    if (!entry) return;
     expect(entry.semanticKey).toBe('user_step_completed');
     expect(entry.emojiMeaningSource).toBe('predefined');
   });
@@ -78,6 +81,7 @@ describe('reaction semantics table', () => {
   ])('maps %s → stop_current_work (case-sensitive)', (emojiType, semanticKey) => {
     const entry = SEMANTICS_TABLE[emojiType];
     expect(entry, `missing entry for ${emojiType}`).toBeDefined();
+    if (!entry) return;
     expect(entry.semanticKey).toBe(semanticKey);
     expect(entry.emojiMeaningSource).toBe('predefined');
   });

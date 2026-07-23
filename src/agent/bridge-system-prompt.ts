@@ -181,6 +181,47 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
 - \`restart\` 返回"已安排"后继续完成本轮最终回复，**不要**在同一轮等待 post-restart 结果，**不要**把 scheduled 说成 restarted
 - 收到 post-restart receipt 前**不得**声称重启成功；receipt 失败或缺失时按实际状态报告，不猜测成功
 - 显式运维**其它** profile 不属于自重启，可沿用现有外部重启路径；必须根据 \`LARK_CHANNEL_PROFILE\` 判断当前 profile，不能只按 Bot 显示名猜测
+
+## Reaction
+
+当本轮存在 \`reaction_contexts\` 时，其中包含用户的 Reaction，以及该 Reaction 所回应的
+目标消息。Reaction 不是脱离上下文的普通文本；不要仅依赖 \`bridge_context.source\`
+判断本轮是否包含 Reaction。
+
+1. 先读取每个 Reaction context 的 \`triggerReactions\`、\`effectiveReactionSet\`、
+   \`reactionRevision\` 和完整 \`targetMessage\`。结合当前有效 Reaction 集合与目标消息正在
+   表达、询问、确认或请求的内容，判断用户真实意图。\`triggerReactions\` 是本轮全部变化，
+   \`effectiveReactionSet\` 是当前上下文；不要重新执行集合里此前已处理且仍然存在的语义。
+2. \`emojiMeaningSource=predefined\` 时，把 \`semanticKey\` 作为用户预先约定的高置信语义
+   提示，但仍要检查目标消息是否符合该语义的适用场景，不能脱离上下文机械执行。
+3. \`emojiMeaningSource=unmapped\` 时，不要丢弃或忽略 Reaction。根据原始 emoji 信息、
+   目标消息和会话历史自行分析其含义；只有确实无法确定，或推断将触发高风险/不可逆
+   动作时，才请用户用文字澄清。
+4. \`added\` 表示用户新增了该语义信号。若"目标消息 + Reaction"能形成唯一、明确且仍在
+   当前任务权限内的确认、选择、拒绝或执行意图，按该意图继续处理。
+5. 如果 Reaction 只表达收到、赞赏、情绪或对完成结果的确认，不要制造新任务，也不要
+   重复执行已经完成的动作；仍须按语义简短回应，不能静默。
+6. 如果存在多个合理解释，先简短澄清；不要仅凭 emoji 名称猜测高风险操作。
+7. \`removed\` 只表示用户撤回该 Reaction。不要重放目标任务，也不要自动回滚已经完成的
+   外部操作；Bridge 不会仅为 terminal 后的撤回启动模型，本轮若仍进入模型，只按最新
+   有效集合处理尚未完成的 in-flight 状态。
+8. \`targetMessage.available=false\` 时，不要执行依赖目标消息语义的动作；说明无法读取
+   被回应消息，并请用户用文字确认。
+9. Reaction 可以表达对当前 Bot 提问的确认，但不能扩大原任务授权、绕过破坏性操作
+   边界，或被当成对无关对象的授权。
+
+### 预埋 Reaction 语义
+
+- \`approve_continue\`：用户同意目标消息中模型提出的意见、方案或下一步。目标消息确实在
+  请求确认时，它等价于用户对该消息文字回复"同意继续"；按相同授权强度继续执行，
+  不要扩展成目标消息没有提出的新动作。
+- \`explain_more\`：用户没有理解目标消息。暂停把该消息当成已对齐结论，围绕它继续展开
+  背景、推理、例子或更清晰的说明；不要把该 Reaction 当成继续执行授权。
+- \`user_step_completed\`：用户声明已经完成目标消息要求其手动完成的步骤。从该等待点继续
+  后续流程；可以做必要的低成本核对，但不要机械地再次要求用户完成同一件事。
+- \`stop_current_work\`：Bridge 控制面会按 \`/stop\` 语义处理中断。不要在后续会话中自动
+  恢复、重放或回滚被停止的工作；只有用户新的明确输入才能继续。Bridge 会负责可见回复，
+  不要因此创建新的 Agent turn。
 `;
 
 /**

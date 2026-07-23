@@ -165,3 +165,126 @@ describe('prefixBridgeSystemPrompt', () => {
     expect(prompt.endsWith('hello world')).toBe(true);
   });
 });
+
+// ── Unit 5: Reaction section (RED first — will fail until prompt is updated) ──
+
+describe('BRIDGE_SYSTEM_PROMPT Reaction section', () => {
+  it('contains the ## Reaction heading', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('## Reaction');
+  });
+
+  it('documents reaction_contexts as the authoritative source, not bridge_context.source', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('reaction_contexts');
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/不.*依赖.*bridge_context\.source|bridge_context\.source.*判断/);
+  });
+
+  it('instructs reading triggerReactions, effectiveReactionSet, reactionRevision, and targetMessage first', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('triggerReactions');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('effectiveReactionSet');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('reactionRevision');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('targetMessage');
+  });
+
+  it('tells agent not to re-execute previously-handled semanticKeys from effectiveReactionSet', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/不要.*重新执行|不.*重放|此前已处理/);
+  });
+
+  it('documents predefined emojiMeaningSource with semanticKey as high-confidence hint', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('emojiMeaningSource');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('predefined');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('semanticKey');
+  });
+
+  it('requires checking target message fit even for predefined semanticKey', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/结合.*目标消息|检查.*目标消息.*适用|脱离上下文/);
+  });
+
+  it('instructs not to discard or ignore unmapped reactions', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('unmapped');
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/不要丢弃|不要.*忽略|不.*丢弃/);
+  });
+
+  it('requires clarification only when unmapped meaning is ambiguous AND high-risk', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/确实无法确定.*高风险|无法确定.*不可逆/);
+  });
+
+  it('treats added as a new semantic signal to combine with target message', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('added');
+  });
+
+  it('warns not to create new tasks for acknowledgment/appreciation reactions', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/赞赏|情绪|收到.*确认|不要.*制造.*新任务/);
+  });
+
+  it('requires brief clarification for ambiguous reactions, not guessing', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/多个.*合理解释.*澄清|多个.*可能.*澄清/);
+  });
+
+  it('documents removed as withdrawal only — no replay, no rollback', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('removed');
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/撤回|不.*重放|不.*回滚/);
+  });
+
+  it('requires agent to explain and not act when targetMessage.available=false', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('available');
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/无法读取|不.*执行.*依赖/);
+  });
+
+  it('states reactions cannot expand original task authorization or bypass destructive boundaries', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/不能.*扩大.*授权|破坏性.*操作.*边界|绕过.*边界/);
+  });
+
+  // ── Predefined semantics subsection ──
+
+  it('documents approve_continue semanticKey', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('approve_continue');
+  });
+
+  it('documents explain_more semanticKey', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('explain_more');
+  });
+
+  it('documents user_step_completed semanticKey', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('user_step_completed');
+  });
+
+  it('documents stop_current_work as Bridge control-plane handled', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('stop_current_work');
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/Bridge.*控制面|控制面.*处理|不.*创建.*新的.*Agent.*turn/);
+  });
+
+  it('states that stop_current_work removal does not auto-restore work', () => {
+    // "不要在后续会话中自动恢复、重放或回滚被停止的工作"
+    expect(BRIDGE_SYSTEM_PROMPT).toMatch(/不要在后续会话中自动[\s\S]*恢复、重放或回滚被停止的工作/);
+  });
+
+  // ── Injection path tests (Claude + Codex both receive the rules) ──
+
+  it('is injected through composeBridgeSystemPrompt (shared constant)', () => {
+    const prompt = composeBridgeSystemPrompt({ openId: 'ou_test', name: 'Test' });
+    expect(prompt).toContain('## Reaction');
+    expect(prompt).toContain('approve_continue');
+    expect(prompt).toContain('stop_current_work');
+  });
+
+  it('is injected through buildBridgeSystemPrompt (no group addendum)', () => {
+    const prompt = buildBridgeSystemPrompt({ openId: 'ou_test', name: 'Test' });
+    expect(prompt).toContain('## Reaction');
+  });
+
+  it('is injected through prefixBridgeSystemPrompt', () => {
+    const prompt = prefixBridgeSystemPrompt('test', { openId: 'ou_test' });
+    expect(prompt).toContain('## Reaction');
+  });
+
+  it('Reaction section lives in shared prompt, not group-level addendum', () => {
+    const prompt = composeBridgeSystemPrompt(
+      { openId: 'ou_test', name: 'Test' },
+      'some group addendum',
+    );
+    const reactionIdx = prompt.indexOf('## Reaction');
+    const groupIdx = prompt.indexOf('<group_system_prompt>');
+    // Reaction section should come before group-level addendum
+    expect(reactionIdx).toBeLessThan(groupIdx);
+  });
+});
