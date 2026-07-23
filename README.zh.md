@@ -9,6 +9,21 @@
 
 [English README](./README.md)
 
+## 本 Fork 维护的增强能力
+
+这个 Fork 不只是重新打包上游代码。面向多 Bot 项目协作和长时间运行的
+飞书 / Lark 编程任务，我们新增并持续维护了以下能力：
+
+| 领域 | 本 Fork 新增的能力 | 解决的问题 |
+|---|---|---|
+| **多 Bot 项目启动** | `/botAdmin` 和 `/project bootstrap` 可以发现并邀请所需的 Bridge Bot、绑定项目工作目录，并在项目群中派发启动命令。 | 过去启动多 Bot 项目需要人工逐个拉 Bot、改权限、切目录和发命令，没有一个经过校验的统一入口。 |
+| **原生 Bot-to-Bot 交接** | `lark-channel-bridge at-bot` 会用当前群实时 Bot 列表校验目标，并以当前 profile 的 Bot 身份发送飞书原生结构化 mention。 | 纯文本 `@名字`、手拼 mention JSON、过期的 `open_id` 或选错回传对象，都可能让交接静默丢失，但 Agent 仍误以为已经通知成功。 |
+| **按群定制行为** | 支持按群加载 operator prompt，并提供 `mention-only`、`owner-default`、`all-messages`、按群 `owner-allowlist` 四种响应模式，不需要为了免 @ 而向所有群成员开放 Bot。 | 一套全局 Prompt 和全局 @ 策略无法满足不同项目群的角色分工；Bot 可能在 owner 希望它响应时保持沉默，或响应范围过大。 |
+| **结构化 Agent 上下文** | Bridge 会注入消息、发送者/Bot 身份、引用消息、交互卡片和回传路由信息，并在每次 Codex run 中用 developer instructions 传递 Bridge 规则。 | 把协议规则混在普通用户文本里更容易被忽略或误解，尤其是在引用回复、卡片、Bot 发送者和 Codex 恢复会话场景。 |
+| **可靠的过程消息与最终回复** | COT/过程输出和最终答案彻底分开，卡片与纯文本模式都单独发送最终回复；同时补齐话题路由、CardKit 流过期、陈旧回读、Codex 空终态/持久化终态和 Markdown 渲染失败的恢复路径。 | 长任务可能留下陈旧卡片或运行中 footer、重复旧内容、误触发 fallback、回复跑出话题，或者本地已经结束却没有把最终答案送到飞书。 |
+| **延后自重启与结果回执** | 同 profile 自重启会等待当前回复和活跃任务排空，再由 detached helper 重启，并向原群、原话题或原私聊发送且只发送一条成功/失败回执。 | Bot 自部署时可能在回复中途把自己终止，重启后用户也无法确定新进程是否真正连接成功。 |
+| **维护版 Channel 与可安装产物** | Release 内置维护版 `@larksuite/channel` `0.4.0-qp.1`，修复 CardKit stream rollover，并以自包含的 `@penn.qp/lark-channel-bridge` npm 包和对应 GitHub Release 发布。 | rollover 可能先把前一张卡完整重发一遍再创建下一张卡，形成重复消息；file dependency 也可能在发布产物中丢失。 |
+
 关于能实现的效果，详情可以阅读[飞书文档](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
 ## 主要功能
@@ -136,6 +151,7 @@ lark-channel-bridge status --profile codex
 ```text
 lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
 lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
+lark-channel-bridge at-bot --chat-id <chat_id> --bot-id <open_id> --message <text>
 lark-channel-bridge ps
 lark-channel-bridge kill <id|#>
 lark-channel-bridge --help
@@ -175,7 +191,11 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/invite admin @某人` | 添加访问控制管理员 |
 | `/invite group` | 允许当前群使用 bot |
 | `/invite all group` | 允许 bot 所在的所有群使用 |
+| `/invite owner-default group` | 允许当前 Bot 在本群响应 owner 未 @ 任何账号的消息 |
 | `/remove user @某人`, `/remove admin @某人`, `/remove group` | 移除访问控制条目 |
+| `/remove owner-default group` | 从 owner 无 @ 响应名单中移除当前群 |
+| `/botAdmin add <Bot>`, `/botAdmin remove <Bot>`, `/botAdmin list` | 管理可以执行群运维命令的 Bot |
+| `/project bootstrap <workspace> <implementer>` | 发现/邀请项目 Bot、绑定工作目录并启动项目群协作 |
 | `/stop` | 停止当前 run，也可点卡片停止按钮 |
 | `/timeout [N\|off\|default]` | 设置或清除当前会话的 idle watchdog |
 | `/ps` | 列出本机 bridge 进程 |

@@ -9,6 +9,22 @@ A lightweight bot that bridges Feishu / Lark messenger with your local Claude Co
 
 [中文 README](./README.zh.md)
 
+## Enhancements maintained in this fork
+
+This fork is more than a repackaged upstream build. It adds and maintains the
+following capabilities for multi-bot project work and long-running Feishu /
+Lark coding sessions:
+
+| Area | What this fork adds | Problem it solves |
+|---|---|---|
+| **Multi-bot project bootstrap** | `/botAdmin` and `/project bootstrap` discover and invite the required Bridge bots, bind the project workspace, and dispatch the startup commands for a project group. | Starting a multi-bot project previously required several manual invitations, permission changes, and working-directory commands, with no single validated entry point. |
+| **Native bot-to-bot handoff** | `lark-channel-bridge at-bot` validates the target against the current group's live bot list and sends a native structured mention with the current profile's bot identity. | Plain-text `@name`, hand-built mention JSON, stale `open_id` values, and replying to the wrong bot could silently lose a handoff while the agent still claimed it had notified the target. |
+| **Per-group behavior** | Group-scoped operator prompts and four response modes (`mention-only`, `owner-default`, `all-messages`, and per-chat `owner-allowlist`) let each bot behave differently by group without opening access to everyone. | One global prompt and one global mention policy could not serve project groups with different roles; bots either stayed silent when the owner expected a reply or responded too broadly. |
+| **Structured agent context** | The Bridge injects message, sender/bot identity, quote, card, and return-route context, and sends Bridge rules to Codex as developer instructions on every run. | Protocol rules mixed into ordinary user text were easier to ignore or misinterpret, especially for quoted messages, interactive cards, bot senders, and resumed Codex sessions. |
+| **Reliable progress and final replies** | COT/progress output is separated from the dedicated final reply in both card and plain-text modes. Topic routing, expired CardKit streams, stale readback, empty or persisted Codex terminal turns, and markdown-render failures all have targeted recovery paths. | Long tasks could leave a stale card/footer, repeat earlier content, fall back unnecessarily, reply outside the topic, or finish locally without delivering the final answer. |
+| **Deferred self-restart with receipt** | A same-profile restart waits for the current reply and active runs to drain, restarts through a detached helper, and sends exactly one success or failure receipt back to the original chat or topic. | Self-deployment could terminate the bot mid-reply, and users had no reliable evidence that the replacement process connected successfully. |
+| **Maintained Channel and release artifact** | Releases bundle the maintained `@larksuite/channel` `0.4.0-qp.1`, which fixes CardKit stream rollover, and are published as a self-contained `@penn.qp/lark-channel-bridge` package plus a matching GitHub Release. | A rollover could resend the full earlier card before opening the next card, producing repeated messages; file-based Channel dependencies could also be missing from a published package. |
+
 For a product walkthrough, see the [Feishu document](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e).
 
 ## What it does
@@ -136,6 +152,7 @@ External restarts of **other** profiles (and standard `start` / `stop` operation
 ```text
 lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
 lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
+lark-channel-bridge at-bot --chat-id <chat_id> --bot-id <open_id> --message <text>
 lark-channel-bridge ps
 lark-channel-bridge kill <id|#>
 lark-channel-bridge --help
@@ -175,7 +192,11 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/invite admin @name` | Add an access-control admin |
 | `/invite group` | Allow the current group to use the bot |
 | `/invite all group` | Allow all groups the bot has joined |
+| `/invite owner-default group` | Let this bot answer its owner without an @ mention in the current group |
 | `/remove user @name`, `/remove admin @name`, `/remove group` | Remove access entries |
+| `/remove owner-default group` | Remove the current group from the owner no-mention allowlist |
+| `/botAdmin add <bot>`, `/botAdmin remove <bot>`, `/botAdmin list` | Manage bots allowed to run operational group commands |
+| `/project bootstrap <workspace> <implementer>` | Discover/invite the project bots, bind the workspace, and start project-group collaboration |
 | `/stop` | Stop the current run, including the card stop button |
 | `/timeout [N\|off\|default]` | Set or clear the current session idle watchdog |
 | `/ps` | List local bridge processes |
