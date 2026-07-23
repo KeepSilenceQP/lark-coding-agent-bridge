@@ -10,6 +10,12 @@ export interface StopControlEntry {
   fingerprint: string;
   /** 'added' or 'removed' */
   action: 'added' | 'removed';
+  /** Operator that performed the reaction. */
+  operatorOpenId: string;
+  /** Target message the reaction was on. */
+  targetMessageId: string;
+  /** Emoji type of the stop reaction. */
+  emojiType: string;
   /** When the event was consumed. */
   consumedAt: number;
   /** For 'added': the result reply that was sent. */
@@ -32,12 +38,13 @@ export function resolveControlLedgerPath(profileDir: string): string {
 
 /**
  * Generate a stable dedup fingerprint from event fields.
- * Prefer `evt.raw.header.event_id` if available, otherwise use
- * normalized fields + actionTime.
+ * Prefer a stable event_id from `evt.raw.header.event_id` if available,
+ * otherwise use normalized fields + actionTime.
  */
 export function stopEventFingerprint(
   operatorOpenId: string,
   targetMessageId: string,
+  emojiType: string,
   action: 'added' | 'removed',
   actionTime?: number,
   stableId?: string,
@@ -46,8 +53,9 @@ export function stopEventFingerprint(
   if (stableId) {
     hash.update(`id:${stableId}`);
   } else {
+    // Canonical composite key — deterministic field order, \x1f separator.
     hash.update(
-      `fields:${operatorOpenId}\x1f${targetMessageId}\x1f${action}\x1f${actionTime ?? 0}`,
+      `fields:${operatorOpenId}\x1f${targetMessageId}\x1f${emojiType}\x1f${action}\x1f${actionTime ?? 0}`,
     );
   }
   return hash.digest('hex');
@@ -81,54 +89,44 @@ export class StopControlLedger {
     this.doc = initial ? structuredClone(initial) : { schemaVersion: 1, entries: {} };
   }
 
-  /**
-   * Check if an event fingerprint has already been consumed.
-   */
+  /** Check if an event fingerprint has already been consumed. */
   isConsumed(fingerprint: string): boolean {
     return fingerprint in this.doc.entries;
   }
 
   /**
-   * Check if a stop-added event exists for the given operator+target+emoji combo.
-   * Used by the 'removed' path to find matching added entries.
-   */
-  findAddedEntry(
-    operatorOpenId: string,
-    targetMessageId: string,
-  ): StopControlEntry | undefined {
-    // Search entries for a matching 'added' entry
-    for (const entry of Object.values(this.doc.entries)) {
-      if (entry.action !== 'added') continue;
-      // We can't fully reconstruct the fingerprint without the original fields,
-      // so we check all added entries. In practice, this is called with the
-      // removed event's fingerprint, and we use fingerprintForOperatorTarget.
-    }
-    return undefined;
-  }
-
-  /**
-   * Find the stop-added entry matching a removed event's operator+target.
+   * Find a matching stop-added entry for the given operator + target + emoji.
+   * Used by the 'removed' path: removed only replies after matching a
+   * previously-consumed added entry (F6/F7).
    */
   findMatchingAdded(
     operatorOpenId: string,
     targetMessageId: string,
+    emojiType: string,
   ): { fingerprint: string; entry: StopControlEntry } | undefined {
     for (const [fp, entry] of Object.entries(this.doc.entries)) {
-      if (entry.action !== 'added') continue;
-      // The fingerprint embeds operator+target. We can't reverse it,
-      // so we store the operator+target in the entry.
-      // For simplicity, we check all added entries.
-      // In practice, we match via the removed event's resolved context.
+      if (
+        entry.action === 'added' &&
+        entry.operatorOpenId === operatorOpenId &&
+        entry.targetMessageId === targetMessageId &&
+        entry.emojiType === emojiType
+      ) {
+        return { fingerprint: fp, entry };
+      }
     }
     return undefined;
   }
 
   /**
    * Record a consumed stop event. Persists atomically to disk.
+   * Callers MUST check isConsumed() first — duplicate events are no-ops.
    */
   async record(
     fingerprint: string,
     action: 'added' | 'removed',
+    operatorOpenId: string,
+    targetMessageId: string,
+    emojiType: string,
     replyKind?: StopControlEntry['replyKind'],
   ): Promise<StopControlEntry> {
     const transaction = this.queue.then(async () => {
@@ -139,9 +137,16 @@ export class StopControlLedger {
         disk = structuredClone(this.doc);
       }
 
+      if (fingerprint in disk.entries) {
+        return disk.entries[fingerprint]!;
+      }
+
       const entry: StopControlEntry = {
         fingerprint,
         action,
+        operatorOpenId,
+        targetMessageId,
+        emojiType,
         consumedAt: Date.now(),
         replyKind,
       };
@@ -155,6 +160,11 @@ export class StopControlLedger {
       () => undefined,
     );
     return transaction;
+  }
+
+  /** Return a shallow snapshot of all consumed entries. */
+  allEntries(): StopControlEntry[] {
+    return Object.values(this.doc.entries);
   }
 
   private async persist(doc: StopControlLedgerDocument): Promise<void> {

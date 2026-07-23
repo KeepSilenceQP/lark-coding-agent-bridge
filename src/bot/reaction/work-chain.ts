@@ -98,6 +98,10 @@ export class WorkChainStore {
   /**
    * Resolve via outbound message if known, otherwise allocate a new chain.
    * Used when a reply or Reaction targets a Bot message — inherit the chain.
+   *
+   * F10: When inheriting a historical (terminal) chain, calls markCurrent()
+   * so the chain becomes current again and can be stopped by a subsequent
+   * stop reaction targeting the confirmation/continuation message.
    */
   resolveOrAllocate(scope: string, replyToMessageId?: string): string {
     if (replyToMessageId) {
@@ -106,6 +110,10 @@ export class WorkChainStore {
         const chain = this.chains.get(existing);
         if (chain) {
           chain.lastAccessAt = Date.now();
+          // F10: re-continue a historical chain
+          if (chain.terminal) {
+            this.markCurrent(existing);
+          }
           return existing;
         }
       }

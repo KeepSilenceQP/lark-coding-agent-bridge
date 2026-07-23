@@ -116,19 +116,30 @@ import type { CanonicalReactionRecord } from './types';
 /**
  * Compute a canonical fingerprint from a set of reaction records.
  *
- * 1. Dedup by reaction_id (if present)
- * 2. Normalize to { operator_type, operator_id, emoji_type }
- * 3. Deterministic sort by operator_id then emoji_type (case-sensitive)
- * 4. SHA-256 hash of the sorted, stable JSON representation
+ * 1. Dedup by reaction_id (if present), then by stable composite key
+ *    (operator_type + operator_id + emoji_type) as secondary dedup (F8/F9).
+ * 2. Normalize to { operator_type, operator_id, emoji_type }.
+ * 3. Deterministic sort by operator_id then emoji_type (case-sensitive).
+ * 4. Serialize with explicit sorted-field order (cross-platform deterministic
+ *    byte order — no reliance on JSON.stringify key insertion order).
+ * 5. SHA-256 hash of the serialized representation.
  */
 export function computeCanonicalFingerprint(records: CanonicalReactionRecord[]): string {
-  // Dedup by reaction_id when available
-  const seen = new Set<string>();
+  // Primary dedup: by reaction_id when available
+  const seenIds = new Set<string>();
+  // Secondary dedup (F8/F9): by stable composite key to prevent pseudo-revision
+  // when the same logical record appears with different reaction_ids across pages.
+  const seenComposite = new Set<string>();
   const deduped: CanonicalReactionRecord[] = [];
+
   for (const r of records) {
-    const dedupKey = r.reaction_id ?? `${r.operator_type}\x1f${r.operator_id}\x1f${r.emoji_type}`;
-    if (seen.has(dedupKey)) continue;
-    seen.add(dedupKey);
+    if (r.reaction_id) {
+      if (seenIds.has(r.reaction_id)) continue;
+      seenIds.add(r.reaction_id);
+    }
+    const compositeKey = `${r.operator_type}\x1f${r.operator_id}\x1f${r.emoji_type}`;
+    if (seenComposite.has(compositeKey)) continue;
+    seenComposite.add(compositeKey);
     deduped.push(r);
   }
 
@@ -141,8 +152,13 @@ export function computeCanonicalFingerprint(records: CanonicalReactionRecord[]):
       return a.emoji_type.localeCompare(b.emoji_type);
     });
 
+  // Cross-platform deterministic serialization (F8): explicit field order
+  // using a format that is guaranteed to produce identical bytes on any
+  // platform / endianness.
   const hash = createHash('sha256');
-  hash.update(JSON.stringify(sorted));
+  for (const item of sorted) {
+    hash.update(`ot:${item.operator_type}\x1foi:${item.operator_id}\x1fet:${item.emoji_type}\x1f`);
+  }
   return hash.digest('hex');
 }
 

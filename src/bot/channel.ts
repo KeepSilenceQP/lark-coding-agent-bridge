@@ -109,6 +109,9 @@ import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
+import { handleReactionEvent } from './reaction/pipeline';
+import { isStopEmoji } from './reaction/semantics';
+import { WorkChainStore } from './reaction/work-chain';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -683,6 +686,9 @@ export interface StartChannelDeps {
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
   const { cfg, agent, sessions, sessionCatalog, workspaces, controls } = deps;
   const activeRuns = new ActiveRuns();
+  // WorkChainStore: maps message→workChainId for stop reaction validation (DD15).
+  // In-memory store — restart fail-closed (all historical associations lost).
+  const workChainStore = new WorkChainStore();
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
   const chatModeCache = new ChatModeCache();
@@ -934,69 +940,94 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     reaction: async (evt) => {
       await withTrace({ chatId: evt.messageId }, async () => {
         try {
-          // Self-operator guard (Spec §Agent Input Contract 2, DD2):
-          // Silently drop reactions added by THIS bot/app itself, including
-          // Typing work-state reactions, before any side effect.
-          const raw = evt.raw as Record<string, unknown> | undefined;
-          if (
-            evt.operator.openId === channel.botIdentity?.openId ||
-            evt.operator.openId === cfg.accounts.app.id ||
-            raw?.operator_type === 'app'
-          ) {
+          // Delegate to pipeline (F1): self-operator → route → own-message →
+          // permission → stop control / enqueue.
+          const pipelineResult = await handleReactionEvent(evt, {
+            channel,
+            botOpenId: channel.botIdentity?.openId,
+            appId: cfg.accounts.app.id,
+          }, {
+            checkAccess: (chatType, chatId, senderId) => {
+              if (chatType === 'p2p') {
+                return canUseDm(controls.profileConfig, controls, senderId);
+              }
+              // For group: don't use shouldBypassDeniedChatForInviteGroup
+              return canUseGroup(controls.profileConfig, controls, chatId, senderId);
+            },
+            checkGroupResponse: (_chatType, chatId, senderId) => {
+              const decision = decideGroupResponse({
+                chatType: 'group',
+                mode: controls.profileConfig.access.groupResponseMode,
+                senderId,
+                botOwnerId: controls.botOwnerId,
+                ownerRefreshState: controls.ownerRefreshState,
+                mentionedBot: false,
+                mentionCount: 0,
+                mentionAll: false,
+                chatId,
+                ownerNoMentionChats: controls.profileConfig.access.ownerNoMentionChats,
+              });
+              return decision;
+            },
+            hasCurrentWork: (scope) => {
+              return activeRuns.get(scope) !== undefined;
+            },
+            validateStopTarget: (targetMessageId, scope) => {
+              // scope param available for future use
+              void scope;
+              return workChainStore.resolveCurrentChain(targetMessageId) !== undefined;
+            },
+            executeStop: async (scope) => {
+              const hadActive = activeRuns.interrupt(scope);
+              const cancelled = pending.cancel(scope);
+              return hadActive || cancelled.length > 0;
+            },
+            resolveWorkChain: (scope, replyToMessageId) => {
+              return workChainStore.resolveOrAllocate(scope, replyToMessageId);
+            },
+          });
+
+          if (pipelineResult.kind === 'drop') {
+            // Silently dropped — guard/access/group-response denied
             return;
           }
 
-          const r = await channel.rawClient.im.v1.message.get({
-            path: { message_id: evt.messageId },
-          });
-          const item = r?.data?.items?.[0];
-          const chatId = item?.chat_id as string | undefined;
-          if (!chatId) {
-            log.warn('reaction', 'no-chatId', { messageId: evt.messageId });
+          if (pipelineResult.kind === 'stop-added-reply') {
+            // F11/F12: Stop control plane executes interrupt + cancel via pipeline.
+            // Control ledger persistence will be wired when profileDir is available.
+            // Send bridge reply
+            try {
+              await channel.send(pipelineResult.chatId, { markdown: pipelineResult.message }, {
+                replyTo: pipelineResult.targetMessageId,
+              });
+            } catch (err) {
+              log.warn('reaction', 'stop-reply-failed', { err: String(err) });
+            }
             return;
           }
-          // Only forward reactions on THIS bot's messages.
-          // Compare both open_id (ou_xxx) and app client id (cli_xxx) —
-          // the message API returns bot senders in cli_xxx format.
-          const messageSenderId = item?.sender?.id as string | undefined;
-          const isOwnMessage =
-            messageSenderId === channel.botIdentity?.openId ||
-            messageSenderId === cfg.accounts.app.id;
-          if (!isOwnMessage) {
-            log.info('reaction', 'skip-other-sender', {
-              messageId: evt.messageId,
-              messageSenderId,
-              botOpenId: channel.botIdentity?.openId,
-              appId: cfg.accounts.app.id,
+
+          if (pipelineResult.kind === 'stop-removed-reply') {
+            // F6/F7: Bridge replies to removed stop Reaction.
+            // Control ledger matching will be wired when profileDir is available.
+            try {
+              await channel.send(pipelineResult.chatId, { markdown: pipelineResult.message }, {
+                replyTo: pipelineResult.targetMessageId,
+              });
+            } catch (err) {
+              log.warn('reaction', 'stop-removed-reply-failed', { err: String(err) });
+            }
+            return;
+          }
+
+          if (pipelineResult.kind === 'enqueue-reaction') {
+            // F1: Push through pushBarrier (batch isolation), not regular push
+            pending.pushBarrier(pipelineResult.scope, pipelineResult.normalizedMsg);
+            log.info('reaction', 'enqueued', {
+              scope: pipelineResult.scope,
+              emojiType: evt.emojiType,
+              action: evt.action,
             });
-            return;
           }
-          const chatMode = await chatModeCache.resolve(channel, chatId);
-          const threadId = item?.thread_id as string | undefined;
-          const scope =
-            chatMode === 'topic' && threadId
-              ? `${chatId}:${threadId}`
-              : chatId;
-          const chatType = chatMode === 'p2p' ? 'p2p' as const : 'group' as const;
-          pending.push(scope, {
-            messageId: evt.messageId,
-            chatId,
-            chatType,
-            threadId,
-            senderId: evt.operator.openId,
-            content: `[reaction-${evt.action}] ${evt.emojiType} (on msg ${evt.messageId.slice(-8)})`,
-            rawContentType: 'reaction' as const,
-            resources: [],
-            mentions: [],
-            mentionAll: false,
-            mentionedBot: false,
-            createTime: evt.actionTime ?? Date.now(),
-          });
-          log.info('reaction', 'enqueued', {
-            scope,
-            emojiType: evt.emojiType,
-            action: evt.action,
-          });
         } catch (err) {
           log.fail('reaction', err);
         }
@@ -1492,6 +1523,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       ]
     : undefined;
 
+  // F1: Detect reaction batches and collect their reactionContexts
+  const isReactionBatch = lastMsg.rawContentType === ('reaction' as never);
+  const reactionContexts = isReactionBatch
+    ? (batch[0] as NormalizedMessage & { _reactionContext?: unknown })?.['_reactionContext' as keyof NormalizedMessage]
+      ? [(batch[0] as NormalizedMessage & { _reactionContext?: unknown })._reactionContext]
+      : undefined
+    : undefined;
+
   const prompt = buildPrompt(
     batch,
     attachments,
@@ -1499,6 +1538,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     topicContext,
     channel.botIdentity,
     extraInstructions,
+    reactionContexts as unknown[] | undefined,
   );
   log.info('prompt', 'built', {
     promptChars: prompt.length,
@@ -1510,8 +1550,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // For topic groups: thread the reply so it lands in the same topic as the
   // user's message. Otherwise the SDK posts at top level and the user's
   // topic discussion breaks visually.
+  // F1: For reaction batches, replyTo targets the reaction's target message,
+  // not the last batch message (which is the synthetic reaction placeholder).
+  const replyToId = isReactionBatch ? (batch[0]?.messageId ?? lastMsg.messageId) : lastMsg.messageId;
   const sendOpts = {
-    replyTo: lastMsg.messageId,
+    replyTo: replyToId,
     ...(mode === 'topic' && threadId ? { replyInThread: true } : {}),
   };
   log.info('flush', 'reply-target', {
@@ -2825,9 +2868,13 @@ function buildPrompt(
   topicContext: QuotedContext[] = [],
   botIdentity?: { openId: string; name?: string },
   extraInstructions?: string[],
+  reactionContexts?: unknown[],
 ): string {
   const first = batch[0];
   if (!first) return '';
+
+  // Detect reaction batch: rawContentType === 'reaction' on first message
+  const isReactionBatch = first.rawContentType === ('reaction' as never);
 
   const fileKeys = batch.flatMap((m) => m.resources.map((r) => r.fileKey));
   // When the debounce window merged messages (possibly from several senders —
@@ -2862,7 +2909,7 @@ function buildPrompt(
       ...(mentions.length > 0 ? { mentions } : {}),
       ...(first.threadId ? { threadId: first.threadId } : {}),
       messageIds: batch.map((m) => m.messageId),
-      source: 'im',
+      source: isReactionBatch ? 'reaction' : 'im',
     },
     instructions:
       extraInstructions && extraInstructions.length > 0
@@ -2873,6 +2920,7 @@ function buildPrompt(
     quotedMessages: quotes.map(toPromptQuote),
     interactiveCards: batch.map(toPromptInteractiveCard).filter(isDefined),
     attachments: attachments.map(toPromptAttachment),
+    ...(reactionContexts && reactionContexts.length > 0 ? { reactionContexts } : {}),
   });
 }
 

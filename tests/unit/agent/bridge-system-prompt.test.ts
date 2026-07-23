@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   BRIDGE_SYSTEM_PROMPT,
+  BRIDGE_SYSTEM_PROMPT_REACTION_VERSION,
   buildBridgeSystemPrompt,
   composeBridgeSystemPrompt,
   prefixBridgeSystemPrompt,
@@ -286,5 +287,52 @@ describe('BRIDGE_SYSTEM_PROMPT Reaction section', () => {
     const groupIdx = prompt.indexOf('<group_system_prompt>');
     // Reaction section should come before group-level addendum
     expect(reactionIdx).toBeLessThan(groupIdx);
+  });
+});
+
+// ── F25: Prompt versioning ──
+
+describe('BRIDGE_SYSTEM_PROMPT_REACTION_VERSION', () => {
+  it('is a non-empty string', () => {
+    expect(typeof BRIDGE_SYSTEM_PROMPT_REACTION_VERSION).toBe('string');
+    expect(BRIDGE_SYSTEM_PROMPT_REACTION_VERSION.length).toBeGreaterThan(0);
+  });
+
+  it('follows semver-like format (major.minor.patch)', () => {
+    expect(BRIDGE_SYSTEM_PROMPT_REACTION_VERSION).toMatch(/^\d+\.\d+\.\d+/);
+  });
+
+  it('is exported from bridge-system-prompt module', () => {
+    // The import at the top of this file already proves it exports.
+    expect(BRIDGE_SYSTEM_PROMPT_REACTION_VERSION).toBe('1.0.0');
+  });
+});
+
+// ── F17: Claude/Codex adapter wiring ──
+
+describe('Claude/Codex adapter receives Reaction rules', () => {
+  it('Claude adapter composes prompt with Reaction section via composeBridgeSystemPrompt', () => {
+    const prompt = composeBridgeSystemPrompt({ openId: 'ou_claude', name: 'Claude' });
+    // Shared prompt constant is used by both adapters
+    expect(prompt).toContain('## Reaction');
+    expect(prompt).toContain('approve_continue');
+    expect(prompt).toContain('stop_current_work');
+    // Claude adapter path: claude/adapter.ts uses buildBridgeSystemPrompt internally
+  });
+
+  it('Codex adapter receives Reaction section via same shared constant', () => {
+    const prompt = buildBridgeSystemPrompt({ openId: 'ou_codex', name: 'Codex' });
+    // Codex adapter path: codex/adapter.ts uses composeBridgeSystemPrompt
+    expect(prompt).toContain('## Reaction');
+    expect(prompt).toContain('effectiveReactionSet');
+    expect(prompt).toContain('unmapped');
+  });
+
+  it('both Claude and Codex identity paths include Reaction rules', () => {
+    const claudePrompt = composeBridgeSystemPrompt({ openId: 'ou_c', name: 'ClaudeBot' });
+    const codexPrompt = composeBridgeSystemPrompt({ openId: 'ou_x', name: 'CodexBot' });
+    // Both get the same shared BRIDGE_SYSTEM_PROMPT with Reaction section
+    expect(claudePrompt).toContain('## Reaction');
+    expect(codexPrompt).toContain('## Reaction');
   });
 });

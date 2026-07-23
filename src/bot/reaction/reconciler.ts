@@ -1,4 +1,5 @@
 import type { LarkChannel } from '@larksuite/channel';
+import { createHash } from 'node:crypto';
 import { log } from '../../core/logger';
 import {
   computeCanonicalFingerprint,
@@ -40,12 +41,11 @@ interface ReactionListResponse {
   };
 }
 
-// ── Reconciler ──
+// ── Reconciler deps ──
 
 export interface ReconcilerDeps {
   channel: LarkChannel;
   ledger: ReactionLedger;
-  /** Bot open_id and app id for excluding self from effective set. */
   botOpenId?: string;
   appId?: string;
 }
@@ -53,11 +53,15 @@ export interface ReconcilerDeps {
 /**
  * Reconcile buffered events against the authoritative reaction list API.
  *
- * Returns a ReconciliationResult that the pipeline uses to decide:
- * - No-op (same fingerprint, no net-zero pair)
- * - Net-zero consumed (added→removed pair, back to original fingerprint)
- * - New revision (fingerprint changed → Agent turn)
- * - Reconciliation failed (reply to retry)
+ * Key behaviors:
+ * - Fetches ALL pages from messageReaction.list (full pagination, not just page 1).
+ * - Excludes self-app reactions (operator_type==='app' or self openId).
+ * - Computes canonical fingerprint (operator_id, emoji_type; dedup by reaction_id).
+ * - Compares fingerprint against persistent ledger to decide: no-op, net-zero,
+ *   or new revision.
+ * - Implements finite retry on list API lag (F4); only returns
+ *   reconciliationFailed after exhausting retries.
+ * - Persists updated ledger entry on state change (F3/F5).
  */
 export async function reconcile(
   key: ReactionKey,
@@ -77,14 +81,33 @@ export async function reconcile(
     noOp: true,
   };
 
-  // ── Fetch authoritative snapshot (with retry) ──
-  let records: CanonicalReactionRecord[];
-  try {
-    records = await fetchAllReactions(deps.channel, components.targetMessageId, deps);
-  } catch (err) {
+  // ── Fetch authoritative snapshot with finite retry (F4) ──
+  let records: CanonicalReactionRecord[] = [];
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= RECONCILE_MAX_RETRIES; attempt++) {
+    try {
+      records = await fetchAllReactions(deps.channel, components.targetMessageId, deps);
+      lastErr = undefined;
+      break;
+    } catch (err) {
+      lastErr = err;
+      log.warn('reaction', 'reconcile-list-attempt-failed', {
+        targetMessageId: components.targetMessageId,
+        attempt,
+        maxRetries: RECONCILE_MAX_RETRIES,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      if (attempt < RECONCILE_MAX_RETRIES) {
+        await sleep(RECONCILE_RETRY_DELAY_MS * attempt);
+      }
+    }
+  }
+
+  if (lastErr) {
     log.warn('reaction', 'reconcile-list-failed', {
       targetMessageId: components.targetMessageId,
-      err: err instanceof Error ? err.message : String(err),
+      err: lastErr instanceof Error ? lastErr.message : String(lastErr),
     });
     return { ...base, reconciliationFailed: true, noOp: false };
   }
@@ -94,24 +117,29 @@ export async function reconcile(
     (r) => r.operator_id === components.operatorOpenId,
   );
 
-  // ── Compute fingerprint ──
+  // ── Compute canonical fingerprint (F8/F9: cross-platform deterministic) ──
   const fingerprint = computeCanonicalFingerprint(operatorRecords);
 
-  // ── Build effectiveReactionSet (from API, not events) ──
-  const effectiveSet = buildEffectiveSet(operatorRecords, components.operatorOpenId);
+  // ── Build effectiveReactionSet from API records (authoritative) ──
+  const effectiveSet = buildEffectiveSet(operatorRecords);
 
-  // ── Build triggerReactions from buffered events ──
+  // ── Build ordered triggerReactions from buffered events ──
   const triggers = buildTriggerReactions(events);
 
   // ── Load ledger state ──
   const ledgerEntry = deps.ledger.get(key);
   const consumedFingerprint = ledgerEntry?.consumedFingerprint ?? EMPTY_FINGERPRINT;
+  const currentFingerprint = ledgerEntry?.fingerprint ?? EMPTY_FINGERPRINT;
 
-  // ── No-op: fingerprint unchanged ──
-  if (fingerprint === consumedFingerprint && fingerprint === (ledgerEntry?.fingerprint ?? EMPTY_FINGERPRINT)) {
+  // ── No-op: fingerprint unchanged (F3/F5: check against consumed fingerprint) ──
+  if (fingerprint === currentFingerprint && fingerprint === consumedFingerprint) {
     // Check for net-zero added→removed exception (DD7)
     const netZero = detectNetZeroPair(events);
     if (netZero) {
+      // Persist the event-pair consumption (F3)
+      await persistLedgerEntry(deps, key, fingerprint, consumedFingerprint,
+        operatorRecords.map((r) => r.reaction_id).filter((id): id is string => Boolean(id)),
+        (ledgerEntry?.lastRevision ?? 0));
       return {
         ...base,
         triggerReactions: triggers,
@@ -122,7 +150,7 @@ export async function reconcile(
         noOp: false,
       };
     }
-    // True no-op
+    // True no-op: no state change, no net-zero pair
     return {
       ...base,
       triggerReactions: triggers,
@@ -133,8 +161,12 @@ export async function reconcile(
     };
   }
 
-  // ── State change → new revision ──
+  // ── State change → new revision (F3: persist updated ledger) ──
   const newRevision = (ledgerEntry?.lastRevision ?? 0) + 1;
+
+  await persistLedgerEntry(deps, key, fingerprint, fingerprint,
+    operatorRecords.map((r) => r.reaction_id).filter((id): id is string => Boolean(id)),
+    newRevision);
 
   return {
     ...base,
@@ -144,6 +176,32 @@ export async function reconcile(
     fingerprint,
     noOp: false,
   };
+}
+
+// ── Persist ledger entry (F3/F5) ──
+
+async function persistLedgerEntry(
+  deps: ReconcilerDeps,
+  key: ReactionKey,
+  fingerprint: string,
+  consumedFingerprint: string,
+  recordIds: string[],
+  revision: number,
+): Promise<void> {
+  try {
+    await deps.ledger.updateEntry(key, (prev) => ({
+      fingerprint,
+      consumedFingerprint,
+      latestActionTime: Date.now(),
+      recordIds,
+      lastRevision: revision > (prev?.lastRevision ?? 0) ? revision : (prev?.lastRevision ?? 0),
+    }));
+  } catch (err) {
+    log.warn('reaction', 'ledger-persist-failed', {
+      key,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 // ── Full-page list fetch ──
@@ -194,11 +252,7 @@ function isSelfApp(item: ReactionListItem, deps: ReconcilerDeps): boolean {
 
 // ── Build effective set from API records ──
 
-function buildEffectiveSet(
-  records: CanonicalReactionRecord[],
-  _operatorOpenId: string,
-): EffectiveReactionEntry[] {
-  // Dedup by emoji_type within this operator
+function buildEffectiveSet(records: CanonicalReactionRecord[]): EffectiveReactionEntry[] {
   const seen = new Set<string>();
   const result: EffectiveReactionEntry[] = [];
   for (const r of records) {
@@ -226,9 +280,7 @@ function buildEffectiveSet(
 
 // ── Build trigger reactions from buffered events ──
 
-function buildTriggerReactions(
-  events: BufferedReactionEvent[],
-): ReactionTriggerEntry[] {
+function buildTriggerReactions(events: BufferedReactionEvent[]): ReactionTriggerEntry[] {
   return events.map((e) => ({
     action: e.action,
     emojiType: e.emojiType,
@@ -245,9 +297,6 @@ function buildTriggerReactions(
 /**
  * Detect an added→removed pair for the SAME emojiType where the list API
  * already reflects the removal (fingerprint back to original).
- *
- * Returns true when: there exists an emojiType that appears as both
- * 'added' and 'removed' in the buffer events, and the net effect is zero.
  */
 export function detectNetZeroPair(events: BufferedReactionEvent[]): boolean {
   if (events.length === 0) return false;
@@ -260,7 +309,6 @@ export function detectNetZeroPair(events: BufferedReactionEvent[]): boolean {
     byEmoji.set(e.emojiType, counts);
   }
 
-  // Net zero for at least one emoji type: same count of added and removed
   for (const counts of byEmoji.values()) {
     if (counts.added > 0 && counts.removed > 0 && counts.added === counts.removed) {
       return true;
@@ -268,4 +316,8 @@ export function detectNetZeroPair(events: BufferedReactionEvent[]): boolean {
   }
 
   return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -23,20 +23,20 @@ describe('StopControlLedger', () => {
   // ── Dedup fingerprint ──
 
   it('generates stable fingerprints from event fields', () => {
-    const fp1 = stopEventFingerprint('ou_user', 'om_target', 'added', 1000);
-    const fp2 = stopEventFingerprint('ou_user', 'om_target', 'added', 1000);
+    const fp1 = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', 1000);
+    const fp2 = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', 1000);
     expect(fp1).toBe(fp2);
   });
 
   it('different actions produce different fingerprints', () => {
-    const fpAdd = stopEventFingerprint('ou_user', 'om_target', 'added', 1000);
-    const fpRem = stopEventFingerprint('ou_user', 'om_target', 'removed', 1000);
+    const fpAdd = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', 1000);
+    const fpRem = stopEventFingerprint('ou_user', 'om_target', 'No', 'removed', 1000);
     expect(fpAdd).not.toBe(fpRem);
   });
 
   it('prefers stable ID when available', () => {
-    const fp1 = stopEventFingerprint('ou_user', 'om_target', 'added', undefined, 'evt_abc');
-    const fp2 = stopEventFingerprint('ou_user', 'om_target', 'added', undefined, 'evt_abc');
+    const fp1 = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', undefined, 'evt_abc');
+    const fp2 = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', undefined, 'evt_abc');
     expect(fp1).toBe(fp2);
     expect(fp1.length).toBe(64); // SHA-256 hex
   });
@@ -45,20 +45,20 @@ describe('StopControlLedger', () => {
 
   it('records a consumed stop-added event', async () => {
     const ledger = new StopControlLedger(join(tmpDir, 'control.json'));
-    const fp = stopEventFingerprint('ou_user', 'om_target', 'added', 1000);
+    const fp = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', 1000);
 
     expect(ledger.isConsumed(fp)).toBe(false);
 
-    await ledger.record(fp, 'added', 'stopped');
+    await ledger.record(fp, 'added', 'ou_user', 'om_target', 'No', 'stopped');
 
     expect(ledger.isConsumed(fp)).toBe(true);
   });
 
   it('records a consumed stop-removed event', async () => {
     const ledger = new StopControlLedger(join(tmpDir, 'control.json'));
-    const fp = stopEventFingerprint('ou_user', 'om_target', 'removed', 2000);
+    const fp = stopEventFingerprint('ou_user', 'om_target', 'No', 'removed', 2000);
 
-    await ledger.record(fp, 'removed');
+    await ledger.record(fp, 'removed', 'ou_user', 'om_target', 'No');
     expect(ledger.isConsumed(fp)).toBe(true);
   });
 
@@ -68,17 +68,17 @@ describe('StopControlLedger', () => {
     const { resolveControlLedgerPath } = await import('../../../src/bot/reaction/control-ledger');
     const path = resolveControlLedgerPath(tmpDir);
     const ledger1 = new StopControlLedger(path);
-    const fpAdded = stopEventFingerprint('ou_user', 'om_target', 'added', 1000);
+    const fpAdded = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', 1000);
 
-    await ledger1.record(fpAdded, 'added', 'stopped');
+    await ledger1.record(fpAdded, 'added', 'ou_user', 'om_target', 'No', 'stopped');
 
     // Simulate restart
     const ledger2 = await loadStopControlLedger(tmpDir);
     expect(ledger2.isConsumed(fpAdded)).toBe(true);
 
     // A removed event arrives after restart
-    const fpRemoved = stopEventFingerprint('ou_user', 'om_target', 'removed', 2000);
-    await ledger2.record(fpRemoved, 'removed');
+    const fpRemoved = stopEventFingerprint('ou_user', 'om_target', 'No', 'removed', 2000);
+    await ledger2.record(fpRemoved, 'removed', 'ou_user', 'om_target', 'No');
     expect(ledger2.isConsumed(fpRemoved)).toBe(true);
   });
 
@@ -86,9 +86,9 @@ describe('StopControlLedger', () => {
 
   it('duplicate stop-added events are consumed only once', async () => {
     const ledger = new StopControlLedger(join(tmpDir, 'control.json'));
-    const fp = stopEventFingerprint('ou_user', 'om_target', 'added', 1000);
+    const fp = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', 1000);
 
-    await ledger.record(fp, 'added', 'stopped');
+    await ledger.record(fp, 'added', 'ou_user', 'om_target', 'No', 'stopped');
 
     // Second delivery of same event should be detected as consumed
     expect(ledger.isConsumed(fp)).toBe(true);
@@ -97,9 +97,9 @@ describe('StopControlLedger', () => {
 
   it('duplicate stop-removed events are consumed only once', async () => {
     const ledger = new StopControlLedger(join(tmpDir, 'control.json'));
-    const fp = stopEventFingerprint('ou_user', 'om_target', 'removed', 2000);
+    const fp = stopEventFingerprint('ou_user', 'om_target', 'No', 'removed', 2000);
 
-    await ledger.record(fp, 'removed');
+    await ledger.record(fp, 'removed', 'ou_user', 'om_target', 'No');
 
     // Second delivery should be no-op
     expect(ledger.isConsumed(fp)).toBe(true);

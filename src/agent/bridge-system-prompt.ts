@@ -1,5 +1,10 @@
 import type { AgentBotIdentity } from './types';
 
+/** Version identifier for the Reaction section embedded in BRIDGE_SYSTEM_PROMPT.
+ *  Bump when the Reaction rules or predefined semantics change.  Included in
+ *  live-model acceptance evidence (Spec Unit 11, F25). */
+export const BRIDGE_SYSTEM_PROMPT_REACTION_VERSION = '1.0.0';
+
 export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 
 你正在 lark-channel-bridge 里跑：把飞书/Lark 用户消息桥到本地 agent CLI。
