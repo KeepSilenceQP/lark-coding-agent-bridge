@@ -187,10 +187,10 @@ describe('triggerReactions ordering (from buffered events)', () => {
       evt({ action: 'added', emojiType: 'OK', actionTime: 1500, arrivalOrder: 1 }),
     ];
     // Verify they're ordered by actionTime
-    expect(events[0].emojiType).toBe('JIAYI');
-    expect(events[1].emojiType).toBe('OK');
-    expect(events[0].action).toBe('added');
-    expect(events[1].action).toBe('added');
+    expect(events[0]!.emojiType).toBe('JIAYI');
+    expect(events[1]!.emojiType).toBe('OK');
+    expect(events[0]!.action).toBe('added');
+    expect(events[1]!.action).toBe('added');
   });
 
   it('one add one remove with final non-empty set → both in buffer events', () => {

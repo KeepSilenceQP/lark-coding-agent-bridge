@@ -46,7 +46,7 @@ describe('PendingQueue barrier entries (Reaction batch barrier)', () => {
 
     vi.advanceTimersByTime(150);
     expect(flushed).toHaveLength(1);
-    expect(flushed[0].batch[0].content).toBe('hello world');
+    expect(flushed[0]!.batch[0]!.content).toBe('hello world');
   });
 
   it('does not merge regular messages with reaction turns in the same batch', async () => {
@@ -104,7 +104,7 @@ describe('PendingQueue barrier entries (Reaction batch barrier)', () => {
     const cancelled = queue.cancel('oc_scope');
 
     expect(cancelled).toHaveLength(1);
-    expect(cancelled[0].content).toBe('pending');
+    expect(cancelled[0]!.content).toBe('pending');
   });
 
   it('cancel returns empty array for unknown scope', () => {
