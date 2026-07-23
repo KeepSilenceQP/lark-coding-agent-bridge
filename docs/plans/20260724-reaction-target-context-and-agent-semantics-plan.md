@@ -1,7 +1,7 @@
 # Correct Reaction Handling By Bridge Agents — Coding Plan
 
 Date: 2026-07-24
-Status: draft; pending Plan Review (小P)
+Status: reviewed; Plan Review GO (小P)
 Spec authority: `docs/specs/20260723-reaction-target-context-and-agent-semantics.md` (commit `d18322c`，confirmed；independent review PASS；`d18322c` 在 `e7e178f` 基础上解决 review 歧义)
 Target branch: `fix/bugfix` (synced to `d18322c`)
 Harness protocol: `feishu-group-project-flow-v2`
@@ -26,7 +26,7 @@ Implementer: 小C
 - 2026-07-24 小P 复核 + 云上C总 修订（第 2 版）：DD17/B1 原结论「`/stop` 不取消 pending」误判——经 `src/bot/channel.ts:1304-1331` 复核，`intakeMessage` 对 `tryHandleCommand` 返回 `handled=true` 的命令统一 `pending.cancel(scope)`，`/stop` 已含取消 pending。stop 控制面改为复用现有 `/stop`「interrupt + pending.cancel」复合语义，不比 `/stop` 严格，无 `/stop` 对齐改动；B1 撤回。
 - 2026-07-24 小P Plan Review 结论 BLOCKED（6 项 finding 有效）+ 云上C总 修订（第 3 版，基于 Spec `d18322c`）：①`Get` 不新增为第 12 个预埋 alias，v1 仍 11 个，示例用 `JIAYI`，`Get` 走 unmapped 透传；②单数 `triggerReaction` 改为按 action time+到达顺序排列的 `triggerReactions[]`，保留 `effectiveReactionSet`，补"启动前快速新增两个不同 Reaction"与"同 buffer 一增一减且最终非空"测试；③stop added 顺序改为门禁+防重后先判 scope 完全无 work→回无任务，仅 scope 有 current work 时才做 target→current workChain 关联（历史/无关→fail closed）；④定义 canonical fingerprint 稳定字段/去重/确定性排序，跨页/返回顺序打乱不产生 revision；⑤补 context-builder→fetchQuotedContext→reaction_contexts 卡片/合并转发真实内容 wiring 测试；⑥workChainId 给出明确 TTL/容量/淘汰规则与边界测试。
 - 2026-07-24 小P Plan v3 复审：前 5 项 CLOSED；第 6 项 TTL/LRU 方向成立但 DD15 引入 1 个 BLOCKER（16/256 作总 Map 硬上限与 current 不淘汰、PendingQueue 无背压三者冲突；current outbound mapping 不能被 TTL 淘汰，否则长任务丢 stop 关联）。云上C总 修订（第 4 版）：16/256 重定义为 historical cache 上限（非总 Map 硬上限），current chains 及其 outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，terminal 后才进入 30min historical retention 并按 LRU 裁剪；总边界表述为 current workload references + bounded historical cache；不引入 pending admission/drop/backpressure；Unit6 补 a/b/c 三测试。
-- 待 小P：Plan Review Gate（见文末）。
+- 2026-07-24 小P Plan v4 复审：第 6 项 BLOCKER CLOSED；六项 finding 全部闭合，未发现新的阻塞或 Spec 缩减，Plan Review `GO`。
 
 ## Current Evidence（当前代码现状，file:line）
 
@@ -453,8 +453,8 @@ pnpm -s test
 
 ## Plan Review Gate  Owner: 小P
 
-- [ ] 小P 确认本 Plan 覆盖 Spec 全部必做单元（权限/self-operator 门禁、buffer/权威快照/ledger/revision、动态 Reaction 上下文、共享 System Prompt、可见回复、stop 控制面）。
-- [ ] 小P 复审第 3 版 6 项 finding 是否逐项解决：①Get unmapped（v1 仍 11，示例 JIAYI）；②triggerReactions[] 有序+两场景测试；③stop added 顺序（无 work→无任务；有 current work→关联）；④canonical fingerprint 稳定字段/去重/确定性排序+跨页不产生 revision；⑤卡片/合并转发 wiring 测试；⑥workChainId TTL/容量/淘汰+边界测试。
+- [x] 小P 确认本 Plan 覆盖 Spec 全部必做单元（权限/self-operator 门禁、buffer/权威快照/ledger/revision、动态 Reaction 上下文、共享 System Prompt、可见回复、stop 控制面）。
+- [x] 小P 复审第 3 版 6 项 finding 是否逐项解决：①Get unmapped（v1 仍 11，示例 JIAYI）；②triggerReactions[] 有序+两场景测试；③stop added 顺序（无 work→无任务；有 current work→关联）；④canonical fingerprint 稳定字段/去重/确定性排序+跨页不产生 revision；⑤卡片/合并转发 wiring 测试；⑥workChainId TTL/容量/淘汰+边界测试。
 - [x] DD17/B1 已澄清：`/stop` 经 `intakeMessage`（`channel.ts:1304-1331`）已 `interrupt + pending.cancel`；stop 控制面复用该语义，不比 `/stop` 严格，无 `/stop` 对齐改动。
-- [ ] 确认未静默缩减 Spec 验收，覆盖矩阵完整。
-- [ ] GO 后交 小C 实施；Plan Review 前不修改运行代码。
+- [x] 确认未静默缩减 Spec 验收，覆盖矩阵完整。
+- [x] GO 后交 小C 实施；Plan Review 前不修改运行代码。
