@@ -253,7 +253,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 
 - [x] `ledger.ts`：持久 ledger（`scope+operatorOpenId+targetMessageId` → record IDs/fingerprint/actionTime/consumed fingerprint），镜像 `prompt-binding-ledger.ts`（`writeFileAtomic`、RMW 队列、revision、`schemaVersion`、`profileDir`）。
 - [x] `buffer.ts`：同 key 事件短时 buffer（quiet window + 最大等待，按 action time 再按到达顺序）。
-- [x] `reconciler.ts`：`messageReaction.list` 全分页（`user_id_type=open_id`，循环 `page_token`/`has_more`），重建 `effectiveReactionSet`（剔除 self-app），构建有序 `triggerReactions[]`（按 action time+到达顺序），计算 canonical fingerprint（DD6）与净变化 vs ledger、revision、净零 added→removed 例外、list 落后有限重试、scope 缩权 fail closed。
+- [ ] `reconciler.ts`：`messageReaction.list` 全分页（`user_id_type=open_id`，循环 `page_token`/`has_more`），重建 `effectiveReactionSet`（剔除 self-app），构建有序 `triggerReactions[]`（按 action time+到达顺序），计算 canonical fingerprint（DD6）与净变化 vs ledger、revision、净零 added→removed 例外、list 落后有限重试、scope 缩权 fail closed。
 - [ ] RED：`tests/unit/bot/reaction-reconciler.test.ts` + `tests/integration/bot/reaction-ledger.test.ts` 覆盖：全分页 reconciliation、list 越过中间状态的 added→removed 净零例外（不报失败/不递增 revision/不启动 Agent/只回复一次）、ledger 重启恢复（不重放旧 Reaction）、重复/乱序/无状态变化 no-op、list 暂时落后重试与最终失败单回复、`im:message.reactions:read` 缩权/读取失败 fail closed；**canonical fingerprint**（稳定字段 `operator_type+operator_id+emoji_type`、去重、确定性排序）跨页/API 返回顺序打乱不产生新 revision；**`triggerReactions[]` 有序**（按 action time+到达顺序）：Agent 启动前快速新增两个不同 Reaction → 单 input unit `triggerReactions` 含两个 added、`effectiveReactionSet` 含最终完整集合、不漏不重放；同一 buffer 一增一减且最终集合非空 → `triggerReactions` 保留 added/removed 有序变化、`effectiveReactionSet` 表达最终集合、只按该 revision 处理一次。
 - Depends: Unit 1、Unit 2。
 - Spec 覆盖：§Agent Input Contract 2（buffer/list/ledger/revision/no-op/例外）；Acceptance「重复投递 no-op」「乱序到达」「快速 added→removed list 已回空」「重启后新事件」「list 落后」「缩权/读取失败」。
@@ -321,7 +321,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 
 - [x] 小P 对 Unit 1-10 实现 + 测试做 Code Review（Plan Writer 云上C总 不自审）。
 - [x] DD17/B1 已澄清：当前 `/stop` 经 `intakeMessage`（`channel.ts:1304-1331`）已 `interrupt + pending.cancel`；stop 控制面复用该复合语义，不比 `/stop` 严格，无 `/stop` 对齐改动。
-- [x] 确认未静默缩减 Spec 验收；覆盖矩阵全绿。
+- [ ] 确认未静默缩减 Spec 验收；覆盖矩阵全绿。
 
 Progress update (2026-07-24): Code Review GO at `4855a97`; only Unit 11 is
 released. Reviewer-tracked, non-blocking test-strength follow-ups remain open
@@ -357,6 +357,16 @@ SHA-256 is `720859bbbae726cf289634f2c14bfa6ace56e2e5556e82517be2e4fa12019347`.
 Post-restart readback confirms `claude` PID 85575 and `codex` PID 86566 both
 run through the global executable whose dist contains the reviewed Reaction
 implementation. Unit 11 live cases may now begin; no case is pre-counted.
+
+Progress update (2026-07-24): the first Codex `approve_continue` live case
+failed on target `om_x100b69134b23e4a0c11813f9f6feeed`. The authoritative
+`im.reactions.list` snapshot contained one human `JIAYI` record, but
+`fetchAllReactions()` read nonexistent flat `operator_id` / `operator_type` /
+`emoji_type` fields instead of the real nested `operator.*` and
+`reaction_type.emoji_type` response. Three retries therefore misclassified
+the valid snapshot as stale and replied “本次 Reaction 暂时无法确认，请重试”.
+Unit 3 reconciliation and the coverage gate are reopened; Unit 11 is paused
+until Fix, independent Code Review, rebuilt live install, and restart readback.
 
 ## Acceptance Coverage Matrix（Spec 验收行 → Unit）
 
