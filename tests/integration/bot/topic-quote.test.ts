@@ -273,9 +273,9 @@ describe('topic message quote handling', () => {
     expect(prompt).not.toContain('<topic_context>');
   });
 
-  it('recalls the streamed message when the agent produces no content', async () => {
-    // Empty agent output must not leave an "(no content)" card behind — the SDK
-    // creates the streaming card eagerly, so we recall it when nothing renders.
+  it('does not recall the streamed message when the agent produces no content', async () => {
+    // Restored fork behavior: never turn an empty streamed reply into a visible
+    // Feishu "message recalled" system notice.
     const h = await createHarness({
       chatMode: 'group',
       agentEvents: [{ type: 'done', terminationReason: 'normal' }],
@@ -287,9 +287,9 @@ describe('topic message quote handling', () => {
       message({ messageId: 'om_empty', rootId: 'om_empty', parentId: 'om_empty', content: '@Bridge ping' }),
     );
     await waitFor(() => h.channel.streams.length === 1);
-    await waitFor(() => h.channel.recallMessage.mock.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 60));
 
-    expect(h.channel.recallMessage).toHaveBeenCalledWith('om_stream_1');
+    expect(h.channel.recallMessage).not.toHaveBeenCalled();
   });
 
   it('does not recall when the agent produced real content', async () => {

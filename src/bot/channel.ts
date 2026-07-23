@@ -1843,38 +1843,19 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
         sendOpts,
       );
-      try {
-        await awaitRenderAwareStream({
-          mode: replyMode,
-          streamDone,
-          renderDone,
-          producerStarted: () => producerStarted,
-          fallback: async (state) => {
-            if (controls.profileConfig.agentKind === 'codex') return;
-            if (renderText(filterForPrefs(state)).trim() === '') return;
-            await channel.send(
-              chatId,
-              { card: renderCard(filterForPrefs(state), cardRenderOptions) },
-              sendOpts,
-            );
-          },
-        });
-      } catch (err) {
-        if (controls.profileConfig.agentKind !== 'codex') throw err;
-        log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
-      }
-      await recallIfEmptyStreamedReply(channel, streamDone, filterForPrefs(latestState), scope);
-      if (controls.profileConfig.agentKind === 'codex') {
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalAnswerOnlyState(filterForPrefs(latestState)),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
-      }
+      await awaitRenderAwareStream({
+        mode: replyMode,
+        streamDone,
+        renderDone,
+        producerStarted: () => producerStarted,
+        fallback: async (state) => {
+          await channel.send(
+            chatId,
+            { card: renderCard(filterForPrefs(state), cardRenderOptions) },
+            sendOpts,
+          );
+        },
+      });
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let latestMarkdown = renderMarkdownStreamText(latestState);
@@ -1965,45 +1946,24 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           });
           return result;
         });
-      try {
-        await awaitRenderAwareStream({
-          mode: replyMode,
-          streamDone,
-          renderDone,
-          producerStarted: () => producerStarted,
-          verifyFinal: async (streamValue, state) =>
-            verifyMarkdownFinalReadback(
-              channel,
-              streamValue,
-              renderMarkdownStreamText(filterForPrefs(state)),
-            ),
-          fallback: async (state) => {
-            if (controls.profileConfig.agentKind === 'codex') return;
-            const body = renderText(filterForPrefs(state));
-            if (body.trim()) {
-              await channel.send(chatId, { markdown: body }, sendOpts);
-            }
-          },
-        });
-      } catch (err) {
-        if (controls.profileConfig.agentKind !== 'codex') throw err;
-        log.fail('stream', err, {
-          mode: replyMode,
-          step: 'progress-stream',
-        });
-      }
-      await recallIfEmptyStreamedReply(channel, streamDone, filterForPrefs(latestState), scope);
-      if (controls.profileConfig.agentKind === 'codex') {
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalAnswerOnlyState(filterForPrefs(latestState)),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
-      }
+      await awaitRenderAwareStream({
+        mode: replyMode,
+        streamDone,
+        renderDone,
+        producerStarted: () => producerStarted,
+        verifyFinal: async (streamValue, state) =>
+          verifyMarkdownFinalReadback(
+            channel,
+            streamValue,
+            renderMarkdownStreamText(filterForPrefs(state)),
+          ),
+        fallback: async (state) => {
+          const body = renderText(filterForPrefs(state));
+          if (body.trim()) {
+            await channel.send(chatId, { markdown: body }, sendOpts);
+          }
+        },
+      });
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -2022,10 +1982,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         channel,
         chatId,
         scope,
-        state:
-          controls.profileConfig.agentKind === 'codex'
-            ? finalAnswerOnlyState(filterForPrefs(finalState))
-            : filterForPrefs(finalState),
+        state: filterForPrefs(finalState),
         replyMode,
         sendOpts,
         cardRenderOptions,
@@ -2040,37 +1997,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   }
 }
 
-/**
- * The SDK creates the streaming card eagerly (before any content arrives), so a
- * run that produces no text leaves a card the SDK fills with its "(no content)"
- * placeholder. When the final render has nothing to show — a clean `done` with
- * no text; error/interrupt/timeout keep it non-empty via their notices — recall
- * that empty message instead of leaving noise in the chat.
- *
- * `finalState` must already be `filterForPrefs`-projected (what the user sees).
- */
-async function recallIfEmptyStreamedReply(
-  channel: LarkChannel,
-  streamDone: Promise<unknown>,
-  finalState: RunState,
-  scope: string,
-): Promise<void> {
-  if (renderText(finalState).trim() !== '') return;
-  const result = (await streamDone.catch(() => undefined)) as { messageId?: string } | undefined;
-  const messageId = result?.messageId;
-  if (!messageId) return;
-  try {
-    await channel.recallMessage(messageId);
-    log.info('outbound', 'recall-empty', { scope, messageId });
-  } catch (err) {
-    log.warn('outbound', 'recall-empty-failed', {
-      scope,
-      messageId,
-      err: err instanceof Error ? err.message : String(err),
-    });
-  }
-}
-
 async function sendFinalReply(input: {
   channel: LarkChannel;
   chatId: string;
@@ -2082,31 +2008,37 @@ async function sendFinalReply(input: {
 }): Promise<void> {
   const body = renderText(input.state);
 
-  // Nothing deliverable to send (agent produced no text on a clean finish;
-  // error/interrupt/timeout keep `body` non-empty via their notices). Skip
-  // rather than post an empty card that renders as "(no content)".
-  if (!body.trim()) {
-    log.info('outbound', 'skip-empty', { scope: input.scope, mode: input.replyMode });
-    return;
-  }
-
   if (input.replyMode === 'card') {
     const result = await input.channel.send(
       input.chatId,
       { card: renderCard(input.state, input.cardRenderOptions) },
       input.sendOpts,
     );
-    requireMessageReceipt(result, 'card');
     log.info('outbound', 'sent', outboundLogFields(input, 'card', body, result));
   } else if (input.replyMode === 'markdown') {
     if (body.trim()) {
-      const result = await input.channel.send(
-        input.chatId,
-        { markdown: body },
-        input.sendOpts,
-      );
-      requireMessageReceipt(result, 'markdown');
-      log.info('outbound', 'sent', outboundLogFields(input, 'markdown', body, result));
+      try {
+        await input.channel.stream(
+          input.chatId,
+          {
+            markdown: async (ctrl) => {
+              await ctrl.setContent(body);
+            },
+          },
+          input.sendOpts,
+        );
+        log.info('outbound', 'sent', outboundLogFields(input, 'markdown-stream', body));
+      } catch (err) {
+        log.warn('outbound', 'markdown-stream-fallback', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+        const result = await input.channel.send(
+          input.chatId,
+          { markdown: body },
+          input.sendOpts,
+        );
+        log.info('outbound', 'sent', outboundLogFields(input, 'markdown', body, result));
+      }
     }
   } else if (body.trim()) {
     const result = await input.channel.send(
@@ -2114,14 +2046,7 @@ async function sendFinalReply(input: {
       { markdown: body },
       input.sendOpts,
     );
-    requireMessageReceipt(result, 'text');
     log.info('outbound', 'sent', outboundLogFields(input, 'text', body, result));
-  }
-}
-
-function requireMessageReceipt(result: { messageId?: string }, type: string): void {
-  if (!result.messageId?.trim()) {
-    throw new Error(`final ${type} reply missing message receipt`);
   }
 }
 

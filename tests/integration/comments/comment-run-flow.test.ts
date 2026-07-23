@@ -313,9 +313,7 @@ async function createHarness(options: {
           : { sessionId: sessionIds[index] ?? `session-${index}` }),
         cwd: tmp.workspace,
       },
-      agentKind === 'codex'
-        ? { type: 'final_text', content: text }
-        : { type: 'text', delta: text },
+      { type: 'text', delta: text },
       {
         type: 'done',
         ...(agentKind === 'codex'
@@ -642,7 +640,7 @@ function codexRunWithProgress(threadId: string, progress: string, finalAnswer: s
       input: { command: 'lark-cli docs +fetch --api-version v2 --doc doc-token --doc-format markdown' },
     },
     { type: 'tool_result', id: `${threadId}-tool`, output: 'doc body', isError: false },
-    { type: 'final_text', content: finalAnswer },
+    { type: 'text', delta: finalAnswer },
     { type: 'done', threadId, terminationReason: 'normal' },
   ];
 }
