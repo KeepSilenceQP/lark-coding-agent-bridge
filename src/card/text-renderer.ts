@@ -1,3 +1,4 @@
+import { maskEmails } from './mask-email';
 import type { Block, RunState, ToolEntry } from './run-state';
 import { renderLocalFileLinksAsPaths } from './markdown-links';
 import { toolHeaderText } from './tool-render';
@@ -39,7 +40,10 @@ export function renderText(
     parts.push(footerLine(state.footer));
   }
 
-  return parts.join('\n\n');
+  // Strip raw emails so the Feishu tenant audit doesn't reject the message
+  // (see mask-email.ts). Never removes content, so emptiness checks upstream
+  // still behave.
+  return maskEmails(parts.join('\n\n'));
 }
 
 function renderBlock(block: Block): string {
