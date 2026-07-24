@@ -1,7 +1,15 @@
 # Correct Reaction Handling By Bridge Agents — Delta Spec
 
 Date: 2026-07-24
-Status: reopened; `stop_current_work` trigger-message amendment pending independent review
+Status: confirmed; `stop_current_work` trigger-message amendment independently reviewed PASS
+
+Amendment review history:
+
+- R1 `76e6f02` BLOCKED：user-target eligibility/no-work 顺序、removed ledger bypass、
+  PendingUnit 多 trigger、current mapping TTL/LRU 和 Reaction 无 @ 权限边界不完整。
+- R2 `ab1fee0` BLOCKED：Compatibility/编号规则仍残留 no-work-before-eligibility；
+  expired/restart-lost user target 的 silent 与 visible fail-closed 冲突。
+- R3 `602bc7a` PASS/GO：上述冲突全部闭合；GO 仅代表 Spec，不代表 Plan、实现、部署或 live。
 
 ## Recommendation
 
