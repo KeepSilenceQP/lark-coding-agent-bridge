@@ -1,7 +1,7 @@
 import type { ReactionContext } from './types';
 
 /**
- * Keyed store mapping messageId → ReactionContext[].
+ * Keyed store mapping reactionKey → ReactionContext[].
  *
  * F1: This is the production bridge between the reaction pipeline (which
  * produces reconciled ReactionContexts) and buildPrompt (which consumes
@@ -10,20 +10,20 @@ import type { ReactionContext } from './types';
  * alongside the batch without modifying the SDK type.
  *
  * Callers:
- * - pipeline flush handler: store.set(msgId, contexts) after reconciliation
- * - channel.ts buildPrompt: store.consume(batch) to retrieve and remove
+ * - pipeline flush handler: store.set(reactionKey, contexts) after reconciliation
+ * - channel.ts buildPrompt: resolves turnId → reactionKey, then gets/removes it
  */
 export class ReactionContextStore {
   private readonly map = new Map<string, ReactionContext[]>();
 
-  /** Associate reaction contexts with a message ID. */
-  set(messageId: string, contexts: ReactionContext[]): void {
-    this.map.set(messageId, contexts);
+  /** Associate reaction contexts with a reaction key. */
+  set(reactionKey: string, contexts: ReactionContext[]): void {
+    this.map.set(reactionKey, contexts);
   }
 
-  /** Get reaction contexts for a message ID without removing. */
-  get(messageId: string): ReactionContext[] | undefined {
-    return this.map.get(messageId);
+  /** Get reaction contexts for a reaction key without removing. */
+  get(reactionKey: string): ReactionContext[] | undefined {
+    return this.map.get(reactionKey);
   }
 
   /**
@@ -42,9 +42,9 @@ export class ReactionContextStore {
     return result;
   }
 
-  /** Remove entry for a message ID. */
-  delete(messageId: string): void {
-    this.map.delete(messageId);
+  /** Remove entry for a reaction key. */
+  delete(reactionKey: string): void {
+    this.map.delete(reactionKey);
   }
 
   /** Number of stored entries. */

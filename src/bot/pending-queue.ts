@@ -40,9 +40,9 @@ function totalLength(entry: PendingEntry): number {
   return n;
 }
 
-/** Hooks that allocate/acquire/release a lease on the work-chain store. */
+/** Hooks that resolve/acquire/release a lease on the work-chain store. */
 export interface LeaseHooks {
-  allocate: (scope: string, replyTo?: string) => string;
+  resolveOrAllocate: (scope: string, replyTo?: string) => string;
   acquire: (lease: WorkLease) => void;
   release: (lease: WorkLease) => void;
 }
@@ -82,25 +82,35 @@ export class PendingQueue {
   }
 
   // ── push (regular message) ──
-  // workChainId is optional: production (intakeMessage) passes it so the unit
-  // acquires a work-chain lease; queue-mechanics tests omit it (no lease).
+  // Production derives replyTo from the message itself so every producer
+  // (ordinary IM, Card callback, future synthetic inputs) follows the same
+  // inheritance contract. Queue-mechanics tests may omit leaseHooks.
 
-  push(scope: string, msg: NormalizedMessage, replyTo?: string): number {
+  push(scope: string, msg: NormalizedMessage): number {
+    const replyTo = msg.replyToMessageId;
     const existing = this.map.get(scope);
     if (existing) {
       if (existing.timer) clearTimeout(existing.timer);
       const last = existing.units[existing.units.length - 1];
-      // Merge into the tail regular unit ONLY when it has the same replyTo
-      // (same target chain, or both top-level). Different replyTo → new unit,
-      // so terminal/cancel can release each unit's lease precisely (R3-F1).
-      // R4-B1: top-level (replyTo undefined) messages merge into one unit and
-      // share the unit's lease (allocated once on unit creation) — DD15.
-      const sameUnit = last && last.kind === 'regular' && last.replyTo === replyTo;
+      let resolvedWorkChainId: string | undefined;
+      // Top-level messages in one debounce unit share the unit's fresh chain.
+      // Explicit replies merge when their targets resolve to the same chain,
+      // even if they point at different Bot outbound message IDs.
+      const sameUnit =
+        last?.kind === 'regular' &&
+        (this.leaseHooks
+          ? replyTo === undefined && last.replyTo === undefined
+            ? true
+            : Boolean(
+                (resolvedWorkChainId = this.resolveWorkChain(scope, replyTo)) &&
+                  last.lease?.workChainId === resolvedWorkChainId,
+              )
+          : last.replyTo === replyTo);
       if (sameUnit) {
         last.messages.push(msg);
         // shared lease — no new acquire
       } else {
-        const lease = this.allocateLease(scope, replyTo);
+        const lease = this.allocateLease(scope, replyTo, resolvedWorkChainId);
         if (lease) this.acquireLease(lease);
         existing.units.push({ kind: 'regular', messages: [msg], lease, replyTo });
       }
@@ -116,10 +126,18 @@ export class PendingQueue {
     return 1;
   }
 
-  /** Allocate a workChainId + lease for a new unit (R4-B1). Per-unit (not
-   *  per-message): merged messages share the unit's lease. */
-  private allocateLease(scope: string, replyTo?: string): WorkLease | undefined {
-    const workChainId = this.leaseHooks?.allocate(scope, replyTo) ?? '';
+  private resolveWorkChain(scope: string, replyTo?: string): string {
+    return this.leaseHooks?.resolveOrAllocate(scope, replyTo) ?? '';
+  }
+
+  /** Allocate a workChainId + lease for a new unit. Per-unit (not per-message):
+   *  merged messages share the unit's lease. */
+  private allocateLease(
+    scope: string,
+    replyTo?: string,
+    resolvedWorkChainId?: string,
+  ): WorkLease | undefined {
+    const workChainId = resolvedWorkChainId ?? this.resolveWorkChain(scope, replyTo);
     if (!workChainId) return undefined;
     return { workChainId, unitId: this.nextUnitId() };
   }

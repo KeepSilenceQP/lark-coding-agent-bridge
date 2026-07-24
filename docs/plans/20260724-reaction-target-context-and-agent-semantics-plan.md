@@ -515,6 +515,11 @@ pnpm -s test
   - B2（async onFlush catch 释放 lease）：onFlush handler 的 catch 释放 `lease`（workChainStore.releaseUnit）+ `releaseEnqueuedTurn`（清 reaction meta/tracker），覆盖 chatMode resolve/startFlow/stream 异步 throw。
   - B3（命令 cancel / empty-set 清 reaction side-state）：`intakeMessage` handled cancel 对每个 dropped msg 调 `releaseEnqueuedTurn`；`executeReactionFlushDecision` empty-set 加 `unregisterTrackerForTarget` effect 清 tracker。统一 lease（queue）+ reaction side-state（releaseEnqueuedTurn）释放。
   - 死 side-map 清理：移除 `_ordinaryTurnMeta`/`setOrdinaryTurnMeta`/`consumeOrdinaryTurnMeta`；`releaseEnqueuedTurn` 简化为 reaction-only（ordinary lifecycle 完全在 PendingUnit lease）。typecheck=0、reaction+runtime+executor 364/364。
+- **B9 R6（小P接管实现，待最终 Review/Unit 11）**：R5 Review 发现共享调用方与测试 gate 未闭合，R6 收敛为单一消息契约：
+  - `PendingQueue.push(scope, msg)` 直接读取 `msg.replyToMessageId`，不再要求调用方并行传递 target；top-level 同 debounce unit 共用新 chain，显式回复按实际 resolved `workChainId` 合并，同 chain 的不同 Bot outbound target 不再被误拆成串行 unit。
+  - Card callback synthetic message 写入 `replyToMessageId=evt.messageId`，点击继续承载卡片的原 workChain，不再分配无关 top-level chain。
+  - `releaseEnqueuedTurn` 与 `releaseFlushedTurnAfterError` 统一清理 context/meta/tracker/lease；命令取消、empty-set queued、chatMode/startFlow 前后异常均不会留下无界 context 或 stale tracker。
+  - 新增真实 lease/cleanup production-seam 测试：top-level acquire+merge+cancel release、同 chain 不同 target 合并、不同 chain 拆分、flush ownership transfer、command-style cancel、empty-set queued、async flush failure、Card callback chain target 继承。
 
 ## Plan Review Gate  Owner: 小P
 
