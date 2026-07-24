@@ -1390,6 +1390,15 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch, lease) => {
     const firstMsg = batch[0];
     if (!firstMsg) return;
+    // Reserve synchronously at the dequeue boundary, before chat-mode/media/
+    // quote/prompt preparation can await. A stop Reaction can now abort this
+    // reservation throughout the complete queue→prompt-prep window.
+    const preparationReservation = executor.reserveScope(scope);
+    if (!preparationReservation) {
+      releaseFlushedTurnAfterError(scope, firstMsg.messageId, lease);
+      log.warn('flush', 'reservation-unavailable-at-dequeue', { scope });
+      return;
+    }
     pending.block(scope);
     activeBatchCount += 1;
     void executePendingFlushWithCleanup({
@@ -1437,10 +1446,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           scope,
           mode,
           profileDir: deps.appPaths?.profileDir,
+          preparationReservation,
           });
         }),
       onError: (err) => log.fail('flush', err),
       onFinally: async () => {
+        // Safe after success (ActiveRuns.register already consumed it), abort,
+        // or any pre-start failure.
+        preparationReservation.release();
         pending.unblock(scope);
         activeBatchCount = Math.max(0, activeBatchCount - 1);
         await maybeLaunchDeferredRestart().catch((err) =>
@@ -1665,13 +1678,17 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
               pipelineResult.actionTime, pipelineResult.stableId,
             );
 
-            // F6/F7: Only reply if matching stop-added was consumed
+            // F6/F7: Atomically consume exactly one unmatched stop-added.
+            // Unknown/silent added events never enter the ledger and therefore
+            // cannot borrow an older pair after restart.
             if (stopControlLedger && !stopControlLedger.isConsumed(fp)) {
-              const match = stopControlLedger.findMatchingAdded(
-                pipelineResult.operatorOpenId, pipelineResult.targetMessageId, pipelineResult.emojiType);
-              if (match) {
-                await stopControlLedger.record(fp, 'removed',
-                  pipelineResult.operatorOpenId, pipelineResult.targetMessageId, pipelineResult.emojiType);
+              const removal = await stopControlLedger.recordMatchingRemoval(
+                fp,
+                pipelineResult.operatorOpenId,
+                pipelineResult.targetMessageId,
+                pipelineResult.emojiType,
+              );
+              if (removal) {
                 try {
                   await channel.send(pipelineResult.chatId, {
                     markdown: '撤回停止 Reaction 不会自动恢复工作。如需继续，请发送新的消息。',
@@ -2037,7 +2054,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // Every ordinary input unit (reply OR top-level) carries a workChain lease
   // at enqueue (DD15). PendingQueue derives replyTo from the message so all
   // producers use one inheritance contract.
-  const size = pending.push(scope, emsg);
+  const size = pending.push(scope, emsg, {
+    registerAsTrigger: shouldRegisterInboundTrigger(emsg),
+  });
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
 
@@ -2074,6 +2093,8 @@ interface RunBatchDeps {
   scope: string;
   mode: ChatMode;
   profileDir?: string;
+  /** Acquired synchronously when PendingQueue dequeues the unit. */
+  preparationReservation?: import('./active-runs').RunReservation;
   /** R3-F1: work-chain lease carried by the flushed PendingUnit (acquired at
    *  enqueue; the run releases it on terminal/abort). */
   lease?: WorkLease;
@@ -2303,6 +2324,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         : {}),
       workspaces,
       executor,
+      ...(stage === 'submit' && deps.preparationReservation
+        ? { reservation: deps.preparationReservation }
+        : {}),
       now: Date.now(),
       stopGraceMs: getAgentStopGraceMs(controls.cfg),
       routeId: routeLeaseId,
@@ -3695,17 +3719,23 @@ function buildPrompt(
 }
 
 /**
- * Classify the sender as human or bot from the raw Feishu event
- * (`sender.sender_type`: 'user' = human, 'app' = bot). The normalizer drops
- * this field, so read it off `msg.raw` (`includeRawEvent: true` above).
- * Unknown / missing values return undefined — omit rather than guess.
+ * Classify the sender as human or bot from normalized senderType, with the raw
+ * Feishu event (`sender.sender_type`: 'user' = human, 'app' = bot) as a
+ * compatibility fallback. Unknown / missing values remain undefined.
  */
 function senderTypeOf(msg: NormalizedMessage): 'user' | 'bot' | undefined {
+  if (msg.senderType === 'user') return 'user';
+  if (msg.senderType === 'bot') return 'bot';
   const raw = msg.raw as { sender?: { sender_type?: unknown } } | undefined;
   const senderType = raw?.sender?.sender_type;
   if (senderType === 'user') return 'user';
   if (senderType === 'app' || senderType === 'bot') return 'bot';
   return undefined;
+}
+
+/** Only real human IM inputs may become user-target stop correlation entries. */
+export function shouldRegisterInboundTrigger(msg: NormalizedMessage): boolean {
+  return senderTypeOf(msg) === 'user';
 }
 
 function senderAnnotation(msg: NormalizedMessage): string {

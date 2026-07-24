@@ -20,6 +20,8 @@ export interface StopControlEntry {
   consumedAt: number;
   /** For 'added': the result reply that was sent. */
   replyKind?: 'no-work' | 'stopped' | 'fail-closed';
+  /** For 'removed': the single consumed added entry paired with this removal. */
+  matchedAddedFingerprint?: string;
 }
 
 export interface StopControlLedgerDocument {
@@ -104,17 +106,67 @@ export class StopControlLedger {
     targetMessageId: string,
     emojiType: string,
   ): { fingerprint: string; entry: StopControlEntry } | undefined {
-    for (const [fp, entry] of Object.entries(this.doc.entries)) {
-      if (
-        entry.action === 'added' &&
-        entry.operatorOpenId === operatorOpenId &&
-        entry.targetMessageId === targetMessageId &&
-        entry.emojiType === emojiType
-      ) {
-        return { fingerprint: fp, entry };
+    return findLatestUnmatchedAdded(
+      this.doc,
+      operatorOpenId,
+      targetMessageId,
+      emojiType,
+    );
+  }
+
+  /**
+   * Atomically pair and persist one removed event with the latest unmatched
+   * consumed added entry. Returns undefined for duplicates or when no eligible
+   * added remains, so callers never emit a second removal acknowledgement.
+   */
+  async recordMatchingRemoval(
+    fingerprint: string,
+    operatorOpenId: string,
+    targetMessageId: string,
+    emojiType: string,
+  ): Promise<StopControlEntry | undefined> {
+    const transaction = this.queue.then(async () => {
+      let disk: StopControlLedgerDocument;
+      try {
+        disk = parseDoc(await readFile(this.filePath, 'utf8'));
+      } catch {
+        disk = structuredClone(this.doc);
       }
-    }
-    return undefined;
+
+      if (fingerprint in disk.entries) {
+        this.doc = disk;
+        return undefined;
+      }
+      const match = findLatestUnmatchedAdded(
+        disk,
+        operatorOpenId,
+        targetMessageId,
+        emojiType,
+      );
+      if (!match) {
+        this.doc = disk;
+        return undefined;
+      }
+
+      const entry: StopControlEntry = {
+        fingerprint,
+        action: 'removed',
+        operatorOpenId,
+        targetMessageId,
+        emojiType,
+        consumedAt: Date.now(),
+        matchedAddedFingerprint: match.fingerprint,
+      };
+      disk.entries[fingerprint] = entry;
+      await this.persist(disk);
+      this.doc = disk;
+      return entry;
+    });
+    this.queue = transaction.then(
+      () => undefined,
+      () => undefined,
+    );
+    return transaction;
   }
 
   /**
@@ -171,6 +223,53 @@ export class StopControlLedger {
     await mkdir(dirname(this.filePath), { recursive: true });
     await writeFileAtomic(this.filePath, serialize(doc), { mode: 0o600 });
   }
+}
+
+function sameStopTuple(
+  entry: StopControlEntry,
+  operatorOpenId: string,
+  targetMessageId: string,
+  emojiType: string,
+): boolean {
+  return entry.operatorOpenId === operatorOpenId
+    && entry.targetMessageId === targetMessageId
+    && entry.emojiType === emojiType;
+}
+
+function findLatestUnmatchedAdded(
+  doc: StopControlLedgerDocument,
+  operatorOpenId: string,
+  targetMessageId: string,
+  emojiType: string,
+): { fingerprint: string; entry: StopControlEntry } | undefined {
+  const entries = Object.entries(doc.entries);
+  const usedAdded = new Set(
+    entries
+      .map(([, entry]) => entry.matchedAddedFingerprint)
+      .filter((fp): fp is string => Boolean(fp)),
+  );
+
+  // Legacy schema-v1 removed entries did not persist their pair. Conservatively
+  // pair each one with the latest preceding unmatched added of the same tuple.
+  const legacyRemoved = entries
+    .filter(([, entry]) =>
+      entry.action === 'removed'
+      && !entry.matchedAddedFingerprint
+      && sameStopTuple(entry, operatorOpenId, targetMessageId, emojiType))
+    .sort((a, b) => a[1].consumedAt - b[1].consumedAt);
+  const matchingAdded = entries
+    .filter(([, entry]) =>
+      entry.action === 'added'
+      && sameStopTuple(entry, operatorOpenId, targetMessageId, emojiType))
+    .sort((a, b) => b[1].consumedAt - a[1].consumedAt);
+  for (const [, removed] of legacyRemoved) {
+    const prior = matchingAdded.find(([fp, added]) =>
+      !usedAdded.has(fp) && added.consumedAt <= removed.consumedAt);
+    if (prior) usedAdded.add(prior[0]);
+  }
+
+  const match = matchingAdded.find(([fp]) => !usedAdded.has(fp));
+  return match ? { fingerprint: match[0], entry: match[1] } : undefined;
 }
 
 // ── Factory ──

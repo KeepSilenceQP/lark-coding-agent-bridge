@@ -140,6 +140,34 @@ describe('reaction pipeline wiring (Unit 10)', () => {
     expect(result).toEqual({ kind: 'drop', reason: 'group-response' });
   });
 
+  it('uses thread scope when a converted topic message still resolves as group', async () => {
+    const callbacks = pipelineCallbacks();
+    callbacks.resolveChatMode.mockResolvedValue('group');
+    const target = channelWithTarget('ou_trigger_author');
+    const get = target.rawClient.im.v1.message.get as ReturnType<typeof vi.fn>;
+    get.mockResolvedValue({
+      data: {
+        items: [{
+          chat_id: 'oc_chat',
+          thread_id: 'omt_thread',
+          sender: { id: 'ou_trigger_author', sender_type: 'user' },
+        }],
+      },
+    });
+
+    const result = await handleReactionEvent(
+      reactionEvent({ emojiType: 'No' }),
+      { channel: target, ...BOT_DEPS },
+      callbacks,
+    );
+
+    expect(result).toMatchObject({
+      kind: 'stop-added-reply',
+      scope: 'oc_chat:omt_thread',
+      targetClass: 'user',
+    });
+  });
+
   // ── Self-operator guard in channel context ──
 
   it('self-operator guard drops reactions from the bot itself', () => {

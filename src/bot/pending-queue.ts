@@ -55,7 +55,7 @@ export interface LeaseHooks {
 }
 
 export interface PendingPushOptions {
-  /** False for internal synthetic inputs such as CardKit callbacks. */
+  /** True only for trusted, real human inbound IM messages. */
   registerAsTrigger?: boolean;
 }
 
@@ -99,7 +99,7 @@ export class PendingQueue {
   // inheritance contract. Queue-mechanics tests may omit leaseHooks.
 
   push(scope: string, msg: NormalizedMessage, options: PendingPushOptions = {}): number {
-    const registerAsTrigger = options.registerAsTrigger !== false;
+    const registerAsTrigger = options.registerAsTrigger === true;
     const replyTo = msg.replyToMessageId;
     const existing = this.map.get(scope);
     if (existing) {

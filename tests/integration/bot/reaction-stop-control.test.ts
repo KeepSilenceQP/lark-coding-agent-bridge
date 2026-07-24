@@ -82,6 +82,48 @@ describe('StopControlLedger', () => {
     expect(ledger2.isConsumed(fpRemoved)).toBe(true);
   });
 
+  it('pairs each removed event with one consumed added and does not reuse an old pair', async () => {
+    const { resolveControlLedgerPath } = await import('../../../src/bot/reaction/control-ledger');
+    const path = resolveControlLedgerPath(tmpDir);
+    const ledger1 = new StopControlLedger(path);
+    const added1 = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', 1000);
+    const removed1 = stopEventFingerprint('ou_user', 'om_target', 'No', 'removed', 2000);
+
+    await ledger1.record(added1, 'added', 'ou_user', 'om_target', 'No', 'stopped');
+    expect(await ledger1.recordMatchingRemoval(
+      removed1, 'ou_user', 'om_target', 'No',
+    )).toMatchObject({ matchedAddedFingerprint: added1 });
+
+    // Simulate restart, then an added event that was silently rejected and
+    // therefore was never recorded. Its later removal must not reuse added1.
+    const ledger2 = await loadStopControlLedger(tmpDir);
+    const removed2 = stopEventFingerprint('ou_user', 'om_target', 'No', 'removed', 4000);
+    expect(await ledger2.recordMatchingRemoval(
+      removed2, 'ou_user', 'om_target', 'No',
+    )).toBeUndefined();
+    expect(ledger2.isConsumed(removed2)).toBe(false);
+  });
+
+  it('atomically allows only one concurrent removal to consume an added entry', async () => {
+    const ledger = new StopControlLedger(join(tmpDir, 'control.json'));
+    const added = stopEventFingerprint('ou_user', 'om_target', 'No', 'added', 1000);
+    await ledger.record(added, 'added', 'ou_user', 'om_target', 'No', 'stopped');
+
+    const results = await Promise.all([
+      ledger.recordMatchingRemoval(
+        stopEventFingerprint('ou_user', 'om_target', 'No', 'removed', 2000),
+        'ou_user', 'om_target', 'No',
+      ),
+      ledger.recordMatchingRemoval(
+        stopEventFingerprint('ou_user', 'om_target', 'No', 'removed', 2001),
+        'ou_user', 'om_target', 'No',
+      ),
+    ]);
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(ledger.allEntries().filter((entry) => entry.action === 'removed')).toHaveLength(1);
+  });
+
   // ── Duplicate delivery ──
 
   it('duplicate stop-added events are consumed only once', async () => {

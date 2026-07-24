@@ -159,7 +159,11 @@ export async function handleReactionEvent(
     // 4. Resolve chatMode (F2: use channel's chatModeCache, not oc_/ou_ prefix guessing)
     const chatMode = await callbacks.resolveChatMode(chatId);
     const threadId = item?.thread_id as string | undefined;
-    const scope = (chatMode === 'topic' && threadId) ? `${chatId}:${threadId}` : chatId;
+    // A converted topic group may still resolve as `group` from chat info
+    // while the message itself already carries thread_id. Match ordinary
+    // intake: thread_id is authoritative for topic scope isolation.
+    const effectiveChatMode = threadId ? 'topic' : chatMode;
+    const scope = (effectiveChatMode === 'topic' && threadId) ? `${chatId}:${threadId}` : chatId;
     const chatType: 'p2p' | 'group' = chatMode === 'p2p' ? 'p2p' : 'group';
 
     // 5. Permission gates (F2): access control + group response
@@ -169,7 +173,7 @@ export async function handleReactionEvent(
       return { kind: 'drop', reason: `access-${accessResult.reason}` };
     }
 
-    if (chatType === 'group' || chatMode === 'topic') {
+    if (chatType === 'group' || effectiveChatMode === 'topic') {
       const groupRespResult = callbacks.checkGroupResponse(chatType, chatId, evt.operator.openId);
       if (!groupRespResult.accept) {
         log.info('reaction', 'deny-group-response', { scope, operator: evt.operator.openId.slice(-6), reason: groupRespResult.reason });

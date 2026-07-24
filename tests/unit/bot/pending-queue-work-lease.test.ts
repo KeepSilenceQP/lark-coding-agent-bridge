@@ -59,9 +59,9 @@ describe('PendingQueue WorkLease ownership', () => {
     const h = harness();
     h.queue.block('oc_scope');
 
-    h.queue.push('oc_scope', message('om_first'));
-    h.queue.push('oc_scope', message('om_middle'));
-    h.queue.push('oc_scope', message('om_last'));
+    h.queue.push('oc_scope', message('om_first'), { registerAsTrigger: true });
+    h.queue.push('oc_scope', message('om_middle'), { registerAsTrigger: true });
+    h.queue.push('oc_scope', message('om_last'), { registerAsTrigger: true });
 
     const first = h.store.resolveTrigger('oc_scope', 'om_first');
     expect(first?.status).toBe('current');
