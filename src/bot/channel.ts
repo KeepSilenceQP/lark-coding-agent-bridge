@@ -968,31 +968,52 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       createTime: Date.now(),
     } satisfies import('@larksuite/channel').NormalizedMessage;
     // F10/F11/F18: Before enqueuing the new revision, atomically evict any
-    // previous in-flight entry for the same key (queued/reserved OR active).
-    // A queued entry must be cancelled without a scope interrupt; only an
-    // active same-key entry triggers supersede + interrupt.
+    // previous in-flight entry for the same key (queued/reserved/active).
+    //
+    // Lifecycle state machine:
+    //   queued   — barrier still in PendingQueue → cancelMessage can remove it
+    //   reserved — barrier flushed, ActiveRuns holds a reservation (prompt-prep
+    //              or pool-wait); cancelMessage returns 0 → must interrupt
+    //   active   — agent is streaming → must supersede + interrupt
+    //
+    // The tracker lag (queued between flush and markStatus) is handled by the
+    // cancelMessage result: if it returns 0 for a 'queued' entry, the barrier
+    // was flushed in the meantime → treat as reserved.
     const opId = result.components.operatorOpenId;
     const tgtId = result.components.targetMessageId;
     const existingEntry = _reactionRunTracker?.get(result.components.scope, opId, tgtId);
     if (existingEntry) {
-      // Cancel old pending barrier by its turnId (precise — only this key)
-      const oldTurnId = _reactionTurnIdByKey.get(result.key);
-      if (oldTurnId) {
-        pending.cancelMessage(result.components.scope, oldTurnId);
+      let needsInterrupt = existingEntry.status !== 'queued';
+
+      if (existingEntry.status === 'queued') {
+        // Try to cancel the barrier from PendingQueue
+        const oldTurnId = _reactionTurnIdByKey.get(result.key);
+        if (oldTurnId) {
+          const removed = pending.cancelMessage(result.components.scope, oldTurnId);
+          if (removed.length === 0) {
+            // Barrier was already flushed from the queue — it holds an
+            // ActiveRuns reservation now. Must interrupt to abort it.
+            needsInterrupt = true;
+          }
+        }
       }
+
       // Atomically remove old context, meta, and tracker before enqueuing new
       reactionContextStore.delete(result.key);
       deleteReactionTurnMeta(result.key);
       _reactionRunTracker?.unregister(result.components.scope, opId, tgtId);
 
-      if (existingEntry.active) {
-        // Old run was active — supersede and interrupt scope
+      if (needsInterrupt) {
+        // Old run was reserved or active — supersede and interrupt scope.
+        // activeRuns.interrupt aborts both reservation (prompt-prep/pool-wait)
+        // and active streaming runs (Plan DD12).
         const handle = activeRuns.get(result.components.scope);
         if (handle) handle.superseded = true;
         activeRuns.interrupt(result.components.scope);
-        log.info('reaction', 'superseding-active-run', {
+        log.info('reaction', 'interrupting-inflight-run', {
           scope: result.components.scope,
           key: result.key,
+          oldStatus: existingEntry.status,
           oldRevision: existingEntry.reactionRevision,
           newRevision: result.revision,
         });
@@ -1017,7 +1038,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       targetMessageId: result.components.targetMessageId,
       reactionRevision: result.revision,
       runId: `${result.components.scope}:${Date.now()}`,
-      active: false, // queued, not yet active
+      status: 'queued',
     });
     pending.pushBarrier(result.components.scope, normalizedMsg);
     log.info('reaction', 'reconciled-and-enqueued', {
@@ -2057,10 +2078,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       targetMessageId: rkTgtId,
       reactionRevision: reactionTurnMeta.revision,
       runId: `${scope}:${Date.now()}`,
-      active: false, // queued/reserved, not yet active
+      status: 'reserved', // barrier flushed, ActiveRuns holds reservation
     });
-    // Mark active once the run actually starts — only active entries are interruptible.
-    _reactionRunTracker?.markActive(scope, rkOpId, rkTgtId);
+    // Mark active once the run actually starts — only active entries are interruptible via shouldInterrupt.
+    // The enqueue eviction path handles reserved entries via activeRuns.interrupt (Plan DD12).
+    _reactionRunTracker?.markStatus(scope, rkOpId, rkTgtId, 'active');
   }
   // Register outbound on stream result
   const _registerOutboundOnStream = (result: unknown): void => {

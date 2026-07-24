@@ -17,7 +17,7 @@ describe('ReactionRunTracker', () => {
       targetMessageId: 'om_target',
       reactionRevision: 1,
       runId: 'run-1',
-      active: false,
+      status: 'queued',
     });
     expect(tracker.get('oc_scope', 'ou_user', 'om_target')?.reactionRevision).toBe(1);
   });
@@ -30,7 +30,7 @@ describe('ReactionRunTracker', () => {
       targetMessageId: 'om_target',
       reactionRevision: 1,
       runId: 'run-1',
-      active: false,
+      status: 'queued',
     });
     tracker.unregister('oc_scope', 'ou_user', 'om_target');
     expect(tracker.get('oc_scope', 'ou_user', 'om_target')).toBeUndefined();
@@ -44,7 +44,7 @@ describe('ReactionRunTracker', () => {
       targetMessageId: 'om_target',
       reactionRevision: 1,
       runId: 'run-1',
-      active: true,
+      status: 'active',
     });
     expect(tracker.shouldInterrupt('oc_scope', 'ou_user', 'om_target', 2)).toBe(true);
   });
@@ -57,7 +57,7 @@ describe('ReactionRunTracker', () => {
       targetMessageId: 'om_target',
       reactionRevision: 2,
       runId: 'run-1',
-      active: true,
+      status: 'active',
     });
     expect(tracker.shouldInterrupt('oc_scope', 'ou_user', 'om_target', 2)).toBe(false);
   });
@@ -70,7 +70,7 @@ describe('ReactionRunTracker', () => {
       targetMessageId: 'om_target',
       reactionRevision: 1,
       runId: 'run-1',
-      active: true,
+      status: 'active',
     });
     // Different operator should NOT interrupt
     expect(tracker.shouldInterrupt('oc_scope', 'ou_user_b', 'om_target', 2)).toBe(false);
@@ -84,7 +84,7 @@ describe('ReactionRunTracker', () => {
       targetMessageId: 'om_target_a',
       reactionRevision: 1,
       runId: 'run-1',
-      active: true,
+      status: 'active',
     });
     // Different target should NOT interrupt
     expect(tracker.shouldInterrupt('oc_scope', 'ou_user', 'om_target_b', 2)).toBe(false);
@@ -103,7 +103,7 @@ describe('ReactionRunTracker', () => {
       targetMessageId: 'om_target',
       reactionRevision: 1,
       runId: 'run-1',
-      active: false,
+      status: 'queued',
     });
     expect(tracker.isSameKey('oc_scope', 'ou_user', 'om_target')).toBe(true);
   });
@@ -116,7 +116,7 @@ describe('ReactionRunTracker', () => {
       targetMessageId: 'om_target',
       reactionRevision: 1,
       runId: 'run-1',
-      active: false,
+      status: 'queued',
     });
     expect(tracker.isSameKey('oc_scope', 'ou_user_b', 'om_target')).toBe(false);
   });
@@ -175,7 +175,7 @@ describe('revision invalidation contract', () => {
       targetMessageId: 'om_target',
       reactionRevision: 1,
       runId: 'run-1',
-      active: true,
+      status: 'active',
     });
 
     // New revision 2 comes in → should interrupt old run
@@ -192,7 +192,7 @@ describe('revision invalidation contract', () => {
       targetMessageId: 'om_target',
       reactionRevision: 2,
       runId: 'run-2',
-      active: false,
+      status: 'queued',
     });
 
     // New run should be findable, old run gone
@@ -227,7 +227,7 @@ describe('revision invalidation contract', () => {
       targetMessageId: 'om_target',
       reactionRevision: 1,
       runId: 'run-1',
-      active: false,
+      status: 'queued',
     });
     tracker.unregister('oc_scope', 'ou_user', 'om_target');
 

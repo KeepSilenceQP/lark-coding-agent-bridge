@@ -14,14 +14,16 @@ import { makeReactionKey } from './types';
  * reaction run metadata is stored by reaction key, not scope.
  */
 
+export type ReactionRunStatus = 'queued' | 'reserved' | 'active';
+
 export interface ReactionRunMeta {
   scope: string;
   operatorOpenId: string;
   targetMessageId: string;
   reactionRevision: number;
   runId: string;
-  /** true when the run is actually active (not just queued/reserved). Only active entries can be interrupted. */
-  active: boolean;
+  /** Lifecycle status: queued (in PendingQueue), reserved (flushed, holds ActiveRuns reservation), active (agent streaming). */
+  status: ReactionRunStatus;
 }
 
 /**
@@ -77,12 +79,6 @@ export class ReactionRunTracker {
   }
 
   /**
-   * Check if a new revision for the same operator+target should interrupt
-   * the current run. Returns true when:
-   * - There IS an active run for this reaction key
-   * - The new revision is HIGHER than the active run's revision
-   */
-  /**
    * Check if a new revision should interrupt an ACTIVE run for the same key.
    * Only active runs (not queued/reserved) are interruptible.
    */
@@ -94,14 +90,14 @@ export class ReactionRunTracker {
   ): boolean {
     const current = this.get(scope, operatorOpenId, targetMessageId);
     if (!current) return false;
-    if (!current.active) return false; // queued/reserved — not interruptible
+    if (current.status !== 'active') return false; // queued/reserved — not interruptible via this path
     return newRevision > current.reactionRevision;
   }
 
-  /** Mark a queued/reserved entry as active when the run actually starts. */
-  markActive(scope: string, operatorOpenId: string, targetMessageId: string): void {
+  /** Transition a run's lifecycle status. */
+  markStatus(scope: string, operatorOpenId: string, targetMessageId: string, status: ReactionRunStatus): void {
     const current = this.get(scope, operatorOpenId, targetMessageId);
-    if (current) current.active = true;
+    if (current) current.status = status;
   }
 
   /**

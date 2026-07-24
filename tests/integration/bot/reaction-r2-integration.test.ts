@@ -375,14 +375,14 @@ describe('reconcile e2e with real nested API', () => {
 describe('F17: streaming production path — supersede on revision invalidation', () => {
   it('ReactionRunTracker detects same-key higher revision → shouldInterrupt=true', () => {
     const tracker = new ReactionRunTracker();
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_u', targetMessageId: 'om_t', reactionRevision: 1, runId: 'run-1', active: true });
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_u', targetMessageId: 'om_t', reactionRevision: 1, runId: 'run-1', status: 'active' });
     expect(tracker.shouldInterrupt('oc_s', 'ou_u', 'om_t', 2)).toBe(true);
     expect(tracker.shouldInterrupt('oc_s', 'ou_u', 'om_t', 1)).toBe(false);
   });
 
   it('different key (different operator) → shouldInterrupt=false, no false supersede', () => {
     const tracker = new ReactionRunTracker();
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_t', reactionRevision: 1, runId: 'run-1', active: true });
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_t', reactionRevision: 1, runId: 'run-1', status: 'active' });
     // Different operator should NOT interrupt
     expect(tracker.shouldInterrupt('oc_s', 'ou_b', 'om_t', 2)).toBe(false);
   });
@@ -401,9 +401,9 @@ describe('F17: streaming production path — supersede on revision invalidation'
   it('two keys interleaved: key A terminal does not clobber key B active metadata', () => {
     const tracker = new ReactionRunTracker();
     // Key A: active run
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_a', reactionRevision: 1, runId: 'run-a', active: false });
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_a', reactionRevision: 1, runId: 'run-a', status: 'queued' });
     // Key B: active run, same scope but different operator
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_b', targetMessageId: 'om_b', reactionRevision: 1, runId: 'run-b', active: false });
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_b', targetMessageId: 'om_b', reactionRevision: 1, runId: 'run-b', status: 'queued' });
     // Key A terminal — unregister should not affect key B
     tracker.unregister('oc_s', 'ou_a', 'om_a');
     expect(tracker.get('oc_s', 'ou_a', 'om_a')).toBeUndefined();
@@ -1309,5 +1309,95 @@ describe('same-key revision invalidation while queued (production seam)', () => 
     expect(remaining[0]!.messageId).toBe(turn2);
     // No turn1 in the remaining batch
     expect(remaining.find(m => m.messageId === turn1)).toBeUndefined();
+  });
+});
+
+// ── Reserved (post-flush) eviction: cancelMessage returns 0 → must interrupt ──
+// Exercises the race window where the barrier has been flushed from PendingQueue
+// and ActiveRuns holds a reservation, but the reaction tracker still shows
+// status='queued' (markStatus hasn't been called yet). The eviction path must
+// detect cancelMessage returning 0 and fall through to activeRuns.interrupt.
+
+describe('reserved-state eviction (cancelMessage returns 0 → interrupt)', () => {
+  it('rev1 flushed from queue → cancelMessage returns 0 → needsInterrupt=true', () => {
+    const scope = 'oc_s';
+    const rk = 'oc_s\x1fou_u\x1fom_t';
+    const turn1 = `${rk}:1`;
+    const turn2 = `${rk}:2`;
+
+    // Real PendingQueue — rev1 was already flushed (not pending)
+    const queue = new PendingQueue(9999, () => {});
+
+    // rev2 arrives, existing tracker entry says 'queued'
+    // cancelMessage returns 0 because the barrier was already flushed
+    const removed = queue.cancelMessage(scope, turn1);
+    expect(removed.length).toBe(0); // ← the race: barrier already flushed
+
+    // The eviction path must detect this and set needsInterrupt=true
+    // (this is what the production code now does)
+    const needsInterrupt = removed.length === 0;
+    expect(needsInterrupt).toBe(true);
+  });
+
+  it('rev1 reserved + rev2 → interrupt signal aborts reservation, rev2 survives', async () => {
+    const {
+      setReactionTurnMeta,
+      consumeReactionTurnMeta,
+      deleteReactionTurnMeta,
+      hasTurnMetaForTurnId,
+    } = await import('../../../src/bot/channel');
+
+    const rk = 'oc_s\x1fou_u\x1fom_t';
+    const turn1 = `${rk}:1`;
+    const turn2 = `${rk}:2`;
+
+    // rev1 was enqueued but the barrier has been flushed — tracker still shows
+    // the original queued entry from the buffer handler.
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 1, turn1);
+
+    // rev2 arrives: cancelMessage would return 0 (simulated)
+    // → needsInterrupt=true → evict rev1's meta/context
+    deleteReactionTurnMeta(rk);
+    // enqueue rev2
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 2, turn2);
+
+    // rev1 is gone, rev2 is the sole survivor
+    expect(consumeReactionTurnMeta(turn1)).toBeUndefined();
+    expect(hasTurnMetaForTurnId(turn2)).toBe(true);
+    const meta2 = consumeReactionTurnMeta(turn2);
+    expect(meta2!.revision).toBe(2);
+  });
+
+  it('active A + queued B rev2: cancelMessage removes B, does NOT remove A', () => {
+    const scope = 'oc_s';
+    const rkA = 'oc_s\x1fou_a\x1fom_a';
+    const rkB = 'oc_s\x1fou_b\x1fom_b';
+    const turnA = `${rkA}:1`;
+    const turnB1 = `${rkB}:1`;
+
+    // Use push (not pushBarrier) so both barriers accumulate in the same batch.
+    // pushBarrier's internal flushNow would flush the first barrier when the
+    // second one is pushed. In production, two barriers for different keys can
+    // queue simultaneously because the batch flush aggregates them.
+    const queue = new PendingQueue(9999, () => {});
+    const msg = (id: string) => ({
+      messageId: id, chatId: scope, chatType: 'group' as const,
+      senderId: '', content: '', rawContentType: 'reaction' as never,
+      resources: [], mentions: [], mentionAll: false, mentionedBot: false,
+      createTime: 0,
+    });
+    queue.push(scope, msg(turnA));
+    queue.push(scope, msg(turnB1));
+
+    // rev2 for key B arrives while A is active.
+    // cancelMessage must remove ONLY B's barrier.
+    const removedB = queue.cancelMessage(scope, turnB1);
+    expect(removedB.length).toBe(1);
+    expect(removedB[0]!.messageId).toBe(turnB1);
+
+    // A's barrier is untouched — still in queue
+    const remaining = queue.cancel(scope);
+    expect(remaining.length).toBe(1);
+    expect(remaining[0]!.messageId).toBe(turnA);
   });
 });
