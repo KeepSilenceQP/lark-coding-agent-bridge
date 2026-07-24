@@ -30,8 +30,11 @@ Implementer: 小C（Unit 1-10）→ 小P（B9 R6-R8 接管及后续闭环）
 - 2026-07-24 小P接管 B9 R6-R8：R6 经独立 SubAgent Review 发现 5 项 lifecycle/invariant 问题并在 R7 闭合；R7 复审发现 rev1 已离队但尚未 reserve 时，rev2 replacement 未写 tombstone 的 BLOCKER；R8 `67b43d8` 补齐 exact old turn invalidation。独立 SubAgent 最终复审 `5c2682d..67b43d8` 结论 `GO`，确认 R7 的 5 项修复维持闭合，允许重新打包部署并继续 Unit 11；live 验收仍需单独完成。
 - 2026-07-24 Unit 11 stop live 暴露产品约束：流式卡片在编辑过程中无法添加 Reaction，故“对正在更新的 Bot 卡片添加 stop Reaction”不能作为唯一实时停止入口；当前实现又在 stop 分支之前做 own-message 过滤，导致对触发任务的用户消息添加 `No` 被静默丢弃。
 - 2026-07-24 小P修订 Spec 并完成三轮独立 SubAgent Review：R1 `76e6f02`、R2 `ab1fee0` BLOCKED；R3 `602bc7a` PASS/GO，最终确认提交 `526cbcb`。确认 user-trigger stop 的 eligibility-before-no-work、removed ledger bypass、PendingUnit 全部真实 trigger ID、current mapping TTL/LRU 保护、Reaction 无 @ 权限边界和负向验收；Plan、代码、部署与 live 均需重新过 gate。
+- 2026-07-24 Amendment Plan Review R1（`526cbcb..cf77468`）BLOCKED，5 项 finding 全部采纳：①普通 non-stop 必须 own-message-before-permission，stop 才走 user-target 权限/eligibility；②清除旧完成状态对 amendment 的误覆盖；③把过期 Current Evidence 明确标为 historical baseline；④trigger historical cap 独立于 outbound 256 预算；⑤补 unknown user target 在 no-work / another-current 两种状态下均静默的生产 seam。
 
-## Current Evidence（当前代码现状，file:line）
+## Historical Baseline And Amendment Evidence
+
+以下第一段是最初 Plan 的 pre-implementation historical baseline，用于解释 Unit 1-10 的来源，**不是 `526cbcb` 当前源码状态**：
 
 Reaction 入站现状（核心 gap 所在）：
 
@@ -55,7 +58,7 @@ Reaction 入站现状（核心 gap 所在）：
 - `workChainId`/chain/correlation：**全仓不存在**（grep 0 命中）。outbound Bot 消息 ID 与 run 的关联**未记录**（仅日志）。
 - Bot 身份：`channel.botIdentity?.openId`（`ou_`）、`cfg.accounts.app.id`（`cli_`）、`evt.raw` 的 `operator_type==='app'`（被 `normalizeReaction` 丢弃，仅 `evt.raw` 可达；`includeRawEvent:true` 已开 `channel.ts:782`）。`ReactionEvent` 无稳定 event_id。
 
-Amendment live/source evidence（2026-07-24，当前 `526cbcb`）：
+Amendment current live/source evidence（2026-07-24，`526cbcb`）：
 
 - live 已证流式卡片编辑中不能添加 Reaction；对其 terminal 后可添加 Reaction，但不能满足“旧 run 完成前停止”的实时验收。用户确认采用“对触发当前任务的用户消息添加 stop Reaction”作为主入口。
 - `src/bot/reaction/pipeline.ts:123-130` 当前在 stop emoji 分类前无条件执行 `isOwnMessage`；用户 trigger 上的 `No` 因此在进入控制面前被 `not-own-message` 丢弃。
@@ -76,7 +79,7 @@ Amendment live/source evidence（2026-07-24，当前 `526cbcb`）：
 - `context-builder.ts` — 构建 `<reaction_contexts>` 与目标消息（DD8/DD9）。
 - `control-ledger.ts` — stop added/removed 独立持久控制 ledger（DD16）。
 - `work-chain.ts` — `workChainId` 存储/继承/登记/生命周期（DD15）。
-- `pipeline.ts` — 编排：事件 → self-operator guard → 安全路由/target sender 分类 → Reaction 无 @ 权限门禁 → 语义映射；普通语义再做 own-message 过滤并进入 buffer/reconcile，stop 控制面按 Bot/user target eligibility 分流。
+- `pipeline.ts` — 编排：事件 → self-operator guard → 安全路由/target sender 分类 → stop/non-stop 分类。non-stop 先做 own-Bot-message gate，再做 Reaction 无 @ 权限并进入普通语义/buffer/reconcile；stop 做 Reaction 无 @ 权限后，按 Bot/user target eligibility 或 removed ledger 分流。
 - `types.ts` — `ReactionContext`/`ReactionTurn`/`StopControlState` 等。
 
 `channel.ts:934-992` 改为只做 `pipeline.handleReactionEvent(evt, deps)` 委派；不再合成 `NormalizedMessage`。流水线输出两类：普通 `ReactionTurn`（→ Agent run，DD11）或 stop 控制动作（DD16）。
@@ -93,7 +96,7 @@ Amendment live/source evidence（2026-07-24，当前 `526cbcb`）：
 
 ### DD3 — 权限与群响应门禁复用（Reaction 非旁路）
 
-self-operator guard + 安全路由 + 目标 sender 分类后、更新快照或产生副作用前，按普通消息同一套门禁。普通语义随后要求 own-message；`stop_current_work` 的 user-target added/removed 则按 DD16 的 eligibility/ledger 例外处理：
+self-operator guard + 安全路由 + 目标 sender 分类后先分支：普通 non-stop 必须先通过 own-Bot-message gate，再按普通消息同一套 Reaction 门禁；`stop_current_work` 不先做 own-message，而是通过同一 Reaction 门禁后按 DD16 的 added eligibility / removed ledger 处理：
 
 1. 私聊复用 `canUseDm(profile, controls, operatorOpenId)`（`access.ts:33-45`）。
 2. 群聊复用 `canUseGroup(profile, controls, chatId, operatorOpenId)`（`access.ts:47-58`）。
@@ -198,8 +201,8 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - stop target 分为两类：Bot outbound 与 inbound user trigger。Bot target 沿用已有可见 no-work/fail-closed；user target 必须**先证明 eligibility，再判断 no-work/current/historical**。从未登记、已过期/LRU 淘汰或重启后丢失的 user trigger 无法证明 stop 语义，静默丢弃且不写 control ledger；仍受 retention 保护的 historical user trigger 在无 work 时可见回复无任务，在另一 current chain 存在时 fail closed；映射到 current chain 才执行 stop。
 - 重启后旧关联可整体失效，**不**据会话文本猜测重建。每次 outbound 登记、chain lifecycle 变化、fail-closed reason 写受限结构化日志。存储为内存 Map，**有界性 = current workload references + bounded historical cache**：
   - **current chains 及其 trigger/outbound mappings 不参与 TTL/LRU**：只要 chain 仍有 queued/reserved/active work（current），其 chain 记录与全部关联 trigger/outbound→chain 映射都原样保留，不受 `HISTORICAL_CHAIN_TTL_MS` 与 historical cap 约束（长任务不丢失 stop 关联）。PendingQueue 无容量/背压，active 期间可累积任意数量 current chain，**不**引入 pending admission/drop/backpressure。historical chain 被后续有效输入重新激活时，其仍保留的 trigger/outbound mappings 一并恢复 current 保护。
-  - **historical retention**：chain 全部进入 terminal 后才转为 historical，保留 `HISTORICAL_CHAIN_TTL_MS=1_800_000`（30 min）以供后续 Reaction 继承/关联；historical chain 记录数超过 `MAX_CHAINS_PER_SCOPE=16`、historical trigger+outbound→chain 映射数超过 `MAX_OUTBOUND_MAP_PER_SCOPE=256` 时，按 LRU 淘汰最久未访问的 historical 项。Bot target 淘汰后按可见 fail closed；user target 淘汰后因无法证明 eligibility 而静默丢弃。
-  - `MAX_CHAINS_PER_SCOPE`/`MAX_OUTBOUND_MAP_PER_SCOPE` 是 **historical cache 上限，不是总 Map 硬上限**；总 Map 大小 = current workload references（无上限）+ bounded historical cache（≤ cap）。重启 fail closed。常量为 Plan 定义默认值，小C 实现时可同量级调整。
+  - **historical retention**：chain 全部进入 terminal 后才转为 historical，保留 `HISTORICAL_CHAIN_TTL_MS=1_800_000`（30 min）以供后续 Reaction 继承/关联；historical chain 记录数超过 `MAX_CHAINS_PER_SCOPE=16` 时按 LRU 裁剪。Bot outbound 与 user trigger 使用**独立映射预算**：原 `MAX_OUTBOUND_MAP_PER_SCOPE=256` 只约束 historical outbound，不被 trigger 挤占；新增 `MAX_TRIGGER_MAP_PER_SCOPE=256`（默认值）独立约束 historical trigger。Bot target 淘汰后按可见 fail closed；user target 淘汰后因无法证明 eligibility 而静默丢弃。
+  - 三个 MAX 常量都是 **historical cache 上限，不是总 Map 硬上限**；总 Map 大小 = current workload references（无上限）+ bounded historical outbound cache + bounded historical trigger cache。重启 fail closed。常量为 Plan 定义默认值，实现时可同量级调整，但不得合并预算而缩小 Bot outbound 兼容窗口。
 
 ### DD16 — `stop_current_work` 独立控制面（added/removed 独立持久 ledger，不走 Agent 链路）
 
@@ -319,19 +322,19 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - [x] 原始 Bot-target removed：同门禁（不要求 chain 仍 current）+ 匹配 stop-added ledger + 防重 → 只回复一次「撤回不会自动恢复」；无匹配静默。**Amendment 的 user-target removed 由 Unit 12 以 consumed-added ledger 作为绕过 own-message 的唯一条件。**
 - [ ] RED：`tests/integration/bot/reaction-stop-control.test.ts` 覆盖：与 `/stop` 一致权限判断、`workChainId` 全生命周期关联、目标确认消息被 Reaction 继续、sibling queued unit、重启后未知关联 fail closed、added/removed 独立 ledger 重复投递与重启防重、active handle、run reservation/prompt preparation、scope pending 取消、**无任务幂等（scope 完全无 work 分支，单独测试）**、**scope 有 current work + 目标→current chain 关联通过 → interrupt（单独测试）**、**历史目标 + 另一 current chain → fail closed（单独测试）**、removed 不恢复、每种结果可见回复、interrupted UI 终态、stop 不产生新 Agent run、快速 added→removed（不相消）、removed 重复投递、stop-added 后重启再 removed。
 - Depends: Unit 2、Unit 5、Unit 6、Unit 8。
-- Spec 覆盖：§Stop Reaction Control Contract 全部；Acceptance 所有 stop 行（未授权停止、指向当前链路、指向历史/无关、已产生 Bot 输出、目标确认消息继续、sibling queued、重启 fail closed、无任务幂等、移除不恢复、快速 added→removed、removed 重复投递、stop-added 后重启再 removed）。
+- Spec 覆盖：pre-amendment Bot-target Stop Contract baseline（未授权停止、Bot current/historical/unrelated、已产生 Bot 输出、目标确认消息继续、sibling queued、Bot 重启 fail closed、Bot no-work、移除不恢复与防重）；user-trigger amendment 全部由 Unit 12 覆盖。
 
 ### Unit 10 — 接线：`channel.ts` reaction handler 委派 + 故障隔离  Owner: 小C
 
-- [x] `channel.ts:934-992` 改为 `pipeline.handleReactionEvent(evt, deps)` 委派，移除合成 `NormalizedMessage` push；保留 self-message 路由前提与 `withTrace`。
+- [x] pre-amendment baseline：`channel.ts:934-992` 改为 `pipeline.handleReactionEvent(evt, deps)` 委派，移除合成 `NormalizedMessage` push；普通 non-stop 保留 self-message 路由前提与 `withTrace`。Unit 12 覆盖 stop 的受限 user-trigger 例外。
 - [x] 故障隔离：路由/list/ledger/规范化失败不崩 bridge 队列；受限日志（目标消息 ID、阶段、trace，不记凭据/无界原文）。
 - [ ] RED：`tests/integration/bot/reaction-pipeline-wiring.test.ts` 覆盖端到端：事件 → guard → 门禁 → buffer → reconcile → turn → run → 可见回复；各类失败被隔离不影响普通消息队列。
 - Depends: Unit 1-9。
-- Spec 覆盖：§Compatibility, Failure And Rollback；Acceptance「其他发送者过滤」「无法取得路由/sender 丢弃」。
+- Spec 覆盖：pre-amendment ordinary/Bot-target §Compatibility, Failure And Rollback；Amendment target-class 路由由 Unit 12 覆盖。
 
 ### Unit 12 — stop target 扩展到真实 inbound trigger（Amendment，RED 先行）  Owner: 小P
 
-- [ ] `pipeline.ts` 重排为：self-operator → 安全路由/target sender 分类 → Reaction 无 @ 权限门禁 → stop 语义分流 → target eligibility；普通语义随后才做 own-message filter。禁止把 user-target stop 当普通 Reaction 送入 buffer/Agent。
+- [ ] `pipeline.ts` 重排为：self-operator → 安全路由/target sender 分类 → stop/non-stop 分类。non-stop 先 own-Bot-message gate，再调用 Reaction 无 @ 权限并进入普通流水线；stop 调用 Reaction 无 @ 权限后再做 added eligibility 或 removed ledger 匹配。禁止把 user-target stop 当普通 Reaction 送入 buffer/Agent。
 - [ ] `WorkChainStore` 增加带 target class 的 trigger correlation（或等价的显式 API），并让 `resolveStopTarget` 区分：current trigger、retained historical trigger、unknown/expired/restart-lost user target、Bot outbound。不得把 unknown user target 降级为 Bot fail-closed。
 - [ ] PendingQueue 新建 regular unit 时，把 unit 内全部真实 inbound message ID 登记到同一 lease/workChain；后续合并消息时增量登记；cancel/flush/terminal/重新激活与现有 per-unit lease 生命周期一致。synthetic unit/card callback ID 不创建 user-trigger stop 入口。
 - [ ] current trigger/outbound mapping 与 chain 一起免 TTL/LRU；terminal 后进入同一 historical retention/cap，重新 current 时恢复保护。历史裁剪后 user target 为 silent unknown；Bot target 维持可见 fail-closed。
@@ -343,8 +346,9 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
   - 一个 regular PendingUnit 的 first/middle/last 每个真实 message ID 都可命中同一 chain；
   - same scope 另一 operator 可/不可 stop 仅由 Reaction 无 @ 权限决定；
   - trigger 作者无权限、mention-only 无 @、scope/thread 不一致 → 静默拒绝；
-  - user target 上 `OK/DONE/WHAT/Get` → 静默且不入 Agent；
-  - never-registered、expired/LRU、restart-lost user target → 静默、不回复、不写 control ledger；
+  - user target 上 `OK/DONE/WHAT/Get` → 在 own-message gate 静默，且不调用权限/snapshot/revision/Agent；
+  - scope 无 work + never-registered/expired/LRU/restart-lost user target → 静默、零回复、零 ledger；
+  - scope 有另一 current chain + unknown user target → 静默、零 interrupt/cancel、零回复、零 ledger；
   - retained historical user trigger：无 work → no-work；另一 current chain → fail-closed；
   - current trigger 超 TTL/超 historical cap 仍可 stop；terminal 后裁剪才变 silent unknown；重新 current 恢复保护；
   - user-target added 已消费后 mapping terminal/淘汰/重启，removed 仍仅凭 ledger 回复一次；无 added 的 removed 静默；
@@ -382,7 +386,8 @@ Amendment gate（Spec `526cbcb`）：
 
 ### Unit 11 — 自动化全量 + live-model 对照验收（两路）  Owner: 小P（接管闭环）
 
-- [x] 自动化：Spec §Acceptance Criteria 与 §Next Phase 列举的全部确定性场景在 Claude 与 Codex 两路通过结构/注入测试。
+- [x] pre-amendment 自动化：`526cbcb` 之前的 Spec Acceptance/Next Phase 场景在 Claude 与 Codex 两路通过结构/注入测试。
+- [ ] amendment 自动化：Unit 12 的 user-trigger target、eligibility、permission、mapping lifecycle、removed ledger 与负向场景全部通过。
 - [ ] live-model：隔离可逆带唯一标记测试动作 X，按 Spec oracle 覆盖 4 个预埋 `semanticKey` 各一个代表 emoji + 一次未预埋 + 一次 removed；停止场景证明 interrupt 发生在旧 run 完成之前且无后继 Agent run 自动启动。
 - [ ] 每条验收保存：实际动态 prompt、共享 System Prompt 版本（DD10）、工具调用、可观察副作用、最终回复、飞书消息 ID；记录 Agent 类型、实际模型标识、时间。
 - [ ] 核对 UI 引用、Agent 输入、System Prompt、工具副作用、最终行为一致。
@@ -474,6 +479,7 @@ remains historical evidence and is not reinterpreted as stop completion.
 | 同 scope >16 current chains 不淘汰，terminal 后 historical 收敛至 cap | 6 |
 | current outbound mapping 超30min 仍可 stop，terminal 后过 TTL 才 fail closed | 6 |
 | historical outbound map >256 按 LRU 淘汰 | 6 |
+| historical trigger map >256 独立按 LRU 淘汰，不挤占 outbound 256 | 12 |
 | stop added 顺序：scope 完全无 work → 无任务（分支单独测试） | 9 |
 | stop added：scope 有 current work + 目标→current chain → interrupt | 9 |
 | stop added：历史目标 + 另一 current chain → fail closed | 9 |
@@ -515,7 +521,7 @@ remains historical evidence and is not reinterpreted as stop completion.
 | 同 buffer 一增一减且最终非空（triggerReactions 保留+最终集合） | 3、4 |
 | 目标正文含伪造标签 | 4 |
 
-Spec §Acceptance Criteria 末段「自动化测试至少覆盖……」清单与 live oracle 由 Unit 1-11 + Code Review Gate + 覆盖矩阵共同保证；任一项缺失不得宣称完成。
+Spec §Acceptance Criteria 末段「自动化测试至少覆盖……」清单与 live oracle 由 Unit 1-12 + Amendment Code Review Gate + 覆盖矩阵共同保证；任一项缺失不得宣称完成。
 
 ## Verification Commands
 
@@ -573,7 +579,7 @@ pnpm -s test
 - **B4（实现注意）**：`ReactionEvent` 无稳定 event_id；stop 控制 ledger 与普通 ledger 防重 fingerprint 优先用 `evt.raw.header.event_id`（若可达），否则用规范化字段 + action time（Spec §Stop 已允许）。
 - **B5（实现注意）**：`NormalizedMessage` 为 vendored SDK 类型不易扩展；Reaction turn 经 `PendingQueue` barrier 条目携带 `ReactionTurn` 而非扩展 `NormalizedMessage`（DD11），`<reaction_contexts>` 数据经侧信道 plumbed 到 `buildAgentPrompt`。
 - **B6（实现注意）**：`ActiveRuns` 仅按 scope 键，无 per-run (operator,target,revision,workChainId) 元数据；DD12/DD15 需在其外加 per-run 元数据注册或扩展 `RunHandle`，注意与现有 `interrupt`/`unregister` 生命周期一致。
-- **B7（实现注意，第 3 版；v4 + amendment 修订）**：DD15 的 `workChainId` 常量（`MAX_CHAINS_PER_SCOPE=16`、`MAX_OUTBOUND_MAP_PER_SCOPE=256`、`HISTORICAL_CHAIN_TTL_MS=1_800_000`）为 Plan 定义默认值，实现时可同量级调整。**16/256 是 historical cache 上限，非总 Map 硬上限**；current chains 及其 trigger/outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，仅 terminal 后进入 historical retention 并按 LRU/TTL 裁剪；不引入 pending admission/drop/backpressure。
+- **B7（实现注意，第 3 版；v4 + amendment 修订）**：DD15 的 `workChainId` 常量（`MAX_CHAINS_PER_SCOPE=16`、`MAX_OUTBOUND_MAP_PER_SCOPE=256`、`MAX_TRIGGER_MAP_PER_SCOPE=256`、`HISTORICAL_CHAIN_TTL_MS=1_800_000`）为 Plan 定义默认值，实现时可同量级调整。各 MAX 是独立 historical cache 上限，非总 Map 硬上限；trigger 不得挤占 outbound 256 兼容预算。current chains 及其 trigger/outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，仅 terminal 后进入各自 historical retention 并按 LRU/TTL 裁剪；不引入 pending admission/drop/backpressure。
 - **B8（Unit 11 live blocker，已修复）**：普通 Reaction reconciliation 产生空 `effectiveReactionSet` 时，buffer flush 经 `decideReactionFlush` 走 `bridge-reply`(empty-set) 分支——Bridge 回复"已收到撤回"+interrupt(若有 active)+cancelPending+clearContext+deleteTurnMeta，**不 enqueue Agent**（channel.ts `executeReactionFlushDecision`）。terminal 后 removed 只由 Bridge 回复；in-flight/queued removal 经 `evictInFlightReactionEntry`(tri-state) 使旧 revision 失效；空集合不启动替代 turn；净零/重复投递遵守 DD7/DD14 防重。已由 B8 fix + 本轮 invariants 修复覆盖。
 - **B9（invariants 修复，云上C总 Implementer，R4 — 待小P Review）**：R3 Review（8919bd2..738c6f5）BLOCKED 5 项（R3-F1..F5），R4 把 workChain/lifecycle token 从 messageId side-map 迁移到**真实 PendingUnit**：
   - R3-F1（lease on PendingUnit，替代 side-map）：`PendingQueue` 重写——`PendingUnit` 携带 `WorkLease{workChainId,unitId}`；`leaseHooks{acquire,release}` 在 unit 创建时 acquire、cancel 时 release、onFlush 时 transfer 给 run。`push` 仅同 workChainId 合并（不同 chain 拆 unit），`pushBarrier` 带 lease。`intakeMessage` 普通 REPLY（有 replyTo）传 workChainId（enqueue acquire），top-level（无 replyTo）无 lease（按旧方式合并，run start 分配 B1）。`runAgentBatch` 从 `deps.lease` 取 workChainId/unitId（不再 acquire，不再 consumeOrdinaryTurnMeta）。解决 batch 2..N 条 meta 泄漏。
