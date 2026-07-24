@@ -209,6 +209,40 @@ export function consumeReactionTurnMeta(turnId: string): { workChainId: string; 
 function registerOutboundLifecycle(workChainId: string, messageId: string): void {
   _workChainStore?.registerOutbound(workChainId, messageId);
 }
+
+// ── Ordinary input unit workChain (R2-F1/F3) ──
+// Ordinary messages carry a workChain from enqueue (intakeMessage) so a stop on
+// a queued/reserved ordinary reply resolves a current chain (Spec DD15).
+const _ordinaryTurnMeta = new Map<string, string>(); // messageId → workChainId
+function setOrdinaryTurnMeta(messageId: string, workChainId: string): void {
+  _ordinaryTurnMeta.set(messageId, workChainId);
+}
+function consumeOrdinaryTurnMeta(messageId: string): string | undefined {
+  const wcId = _ordinaryTurnMeta.get(messageId);
+  if (wcId) _ordinaryTurnMeta.delete(messageId);
+  return wcId;
+}
+
+/**
+ * R2-F2: release an enqueued unit's in-flight lifecycle on cancel/abort (stop
+ * cancel of a queued unit, or startFlow reject/abort before the run starts).
+ * Consumes the turn meta (reaction or ordinary) and releases the in-flight
+ * unit + tracker entry so no ghost current-chain/tracker remains.
+ */
+function releaseEnqueuedTurn(scope: string, messageId: string): void {
+  const rMeta = consumeReactionTurnMeta(messageId);
+  if (rMeta) {
+    _workChainStore?.releaseUnit(rMeta.workChainId, messageId);
+    if (rMeta.reactionKey) {
+      const opId = rMeta.reactionKey.split('\x1f')[1] ?? '';
+      const tgtId = rMeta.reactionKey.split('\x1f')[2] ?? '';
+      _reactionRunTracker?.unregister(scope, opId, tgtId);
+    }
+    return;
+  }
+  const ordWcId = consumeOrdinaryTurnMeta(messageId);
+  if (ordWcId) _workChainStore?.releaseUnit(ordWcId, messageId);
+}
 /**
  * Finalize a reaction run's lifecycle on terminal. Only marks the workChain
  * terminal and unregisters the tracker entry if THIS run is still the latest
@@ -1104,6 +1138,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       runId: `${result.components.scope}:${Date.now()}`,
       status: 'queued',
     });
+    // R2-F1: acquire the in-flight unit at ENQUEUE time (not run start) so the
+    // chain stays current while the turn is queued/reserved — a sibling run
+    // terminaling must not mark the shared chain historical while this queued
+    // unit is still in-flight.
+    if (wcId) _workChainStore?.acquireUnit(wcId, turnId);
     pending.pushBarrier(result.components.scope, normalizedMsg);
     log.info('reaction', 'reconciled-and-enqueued', {
       key: result.key,
@@ -1452,7 +1491,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             } else {
               // F11: Real interrupt + cancel pending
               activeRuns.interrupt(pipelineResult.scope);
-              pending.cancel(pipelineResult.scope);
+              // R2-F2: cancel pending + release each removed unit's lifecycle
+              // (meta/tracker/in-flight unit) so no ghost current-chain remains.
+              const removed = pending.cancel(pipelineResult.scope);
+              for (const m of removed) releaseEnqueuedTurn(pipelineResult.scope, m.messageId);
               message = '已停止当前任务。';
               replyKind = 'stopped';
             }
@@ -1845,6 +1887,15 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
+  // R2-F1/F3: ordinary input unit carries a workChain at ENQUEUE time (not run
+  // start) so a stop on a queued/reserved ordinary reply resolves a current
+  // chain (Spec DD15). Allocate/inherit + acquire the in-flight unit now.
+  const ordWcId = _workChainStore?.resolveOrAllocate(scope, emsg.replyToMessageId) ?? '';
+  if (ordWcId) {
+    _workChainStore?.markCurrent(ordWcId);
+    _workChainStore?.acquireUnit(ordWcId, emsg.messageId);
+    setOrdinaryTurnMeta(emsg.messageId, ordWcId);
+  }
   const size = pending.push(scope, emsg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
@@ -2119,6 +2170,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     });
   const flow = await startFlow('submit');
   if (!flow.ok) {
+    // R2-F2: the run never starts — release the enqueued unit's in-flight
+    // lifecycle (acquired at enqueue) so no ghost current-chain/tracker remains.
+    releaseEnqueuedTurn(scope, firstMsg.messageId);
     // Clean up route lease if flow is rejected — no agent run will happen.
     if (routeLeaseId && deps.profileDir) {
       await deleteRouteLease(deps.profileDir, routeLeaseId).catch(() => {});
@@ -2147,10 +2201,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // B1: isReactionTurn distinguishes reaction (revision-supersede + tracker)
   // from ordinary (no tracker, no supersede).
   const isReactionTurn = reactionTurnMeta !== undefined;
-  const runUnitId = handle.run.runId;
+  // R2-F1: unitId is the barrier/queue message id (reaction turnId or ordinary
+  // messageId) — the SAME id acquired at enqueue. run start does NOT acquire
+  // (the unit is in-flight from enqueue); it only transitions status.
+  const runUnitId = firstMsg.messageId;
   if (reactionTurnMeta) {
-    _workChainStore?.markCurrent(reactionTurnMeta.workChainId);
-    _workChainStore?.acquireUnit(reactionTurnMeta.workChainId, runUnitId); // B4
+    _workChainStore?.markCurrent(reactionTurnMeta.workChainId); // idempotent (already current from enqueue)
     const rkOpId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';
     const rkTgtId = reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '';
     _reactionRunTracker?.register({
@@ -2165,12 +2221,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     // The enqueue eviction path handles reserved entries via activeRuns.interrupt (Plan DD12).
     _reactionRunTracker?.markStatus(scope, rkOpId, rkTgtId, 'active');
   } else {
-    // B1: ordinary input unit — allocate/inherit a workChain + acquire a unit
-    // so Card/Markdown/CoT/Text outputs register and stop can correlate.
-    const ordWcId = _workChainStore?.resolveOrAllocate(scope, firstMsg.replyToMessageId) ?? '';
+    // R2-F1/F3: ordinary — consume the workChain allocated at intakeMessage
+    // enqueue (the unit was acquired there; run start only marks current).
+    const ordWcId = consumeOrdinaryTurnMeta(firstMsg.messageId);
     if (ordWcId) {
-      _workChainStore?.markCurrent(ordWcId);
-      _workChainStore?.acquireUnit(ordWcId, runUnitId);
+      _workChainStore?.markCurrent(ordWcId); // idempotent
       reactionTurnMeta = { workChainId: ordWcId, reactionKey: '', revision: 0 };
     }
   }
@@ -2440,11 +2495,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         fallback: async (state) => {
           // F18: If this reaction run was superseded, mark the card state
           const fallbackState = isReactionTurn ? markSuperseded(state) : state;
-          await channel.send(
+          // R2-F4: register the fallback outbound so stop can correlate it.
+          const fbResult = await channel.send(
             chatId,
             { card: renderCard(filterForPrefs(fallbackState), cardRenderOptions) },
             sendOpts,
           );
+          _registerOutboundOnStream(fbResult);
         },
       });
       // Reaction lifecycle: mark terminal after render+stream complete
@@ -2556,7 +2613,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         fallback: async (state) => {
           const body = renderText(filterForPrefs(state));
           if (body.trim()) {
-            await channel.send(chatId, { markdown: body }, sendOpts);
+            // R2-F4: register the fallback outbound so stop can correlate it.
+            const fbResult = await channel.send(chatId, { markdown: body }, sendOpts);
+            _registerOutboundOnStream(fbResult);
           }
         },
       });
