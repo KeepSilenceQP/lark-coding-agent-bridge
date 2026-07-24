@@ -1,5 +1,8 @@
 import { describe, expect, it, beforeEach, vi, afterEach } from 'vitest';
-import { WorkChainStore } from '../../../src/bot/reaction/work-chain';
+import {
+  MAX_OUTBOUND_MAP_PER_SCOPE,
+  WorkChainStore,
+} from '../../../src/bot/reaction/work-chain';
 
 describe('WorkChainStore', () => {
   let store: WorkChainStore;
@@ -147,6 +150,25 @@ describe('WorkChainStore', () => {
     // Current chain should still be resolvable
     expect(store.isCurrent(chainId)).toBe(true);
     expect(store.resolveCurrentChain('om_long_running')).toBe(chainId);
+  });
+
+  it('reactivated current outbound mappings are removed from historical LRU accounting', () => {
+    const scope = 'oc_scope';
+    const continuedChain = store.allocate(scope);
+    store.registerOutbound(continuedChain, 'om_continued');
+    store.markTerminal(continuedChain);
+    expect(store.resolveOrAllocate(scope, 'om_continued')).toBe(continuedChain);
+    store.acquireUnit(continuedChain, 'unit-current');
+
+    const historicalChain = store.allocate(scope);
+    for (let i = 0; i < MAX_OUTBOUND_MAP_PER_SCOPE; i++) {
+      store.registerOutbound(historicalChain, `om_history_${i}`);
+    }
+    store.markTerminal(historicalChain);
+
+    expect(store.isCurrent(continuedChain)).toBe(true);
+    expect(store.resolveOutbound('om_continued')).toBe(continuedChain);
+    expect(store.resolveCurrentChain('om_continued')).toBe(continuedChain);
   });
 
   it('historical chains older than TTL → resolveCurrentChain returns undefined (fail closed)', () => {

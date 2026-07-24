@@ -167,6 +167,15 @@ const _reactionTurnMeta = new Map<string, { workChainId: string; scope: string; 
 const _reactionTurnMetaByMsg = new Map<string, Set<string>>(); // targetMessageId → Set<reactionKey>
 const _reactionTurnMetaByTurnId = new Map<string, string>(); // turnId → reactionKey (1:1, for batch correspondence)
 const _reactionTurnIdByKey = new Map<string, string>(); // reactionKey → turnId (1:1, for cancelPending lookup)
+// turnIds that crossed PendingQueue but were invalidated before ActiveRuns
+// acquired a reservation. runAgentBatch consumes this tombstone before submit.
+const _invalidatedReactionTurnIds = new Set<string>();
+
+export function consumeInvalidatedReactionTurn(turnId: string): boolean {
+  if (!_invalidatedReactionTurnIds.has(turnId)) return false;
+  _invalidatedReactionTurnIds.delete(turnId);
+  return true;
+}
 
 export function setReactionTurnMeta(reactionKey: string, targetMessageId: string, scope: string, workChainId: string, revision: number, turnId: string): void {
   _reactionTurnMeta.set(reactionKey, { workChainId, scope, revision, turnId });
@@ -229,6 +238,7 @@ export function releaseEnqueuedTurn(
   messageId: string,
   overrides: ReactionLifecycleCleanupDeps = {},
 ): void {
+  _invalidatedReactionTurnIds.delete(messageId);
   const rMeta = consumeReactionTurnMeta(messageId);
   if (!rMeta) return;
   const workChainStore = overrides.workChainStore ?? _workChainStore;
@@ -255,6 +265,46 @@ export function releaseFlushedTurnAfterError(
   if (lease) workChainStore?.releaseUnit(lease.workChainId, lease.unitId);
   releaseEnqueuedTurn(scope, messageId, overrides);
 }
+
+/** Stop a Reaction turn that left PendingQueue before its removal arrived but
+ * has not yet synchronously acquired an ActiveRuns reservation. */
+export function releaseInvalidatedReactionTurn(
+  scope: string,
+  messageId: string,
+  lease: WorkLease | undefined,
+  overrides: ReactionLifecycleCleanupDeps = {},
+): boolean {
+  if (!consumeInvalidatedReactionTurn(messageId)) return false;
+  const workChainStore = overrides.workChainStore ?? _workChainStore;
+  if (lease) workChainStore?.releaseUnit(lease.workChainId, lease.unitId);
+  releaseEnqueuedTurn(scope, messageId, overrides);
+  return true;
+}
+
+/** Own the queue→run handoff boundary, including synchronous callback throws. */
+export async function executePendingFlushWithCleanup(input: {
+  scope: string;
+  messageId: string;
+  lease: WorkLease | undefined;
+  run: () => void | Promise<void>;
+  onError?: (error: unknown) => void;
+  onFinally?: () => void | Promise<void>;
+  cleanupOverrides?: ReactionLifecycleCleanupDeps;
+}): Promise<void> {
+  try {
+    await input.run();
+  } catch (error) {
+    input.onError?.(error);
+    releaseFlushedTurnAfterError(
+      input.scope,
+      input.messageId,
+      input.lease,
+      input.cleanupOverrides,
+    );
+  } finally {
+    await input.onFinally?.();
+  }
+}
 /**
  * Finalize a reaction run's lifecycle on terminal. Only marks the workChain
  * terminal and unregisters the tracker entry if THIS run is still the latest
@@ -267,6 +317,7 @@ function finalizeReactionRun(
   reactionTurnMeta: { workChainId: string; reactionKey: string; revision: number } | undefined,
   unitId: string,
 ): void {
+  _invalidatedReactionTurnIds.delete(unitId);
   if (!reactionTurnMeta) return;
   // B4: release this run's in-flight unit; the chain goes historical only if
   // this was the last in-flight unit on that chain (covers same-chain siblings
@@ -295,7 +346,7 @@ export function decideReactionFlush(params: {
   noOp: boolean;
   netZeroConsumed: boolean;
   effectiveReactionSetLength: number;
-  hasMatchingActiveRun: boolean;
+  hasMatchingInFlightRun: boolean;
   targetMessageId: string;
   scope: string;
 }): ReactionFlushDecision {
@@ -313,14 +364,14 @@ export function decideReactionFlush(params: {
       kind: 'bridge-reply', reason: 'empty-set',
       message: '已收到撤回，已完成动作不会自动回滚。',
       targetMessageId: params.targetMessageId,
-      ...(params.hasMatchingActiveRun ? { interrupt: { scope: params.scope } } : {}),
+      ...(params.hasMatchingInFlightRun ? { interrupt: { scope: params.scope } } : {}),
     };
   }
   return { kind: 'enqueue-agent' };
 }
 
 export interface ReactionFlushEffects {
-  cancelPendingForTarget: (scope: string, reactionKey: string) => void;
+  cancelPendingForTarget: (scope: string, reactionKey: string) => number;
   clearContextForTarget: (reactionKey: string) => void;
   deleteTurnMetaForTarget: (reactionKey: string) => void;
   unregisterTrackerForTarget: (scope: string, reactionKey: string) => void;
@@ -337,7 +388,10 @@ export function createReactionFlushEffects(deps: {
   return {
     cancelPendingForTarget: (scope, reactionKey) => {
       const turnId = _reactionTurnIdByKey.get(reactionKey);
-      if (turnId) deps.pending.cancelMessage(scope, turnId);
+      if (!turnId) return 0;
+      const removed = deps.pending.cancelMessage(scope, turnId).length;
+      if (removed === 0) _invalidatedReactionTurnIds.add(turnId);
+      return removed;
     },
     clearContextForTarget: (reactionKey) => {
       deps.contextStore.delete(reactionKey);
@@ -379,11 +433,17 @@ export async function executeReactionFlushDecision(
   if (decision.kind === 'bridge-reply') {
     // Only empty-set removal triggers cleanup. reconciliationFailed/netZero do NOT.
     if (decision.reason === 'empty-set') {
-      if (decision.interrupt) {
+      // A queued barrier can be cancelled without touching an unrelated active
+      // run in the same scope. If it is no longer in PendingQueue, it crossed
+      // the queue→prompt-prep boundary; abort the matching reservation/run.
+      const removedFromQueue = deps.effects.cancelPendingForTarget(
+        deps.scope,
+        deps.reactionKey,
+      );
+      if (decision.interrupt && removedFromQueue === 0) {
         deps.effects.setHandleSuperseded(decision.interrupt.scope);
         deps.effects.interruptActiveRun(decision.interrupt.scope);
       }
-      deps.effects.cancelPendingForTarget(deps.scope, deps.reactionKey);
       deps.effects.clearContextForTarget(deps.reactionKey);
       deps.effects.deleteTurnMetaForTarget(deps.reactionKey);
       deps.effects.unregisterTrackerForTarget(deps.scope, deps.reactionKey);
@@ -1053,16 +1113,23 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     });
 
     // ── Use the production decision+executor seam ──
-    const hasMatchingActive = _reactionRunTracker
-      ? _reactionRunTracker.shouldInterrupt(result.components.scope, result.components.operatorOpenId, result.components.targetMessageId, result.revision)
-      : false;
+    // Any queued/reserved/active entry for the exact reaction key is relevant
+    // to empty-set invalidation. The executor decides whether a queued barrier
+    // was still cancellable or had already crossed into prompt preparation.
+    const hasMatchingInFlight = Boolean(
+      _reactionRunTracker?.get(
+        result.components.scope,
+        result.components.operatorOpenId,
+        result.components.targetMessageId,
+      ),
+    );
 
     const decision = decideReactionFlush({
       reconciliationFailed: result.reconciliationFailed,
       noOp: result.noOp,
       netZeroConsumed: result.netZeroConsumed,
       effectiveReactionSetLength: result.effectiveReactionSet.length,
-      hasMatchingActiveRun: hasMatchingActive,
+      hasMatchingInFlightRun: hasMatchingInFlight,
       targetMessageId: result.components.targetMessageId,
       scope: result.components.scope,
     });
@@ -1320,15 +1387,19 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     if (!firstMsg) return;
     pending.block(scope);
     activeBatchCount += 1;
-    void withTrace({ chatId: firstMsg.chatId }, async () => {
-      log.info('flush', 'start', {
-        scope,
-        batchSize: batch.length,
-        chatId: firstMsg.chatId,
-        threadId: firstMsg.threadId,
-        msgId: firstMsg.messageId,
-      });
-      try {
+    void executePendingFlushWithCleanup({
+      scope,
+      messageId: firstMsg.messageId,
+      lease,
+      run: () =>
+        withTrace({ chatId: firstMsg.chatId }, async () => {
+          log.info('flush', 'start', {
+            scope,
+            batchSize: batch.length,
+            chatId: firstMsg.chatId,
+            threadId: firstMsg.threadId,
+            msgId: firstMsg.messageId,
+          });
         const resolvedMode = await chatModeCache.resolve(channel, firstMsg.chatId);
         // Feishu/Lark converted topic groups may still resolve as `group` from
         // the chat info API/cache, while message events already carry threadId.
@@ -1361,20 +1432,17 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           scope,
           mode,
           profileDir: deps.appPaths?.profileDir,
-        });
-      } catch (err) {
-        log.fail('flush', err);
-        // Async failure before normal finalization: atomically release the
-        // lease and any unconsumed Reaction context/meta/tracker.
-        releaseFlushedTurnAfterError(scope, firstMsg.messageId, lease);
-      } finally {
+          });
+        }),
+      onError: (err) => log.fail('flush', err),
+      onFinally: async () => {
         pending.unblock(scope);
         activeBatchCount = Math.max(0, activeBatchCount - 1);
         await maybeLaunchDeferredRestart().catch((err) =>
           log.fail('service', err, { step: 'deferred-restart' }),
         );
         log.info('flush', 'end');
-      }
+      },
     });
   }, {
     // leaseHooks resolve/acquire/release the in-flight work-chain unit.
@@ -2009,6 +2077,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const firstMsg = batch[0];
   const lastMsg = batch[batch.length - 1];
   if (!firstMsg || !lastMsg) return;
+  if (releaseInvalidatedReactionTurn(scope, firstMsg.messageId, deps.lease)) return;
 
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
@@ -2220,11 +2289,21 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         stage,
       },
     });
+  // A removal may arrive while media/quote/prompt preparation is awaiting.
+  // Check once more immediately before startRunFlow synchronously reserves the
+  // scope; after this point ActiveRuns.interrupt can abort the reservation.
+  if (releaseInvalidatedReactionTurn(scope, firstMsg.messageId, deps.lease)) {
+    if (routeLeaseId && deps.profileDir) {
+      await deleteRouteLease(deps.profileDir, routeLeaseId).catch(() => {});
+    }
+    return;
+  }
   const flow = await startFlow('submit');
   if (!flow.ok) {
     // R3-F2/F4: the run never starts — release the lease (unit) + clean
     // reaction meta/tracker so no ghost current-chain/tracker remains.
     if (deps.lease) _workChainStore?.releaseUnit(deps.lease.workChainId, deps.lease.unitId);
+    _invalidatedReactionTurnIds.delete(firstMsg.messageId);
     const rMeta = consumeReactionTurnMeta(firstMsg.messageId);
     if (rMeta?.reactionKey) {
       const opId = rMeta.reactionKey.split('\x1f')[1] ?? '';
@@ -2290,6 +2369,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   };
 
+  // Everything after reaction metadata is consumed belongs to the run owner.
+  // Keep it under the same terminal catch/finally so a synchronous subscribe
+  // or prompt/render setup failure cannot strand tracker/lease state.
+  let reactionPromise: ReturnType<typeof addWorkingReaction> | undefined;
+  try {
   const eventStream = execution.subscribe();
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
@@ -2434,10 +2518,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // a first streamed token (markdown mode) or the whole run ends (text mode).
   // Add a "Typing" reaction to the triggering message as an instant ack, but
   // never let that outbound API call block agent event draining.
-  const reactionPromise =
+  reactionPromise =
     cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
 
-  try {
     if (cotEnabled) {
       const cotPublisher = new CotPublisher({
         client: cotClient,

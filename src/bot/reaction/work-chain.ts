@@ -156,6 +156,7 @@ export class WorkChainStore {
     chain.terminal = false;
     chain.lastAccessAt = Date.now();
     this.removeHistorical(chain.scope, chainId);
+    this.removeHistoricalOutbounds(chain.scope, chainId);
   }
 
   // ── B4: per-unit in-flight tracking ──
@@ -173,6 +174,7 @@ export class WorkChainStore {
     chain.terminal = false;
     chain.lastAccessAt = Date.now();
     this.removeHistorical(chain.scope, chainId);
+    this.removeHistoricalOutbounds(chain.scope, chainId);
     let units = this.inFlightUnits.get(chainId);
     if (!units) { units = new Set(); this.inFlightUnits.set(chainId, units); }
     units.add(unitId);
@@ -267,7 +269,18 @@ export class WorkChainStore {
       order = [];
       this.scopeHistoricalOutbounds.set(scope, order);
     }
-    order.push(messageId);
+    if (!order.includes(messageId)) order.push(messageId);
+  }
+
+  /** A reactivated chain is current and none of its outbound mappings may
+   * participate in historical TTL/LRU eviction (DD15). Keep the mappings in
+   * outboundMap, but remove their IDs from the historical eviction order. */
+  private removeHistoricalOutbounds(scope: string, chainId: string): void {
+    const order = this.scopeHistoricalOutbounds.get(scope);
+    if (!order) return;
+    const kept = order.filter((messageId) => this.outboundMap.get(messageId) !== chainId);
+    if (kept.length === 0) this.scopeHistoricalOutbounds.delete(scope);
+    else this.scopeHistoricalOutbounds.set(scope, kept);
   }
 
   /**
@@ -286,7 +299,13 @@ export class WorkChainStore {
       const msgId = order[i]!;
       const chainId = this.outboundMap.get(msgId);
       const chain = chainId ? this.chains.get(chainId) : undefined;
-      if (!chain || (chain.terminal && now - chain.lastAccessAt > HISTORICAL_CHAIN_TTL_MS)) {
+      if (chain && !chain.terminal) {
+        // Defensive convergence for chains reactivated before an older runtime
+        // learned to remove their mappings from the historical order.
+        order.splice(i, 1);
+        continue;
+      }
+      if (!chain || now - chain.lastAccessAt > HISTORICAL_CHAIN_TTL_MS) {
         order.splice(i, 1);
         this.outboundMap.delete(msgId);
         // Don't increment i — we removed the element

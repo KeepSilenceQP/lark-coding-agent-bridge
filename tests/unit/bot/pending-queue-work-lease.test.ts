@@ -69,6 +69,19 @@ describe('PendingQueue WorkLease ownership', () => {
     expect(h.release).toHaveBeenCalledTimes(1);
   });
 
+  it('merges repeated replies to the same unknown target without allocating a probe chain', () => {
+    const h = harness();
+    h.queue.block('oc_scope');
+
+    h.queue.push('oc_scope', message('om_1', 'om_unknown'));
+    h.queue.push('oc_scope', message('om_2', 'om_unknown'));
+
+    expect(h.resolveOrAllocate).toHaveBeenCalledTimes(1);
+    expect(h.acquire).toHaveBeenCalledTimes(1);
+    expect(h.queue.cancel('oc_scope').map((item) => item.messageId)).toEqual(['om_1', 'om_2']);
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps replies to different chains in separate leased units', () => {
     const h = harness();
     const chainA = h.store.resolveOrAllocate('oc_scope', undefined);

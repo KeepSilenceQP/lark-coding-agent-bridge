@@ -520,6 +520,12 @@ pnpm -s test
   - Card callback synthetic message 写入 `replyToMessageId=evt.messageId`，点击继续承载卡片的原 workChain，不再分配无关 top-level chain。
   - `releaseEnqueuedTurn` 与 `releaseFlushedTurnAfterError` 统一清理 context/meta/tracker/lease；命令取消、empty-set queued、chatMode/startFlow 前后异常均不会留下无界 context 或 stale tracker。
   - 新增真实 lease/cleanup production-seam 测试：top-level acquire+merge+cancel release、同 chain 不同 target 合并、不同 chain 拆分、flush ownership transfer、command-style cancel、empty-set queued、async flush failure、Card callback chain target 继承。
+- **B9 R7（独立 SubAgent Review BLOCKED 后修复，待复审）**：
+  - empty-set 对 exact key 的 queued/reserved/active 全部视为 in-flight；仍在队列则只精确取消，已跨过 queue→prompt-prep 边界则写 turn tombstone，并在 `runAgentBatch` 入口及 `startRunFlow` 前消费释放；reservation/active 路径同时经 `ActiveRuns.interrupt` 收敛，空集合不再启动无上下文 Agent turn。
+  - 相同未知 `replyTo` 先按 target 快路径合并，不再用有分配副作用的 `resolveOrAllocate` 作 merge probe；不同 target 仍按真实 inherited chain 合并或拆分。
+  - `runAgentBatch` 从 consume Reaction meta 后即进入统一 terminal try/catch；`executePendingFlushWithCleanup` 覆盖 queue→trace/run 的同步与异步异常，均清 lease/context/meta/tracker。
+  - historical chain 重新 current 时同步移除其 outbound IDs 的 historical LRU 资格；prune 再防御性跳过 current chain，保证 DD15 current mappings 永不受 historical TTL/cap 淘汰。
+  - 新增 reserved/prompt-prep empty-set、同步 handoff throw、相同未知 reply target、reactivated-current outbound cap 回归测试。
 
 ## Plan Review Gate  Owner: 小P
 

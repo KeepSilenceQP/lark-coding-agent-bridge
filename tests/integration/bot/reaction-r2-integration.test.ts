@@ -512,7 +512,7 @@ describe('decideReactionFlush — production flush decision engine', () => {
   it('reconciliationFailed → bridge-reply "请重试", no Agent', () => {
     const d = decideReactionFlush({
       reconciliationFailed: true, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -522,7 +522,7 @@ describe('decideReactionFlush — production flush decision engine', () => {
   it('noOp → drop (no reply, no Agent)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: true, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('drop');
@@ -531,7 +531,7 @@ describe('decideReactionFlush — production flush decision engine', () => {
   it('netZeroConsumed → bridge-reply "已收到撤回", no Agent', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: true,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -543,7 +543,7 @@ describe('decideReactionFlush — production flush decision engine', () => {
   it('terminal removal (empty set, no active run) → bridge-reply "已完成动作不回滚", no interrupt, no Agent', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -554,7 +554,7 @@ describe('decideReactionFlush — production flush decision engine', () => {
   it('active same-key empty-set removal → bridge-reply + interrupt (no Agent)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: true,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: true,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -567,26 +567,26 @@ describe('decideReactionFlush — production flush decision engine', () => {
   it('non-empty effective set → enqueue-agent (replacement turn)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 1, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 1, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('enqueue-agent');
   });
 
-  it('non-empty set with hasMatchingActiveRun → enqueue-agent (supersede old run, start replacement)', () => {
+  it('non-empty set with hasMatchingInFlightRun → enqueue-agent (supersede old run, start replacement)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 1, hasMatchingActiveRun: true,
+      effectiveReactionSetLength: 1, hasMatchingInFlightRun: true,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('enqueue-agent');
   });
 
   // ── Different key must NOT trigger interrupt ──
-  it('empty set, hasMatchingActiveRun=false → no interrupt (different key scenario)', () => {
+  it('empty set, hasMatchingInFlightRun=false → no interrupt (different key scenario)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_other', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -596,11 +596,11 @@ describe('decideReactionFlush — production flush decision engine', () => {
   // ── Decision type guard: bridge-reply never coincides with enqueue-agent ──
   it('bridge-reply decisions are mutually exclusive with enqueue-agent', () => {
     const cases = [
-      { reconciliationFailed: true, noOp: false, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingActiveRun: false },
-      { reconciliationFailed: false, noOp: true, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingActiveRun: false },
-      { reconciliationFailed: false, noOp: false, netZeroConsumed: true, effectiveReactionSetLength: 0, hasMatchingActiveRun: false },
-      { reconciliationFailed: false, noOp: false, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingActiveRun: false },
-      { reconciliationFailed: false, noOp: false, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingActiveRun: true },
+      { reconciliationFailed: true, noOp: false, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingInFlightRun: false },
+      { reconciliationFailed: false, noOp: true, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingInFlightRun: false },
+      { reconciliationFailed: false, noOp: false, netZeroConsumed: true, effectiveReactionSetLength: 0, hasMatchingInFlightRun: false },
+      { reconciliationFailed: false, noOp: false, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingInFlightRun: false },
+      { reconciliationFailed: false, noOp: false, netZeroConsumed: false, effectiveReactionSetLength: 0, hasMatchingInFlightRun: true },
     ];
     for (const c of cases) {
       const d = decideReactionFlush({ ...c, targetMessageId: 'om_t', scope: 'oc_s' });
@@ -672,7 +672,7 @@ describe('decideReactionFlush production caller verification', () => {
       noOp: false,
       netZeroConsumed: false,
       effectiveReactionSetLength: 0,
-      hasMatchingActiveRun: false,
+      hasMatchingInFlightRun: false,
       targetMessageId: 'om_t',
       scope: 'oc_s',
     };
@@ -701,7 +701,7 @@ describe('decideReactionFlush production caller verification', () => {
   it('bridge-reply with interrupt includes scope for cancellation', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: true,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: true,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -712,7 +712,7 @@ describe('decideReactionFlush production caller verification', () => {
     // Key B (operator=ou_b, target=om_b): empty set → bridge-reply
     const dB = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_b', scope: 'oc_s',
     });
     expect(dB.kind).toBe('bridge-reply');
@@ -720,7 +720,7 @@ describe('decideReactionFlush production caller verification', () => {
     // Key A (operator=ou_a, target=om_a): non-empty → enqueue-agent
     const dA = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 1, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 1, hasMatchingInFlightRun: false,
       targetMessageId: 'om_a', scope: 'oc_s',
     });
     expect(dA.kind).toBe('enqueue-agent');
@@ -787,7 +787,7 @@ describe('production flush executor — real effects calls, no manual simulation
   it('reconciliationFailed: bridge reply sent, NO effects cleanup (ledger unchanged)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: true, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -853,7 +853,7 @@ describe('production flush executor — real effects calls, no manual simulation
   it('nonempty → enqueue-agent (no bridge-reply, no cleanup)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 1, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 1, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('enqueue-agent');
@@ -885,7 +885,7 @@ describe('production flush executor — real effects calls, no manual simulation
   it('noOp → drop (no bridge-reply, no cleanup, no enqueue)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: true, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('drop');
@@ -895,7 +895,7 @@ describe('production flush executor — real effects calls, no manual simulation
   it('netZero: bridge-reply sent, NO cleanup (no queued turn to cancel)', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: true,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -1029,7 +1029,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
   it('reconciliationFailed → reason=reconciliation-failed, NO cleanup', () => {
     const d = decideReactionFlush({
       reconciliationFailed: true, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -1042,7 +1042,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
   it('netZero → reason=net-zero, NO cleanup', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: true,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: false,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -1054,7 +1054,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
   it('empty-set → reason=empty-set, cleanup triggered', () => {
     const d = decideReactionFlush({
       reconciliationFailed: false, noOp: false, netZeroConsumed: false,
-      effectiveReactionSetLength: 0, hasMatchingActiveRun: true,
+      effectiveReactionSetLength: 0, hasMatchingInFlightRun: true,
       targetMessageId: 'om_t', scope: 'oc_s',
     });
     expect(d.kind).toBe('bridge-reply');
@@ -1072,7 +1072,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
     const supersedeCalls: string[] = [];
 
     const effects: import('../../../src/bot/channel').ReactionFlushEffects = {
-      cancelPendingForTarget: (_s, rk) => { cancelCalls.push(rk); },
+      cancelPendingForTarget: (_s, rk) => { cancelCalls.push(rk); return 0; },
       clearContextForTarget: (rk) => { clearCalls.push(rk); },
       deleteTurnMetaForTarget: (key) => { deleteCalls.push(key); },
       interruptActiveRun: (scope) => { interruptCalls.push(scope); },
@@ -1098,7 +1098,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
   it('executeReactionFlushDecision — reconciliationFailed sends reply but calls NO effects', async () => {
     const cancelCalls: string[] = [];
     const effects: import('../../../src/bot/channel').ReactionFlushEffects = {
-      cancelPendingForTarget: (_s, rk) => { cancelCalls.push(rk); },
+      cancelPendingForTarget: (_s, rk) => { cancelCalls.push(rk); return 0; },
       clearContextForTarget: () => {},
       deleteTurnMetaForTarget: () => {},
       interruptActiveRun: () => {},
@@ -1120,7 +1120,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
   it('executeReactionFlushDecision — netZero sends reply but calls NO effects', async () => {
     const cancelCalls: string[] = [];
     const effects: import('../../../src/bot/channel').ReactionFlushEffects = {
-      cancelPendingForTarget: (_s, rk) => { cancelCalls.push(rk); },
+      cancelPendingForTarget: (_s, rk) => { cancelCalls.push(rk); return 0; },
       clearContextForTarget: () => {},
       deleteTurnMetaForTarget: () => {},
       interruptActiveRun: () => {},

@@ -3,10 +3,12 @@ import { ActiveRuns } from '../../../src/bot/active-runs';
 import {
   createReactionFlushEffects,
   executeReactionFlushDecision,
+  executePendingFlushWithCleanup,
   hasTurnMetaForTurnId,
   hasTurnIdForKey,
   releaseEnqueuedTurn,
   releaseFlushedTurnAfterError,
+  releaseInvalidatedReactionTurn,
   setReactionTurnMeta,
 } from '../../../src/bot/channel';
 import { PendingQueue } from '../../../src/bot/pending-queue';
@@ -79,6 +81,26 @@ describe('Reaction lifecycle cleanup production seams', () => {
       { workChainId: state.workChainId, unitId: state.turnId },
       state,
     );
+    expectCleaned(state);
+  });
+
+  it('synchronous queue-to-run failure clears the transferred lease and side-state', async () => {
+    const state = setup(105);
+    let finalized = false;
+    await executePendingFlushWithCleanup({
+      scope: state.scope,
+      messageId: state.turnId,
+      lease: { workChainId: state.workChainId, unitId: state.turnId },
+      run: () => {
+        throw new Error('sync trace setup failed');
+      },
+      onFinally: () => {
+        finalized = true;
+      },
+      cleanupOverrides: state,
+    });
+
+    expect(finalized).toBe(true);
     expectCleaned(state);
   });
 
@@ -164,6 +186,87 @@ describe('Reaction lifecycle cleanup production seams', () => {
     );
 
     expect(pending.pendingCount(state.scope)).toBe(0);
+    expectCleaned(state);
+  });
+
+  it('empty-set after barrier flush leaves a tombstone that aborts prompt preparation', async () => {
+    const state = setup(106);
+    const pending = new PendingQueue(60_000, () => {});
+    const activeRuns = new ActiveRuns();
+    const effects = createReactionFlushEffects({
+      pending,
+      contextStore: state.reactionContextStore,
+      activeRuns,
+      runTracker: state.reactionRunTracker,
+    });
+
+    await executeReactionFlushDecision(
+      {
+        kind: 'bridge-reply',
+        reason: 'empty-set',
+        message: '已收到撤回，已完成动作不会自动回滚。',
+        targetMessageId: state.targetMessageId,
+        interrupt: { scope: state.scope },
+      },
+      {
+        send: async () => {},
+        effects,
+        reactionKey: state.reactionKey,
+        targetMessageId: state.targetMessageId,
+        scope: state.scope,
+      },
+    );
+
+    expect(
+      releaseInvalidatedReactionTurn(
+        state.scope,
+        state.turnId,
+        { workChainId: state.workChainId, unitId: state.turnId },
+        state,
+      ),
+    ).toBe(true);
+    expectCleaned(state);
+  });
+
+  it('empty-set during reservation aborts ActiveRuns and releases on run-owner convergence', async () => {
+    const state = setup(107);
+    const pending = new PendingQueue(60_000, () => {});
+    const activeRuns = new ActiveRuns();
+    const reservation = activeRuns.reserve(state.scope);
+    expect(reservation).toBeDefined();
+    const effects = createReactionFlushEffects({
+      pending,
+      contextStore: state.reactionContextStore,
+      activeRuns,
+      runTracker: state.reactionRunTracker,
+    });
+
+    await executeReactionFlushDecision(
+      {
+        kind: 'bridge-reply',
+        reason: 'empty-set',
+        message: '已收到撤回，已完成动作不会自动回滚。',
+        targetMessageId: state.targetMessageId,
+        interrupt: { scope: state.scope },
+      },
+      {
+        send: async () => {},
+        effects,
+        reactionKey: state.reactionKey,
+        targetMessageId: state.targetMessageId,
+        scope: state.scope,
+      },
+    );
+
+    expect(reservation?.signal.aborted).toBe(true);
+    expect(
+      releaseInvalidatedReactionTurn(
+        state.scope,
+        state.turnId,
+        { workChainId: state.workChainId, unitId: state.turnId },
+        state,
+      ),
+    ).toBe(true);
     expectCleaned(state);
   });
 });

@@ -93,13 +93,13 @@ export class PendingQueue {
       if (existing.timer) clearTimeout(existing.timer);
       const last = existing.units[existing.units.length - 1];
       let resolvedWorkChainId: string | undefined;
-      // Top-level messages in one debounce unit share the unit's fresh chain.
-      // Explicit replies merge when their targets resolve to the same chain,
-      // even if they point at different Bot outbound message IDs.
+      // Identical targets (including top-level) merge without probing/allocating
+      // a second chain. Different explicit targets may still merge when both
+      // resolve to the same inherited chain.
       const sameUnit =
         last?.kind === 'regular' &&
         (this.leaseHooks
-          ? replyTo === undefined && last.replyTo === undefined
+          ? last.replyTo === replyTo
             ? true
             : Boolean(
                 (resolvedWorkChainId = this.resolveWorkChain(scope, replyTo)) &&
