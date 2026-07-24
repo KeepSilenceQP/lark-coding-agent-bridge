@@ -45,8 +45,8 @@ export type ReactionPipelineAction =
       normalizedMsg: NormalizedMessage;
       workChainId: string;
     }
-  | { kind: 'stop-added-reply'; scope: string; chatId: string; message: string; targetMessageId: string; operatorOpenId: string; emojiType: string; actionTime?: number; stableId?: string }
-  | { kind: 'stop-removed-reply'; scope: string; chatId: string; message: string; targetMessageId: string; operatorOpenId: string; emojiType: string; actionTime?: number; stableId?: string };
+  | { kind: 'stop-added-reply'; scope: string; chatId: string; message: string; targetClass: 'bot' | 'user'; targetMessageId: string; operatorOpenId: string; emojiType: string; actionTime?: number; stableId?: string }
+  | { kind: 'stop-removed-reply'; scope: string; chatId: string; message: string; targetClass: 'bot' | 'user'; targetMessageId: string; operatorOpenId: string; emojiType: string; actionTime?: number; stableId?: string };
 
 // ── Pipeline deps ──
 
@@ -96,8 +96,10 @@ async function resolveRoute(channel: LarkChannel, messageId: string) {
 // ── Pipeline entry point ──
 
 /**
- * Guards pipeline for a reaction event: self-operator → route → own-message →
- * permission → stop fast-path / buffer.
+ * Guards pipeline for a reaction event:
+ * self-operator → route/sender classification → stop/non-stop split.
+ * Non-stop requires own-message before Reaction permission; stop applies
+ * Reaction permission before its target eligibility is resolved by the caller.
  *
  * This does NOT do reconciliation — that's handled by the buffer's flush
  * handler which calls messageReaction.list → reconciler → ledger.
@@ -122,11 +124,36 @@ export async function handleReactionEvent(
       return { kind: 'drop', reason: 'no-chatId' };
     }
 
-    // 3. Own-message filter
+    // 3. Target sender classification + stop/non-stop split.
     const messageSenderId = item?.sender?.id as string | undefined;
-    if (!isOwnMessage(messageSenderId, { botOpenId: deps.botOpenId, appId: deps.appId })) {
+    const ownMessage = isOwnMessage(
+      messageSenderId,
+      { botOpenId: deps.botOpenId, appId: deps.appId },
+    );
+    const stopEmoji = isStopEmoji(evt.emojiType);
+    const senderType = item?.sender?.sender_type as string | undefined;
+
+    // Ordinary Reaction semantics remain Bot-message only and are rejected
+    // before permission/snapshot work.
+    if (!stopEmoji && !ownMessage) {
       log.info('reaction', 'skip-other-sender', { messageId: evt.messageId, messageSenderId });
       return { kind: 'drop', reason: 'not-own-message' };
+    }
+
+    // Stop may additionally target a real inbound user message. Other bots,
+    // unknown sender classes, and synthetic messages are not stop targets.
+    const targetClass: 'bot' | 'user' | undefined = ownMessage
+      ? 'bot'
+      : senderType === 'user'
+        ? 'user'
+        : undefined;
+    if (stopEmoji && !targetClass) {
+      log.info('reaction', 'skip-unsupported-stop-target', {
+        messageId: evt.messageId,
+        messageSenderId,
+        senderType,
+      });
+      return { kind: 'drop', reason: 'unsupported-stop-target' };
     }
 
     // 4. Resolve chatMode (F2: use channel's chatModeCache, not oc_/ou_ prefix guessing)
@@ -151,12 +178,13 @@ export async function handleReactionEvent(
     }
 
     // 6. Stop emoji → control plane fast path (return event info so caller can persist)
-    if (isStopEmoji(evt.emojiType)) {
+    if (stopEmoji) {
       const rawHeader = (evt.raw as Record<string, unknown> | undefined)?.['header'] as Record<string, unknown> | undefined;
       if (evt.action === 'added') {
         return {
           kind: 'stop-added-reply',
           scope, chatId, targetMessageId: evt.messageId,
+          targetClass: targetClass!,
           message: '', // caller fills based on hasCurrentWork/validateStopTarget
           operatorOpenId: evt.operator.openId, emojiType: evt.emojiType,
           actionTime: evt.actionTime, stableId: rawHeader?.['event_id'] as string | undefined,
@@ -165,6 +193,7 @@ export async function handleReactionEvent(
       return {
         kind: 'stop-removed-reply',
         scope, chatId, targetMessageId: evt.messageId,
+        targetClass: targetClass!,
         message: '', // caller fills
         operatorOpenId: evt.operator.openId, emojiType: evt.emojiType,
         actionTime: evt.actionTime, stableId: rawHeader?.['event_id'] as string | undefined,

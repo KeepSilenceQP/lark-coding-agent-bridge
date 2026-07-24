@@ -8,6 +8,9 @@ export const MAX_CHAINS_PER_SCOPE = 16;
 /** Max historical outbound→chain mappings retained per scope (LRU eviction). */
 export const MAX_OUTBOUND_MAP_PER_SCOPE = 256;
 
+/** Max historical inbound-trigger→chain mappings retained per scope. */
+export const MAX_TRIGGER_MAP_PER_SCOPE = 256;
+
 /** TTL for historical chain retention (30 min). Current chains not subject to TTL. */
 export const HISTORICAL_CHAIN_TTL_MS = 1_800_000;
 
@@ -38,6 +41,9 @@ export class WorkChainStore {
   /** outbound messageId → chainId (both current and historical) */
   private readonly outboundMap = new Map<string, string>();
 
+  /** real inbound user messageId → chainId (both current and historical) */
+  private readonly triggerMap = new Map<string, string>();
+
   /** scope → Set<chainId> for LRU tracking */
   private readonly scopeChains = new Map<string, Set<string>>();
 
@@ -45,6 +51,8 @@ export class WorkChainStore {
   private readonly scopeHistoricalOrder = new Map<string, string[]>();
   /** scope → ordered list of historical outbound msgIds (oldest first) for O(1) prune */
   private readonly scopeHistoricalOutbounds = new Map<string, string[]>();
+  /** scope → ordered list of historical inbound trigger msgIds (oldest first) */
+  private readonly scopeHistoricalTriggers = new Map<string, string[]>();
 
   // ── Allocation ──
 
@@ -76,11 +84,37 @@ export class WorkChainStore {
     this.pruneHistoricalOutbounds(chain.scope);
   }
 
+  /** Register a real, user-visible inbound message as a stop trigger. */
+  registerTrigger(chainId: string, messageId: string): void {
+    const chain = this.chains.get(chainId);
+    if (!chain) return;
+    chain.lastAccessAt = Date.now();
+    this.triggerMap.set(messageId, chainId);
+    if (chain.terminal) {
+      this.trackHistoricalTrigger(chain.scope, messageId);
+    }
+    this.pruneHistoricalTriggers(chain.scope);
+  }
+
   // ── Resolution ──
 
   /** Resolve an outbound message to its workChainId. */
   resolveOutbound(messageId: string): string | undefined {
     return this.outboundMap.get(messageId);
+  }
+
+  /** Resolve a real inbound trigger within its scope, preserving current vs historical. */
+  resolveTrigger(
+    scope: string,
+    messageId: string,
+  ): { chainId: string; status: 'current' | 'historical' } | undefined {
+    this.pruneHistoricalChains(scope);
+    this.pruneHistoricalTriggers(scope);
+    const chainId = this.triggerMap.get(messageId);
+    if (!chainId) return undefined;
+    const chain = this.chains.get(chainId);
+    if (!chain || chain.scope !== scope) return undefined;
+    return { chainId, status: chain.terminal ? 'historical' : 'current' };
   }
 
   /**
@@ -145,8 +179,12 @@ export class WorkChainStore {
     for (const [msgId, cId] of this.outboundMap) {
       if (cId === chainId) this.trackHistoricalOutbound(chain.scope, msgId);
     }
+    for (const [msgId, cId] of this.triggerMap) {
+      if (cId === chainId) this.trackHistoricalTrigger(chain.scope, msgId);
+    }
     this.pruneHistoricalChains(chain.scope);
     this.pruneHistoricalOutbounds(chain.scope);
+    this.pruneHistoricalTriggers(chain.scope);
   }
 
   /** Mark a chain as current again (e.g. re-continued via reply). */
@@ -157,6 +195,7 @@ export class WorkChainStore {
     chain.lastAccessAt = Date.now();
     this.removeHistorical(chain.scope, chainId);
     this.removeHistoricalOutbounds(chain.scope, chainId);
+    this.removeHistoricalTriggers(chain.scope, chainId);
   }
 
   // ── B4: per-unit in-flight tracking ──
@@ -175,6 +214,7 @@ export class WorkChainStore {
     chain.lastAccessAt = Date.now();
     this.removeHistorical(chain.scope, chainId);
     this.removeHistoricalOutbounds(chain.scope, chainId);
+    this.removeHistoricalTriggers(chain.scope, chainId);
     let units = this.inFlightUnits.get(chainId);
     if (!units) { units = new Set(); this.inFlightUnits.set(chainId, units); }
     units.add(unitId);
@@ -283,6 +323,23 @@ export class WorkChainStore {
     else this.scopeHistoricalOutbounds.set(scope, kept);
   }
 
+  private trackHistoricalTrigger(scope: string, messageId: string): void {
+    let order = this.scopeHistoricalTriggers.get(scope);
+    if (!order) {
+      order = [];
+      this.scopeHistoricalTriggers.set(scope, order);
+    }
+    if (!order.includes(messageId)) order.push(messageId);
+  }
+
+  private removeHistoricalTriggers(scope: string, chainId: string): void {
+    const order = this.scopeHistoricalTriggers.get(scope);
+    if (!order) return;
+    const kept = order.filter((messageId) => this.triggerMap.get(messageId) !== chainId);
+    if (kept.length === 0) this.scopeHistoricalTriggers.delete(scope);
+    else this.scopeHistoricalTriggers.set(scope, kept);
+  }
+
   /**
    * F13/F14: Bounded O(K) prune where K = historical outbounds for THIS scope
    * (capped at MAX_OUTBOUND_MAP_PER_SCOPE + small overage). Does NOT scan
@@ -318,6 +375,34 @@ export class WorkChainStore {
     while (order.length > MAX_OUTBOUND_MAP_PER_SCOPE) {
       const evicted = order.shift();
       if (evicted) this.outboundMap.delete(evicted);
+    }
+  }
+
+  private pruneHistoricalTriggers(scope: string): void {
+    const order = this.scopeHistoricalTriggers.get(scope);
+    if (!order) return;
+
+    const now = Date.now();
+    let i = 0;
+    while (i < order.length) {
+      const msgId = order[i]!;
+      const chainId = this.triggerMap.get(msgId);
+      const chain = chainId ? this.chains.get(chainId) : undefined;
+      if (chain && !chain.terminal) {
+        order.splice(i, 1);
+        continue;
+      }
+      if (!chain || now - chain.lastAccessAt > HISTORICAL_CHAIN_TTL_MS) {
+        order.splice(i, 1);
+        this.triggerMap.delete(msgId);
+        continue;
+      }
+      i++;
+    }
+
+    while (order.length > MAX_TRIGGER_MAP_PER_SCOPE) {
+      const evicted = order.shift();
+      if (evicted) this.triggerMap.delete(evicted);
     }
   }
 }

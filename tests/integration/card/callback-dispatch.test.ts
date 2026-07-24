@@ -65,6 +65,7 @@ describe('signed card callback dispatch', () => {
     expect(queued[0]?.chatType).toBe('group');
     expect(queued[0]?.replyToMessageId).toBe('om_card');
     expect(h.leaseAllocations).toEqual([{ scope: 'oc_group', replyTo: 'om_card' }]);
+    expect(h.triggerRegistrations).toEqual([]);
   });
 
   it('drops legacy Claude callback markers before command dispatch', async () => {
@@ -149,6 +150,7 @@ type Harness = {
   pending: PendingQueue;
   auth: CallbackAuth;
   leaseAllocations: Array<{ scope: string; replyTo: string | undefined }>;
+  triggerRegistrations: string[];
   dispatch(value: Record<string, unknown>, formValue?: Record<string, unknown>): Promise<void>;
   token(
     action: string,
@@ -166,6 +168,7 @@ async function createHarness(
   const activeRuns = new ActiveRuns();
   const agent = new FakeAgentAdapter();
   const leaseAllocations: Array<{ scope: string; replyTo: string | undefined }> = [];
+  const triggerRegistrations: string[] = [];
   const pending = new PendingQueue(60_000, () => {}, {
     resolveOrAllocate: (scope, replyTo) => {
       leaseAllocations.push({ scope, replyTo });
@@ -173,6 +176,7 @@ async function createHarness(
     },
     acquire: () => {},
     release: () => {},
+    registerTrigger: (_lease, messageId) => triggerRegistrations.push(messageId),
   });
   const store = new CallbackNonceStore(`${tmp.profile}/callback-nonces.json`);
   const controls = {
@@ -222,6 +226,7 @@ async function createHarness(
     pending,
     auth,
     leaseAllocations,
+    triggerRegistrations,
     token: (action, overrides = {}) => {
       nonce = overrides.nonce ?? `nonce-${action}`;
       return auth.sign({

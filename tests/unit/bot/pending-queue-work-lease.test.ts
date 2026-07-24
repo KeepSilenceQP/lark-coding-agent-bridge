@@ -29,12 +29,14 @@ function harness(onFlush: (batch: NormalizedMessage[], lease?: WorkLease) => voi
   });
   const acquire = vi.fn((lease: WorkLease) => store.acquireUnit(lease.workChainId, lease.unitId));
   const release = vi.fn((lease: WorkLease) => store.releaseUnit(lease.workChainId, lease.unitId));
+  const registerTrigger = vi.fn((lease: WorkLease, messageId: string) =>
+    store.registerTrigger(lease.workChainId, messageId));
   const queue = new PendingQueue(
     60_000,
     (_scope, batch, lease) => onFlush(batch, lease),
-    { resolveOrAllocate, acquire, release },
+    { resolveOrAllocate, acquire, release, registerTrigger },
   );
-  return { store, queue, resolveOrAllocate, acquire, release };
+  return { store, queue, resolveOrAllocate, acquire, release, registerTrigger };
 }
 
 describe('PendingQueue WorkLease ownership', () => {
@@ -51,6 +53,33 @@ describe('PendingQueue WorkLease ownership', () => {
     expect(h.queue.cancel('oc_scope').map((item) => item.messageId)).toEqual(['om_1', 'om_2']);
     expect(h.release).toHaveBeenCalledTimes(1);
     expect(h.store.hasCurrentWork('oc_scope')).toBe(false);
+  });
+
+  it('registers every real message in a merged regular unit as the same current trigger chain', () => {
+    const h = harness();
+    h.queue.block('oc_scope');
+
+    h.queue.push('oc_scope', message('om_first'));
+    h.queue.push('oc_scope', message('om_middle'));
+    h.queue.push('oc_scope', message('om_last'));
+
+    const first = h.store.resolveTrigger('oc_scope', 'om_first');
+    expect(first?.status).toBe('current');
+    expect(h.store.resolveTrigger('oc_scope', 'om_middle')?.chainId).toBe(first?.chainId);
+    expect(h.store.resolveTrigger('oc_scope', 'om_last')?.chainId).toBe(first?.chainId);
+    expect(h.registerTrigger).toHaveBeenCalledTimes(3);
+    h.queue.cancelAll();
+  });
+
+  it('does not register an internal synthetic message as a user stop trigger', () => {
+    const h = harness();
+    h.queue.block('oc_scope');
+
+    h.queue.push('oc_scope', message('om_card_callback'), { registerAsTrigger: false });
+
+    expect(h.store.resolveTrigger('oc_scope', 'om_card_callback')).toBeUndefined();
+    expect(h.registerTrigger).not.toHaveBeenCalled();
+    h.queue.cancelAll();
   });
 
   it('merges replies to different Bot messages when both targets inherit the same chain', () => {

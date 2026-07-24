@@ -22,7 +22,13 @@ import { log } from '../core/logger';
 export type WorkLease = { workChainId: string; unitId: string };
 
 type PendingUnit =
-  | { kind: 'regular'; messages: NormalizedMessage[]; lease: WorkLease | undefined; replyTo: string | undefined }
+  | {
+      kind: 'regular';
+      messages: NormalizedMessage[];
+      lease: WorkLease | undefined;
+      replyTo: string | undefined;
+      triggerMessageIds: string[];
+    }
   | { kind: 'barrier'; message: NormalizedMessage; lease: WorkLease | undefined };
 
 function unitLength(u: PendingUnit): number {
@@ -45,6 +51,12 @@ export interface LeaseHooks {
   resolveOrAllocate: (scope: string, replyTo?: string) => string;
   acquire: (lease: WorkLease) => void;
   release: (lease: WorkLease) => void;
+  registerTrigger?: (lease: WorkLease, messageId: string) => void;
+}
+
+export interface PendingPushOptions {
+  /** False for internal synthetic inputs such as CardKit callbacks. */
+  registerAsTrigger?: boolean;
 }
 
 export type FlushHandler = (
@@ -86,7 +98,8 @@ export class PendingQueue {
   // (ordinary IM, Card callback, future synthetic inputs) follows the same
   // inheritance contract. Queue-mechanics tests may omit leaseHooks.
 
-  push(scope: string, msg: NormalizedMessage): number {
+  push(scope: string, msg: NormalizedMessage, options: PendingPushOptions = {}): number {
+    const registerAsTrigger = options.registerAsTrigger !== false;
     const replyTo = msg.replyToMessageId;
     const existing = this.map.get(scope);
     if (existing) {
@@ -108,19 +121,27 @@ export class PendingQueue {
           : last.replyTo === replyTo);
       if (sameUnit) {
         last.messages.push(msg);
+        if (registerAsTrigger && last.lease && !last.triggerMessageIds.includes(msg.messageId)) {
+          last.triggerMessageIds.push(msg.messageId);
+          this.leaseHooks?.registerTrigger?.(last.lease, msg.messageId);
+        }
         // shared lease — no new acquire
       } else {
         const lease = this.allocateLease(scope, replyTo, resolvedWorkChainId);
         if (lease) this.acquireLease(lease);
-        existing.units.push({ kind: 'regular', messages: [msg], lease, replyTo });
+        const triggerMessageIds = registerAsTrigger ? [msg.messageId] : [];
+        if (lease && registerAsTrigger) this.leaseHooks?.registerTrigger?.(lease, msg.messageId);
+        existing.units.push({ kind: 'regular', messages: [msg], lease, replyTo, triggerMessageIds });
       }
       existing.timer = this.blocked.has(scope) ? undefined : this.armTimer(scope);
       return totalLength(existing);
     }
     const lease = this.allocateLease(scope, replyTo);
     if (lease) this.acquireLease(lease);
+    const triggerMessageIds = registerAsTrigger ? [msg.messageId] : [];
+    if (lease && registerAsTrigger) this.leaseHooks?.registerTrigger?.(lease, msg.messageId);
     this.map.set(scope, {
-      units: [{ kind: 'regular', messages: [msg], lease, replyTo }],
+      units: [{ kind: 'regular', messages: [msg], lease, replyTo, triggerMessageIds }],
       timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
     });
     return 1;
@@ -207,7 +228,13 @@ export class PendingQueue {
           else keptMsgs.push(m);
         }
         if (keptMsgs.length > 0) {
-          kept.push({ kind: 'regular', messages: keptMsgs, lease: u.lease, replyTo: u.replyTo });
+          kept.push({
+            kind: 'regular',
+            messages: keptMsgs,
+            lease: u.lease,
+            replyTo: u.replyTo,
+            triggerMessageIds: u.triggerMessageIds.filter((id) => id !== messageId),
+          });
         } else {
           // Unit fully emptied → release its lease (R3-F2).
           if (u.lease) this.releaseLease(u.lease);

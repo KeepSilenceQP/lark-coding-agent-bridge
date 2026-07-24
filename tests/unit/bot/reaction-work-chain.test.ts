@@ -1,5 +1,6 @@
 import { describe, expect, it, beforeEach, vi, afterEach } from 'vitest';
 import {
+  MAX_TRIGGER_MAP_PER_SCOPE,
   MAX_OUTBOUND_MAP_PER_SCOPE,
   WorkChainStore,
 } from '../../../src/bot/reaction/work-chain';
@@ -41,6 +42,17 @@ describe('WorkChainStore', () => {
 
   it('resolveOutbound returns undefined for unknown message id', () => {
     expect(store.resolveOutbound('om_nonexistent')).toBeUndefined();
+  });
+
+  it('classifies a registered inbound trigger as current for the same scope', () => {
+    const chainId = store.allocate('oc_scope');
+    store.registerTrigger(chainId, 'om_user_trigger');
+
+    expect(store.resolveTrigger('oc_scope', 'om_user_trigger')).toEqual({
+      chainId,
+      status: 'current',
+    });
+    expect(store.resolveTrigger('oc_other_scope', 'om_user_trigger')).toBeUndefined();
   });
 
   // ── Inheritance ──
@@ -150,6 +162,60 @@ describe('WorkChainStore', () => {
     // Current chain should still be resolvable
     expect(store.isCurrent(chainId)).toBe(true);
     expect(store.resolveCurrentChain('om_long_running')).toBe(chainId);
+  });
+
+  it('current inbound trigger mappings survive beyond historical TTL', () => {
+    const chainId = store.allocate('oc_scope');
+    store.registerTrigger(chainId, 'om_long_trigger');
+
+    vi.advanceTimersByTime(2_000_000);
+
+    expect(store.resolveTrigger('oc_scope', 'om_long_trigger')).toEqual({
+      chainId,
+      status: 'current',
+    });
+  });
+
+  it('expires a terminal inbound trigger after historical TTL', () => {
+    const chainId = store.allocate('oc_scope');
+    store.registerTrigger(chainId, 'om_old_trigger');
+    store.markTerminal(chainId);
+    expect(store.resolveTrigger('oc_scope', 'om_old_trigger')?.status).toBe('historical');
+
+    vi.advanceTimersByTime(2_000_000);
+
+    expect(store.resolveTrigger('oc_scope', 'om_old_trigger')).toBeUndefined();
+  });
+
+  it('uses a separate trigger LRU budget without evicting Bot outbound mappings', () => {
+    const chainId = store.allocate('oc_scope');
+    store.registerOutbound(chainId, 'om_bot_outbound');
+    for (let i = 0; i <= MAX_TRIGGER_MAP_PER_SCOPE; i++) {
+      store.registerTrigger(chainId, `om_trigger_${i}`);
+    }
+    store.markTerminal(chainId);
+
+    expect(store.resolveTrigger('oc_scope', 'om_trigger_0')).toBeUndefined();
+    expect(store.resolveTrigger('oc_scope', `om_trigger_${MAX_TRIGGER_MAP_PER_SCOPE}`)?.status)
+      .toBe('historical');
+    expect(store.resolveOutbound('om_bot_outbound')).toBe(chainId);
+  });
+
+  it('restores current protection for retained triggers when a historical chain is reactivated', () => {
+    const scope = 'oc_scope';
+    const chainId = store.allocate(scope);
+    store.registerOutbound(chainId, 'om_bot_continuation');
+    store.registerTrigger(chainId, 'om_original_trigger');
+    store.markTerminal(chainId);
+
+    expect(store.resolveOrAllocate(scope, 'om_bot_continuation')).toBe(chainId);
+    store.acquireUnit(chainId, 'unit_reactivated');
+    vi.advanceTimersByTime(2_000_000);
+
+    expect(store.resolveTrigger(scope, 'om_original_trigger')).toEqual({
+      chainId,
+      status: 'current',
+    });
   });
 
   it('reactivated current outbound mappings are removed from historical LRU accounting', () => {

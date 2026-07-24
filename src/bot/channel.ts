@@ -122,6 +122,7 @@ import { loadStopControlLedger, stopEventFingerprint } from './reaction/control-
 import type { StopControlLedger } from './reaction/control-ledger';
 import { ReactionRunTracker } from './reaction/run-tracker';
 import { buildReactionTargetMessage } from './reaction/context-builder';
+import { decideStopAdded, executeStopAdded } from './reaction/stop-target';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -1460,6 +1461,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     },
     acquire: (l: WorkLease) => _workChainStore?.acquireUnit(l.workChainId, l.unitId),
     release: (l: WorkLease) => _workChainStore?.releaseUnit(l.workChainId, l.unitId),
+    registerTrigger: (l: WorkLease, messageId: string) =>
+      _workChainStore?.registerTrigger(l.workChainId, messageId),
   });
 
   // Counter for stdout reconnect escalation; reset on `reconnected`.
@@ -1594,32 +1597,49 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             // F3/F12: isConsumed check before any action
             if (stopControlLedger?.isConsumed(fp)) return;
 
-            // F11: Determine result based on current state
-            let message: string;
-            let replyKind: 'no-work' | 'stopped' | 'fail-closed';
-
+            // Eligibility is target-class specific. Unknown/expired/restart-
+            // lost user messages are silent BEFORE no-work; Bot targets retain
+            // the existing visible no-work/fail-closed behavior.
             // B2: current-work must cover queued (PendingQueue) + reserved
             // (ActiveRuns reservation) + active (ActiveRuns handle) — not only
             // the active handle. Otherwise a stop on a queued/reserved reaction
             // misreports no-work and the old task still starts later.
             const hasWork = activeRuns.hasActiveOrReserved(pipelineResult.scope)
               || pending.pendingCount(pipelineResult.scope) > 0;
-            if (!hasWork) {
-              message = '当前没有需要停止的任务。';
-              replyKind = 'no-work';
-            } else if (workChainStore.resolveCurrentChain(pipelineResult.targetMessageId) === undefined) {
-              message = '该 Reaction 未停止当前任务，如需停止请使用 /stop 命令。';
-              replyKind = 'fail-closed';
-            } else {
-              // F11: Real interrupt + cancel pending
-              activeRuns.interrupt(pipelineResult.scope);
-              // R2-F2: cancel pending + release each removed unit's lifecycle
-              // (meta/tracker/in-flight unit) so no ghost current-chain remains.
-              const removed = pending.cancel(pipelineResult.scope);
-              for (const m of removed) releaseEnqueuedTurn(pipelineResult.scope, m.messageId);
-              message = '已停止当前任务。';
-              replyKind = 'stopped';
+            const decision = decideStopAdded({
+              targetClass: pipelineResult.targetClass,
+              hasWork,
+              trigger: pipelineResult.targetClass === 'user'
+                ? workChainStore.resolveTrigger(
+                    pipelineResult.scope,
+                    pipelineResult.targetMessageId,
+                  )
+                : undefined,
+              botTargetIsCurrent: pipelineResult.targetClass === 'bot'
+                && workChainStore.resolveCurrentChain(pipelineResult.targetMessageId) !== undefined,
+            });
+
+            const execution = executeStopAdded(decision, {
+              interrupt: () => {
+                activeRuns.interrupt(pipelineResult.scope);
+              },
+              cancelPending: () => {
+                const removed = pending.cancel(pipelineResult.scope);
+                for (const m of removed) {
+                  releaseEnqueuedTurn(pipelineResult.scope, m.messageId);
+                }
+              },
+            });
+
+            if (!execution) {
+              log.info('reaction', 'stop-user-target-ineligible', {
+                scope: pipelineResult.scope,
+                targetMessageId: pipelineResult.targetMessageId,
+                reason: decision.kind === 'silent-drop' ? decision.reason : 'unknown',
+              });
+              return;
             }
+            const { message, replyKind } = execution;
 
             // F12: Persist consumed state
             if (stopControlLedger) {

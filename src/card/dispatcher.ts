@@ -203,7 +203,7 @@ function forwardToAgent(
     mentionedBot: false,
     createTime: Date.now(),
   };
-  deps.pending.push(scope, synthetic);
+  deps.pending.push(scope, synthetic, { registerAsTrigger: false });
 }
 
 function verifyBridgeToken(
