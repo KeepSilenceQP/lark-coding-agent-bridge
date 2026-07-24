@@ -98,12 +98,24 @@ export class PendingQueue {
     // block(scope) — only one unit is ever consumed here.
     this.flushFirstUnit(scope);
 
-    // flushFirstUnit may have triggered onFlush → block(scope).  Re-check
-    // before arming a timer so the new barrier doesn't fire during the run.
-    this.map.set(scope, {
-      units: [{ kind: 'barrier', message: msg }],
-      timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
-    });
+    // flushFirstUnit may have consumed the first unit but left remaining
+    // units in the entry.  Append to tail instead of overwriting — otherwise
+    // a multi-unit queue (e.g. unblocked B,C,D with timer still ticking)
+    // would silently lose C,D when a new barrier E arrives.
+    const existing = this.map.get(scope);
+    if (existing) {
+      existing.units.push({ kind: 'barrier', message: msg });
+      // If not blocked and no timer is armed yet (unit was only one just
+      // flushed, or all prior units were already drained), arm one.
+      if (!this.blocked.has(scope) && !existing.timer) {
+        existing.timer = this.armTimer(scope);
+      }
+    } else {
+      this.map.set(scope, {
+        units: [{ kind: 'barrier', message: msg }],
+        timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
+      });
+    }
   }
 
   // ── cancel / cancelMessage ──

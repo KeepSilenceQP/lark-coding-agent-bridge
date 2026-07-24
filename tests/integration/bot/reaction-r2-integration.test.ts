@@ -1602,6 +1602,45 @@ describe('PendingQueue ordered-unit deque — interleaved arrival order', () => 
     expect(remaining.map(m => m.messageId)).toEqual(['C']);
   });
 
+  // ── 7a) pushBarrier does NOT overwrite remaining units after flushFirstUnit ──
+  // Regression: blocked B,C,D → unblock → pushBarrier E before timer fires.
+  // flushFirstUnit flushes B, but C,D remain in the entry. The old code
+  // overwrote the entry with just E, losing C and D.
+  it('unblocked multi-unit queue + pushBarrier before timer: remaining units survive, new appended', () => {
+    const scope = 'oc_s';
+    const flushed: string[] = [];
+    const queue = new PendingQueue(1, (_s, batch) => {
+      flushed.push(...batch.map(m => m.messageId));
+      queue.block(scope);
+    });
+
+    // Block → B barrier → C ordinary → D barrier
+    queue.block(scope);
+    queue.pushBarrier(scope, barrier(scope, 'B'));
+    queue.push(scope, reg(scope, 'C'));
+    queue.pushBarrier(scope, barrier(scope, 'D'));
+    expect(queue.pendingCount(scope)).toBe(3);
+
+    // Unblock — timer armed (1ms), but we act before it fires
+    queue.unblock(scope);
+    expect(queue.isBlocked(scope)).toBe(false);
+
+    // pushBarrier E arrives before the timer fires.
+    // flushFirstUnit → B flushed (onFlush → block).  C,D still in map.
+    queue.pushBarrier(scope, barrier(scope, 'E'));
+
+    // B was flushed, scope is now blocked by onFlush.
+    expect(flushed).toEqual(['B']);
+
+    // Remaining units: C (regular), D (barrier), E (barrier) — 3 pending
+    expect(queue.pendingCount(scope)).toBe(3);
+
+    // Drain and verify FIFO order: C, D, E
+    queue.unblock(scope);
+    const remaining = queue.cancel(scope);
+    expect(remaining.map(m => m.messageId)).toEqual(['C', 'D', 'E']);
+  });
+
   // ── 7) blocked entry check after flushFirst — timer NOT armed while blocked ──
   it('pushBarrier after flushFirst does NOT arm timer when onFlush blocked scope', () => {
     const scope = 'oc_s';
