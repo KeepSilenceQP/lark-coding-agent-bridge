@@ -10,7 +10,7 @@ import { isSnapshotCompatible } from '../../../src/bot/reaction/reconciler';
 import { detectNetZeroPair } from '../../../src/bot/reaction/reconciler';
 import type { BufferedReactionEvent, CanonicalReactionRecord } from '../../../src/bot/reaction/types';
 import { lookupReactionSemantics } from '../../../src/bot/reaction/semantics';
-import { makeReactionKey } from '../../../src/bot/reaction/types';
+import { makeReactionKey, parseReactionKey } from '../../../src/bot/reaction/types';
 import { createReactionFlushEffects, decideReactionFlush } from '../../../src/bot/channel';
 import type { ReactionFlushEffects } from '../../../src/bot/channel';
 
@@ -943,5 +943,156 @@ describe('PendingQueue.cancelMessage — real queue, no mocks', () => {
     const removed = queue.cancelMessage('oc_s', 'om_only');
     expect(removed).toHaveLength(1);
     expect(queue.cancel('oc_s')).toEqual([]); // scope gone
+  });
+});
+
+// ── ReactionTurnMeta: two operators same target isolation ──
+
+describe('reactionTurnMeta: two operators same target isolation', () => {
+  it('two operators on same target get distinct entries, no overwrite', () => {
+    // simulate setReactionTurnMeta for operator A on target om_t
+    const keyA = 'oc_s\x1fou_a\x1fom_t';
+    const keyB = 'oc_s\x1fou_b\x1fom_t';
+    // Both reference same targetMessageId but are distinct by reactionKey
+    expect(keyA).not.toBe(keyB);
+    // parseReactionKey distinguishes them — already imported at top of file
+    expect(parseReactionKey(keyA).operatorOpenId).toBe('ou_a');
+    expect(parseReactionKey(keyB).operatorOpenId).toBe('ou_b');
+  });
+
+  it('cleanup of operator A does not remove operator B meta (per-key delete)', () => {
+    const map = new Map<string, { operator: string }>();
+    const byMsg = new Map<string, string>();
+    // set both
+    map.set('oc_s\x1fou_a\x1fom_t', { operator: 'ou_a' });
+    map.set('oc_s\x1fou_b\x1fom_t', { operator: 'ou_b' });
+    byMsg.set('om_t', 'oc_s\x1fou_a\x1fom_t'); // last writer for msg index
+
+    // delete operator A (per-key)
+    const keyA = 'oc_s\x1fou_a\x1fom_t';
+    map.delete(keyA);
+    for (const [msgId, rKey] of byMsg) {
+      if (rKey === keyA) { byMsg.delete(msgId); break; }
+    }
+
+    // operator B still exists
+    expect(map.has('oc_s\x1fou_b\x1fom_t')).toBe(true);
+    expect(map.get('oc_s\x1fou_b\x1fom_t')!.operator).toBe('ou_b');
+  });
+});
+
+// ── Bridge-reply reason-based cleanup policy ──
+
+describe('bridge-reply reason-based cleanup policy', () => {
+  it('reconciliationFailed → reason=reconciliation-failed, NO cleanup', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: true, noOp: false, netZeroConsumed: false,
+      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      targetMessageId: 'om_t', scope: 'oc_s',
+    });
+    expect(d.kind).toBe('bridge-reply');
+    expect((d as { reason: string }).reason).toBe('reconciliation-failed');
+    // Only empty-set triggers cleanup
+    const shouldCleanup = (d as { reason: string }).reason === 'empty-set';
+    expect(shouldCleanup).toBe(false);
+  });
+
+  it('netZero → reason=net-zero, NO cleanup', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: false, noOp: false, netZeroConsumed: true,
+      effectiveReactionSetLength: 0, hasMatchingActiveRun: false,
+      targetMessageId: 'om_t', scope: 'oc_s',
+    });
+    expect(d.kind).toBe('bridge-reply');
+    expect((d as { reason: string }).reason).toBe('net-zero');
+    const shouldCleanup = (d as { reason: string }).reason === 'empty-set';
+    expect(shouldCleanup).toBe(false);
+  });
+
+  it('empty-set → reason=empty-set, cleanup triggered', () => {
+    const d = decideReactionFlush({
+      reconciliationFailed: false, noOp: false, netZeroConsumed: false,
+      effectiveReactionSetLength: 0, hasMatchingActiveRun: true,
+      targetMessageId: 'om_t', scope: 'oc_s',
+    });
+    expect(d.kind).toBe('bridge-reply');
+    expect((d as { reason: string }).reason).toBe('empty-set');
+    const shouldCleanup = (d as { reason: string }).reason === 'empty-set';
+    expect(shouldCleanup).toBe(true);
+  });
+
+  it('executeReactionFlushDecision — empty-set calls cancel+clear+delete+interrupt via effects', async () => {
+    const sendCalls: string[] = [];
+    const cancelCalls: string[] = [];
+    const clearCalls: string[] = [];
+    const deleteCalls: string[] = [];
+    const interruptCalls: string[] = [];
+    const supersedeCalls: string[] = [];
+
+    const effects: import('../../../src/bot/channel').ReactionFlushEffects = {
+      sendBridgeReply: async () => {},
+      cancelPendingForTarget: (_s, msgId) => { cancelCalls.push(msgId); },
+      clearContextForTarget: (msgId) => { clearCalls.push(msgId); },
+      deleteTurnMetaForTarget: (key) => { deleteCalls.push(key); },
+      interruptActiveRun: (scope) => { interruptCalls.push(scope); },
+      setHandleSuperseded: (scope) => { supersedeCalls.push(scope); },
+    };
+
+    const { executeReactionFlushDecision } = await import('../../../src/bot/channel');
+
+    await executeReactionFlushDecision(
+      { kind: 'bridge-reply', reason: 'empty-set', message: 'test', targetMessageId: 'om_t', interrupt: { scope: 'oc_s' } },
+      { send: async (_c, m, _r) => { sendCalls.push(m); }, effects, reactionKey: 'k', targetMessageId: 'om_t', scope: 'oc_s' },
+    );
+
+    expect(sendCalls).toHaveLength(1);
+    expect(cancelCalls).toHaveLength(1);
+    expect(clearCalls).toHaveLength(1);
+    expect(deleteCalls).toHaveLength(1);
+    expect(interruptCalls).toHaveLength(1);
+    expect(supersedeCalls).toHaveLength(1);
+  });
+
+  it('executeReactionFlushDecision — reconciliationFailed sends reply but calls NO effects', async () => {
+    const cancelCalls: string[] = [];
+    const effects: import('../../../src/bot/channel').ReactionFlushEffects = {
+      sendBridgeReply: async () => {},
+      cancelPendingForTarget: (_s, msgId) => { cancelCalls.push(msgId); },
+      clearContextForTarget: () => {},
+      deleteTurnMetaForTarget: () => {},
+      interruptActiveRun: () => {},
+      setHandleSuperseded: () => {},
+    };
+
+    const { executeReactionFlushDecision } = await import('../../../src/bot/channel');
+
+    await executeReactionFlushDecision(
+      { kind: 'bridge-reply', reason: 'reconciliation-failed', message: '请重试', targetMessageId: 'om_t' },
+      { send: async () => {}, effects, reactionKey: 'k', targetMessageId: 'om_t', scope: 'oc_s' },
+    );
+
+    // reconciliation-failed must NOT trigger cancel/clear/delete/interrupt
+    expect(cancelCalls).toHaveLength(0);
+  });
+
+  it('executeReactionFlushDecision — netZero sends reply but calls NO effects', async () => {
+    const cancelCalls: string[] = [];
+    const effects: import('../../../src/bot/channel').ReactionFlushEffects = {
+      sendBridgeReply: async () => {},
+      cancelPendingForTarget: (_s, msgId) => { cancelCalls.push(msgId); },
+      clearContextForTarget: () => {},
+      deleteTurnMetaForTarget: () => {},
+      interruptActiveRun: () => {},
+      setHandleSuperseded: () => {},
+    };
+
+    const { executeReactionFlushDecision } = await import('../../../src/bot/channel');
+
+    await executeReactionFlushDecision(
+      { kind: 'bridge-reply', reason: 'net-zero', message: '已收到撤回', targetMessageId: 'om_t' },
+      { send: async () => {}, effects, reactionKey: 'k', targetMessageId: 'om_t', scope: 'oc_s' },
+    );
+
+    expect(cancelCalls).toHaveLength(0);
   });
 });

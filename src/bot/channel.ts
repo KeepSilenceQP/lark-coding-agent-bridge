@@ -140,24 +140,33 @@ function getReactionContexts(messageIds: string[]): unknown[] {
 // ── Reaction lifecycle bridges (module-level, wired by startChannel) ──
 let _workChainStore: WorkChainStore | null = null;
 let _reactionRunTracker: ReactionRunTracker | null = null;
-/** targetMessageId → { workChainId, reactionKey, scope, revision }
- *  Keyed by the reaction target message so runAgentBatch can find its meta
- *  via batch[0].messageId (which IS the targetMessageId for reaction turns). */
-const _reactionTurnMeta = new Map<string, { workChainId: string; reactionKey: string; scope: string; revision: number }>();
+/** reactionKey → { workChainId, scope, revision }
+ *  Keyed by full reaction identity (scope\x1foperator\x1ftarget).
+ *  targetMessageId→reactionKey index allows runAgentBatch to find its entry
+ *  via batch[0].messageId. */
+const _reactionTurnMeta = new Map<string, { workChainId: string; scope: string; revision: number }>();
+const _reactionTurnMetaByMsg = new Map<string, string>(); // targetMessageId → reactionKey
 
-function setReactionTurnMeta(targetMessageId: string, reactionKey: string, scope: string, workChainId: string, revision: number): void {
-  _reactionTurnMeta.set(targetMessageId, { workChainId, reactionKey, scope, revision });
+function setReactionTurnMeta(reactionKey: string, targetMessageId: string, scope: string, workChainId: string, revision: number): void {
+  _reactionTurnMeta.set(reactionKey, { workChainId, scope, revision });
+  _reactionTurnMetaByMsg.set(targetMessageId, reactionKey);
 }
-function deleteReactionTurnMeta(targetMessageId: string): void {
-  _reactionTurnMeta.delete(targetMessageId);
+function deleteReactionTurnMeta(reactionKey: string): void {
+  // Also clean up the message→key index
+  for (const [msgId, rKey] of _reactionTurnMetaByMsg) {
+    if (rKey === reactionKey) { _reactionTurnMetaByMsg.delete(msgId); break; }
+  }
+  _reactionTurnMeta.delete(reactionKey);
 }
 function consumeReactionTurnMeta(batchMessageId: string): { workChainId: string; reactionKey: string; revision: number } | undefined {
-  const meta = _reactionTurnMeta.get(batchMessageId);
-  if (meta) {
-    _reactionTurnMeta.delete(batchMessageId);
-    return { workChainId: meta.workChainId, reactionKey: meta.reactionKey, revision: meta.revision };
-  }
-  return undefined;
+  // Look up reactionKey via targetMessageId index, then get meta by reactionKey
+  const reactionKey = _reactionTurnMetaByMsg.get(batchMessageId);
+  if (!reactionKey) return undefined;
+  const meta = _reactionTurnMeta.get(reactionKey);
+  if (!meta) return undefined;
+  _reactionTurnMetaByMsg.delete(batchMessageId);
+  _reactionTurnMeta.delete(reactionKey);
+  return { workChainId: meta.workChainId, reactionKey, revision: meta.revision };
 }
 function registerOutboundLifecycle(workChainId: string, messageId: string): void {
   _workChainStore?.registerOutbound(workChainId, messageId);
@@ -166,54 +175,10 @@ function markTerminalLifecycle(workChainId: string): void {
   _workChainStore?.markTerminal(workChainId);
 }
 
-// ── Injectable effects executor for the reaction flush handler ──
-// Extracted so production tests can spy on effects (send, enqueue, cancel).
-export interface ReactionFlushEffects {
-  sendBridgeReply: (chatId: string, message: string, replyToMessageId: string) => Promise<void>;
-  /** Cancel a single pending reaction barrier for a specific target message.
-   *  Per-key cleanup — does NOT cancel all scope entries. */
-  cancelPendingForTarget: (scope: string, targetMessageId: string) => void;
-  clearContextForTarget: (targetMessageId: string) => void;
-  deleteTurnMetaForTarget: (targetMessageId: string) => void;
-  interruptActiveRun: (scope: string) => void;
-  setHandleSuperseded: (scope: string) => void;
-}
-
-export function createReactionFlushEffects(deps: {
-  pending: PendingQueue;
-  contextStore: ReactionContextStore;
-  activeRuns: ActiveRuns;
-}): ReactionFlushEffects {
-  return {
-    sendBridgeReply: async (_chatId, _message, _replyToMessageId) => {
-      // Bridge reply sent inline by caller using channel.send
-    },
-    cancelPendingForTarget: (scope, targetMessageId) => {
-      // Per-key cancel: remove only this specific barrier message, not whole scope
-      deps.pending.cancelMessage(scope, targetMessageId);
-    },
-    clearContextForTarget: (targetMessageId) => {
-      deps.contextStore.delete(targetMessageId);
-    },
-    deleteTurnMetaForTarget: (targetMessageId) => {
-      deleteReactionTurnMeta(targetMessageId);
-    },
-    interruptActiveRun: (scope) => {
-      deps.activeRuns.interrupt(scope);
-    },
-    setHandleSuperseded: (scope) => {
-      const handle = deps.activeRuns.get(scope);
-      if (handle) handle.superseded = true;
-    },
-  };
-}
-
-// ── Testable flush decision seam (extracted for RED→GREEN testing) ──
-// Returns the action the buffer flush handler should take.
-// Exported for use in production wiring tests.
+// ── Reaction flush decision + executor (single seam, called by buffer handler) ──
 export type ReactionFlushDecision =
   | { kind: 'drop'; reason: string }
-  | { kind: 'bridge-reply'; message: string; targetMessageId: string; interrupt?: { scope: string } }
+  | { kind: 'bridge-reply'; reason: 'reconciliation-failed' | 'net-zero' | 'empty-set'; message: string; targetMessageId: string; interrupt?: { scope: string } }
   | { kind: 'enqueue-agent' };
 
 export function decideReactionFlush(params: {
@@ -226,24 +191,89 @@ export function decideReactionFlush(params: {
   scope: string;
 }): ReactionFlushDecision {
   if (params.reconciliationFailed) {
-    return { kind: 'bridge-reply', message: '本次 Reaction 暂时无法确认，请重试。', targetMessageId: params.targetMessageId };
+    return { kind: 'bridge-reply', reason: 'reconciliation-failed', message: '本次 Reaction 暂时无法确认，请重试。', targetMessageId: params.targetMessageId };
   }
   if (params.noOp) {
     return { kind: 'drop', reason: 'no-op' };
   }
   if (params.netZeroConsumed) {
-    return { kind: 'bridge-reply', message: '已收到撤回。', targetMessageId: params.targetMessageId };
+    return { kind: 'bridge-reply', reason: 'net-zero', message: '已收到撤回。', targetMessageId: params.targetMessageId };
   }
   if (params.effectiveReactionSetLength === 0) {
     return {
-      kind: 'bridge-reply',
+      kind: 'bridge-reply', reason: 'empty-set',
       message: '已收到撤回，已完成动作不会自动回滚。',
       targetMessageId: params.targetMessageId,
       ...(params.hasMatchingActiveRun ? { interrupt: { scope: params.scope } } : {}),
     };
   }
-  // Non-empty effective set → enqueue Agent turn
   return { kind: 'enqueue-agent' };
+}
+
+export interface ReactionFlushEffects {
+  sendBridgeReply: (chatId: string, message: string, replyToMessageId: string) => Promise<void>;
+  cancelPendingForTarget: (scope: string, targetMessageId: string) => void;
+  clearContextForTarget: (targetMessageId: string) => void;
+  deleteTurnMetaForTarget: (reactionKey: string) => void;
+  interruptActiveRun: (scope: string) => void;
+  setHandleSuperseded: (scope: string) => void;
+}
+
+export function createReactionFlushEffects(deps: {
+  pending: PendingQueue;
+  contextStore: ReactionContextStore;
+  activeRuns: ActiveRuns;
+}): ReactionFlushEffects {
+  return {
+    sendBridgeReply: async (_chatId, _message, _replyToMessageId) => {},
+    cancelPendingForTarget: (scope, targetMessageId) => {
+      deps.pending.cancelMessage(scope, targetMessageId);
+    },
+    clearContextForTarget: (targetMessageId) => {
+      deps.contextStore.delete(targetMessageId);
+    },
+    deleteTurnMetaForTarget: (reactionKey) => {
+      deleteReactionTurnMeta(reactionKey);
+    },
+    interruptActiveRun: (scope) => {
+      deps.activeRuns.interrupt(scope);
+    },
+    setHandleSuperseded: (scope) => {
+      const handle = deps.activeRuns.get(scope);
+      if (handle) handle.superseded = true;
+    },
+  };
+}
+
+// ── Production executor: single seam called by buffer handler ──
+export async function executeReactionFlushDecision(
+  decision: ReactionFlushDecision,
+  deps: {
+    send: (chatId: string, markdown: string, replyTo: string) => Promise<void>;
+    effects: ReactionFlushEffects;
+    reactionKey: string;
+    targetMessageId: string;
+    scope: string;
+  },
+): Promise<void> {
+  if (decision.kind === 'drop') return;
+
+  if (decision.kind === 'bridge-reply') {
+    // Only empty-set removal triggers cleanup. reconciliationFailed/netZero do NOT.
+    if (decision.reason === 'empty-set') {
+      if (decision.interrupt) {
+        deps.effects.setHandleSuperseded(decision.interrupt.scope);
+        deps.effects.interruptActiveRun(decision.interrupt.scope);
+      }
+      deps.effects.cancelPendingForTarget(deps.scope, deps.targetMessageId);
+      deps.effects.clearContextForTarget(deps.targetMessageId);
+      deps.effects.deleteTurnMetaForTarget(deps.reactionKey);
+    }
+    await deps.send(deps.scope.split(':')[0] ?? deps.scope, decision.message, deps.targetMessageId);
+    return;
+  }
+
+  // enqueue-agent: caller builds context + pushBarrier after this returns
 }
 
 const DEBOUNCE_MS = 600;
@@ -835,7 +865,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       appId: cfg.accounts.app.id,
     });
 
-    // ── Use the testable decision seam for flush logic ──
+    // ── Use the production decision+executor seam ──
     const hasMatchingActive = _reactionRunTracker
       ? _reactionRunTracker.shouldInterrupt(result.components.scope, result.components.operatorOpenId, result.components.targetMessageId, result.revision)
       : false;
@@ -850,34 +880,17 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       scope: result.components.scope,
     });
 
-    if (decision.kind === 'drop') return;
-
-    if (decision.kind === 'bridge-reply') {
-      // Effects policy: only cleanup on empty-set/removal, NOT on reconciliationFailed.
-      // reconciliationFailed → ledger unchanged, no cancel, no context clear.
-      const isEmptySetRemoval = result.effectiveReactionSet.length === 0;
-      if (isEmptySetRemoval) {
-        const effects = createReactionFlushEffects({ pending, contextStore: reactionContextStore, activeRuns });
-        if (decision.interrupt) {
-          effects.setHandleSuperseded(decision.interrupt.scope);
-          effects.interruptActiveRun(decision.interrupt.scope);
-        }
-        effects.cancelPendingForTarget(result.components.scope, result.components.targetMessageId);
-        effects.clearContextForTarget(result.components.targetMessageId);
-        effects.deleteTurnMetaForTarget(result.components.targetMessageId);
-        log.info('reaction', 'bridge-reply-removal', {
-          scope: result.components.scope, key: result.key,
-          message: decision.message.substring(0, 30),
-          interrupted: !!decision.interrupt,
-        });
-      }
-      try {
-        await channel.send(
-          result.components.scope.split(':')[0] ?? result.components.scope,
-          { markdown: decision.message },
-          { replyTo: result.components.targetMessageId },
-        );
-      } catch { /* best-effort */ }
+    if (decision.kind === 'drop' || decision.kind === 'bridge-reply') {
+      const effects = createReactionFlushEffects({ pending, contextStore: reactionContextStore, activeRuns });
+      await executeReactionFlushDecision(decision, {
+        send: async (chatId, markdown, replyTo) => {
+          try { await channel.send(chatId, { markdown }, { replyTo }); } catch { /* best-effort */ }
+        },
+        effects,
+        reactionKey: result.key,
+        targetMessageId: result.components.targetMessageId,
+        scope: result.components.scope,
+      });
       return;
     }
 
@@ -932,7 +945,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
     if (wcId) _workChainStore?.markCurrent(wcId);
     // Per-key metadata (keyed by targetMessageId so runAgentBatch finds via batch[0].messageId)
-    setReactionTurnMeta(result.components.targetMessageId, result.key, result.components.scope, wcId, result.revision);
+    setReactionTurnMeta(result.key, result.components.targetMessageId, result.components.scope, wcId, result.revision);
     // Register in tracker at queued/reserved time so empty-set removal can detect it
     _reactionRunTracker?.register({
       scope: result.components.scope,
