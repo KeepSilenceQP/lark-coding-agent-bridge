@@ -67,6 +67,10 @@ export class RunExecutor {
     return this.activeRuns.reserve(scopeId);
   }
 
+  interruptEpoch(scopeId: string): number {
+    return this.activeRuns.interruptEpoch(scopeId);
+  }
+
   async submit(input: SubmitRunInput): Promise<RunExecution> {
     const submittedAt = this.now();
     if (input.policy.expiresAt <= this.now()) {

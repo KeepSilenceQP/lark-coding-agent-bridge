@@ -93,7 +93,7 @@ import type {
   PromptSessionService,
 } from '../session/prompt-session-service';
 import type { WorkspaceStore } from '../workspace/store';
-import { ActiveRuns, type RunHandle } from './active-runs';
+import { ActiveRuns, type RunHandle, type RunReservation } from './active-runs';
 import { resolveRunIdleTimeoutMs, resolveRunStartupTimeoutMs } from './run-idle-timeout';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
@@ -1393,6 +1393,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     // Reserve synchronously at the dequeue boundary, before chat-mode/media/
     // quote/prompt preparation can await. A stop Reaction can now abort this
     // reservation throughout the complete queue→prompt-prep window.
+    const initialInterruptEpoch = activeRuns.interruptEpoch(scope);
     const preparationReservation = executor.reserveScope(scope);
     if (!preparationReservation) {
       releaseFlushedTurnAfterError(scope, firstMsg.messageId, lease);
@@ -1447,6 +1448,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           mode,
           profileDir: deps.appPaths?.profileDir,
           preparationReservation,
+          initialInterruptEpoch,
           });
         }),
       onError: (err) => log.fail('flush', err),
@@ -1618,7 +1620,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             // the active handle. Otherwise a stop on a queued/reserved reaction
             // misreports no-work and the old task still starts later.
             const hasWork = activeRuns.hasActiveOrReserved(pipelineResult.scope)
-              || pending.pendingCount(pipelineResult.scope) > 0;
+              || pending.pendingCount(pipelineResult.scope) > 0
+              // Covers the narrow timeout-cleanup/retry-handoff gap where the
+              // WorkLease is still current but ActiveRuns has no handle yet.
+              || workChainStore.hasCurrentWork(pipelineResult.scope);
             const decision = decideStopAdded({
               targetClass: pipelineResult.targetClass,
               hasWork,
@@ -2094,7 +2099,9 @@ interface RunBatchDeps {
   mode: ChatMode;
   profileDir?: string;
   /** Acquired synchronously when PendingQueue dequeues the unit. */
-  preparationReservation?: import('./active-runs').RunReservation;
+  preparationReservation?: RunReservation;
+  /** Explicit-stop generation captured together with the dequeue reservation. */
+  initialInterruptEpoch?: number;
   /** R3-F1: work-chain lease carried by the flushed PendingUnit (acquired at
    *  enqueue; the run releases it on terminal/abort). */
   lease?: WorkLease;
@@ -2302,6 +2309,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const startFlow = (
     stage: 'submit' | 'startup-retry',
     reuseDecision?: PromptSessionDecision,
+    reservation?: RunReservation,
   ) =>
     startRunFlow({
       scopeId: scope,
@@ -2324,9 +2332,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         : {}),
       workspaces,
       executor,
-      ...(stage === 'submit' && deps.preparationReservation
-        ? { reservation: deps.preparationReservation }
-        : {}),
+      ...(reservation
+        ? { reservation }
+        : stage === 'submit' && deps.preparationReservation
+          ? { reservation: deps.preparationReservation }
+          : {}),
       now: Date.now(),
       stopGraceMs: getAgentStopGraceMs(controls.cfg),
       routeId: routeLeaseId,
@@ -2480,44 +2490,56 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   };
   let startupRetryUsed = false;
   const recoverStartupTimeout = async (): Promise<
-    { handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined
+    StartupRecoveryResult | undefined
   > => {
     if (capability.agentId !== 'codex' || startupRetryUsed) return undefined;
     startupRetryUsed = true;
-    await execution.stop();
-    const safe = await execution.run.canRetryAfterNoOutput?.() ?? false;
-    if (!safe) {
-      log.warn('agent', 'startup-timeout-retry-skipped', {
-        scope,
-        reason: execution.run.canRetryAfterNoOutput
-          ? 'turn-not-empty-terminal'
-          : 'agent-does-not-support-verification',
-      });
-      return undefined;
-    }
-    const replacement = await startFlow(
-      'startup-retry',
-      activeFlow.promptSession?.decision,
-    );
-    if (!replacement.ok) {
-      log.warn('agent', 'startup-timeout-retry-rejected', {
-        scope,
-        code: replacement.rejectReason.code,
-      });
-      return undefined;
-    }
-    log.warn('agent', 'startup-timeout-retry-started', {
+    return runStartupRetryWithStopGuard({
       scope,
-      previousRunId: execution.runId,
-      retryRunId: replacement.execution.runId,
-      threadId: replacement.resumeFrom,
+      initialInterruptEpoch: deps.initialInterruptEpoch
+        ?? executor.interruptEpoch(scope),
+      activeRuns: executor,
+      executor,
+      stopCurrent: () => execution.stop(),
+      canRetry: async () => {
+        const safe = await execution.run.canRetryAfterNoOutput?.() ?? false;
+        if (!safe) {
+          log.warn('agent', 'startup-timeout-retry-skipped', {
+            scope,
+            reason: execution.run.canRetryAfterNoOutput
+              ? 'turn-not-empty-terminal'
+              : 'agent-does-not-support-verification',
+          });
+        }
+        return safe;
+      },
+      startReplacement: async (retryReservation) => {
+        const replacement = await startFlow(
+          'startup-retry',
+          activeFlow.promptSession?.decision,
+          retryReservation,
+        );
+        if (!replacement.ok) {
+          log.warn('agent', 'startup-timeout-retry-rejected', {
+            scope,
+            code: replacement.rejectReason.code,
+          });
+          return undefined;
+        }
+        log.warn('agent', 'startup-timeout-retry-started', {
+          scope,
+          previousRunId: execution.runId,
+          retryRunId: replacement.execution.runId,
+          threadId: replacement.resumeFrom,
+        });
+        activeFlow = replacement;
+        if (replacement.promptSession) promptAdmissions.push(replacement.promptSession.admission);
+        return {
+          handle: replacement.execution.handle,
+          events: replacement.execution.subscribe(),
+        };
+      },
     });
-    activeFlow = replacement;
-    if (replacement.promptSession) promptAdmissions.push(replacement.promptSession.admission);
-    return {
-      handle: replacement.execution.handle,
-      events: replacement.execution.subscribe(),
-    };
   };
 
   // Resolve idle-timeout for this run: scope override (on SessionEntry) wins
@@ -2968,6 +2990,59 @@ function streamResultLogFields(result: unknown): Record<string, unknown> {
   };
 }
 
+export type StartupRecoveryResult =
+  | { handle: RunHandle; events: AsyncIterable<AgentEvent> }
+  | { interrupted: true };
+
+/**
+ * Preserve explicit-stop ownership across Codex's timeout cleanup/probe/retry
+ * gap. Internal timeout cleanup does not advance ActiveRuns.interruptEpoch;
+ * user/control-plane interrupt does, and also aborts the retry reservation.
+ */
+export async function runStartupRetryWithStopGuard(input: {
+  scope: string;
+  initialInterruptEpoch: number;
+  activeRuns: Pick<ActiveRuns, 'interruptEpoch'>;
+  executor: Pick<RunExecutor, 'reserveScope'>;
+  stopCurrent: () => Promise<void>;
+  canRetry: () => Promise<boolean>;
+  startReplacement: (
+    reservation: RunReservation,
+  ) => Promise<{ handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined>;
+}): Promise<StartupRecoveryResult | undefined> {
+  await input.stopCurrent();
+  if (input.activeRuns.interruptEpoch(input.scope) !== input.initialInterruptEpoch) {
+    return { interrupted: true };
+  }
+
+  // Acquire synchronously before the potentially slow persisted-turn probe.
+  // From this point stop_current_work sees hasWork and can abort the retry.
+  const retryReservation = input.executor.reserveScope(input.scope);
+  if (!retryReservation) return undefined;
+  try {
+    const safe = await input.canRetry();
+    if (
+      retryReservation.signal.aborted
+      || input.activeRuns.interruptEpoch(input.scope) !== input.initialInterruptEpoch
+    ) {
+      return { interrupted: true };
+    }
+    if (!safe) return undefined;
+
+    const replacement = await input.startReplacement(retryReservation);
+    if (
+      retryReservation.signal.aborted
+      || input.activeRuns.interruptEpoch(input.scope) !== input.initialInterruptEpoch
+    ) {
+      return { interrupted: true };
+    }
+    return replacement;
+  } finally {
+    // Idempotent after ActiveRuns.register consumes the reservation.
+    retryReservation.release();
+  }
+}
+
 /**
  * Drive the agent's event stream into a stateful RunState, calling `flush`
  * on every state transition. Used by both card and markdown reply modes —
@@ -2981,9 +3056,7 @@ export async function processAgentStream(
   startupTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void | Promise<void>,
   flush: (state: RunState) => Promise<void>,
-  recoverStartupTimeout?: () => Promise<
-    { handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined
-  >,
+  recoverStartupTimeout?: () => Promise<StartupRecoveryResult | undefined>,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = initialState;
@@ -3115,6 +3188,11 @@ export async function processAgentStream(
     try {
       const replacement = await recoverStartupTimeout();
       if (replacement) {
+        if ('interrupted' in replacement) {
+          state = markInterrupted(state);
+          await flush(state);
+          return state;
+        }
         log.warn('agent', 'startup-timeout-retrying', { scope });
         return processAgentStream(
           replacement.handle,
