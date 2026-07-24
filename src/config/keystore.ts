@@ -13,7 +13,7 @@ import { writeFileAtomic } from '../platform/atomic-write';
  *   ~/.lark-channel/.keystore.salt   — 32 random bytes, generated once
  *
  * Both files are chmod 0600. The encryption key is derived (PBKDF2-SHA256,
- * 100k iters) from `hostname + userInfo().username + salt`. This is
+ * 100k iters) from a stable application label plus the persisted salt. This is
  * **defense-in-depth against accidental disclosure** (backups, git commits,
  * log dumps) — *not* against a same-user process actively decrypting. That
  * threat needs a real OS keychain, which is out of scope for this bridge
@@ -24,7 +24,9 @@ const KEY_LEN = 32;
 const IV_LEN = 12; // GCM standard
 const TAG_LEN = 16; // GCM auth tag
 const PBKDF2_ITER = 100_000;
-const FILE_VERSION = 1;
+const LEGACY_FILE_VERSION = 1;
+const FILE_VERSION = 2;
+const STABLE_KEY_SEED = 'lark-channel-bridge-keystore-v2';
 const derivedKeyCache = new Map<string, Buffer>();
 
 interface Envelope {
@@ -37,7 +39,7 @@ interface Envelope {
 }
 
 interface StoreFile {
-  version: number;
+  version: typeof LEGACY_FILE_VERSION | typeof FILE_VERSION;
   entries: Record<string, Envelope>;
 }
 
@@ -48,7 +50,12 @@ async function readStore(storePaths: KeystorePaths = paths): Promise<StoreFile> 
   try {
     const text = await readFile(storePaths.secretsFile, 'utf8');
     const parsed = JSON.parse(text) as Partial<StoreFile>;
-    if (parsed?.version !== FILE_VERSION || !parsed.entries) return emptyStore();
+    if (
+      (parsed?.version !== LEGACY_FILE_VERSION && parsed?.version !== FILE_VERSION) ||
+      !parsed.entries
+    ) {
+      return emptyStore();
+    }
     return { version: parsed.version, entries: { ...parsed.entries } };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return emptyStore();
@@ -84,7 +91,17 @@ async function loadOrCreateSalt(storePaths: KeystorePaths = paths): Promise<Buff
 }
 
 async function deriveKey(storePaths: KeystorePaths = paths): Promise<Buffer> {
-  const cacheKey = `${storePaths.keystoreSaltFile}`;
+  const cacheKey = `${storePaths.keystoreSaltFile}:v${FILE_VERSION}`;
+  const cached = derivedKeyCache.get(cacheKey);
+  if (cached) return cached;
+  const salt = await loadOrCreateSalt(storePaths);
+  const key = pbkdf2Sync(STABLE_KEY_SEED, salt, PBKDF2_ITER, KEY_LEN, 'sha256');
+  derivedKeyCache.set(cacheKey, key);
+  return key;
+}
+
+async function deriveLegacyKey(storePaths: KeystorePaths = paths): Promise<Buffer> {
+  const cacheKey = `${storePaths.keystoreSaltFile}:v${LEGACY_FILE_VERSION}`;
   const cached = derivedKeyCache.get(cacheKey);
   if (cached) return cached;
   const salt = await loadOrCreateSalt(storePaths);
@@ -118,6 +135,30 @@ function decrypt(key: Buffer, env: Envelope): string {
   return dec.toString('utf8');
 }
 
+async function migrateLegacyStore(
+  store: StoreFile,
+  storePaths: KeystorePaths,
+): Promise<StoreFile> {
+  if (store.version !== LEGACY_FILE_VERSION) return store;
+  const legacyKey = await deriveLegacyKey(storePaths);
+  const stableKey = await deriveKey(storePaths);
+  const entries: Record<string, Envelope> = {};
+  try {
+    for (const [id, env] of Object.entries(store.entries)) {
+      entries[id] = encrypt(stableKey, decrypt(legacyKey, env));
+    }
+  } catch (cause) {
+    throw new Error(
+      'legacy keystore decryption failed; hostname or username may have changed. ' +
+        'Restore the App Secret from an authorized credential store before replacing secrets.enc.',
+      { cause },
+    );
+  }
+  const migrated: StoreFile = { version: FILE_VERSION, entries };
+  await writeStore(migrated, storePaths);
+  return migrated;
+}
+
 /** Look up an entry by id (e.g. "app-cli_xxx"). Returns plaintext or
  * `undefined` when not present. Errors (decryption failure, invalid file)
  * propagate. */
@@ -125,7 +166,7 @@ export async function getSecret(
   id: string,
   storePaths: KeystorePaths = paths,
 ): Promise<string | undefined> {
-  const store = await readStore(storePaths);
+  const store = await migrateLegacyStore(await readStore(storePaths), storePaths);
   const env = store.entries[id];
   if (!env) return undefined;
   const key = await deriveKey(storePaths);
@@ -140,7 +181,7 @@ export async function setSecret(
 ): Promise<void> {
   const key = await deriveKey(storePaths);
   const env = encrypt(key, plaintext);
-  const store = await readStore(storePaths);
+  const store = await migrateLegacyStore(await readStore(storePaths), storePaths);
   store.entries[id] = env;
   await writeStore(store, storePaths);
 }
