@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildReceiptRequestBody,
   sendLarkMessage,
+  sendReceiptWithRetry,
   getTenantAccessToken,
   type ReceiptSendParams,
 } from '../../../src/runtime/restart-receipt-sender';
@@ -311,6 +312,19 @@ describe('getTenantAccessToken', () => {
 // ── Retry uses identical uuid ──────────────────────────────────────────
 
 describe('retry uuid stability', () => {
+  it('reports one actual attempt for a deterministic HTTP 400', async () => {
+    const send = vi.fn(async () => {
+      throw new Error('message reply failed: HTTP 400');
+    });
+
+    const result = await sendReceiptWithRetry(send, {
+      sleep: async () => {},
+    });
+
+    expect(result).toMatchObject({ ok: false, attempts: 1 });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it('produces identical body (including uuid) across retries', () => {
     const params = makeParams({ uuid: 'uuid-retry-test' });
     const body1 = buildReceiptRequestBody(params);

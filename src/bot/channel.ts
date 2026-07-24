@@ -2296,7 +2296,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     const lease = await createRouteLease(deps.profileDir, {
       chatId,
       threadId,
-      replyTo: lastMsg.messageId,
+      replyTo: replyToId,
       bridgePid: process.pid,
       runId: `${scope}:${Date.now()}`,
     });

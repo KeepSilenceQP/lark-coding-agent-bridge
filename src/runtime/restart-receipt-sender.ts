@@ -20,6 +20,11 @@ export interface ReceiptSendResult {
   messageId?: string;
 }
 
+export interface ReceiptRetryResult extends ReceiptSendResult {
+  attempts: number;
+  lastError?: unknown;
+}
+
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
@@ -88,35 +93,66 @@ export async function sendRestartReceipt(
     return { ok: false };
   }
 
-  // Bounded retry loop for the actual send. Only truly transient errors
-  // (network, HTTP 5xx) are retried. Deterministic API errors (4xx, bad
-  // content) break immediately.
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const messageId = await sendLarkMessage(
+  const sendResult = await sendReceiptWithRetry(
+    () =>
+      sendLarkMessage(
         domain,
         token,
         params.returnRoute,
         body,
-      );
-      return { ok: true, messageId };
-    } catch (err) {
-      lastError = err;
-      if (!isRetryable(err)) break;
-      if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_DELAY_MS * attempt);
-      }
-    }
+      ),
+  );
+  if (sendResult.ok) {
+    return { ok: true, messageId: sendResult.messageId };
   }
 
   log.warn('receipt', 'send-failed', {
     receiptId: params.receiptId,
     kind: params.kind,
-    error: lastError instanceof Error ? lastError.message : String(lastError),
-    attempts: MAX_RETRIES,
+    error:
+      sendResult.lastError instanceof Error
+        ? sendResult.lastError.message
+        : String(sendResult.lastError),
+    attempts: sendResult.attempts,
   });
   return { ok: false };
+}
+
+/**
+ * Run the bounded receipt-send retry policy and report the attempts that
+ * actually occurred. Deterministic 4xx/content failures stop after one try.
+ */
+export async function sendReceiptWithRetry(
+  send: () => Promise<string>,
+  options: {
+    maxAttempts?: number;
+    retryDelayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<ReceiptRetryResult> {
+  const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_RETRIES);
+  const retryDelayMs = options.retryDelayMs ?? RETRY_DELAY_MS;
+  const wait = options.sleep ?? sleep;
+  let attempts = 0;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    attempts = attempt;
+    try {
+      const messageId = await send();
+      return { ok: true, messageId, attempts };
+    } catch (err) {
+      lastError = err;
+      if (!isRetryable(err)) break;
+      if (attempt < maxAttempts) {
+        await wait(retryDelayMs * attempt);
+      }
+    }
+  }
+  return {
+    ok: false,
+    attempts,
+    ...(lastError !== undefined ? { lastError } : {}),
+  };
 }
 
 /**

@@ -7,6 +7,8 @@ import { log } from '../../../src/core/logger.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { requestDeferredServiceRestart } from '../../../src/runtime/deferred-service-restart.js';
+import { readRouteLease } from '../../../src/runtime/route-lease.js';
+import { makeReactionKey } from '../../../src/bot/reaction/types.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
 
@@ -26,7 +28,7 @@ vi.mock('@larksuite/channel', async (importOriginal) => {
   };
 });
 
-import { startChannel } from '../../../src/bot/channel.js';
+import { setReactionTurnMeta, startChannel } from '../../../src/bot/channel.js';
 
 interface MessageHandlerMap {
   message?: (msg: NormalizedMessage) => Promise<void> | void;
@@ -94,6 +96,28 @@ afterEach(async () => {
 });
 
 describe('markdown stream startup failures', () => {
+  it('routes a Reaction-triggered restart receipt back to the real target message', async () => {
+    const h = await createHarness();
+    await startTestBridge(h);
+    const scope = 'oc_dm';
+    const operatorId = 'ou_user';
+    const targetMessageId = 'om_reaction_target';
+    const reactionKey = makeReactionKey(scope, operatorId, targetMessageId);
+    const turnId = `${reactionKey}:1`;
+    setReactionTurnMeta(reactionKey, targetMessageId, scope, 'wc-receipt-route', 1, turnId);
+
+    await h.channel.handlers.message?.({
+      ...message(turnId, '[reaction] GoGoGo'),
+      rawContentType: 'reaction' as never,
+    });
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    const routeId = h.agent.runOptions[0]?.routeId;
+    expect(routeId).toBeTypeOf('string');
+    const lease = await readRouteLease(h.tmp.profile, routeId!);
+    expect(lease?.replyTo).toBe(targetMessageId);
+  });
+
   it('does not leave the IM queue blocked when the agent exits before stream producer starts', async () => {
     const h = await createHarness();
     await startTestBridge(h);
