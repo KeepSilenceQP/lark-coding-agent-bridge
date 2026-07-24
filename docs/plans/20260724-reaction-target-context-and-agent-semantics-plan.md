@@ -1,13 +1,13 @@
 # Correct Reaction Handling By Bridge Agents — Coding Plan
 
 Date: 2026-07-24
-Status: Code Review blocked; Fix in progress
+Status: Code Review GO; Unit 11 live verification pending deployment
 Spec authority: `docs/specs/20260723-reaction-target-context-and-agent-semantics.md` (commit `d18322c`，confirmed；independent review PASS；`d18322c` 在 `e7e178f` 基础上解决 review 歧义)
 Target branch: `fix/bugfix` (synced to `d18322c`)
 Harness protocol: `feishu-group-project-flow-v2`
 Plan Writer: 云上C总 (only writes this Plan; no self-review, no implementation)
 Plan Reviewer: 小P
-Implementer: 小C
+Implementer: 小C（Unit 1-10）→ 小P（B9 R6-R8 接管及后续闭环）
 
 > 本 Plan 不重写需求。所有行为契约、字段、验收以 Spec 为准；本文件只把 Spec 落到真实模块、依赖、顺序、Execution Units、完成条件与 gate。Spec 与当前代码冲突处单列在「Known Issues / Blockers」与「Resolved Decisions」，不静默裁定。
 
@@ -27,6 +27,7 @@ Implementer: 小C
 - 2026-07-24 小P Plan Review 结论 BLOCKED（6 项 finding 有效）+ 云上C总 修订（第 3 版，基于 Spec `d18322c`）：①`Get` 不新增为第 12 个预埋 alias，v1 仍 11 个，示例用 `JIAYI`，`Get` 走 unmapped 透传；②单数 `triggerReaction` 改为按 action time+到达顺序排列的 `triggerReactions[]`，保留 `effectiveReactionSet`，补"启动前快速新增两个不同 Reaction"与"同 buffer 一增一减且最终非空"测试；③stop added 顺序改为门禁+防重后先判 scope 完全无 work→回无任务，仅 scope 有 current work 时才做 target→current workChain 关联（历史/无关→fail closed）；④定义 canonical fingerprint 稳定字段/去重/确定性排序，跨页/返回顺序打乱不产生 revision；⑤补 context-builder→fetchQuotedContext→reaction_contexts 卡片/合并转发真实内容 wiring 测试；⑥workChainId 给出明确 TTL/容量/淘汰规则与边界测试。
 - 2026-07-24 小P Plan v3 复审：前 5 项 CLOSED；第 6 项 TTL/LRU 方向成立但 DD15 引入 1 个 BLOCKER（16/256 作总 Map 硬上限与 current 不淘汰、PendingQueue 无背压三者冲突；current outbound mapping 不能被 TTL 淘汰，否则长任务丢 stop 关联）。云上C总 修订（第 4 版）：16/256 重定义为 historical cache 上限（非总 Map 硬上限），current chains 及其 outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，terminal 后才进入 30min historical retention 并按 LRU 裁剪；总边界表述为 current workload references + bounded historical cache；不引入 pending admission/drop/backpressure；Unit6 补 a/b/c 三测试。
 - 2026-07-24 小P Plan v4 复审：第 6 项 BLOCKER CLOSED；六项 finding 全部闭合，未发现新的阻塞或 Spec 缩减，Plan Review `GO`。
+- 2026-07-24 小P接管 B9 R6-R8：R6 经独立 SubAgent Review 发现 5 项 lifecycle/invariant 问题并在 R7 闭合；R7 复审发现 rev1 已离队但尚未 reserve 时，rev2 replacement 未写 tombstone 的 BLOCKER；R8 `67b43d8` 补齐 exact old turn invalidation。独立 SubAgent 最终复审 `5c2682d..67b43d8` 结论 `GO`，确认 R7 的 5 项修复维持闭合，允许重新打包部署并继续 Unit 11；live 验收仍需单独完成。
 
 ## Current Evidence（当前代码现状，file:line）
 
@@ -321,7 +322,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 
 - [x] 小P 对 Unit 1-10 实现 + 测试做 Code Review（Plan Writer 云上C总 不自审）。
 - [x] DD17/B1 已澄清：当前 `/stop` 经 `intakeMessage`（`channel.ts:1304-1331`）已 `interrupt + pending.cancel`；stop 控制面复用该复合语义，不比 `/stop` 严格，无 `/stop` 对齐改动。
-- [ ] 确认未静默缩减 Spec 验收；覆盖矩阵全绿。
+- [x] 确认未静默缩减 Spec 验收；覆盖矩阵全绿。
 
 Progress update (2026-07-24): Code Review GO at `4855a97`; only Unit 11 is
 released. Reviewer-tracked, non-blocking test-strength follow-ups remain open
@@ -330,9 +331,17 @@ in the unchecked RED items for Units 3/4/5/8/9/10: full mocked
 injection, streaming-path superseded, stop UI terminal convergence, and
 card/merged-forward reaction-context propagation.
 
-### Unit 11 — 自动化全量 + live-model 对照验收（两路）  Owner: 小C（live profile 协调 小P）
+Progress update (2026-07-24): B9 R6-R8 was implemented by 小P after takeover
+and reviewed by an independent SubAgent. R6 review found five lifecycle and
+invariant gaps; R7 closed them, and R8 closed the remaining pre-reservation
+replacement race. Final review of `5c2682d..67b43d8` is `GO`. Full automated
+verification at `67b43d8`: typecheck 0, build success, 1292 pass / 33 skip /
+0 fail, worktree clean, and `git diff --check` clean. Code Review Gate is
+closed; this GO releases deployment and Unit 11 only, not live completion.
 
-- [ ] 自动化：Spec §Acceptance Criteria 与 §Next Phase 列举的全部确定性场景在 Claude 与 Codex 两路通过结构/注入测试。
+### Unit 11 — 自动化全量 + live-model 对照验收（两路）  Owner: 小P（接管闭环）
+
+- [x] 自动化：Spec §Acceptance Criteria 与 §Next Phase 列举的全部确定性场景在 Claude 与 Codex 两路通过结构/注入测试。
 - [ ] live-model：隔离可逆带唯一标记测试动作 X，按 Spec oracle 覆盖 4 个预埋 `semanticKey` 各一个代表 emoji + 一次未预埋 + 一次 removed；停止场景证明 interrupt 发生在旧 run 完成之前且无后继 Agent run 自动启动。
 - [ ] 每条验收保存：实际动态 prompt、共享 System Prompt 版本（DD10）、工具调用、可观察副作用、最终回复、飞书消息 ID；记录 Agent 类型、实际模型标识、时间。
 - [ ] 核对 UI 引用、Agent 输入、System Prompt、工具副作用、最终行为一致。
@@ -520,13 +529,13 @@ pnpm -s test
   - Card callback synthetic message 写入 `replyToMessageId=evt.messageId`，点击继续承载卡片的原 workChain，不再分配无关 top-level chain。
   - `releaseEnqueuedTurn` 与 `releaseFlushedTurnAfterError` 统一清理 context/meta/tracker/lease；命令取消、empty-set queued、chatMode/startFlow 前后异常均不会留下无界 context 或 stale tracker。
   - 新增真实 lease/cleanup production-seam 测试：top-level acquire+merge+cancel release、同 chain 不同 target 合并、不同 chain 拆分、flush ownership transfer、command-style cancel、empty-set queued、async flush failure、Card callback chain target 继承。
-- **B9 R7（独立 SubAgent Review BLOCKED 后修复，待复审）**：
+- **B9 R7（独立 SubAgent Review BLOCKED 后修复；R7 复审发现 1 项 replacement race，转 R8）**：
   - empty-set 对 exact key 的 queued/reserved/active 全部视为 in-flight；仍在队列则只精确取消，已跨过 queue→prompt-prep 边界则写 turn tombstone，并在 `runAgentBatch` 入口及 `startRunFlow` 前消费释放；reservation/active 路径同时经 `ActiveRuns.interrupt` 收敛，空集合不再启动无上下文 Agent turn。
   - 相同未知 `replyTo` 先按 target 快路径合并，不再用有分配副作用的 `resolveOrAllocate` 作 merge probe；不同 target 仍按真实 inherited chain 合并或拆分。
   - `runAgentBatch` 从 consume Reaction meta 后即进入统一 terminal try/catch；`executePendingFlushWithCleanup` 覆盖 queue→trace/run 的同步与异步异常，均清 lease/context/meta/tracker。
   - historical chain 重新 current 时同步移除其 outbound IDs 的 historical LRU 资格；prune 再防御性跳过 current chain，保证 DD15 current mappings 永不受 historical TTL/cap 淘汰。
   - 新增 reserved/prompt-prep empty-set、同步 handoff throw、相同未知 reply target、reactivated-current outbound cap 回归测试。
-- **B9 R8（R7 独立复审 BLOCKED 后修复，待复审）**：同 key 新 revision 的 `evictInFlightReactionEntry` 与 empty-set 共用 queue→reservation tombstone 约束；旧 barrier 已 flush、`ActiveRuns` 尚未 reserve 时，rev2 为 rev1 turnId 写 invalidation，rev1 在 run 入口/submit 前释放，不能以 ordinary synthetic Reaction 继续启动。新增 rev1-flushed/pre-reserve→rev2 replacement production-seam 回归测试。
+- **B9 R8（独立 SubAgent 最终复审 GO）**：同 key 新 revision 的 `evictInFlightReactionEntry` 与 empty-set 共用 queue→reservation tombstone 约束；旧 barrier 已 flush、`ActiveRuns` 尚未 reserve 时，rev2 为 rev1 turnId 写 invalidation，rev1 在 run 入口/submit 前释放，不能以 ordinary synthetic Reaction 继续启动。新增 rev1-flushed/pre-reserve→rev2 replacement production-seam 回归测试。独立复审 `5c2682d..67b43d8` 确认 exact old turnId 被精准失效、rev2 不受影响，且 R7 的 5 项修复维持闭合；结论 `GO`，Code Review Gate 关闭，进入部署与 Unit 11 live。
 
 ## Plan Review Gate  Owner: 小P
 
