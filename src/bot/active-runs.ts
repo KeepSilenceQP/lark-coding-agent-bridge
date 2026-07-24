@@ -3,6 +3,10 @@ import type { AgentRun } from '../agent/types';
 export interface RunHandle {
   run: AgentRun;
   interrupted: boolean;
+  /** Set when an explicit control-plane action requested termination. */
+  controlPlaneInterrupted?: boolean;
+  /** Set when interrupted due to reaction revision supersede (not /stop). */
+  superseded?: boolean;
 }
 
 export interface RunReservation {
@@ -19,6 +23,8 @@ interface ReservationState {
 export class ActiveRuns {
   private readonly handles = new Map<string, RunHandle>();
   private readonly reservations = new Map<string, ReservationState>();
+  /** Monotonic per-scope epoch advanced only by explicit interrupt(). */
+  private readonly interruptEpochs = new Map<string, number>();
   private pauseDepth = 0;
   private pauseReason: string | undefined;
 
@@ -77,6 +83,20 @@ export class ActiveRuns {
     return this.handles.get(chatId);
   }
 
+  /** True when a run is reserved (prompt-prep/pool-wait) but not yet active. */
+  hasReservation(chatId: string): boolean {
+    return this.reservations.has(chatId);
+  }
+
+  /** True when there is an active handle OR a reservation for this scope. */
+  hasActiveOrReserved(chatId: string): boolean {
+    return this.handles.has(chatId) || this.reservations.has(chatId);
+  }
+
+  interruptEpoch(chatId: string): number {
+    return this.interruptEpochs.get(chatId) ?? 0;
+  }
+
   unregister(chatId: string, run: AgentRun): void {
     const existing = this.handles.get(chatId);
     if (existing?.run === run) this.handles.delete(chatId);
@@ -96,6 +116,10 @@ export class ActiveRuns {
    * generator exits on its own as the subprocess dies.
    */
   interrupt(chatId: string): boolean {
+    // Record the explicit stop intent even if the active handle was just
+    // removed by timeout cleanup. Queue→run handoff and startup-retry guards
+    // compare this epoch so an in-flight successor cannot start afterward.
+    this.interruptEpochs.set(chatId, this.interruptEpoch(chatId) + 1);
     let interrupted = false;
     const reservation = this.reservations.get(chatId);
     if (reservation) {
@@ -105,13 +129,16 @@ export class ActiveRuns {
       interrupted = true;
     }
     const h = this.handles.get(chatId);
-    if (!h) return interrupted;
-    h.interrupted = true;
-    this.handles.delete(chatId);
-    void h.run.stop().catch(() => {
-      /* stop errors are non-fatal */
-    });
-    return true;
+    if (h) {
+      h.interrupted = true;
+      h.controlPlaneInterrupted = true;
+      this.handles.delete(chatId);
+      void h.run.stop().catch(() => {
+        /* stop errors are non-fatal */
+      });
+      interrupted = true;
+    }
+    return interrupted;
   }
 
   async stopAll(): Promise<void> {
@@ -122,7 +149,10 @@ export class ActiveRuns {
       reservation.controller.abort();
     }
     this.reservations.clear();
-    for (const h of all) h.interrupted = true;
+    for (const h of all) {
+      h.interrupted = true;
+      h.controlPlaneInterrupted = true;
+    }
     await Promise.allSettled(all.map((h) => h.run.stop()));
   }
 

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildReceiptRequestBody,
   sendLarkMessage,
+  sendReceiptWithRetry,
   getTenantAccessToken,
   type ReceiptSendParams,
 } from '../../../src/runtime/restart-receipt-sender';
@@ -194,6 +195,38 @@ describe('sendLarkMessage — uuid end-to-end', () => {
     ).rejects.toThrow(/HTTP 500/);
   });
 
+  it('preserves sanitized Lark error details for an HTTP 400 reply failure', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      fakeJsonResponse(
+        {
+          code: 99992354,
+          msg: 'invalid open_message_id',
+          error: {
+            field_violations: [
+              {
+                field: 'message_id',
+                value: 'om_bad',
+                description: 'id not exist',
+              },
+            ],
+          },
+        },
+        400,
+      ),
+    ) as typeof fetch;
+
+    await expect(
+      sendLarkMessage(
+        'https://open.feishu.cn',
+        't',
+        makeRoute({ replyTo: 'om_bad' }),
+        buildReceiptRequestBody(makeParams()),
+      ),
+    ).rejects.toThrow(
+      /HTTP 400.*code=99992354.*msg=invalid open_message_id.*field_violations=.*message_id.*id not exist/,
+    );
+  });
+
   it('throws on code=0 but missing data.message_id', async () => {
     globalThis.fetch = vi.fn(async () =>
       // API returns success code but no message_id — protocol error
@@ -311,6 +344,19 @@ describe('getTenantAccessToken', () => {
 // ── Retry uses identical uuid ──────────────────────────────────────────
 
 describe('retry uuid stability', () => {
+  it('reports one actual attempt for a deterministic HTTP 400', async () => {
+    const send = vi.fn(async () => {
+      throw new Error('message reply failed: HTTP 400');
+    });
+
+    const result = await sendReceiptWithRetry(send, {
+      sleep: async () => {},
+    });
+
+    expect(result).toMatchObject({ ok: false, attempts: 1 });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it('produces identical body (including uuid) across retries', () => {
     const params = makeParams({ uuid: 'uuid-retry-test' });
     const body1 = buildReceiptRequestBody(params);
