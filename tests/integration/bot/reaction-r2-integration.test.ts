@@ -1771,3 +1771,51 @@ describe('WorkChainStore single allocation + outbound registration (production s
     expect(store.resolveCurrentChain(targetMsgId)).toBeUndefined();
   });
 });
+
+// ── B4: WorkChainStore per-unit in-flight tracking ──
+describe('WorkChainStore per-unit in-flight (B4)', () => {
+  it('chain stays current while any unit in-flight; historical only when last releases', () => {
+    const store = new WorkChainStore();
+    const chain = store.allocate('oc_s');
+
+    store.acquireUnit(chain, 'unit-a');
+    store.acquireUnit(chain, 'unit-b');
+    // Two units in-flight → current (sibling on same chain doesn't terminal-mark)
+    expect(store.isCurrent(chain)).toBe(true);
+
+    // Release one → still current (other unit still in-flight)
+    store.releaseUnit(chain, 'unit-a');
+    expect(store.isCurrent(chain)).toBe(true);
+
+    // Release the last → historical
+    store.releaseUnit(chain, 'unit-b');
+    expect(store.isCurrent(chain)).toBe(false);
+  });
+
+  it('acquireUnit re-currents a terminal chain (re-continue / supersede)', () => {
+    const store = new WorkChainStore();
+    const chain = store.allocate('oc_s');
+    store.acquireUnit(chain, 'u1');
+    store.releaseUnit(chain, 'u1');
+    expect(store.isCurrent(chain)).toBe(false);
+    // Re-acquire → current again
+    store.acquireUnit(chain, 'u2');
+    expect(store.isCurrent(chain)).toBe(true);
+    store.releaseUnit(chain, 'u2');
+    expect(store.isCurrent(chain)).toBe(false);
+  });
+});
+
+// ── B2: ActiveRuns covers reserved + active for stop current-work ──
+describe('ActiveRuns hasActiveOrReserved (B2)', () => {
+  it('detects reservation (reserved, not yet active) — the B2 stop gap', () => {
+    const runs = new ActiveRuns();
+    expect(runs.hasActiveOrReserved('oc_s')).toBe(false);
+    const res = runs.reserve('oc_s');
+    expect(res).toBeDefined();
+    // Reserved (prompt-prep/pool-wait) must count as current work for stop
+    expect(runs.hasActiveOrReserved('oc_s')).toBe(true);
+    res!.release();
+    expect(runs.hasActiveOrReserved('oc_s')).toBe(false);
+  });
+});

@@ -79,6 +79,16 @@ export class ActiveRuns {
     return this.handles.get(chatId);
   }
 
+  /** True when a run is reserved (prompt-prep/pool-wait) but not yet active. */
+  hasReservation(chatId: string): boolean {
+    return this.reservations.has(chatId);
+  }
+
+  /** True when there is an active handle OR a reservation for this scope. */
+  hasActiveOrReserved(chatId: string): boolean {
+    return this.handles.has(chatId) || this.reservations.has(chatId);
+  }
+
   unregister(chatId: string, run: AgentRun): void {
     const existing = this.handles.get(chatId);
     if (existing?.run === run) this.handles.delete(chatId);

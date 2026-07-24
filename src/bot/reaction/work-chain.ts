@@ -158,6 +158,38 @@ export class WorkChainStore {
     this.removeHistorical(chain.scope, chainId);
   }
 
+  // ── B4: per-unit in-flight tracking ──
+  // A chain stays current while ANY unit is in-flight; it goes historical only
+  // when the LAST unit releases. This prevents one sibling run's terminal from
+  // marking a shared chain historical while other queued/reserved/active units
+  // on the same chain are still live (covers same-chain different-key + ordinary
+  // siblings, which isLatest alone cannot protect).
+  private readonly inFlightUnits = new Map<string, Set<string>>();
+
+  /** Acquire an in-flight unit on a chain (run start). Keeps the chain current. */
+  acquireUnit(chainId: string, unitId: string): void {
+    const chain = this.chains.get(chainId);
+    if (!chain) return;
+    chain.terminal = false;
+    chain.lastAccessAt = Date.now();
+    this.removeHistorical(chain.scope, chainId);
+    let units = this.inFlightUnits.get(chainId);
+    if (!units) { units = new Set(); this.inFlightUnits.set(chainId, units); }
+    units.add(unitId);
+  }
+
+  /** Release an in-flight unit (run terminal). Chain goes historical only if
+   *  this was the last in-flight unit on that chain. */
+  releaseUnit(chainId: string, unitId: string): void {
+    const units = this.inFlightUnits.get(chainId);
+    if (!units) return;
+    units.delete(unitId);
+    if (units.size === 0) {
+      this.inFlightUnits.delete(chainId);
+      this.markTerminal(chainId); // last in-flight unit → historical
+    }
+  }
+
   // ── Scope helpers ──
 
   /** Check if a scope has any active/reserved/queued work. */

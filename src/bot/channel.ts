@@ -209,10 +209,6 @@ export function consumeReactionTurnMeta(turnId: string): { workChainId: string; 
 function registerOutboundLifecycle(workChainId: string, messageId: string): void {
   _workChainStore?.registerOutbound(workChainId, messageId);
 }
-function markTerminalLifecycle(workChainId: string): void {
-  _workChainStore?.markTerminal(workChainId);
-}
-
 /**
  * Finalize a reaction run's lifecycle on terminal. Only marks the workChain
  * terminal and unregisters the tracker entry if THIS run is still the latest
@@ -223,13 +219,22 @@ function markTerminalLifecycle(workChainId: string): void {
 function finalizeReactionRun(
   scope: string,
   reactionTurnMeta: { workChainId: string; reactionKey: string; revision: number } | undefined,
+  unitId: string,
 ): void {
   if (!reactionTurnMeta) return;
-  const opId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';
-  const tgtId = reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '';
-  if (_reactionRunTracker?.isLatest(scope, opId, tgtId, reactionTurnMeta.revision) ?? false) {
-    markTerminalLifecycle(reactionTurnMeta.workChainId);
-    _reactionRunTracker?.unregister(scope, opId, tgtId);
+  // B4: release this run's in-flight unit; the chain goes historical only if
+  // this was the last in-flight unit on that chain (covers same-chain siblings
+  // — one run's terminal must not mark a shared chain historical while other
+  // queued/reserved/active units are still live).
+  _workChainStore?.releaseUnit(reactionTurnMeta.workChainId, unitId);
+  // Reaction-only (B1/B2): unregister the tracker entry iff this run is still
+  // the latest revision for the key — rev1's terminal must not clear rev2.
+  if (reactionTurnMeta.reactionKey) {
+    const opId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';
+    const tgtId = reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '';
+    if (_reactionRunTracker?.isLatest(scope, opId, tgtId, reactionTurnMeta.revision) ?? false) {
+      _reactionRunTracker?.unregister(scope, opId, tgtId);
+    }
   }
 }
 
@@ -1027,7 +1032,31 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       return;
     }
 
-    // Build ReactionContext from reconciliation result with real target content
+    // B3: evict any previous in-flight entry for the same key FIRST — before
+    // writing rev2 context. evictInFlightReactionEntry calls
+    // contextStore.delete(reactionKey); if we set rev2 context first, evict
+    // would wipe it (same reactionKey). Evict-old-before-write-rev2 (invariant B).
+    const opId = result.components.operatorOpenId;
+    const tgtId = result.components.targetMessageId;
+    const existingEntry = _reactionRunTracker?.get(result.components.scope, opId, tgtId);
+    if (existingEntry && _reactionRunTracker) {
+      evictInFlightReactionEntry({
+        reactionKey: result.key,
+        scope: result.components.scope,
+        opId,
+        tgtId,
+        existingStatus: existingEntry.status,
+        oldRevision: existingEntry.reactionRevision,
+        newRevision: result.revision,
+        pending,
+        contextStore: reactionContextStore,
+        activeRuns,
+        tracker: _reactionRunTracker,
+      });
+    }
+
+    // Build ReactionContext (rev2) from reconciliation result with real target content.
+    // Written AFTER evict so it survives — rev2 is the only context for this key.
     const sem = lookupReactionSemantics(events[0]?.emojiType ?? '');
     const reactionContext = {
       operatorOpenId: result.components.operatorOpenId,
@@ -1055,27 +1084,6 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       mentionedBot: false,
       createTime: Date.now(),
     } satisfies import('@larksuite/channel').NormalizedMessage;
-    // F10/F11/F18: Atomically evict any previous in-flight entry for the same
-    // key before enqueuing the new revision. Uses the exported production seam
-    // evictInFlightReactionEntry (testable with real ActiveRuns/PendingQueue).
-    const opId = result.components.operatorOpenId;
-    const tgtId = result.components.targetMessageId;
-    const existingEntry = _reactionRunTracker?.get(result.components.scope, opId, tgtId);
-    if (existingEntry && _reactionRunTracker) {
-      evictInFlightReactionEntry({
-        reactionKey: result.key,
-        scope: result.components.scope,
-        opId,
-        tgtId,
-        existingStatus: existingEntry.status,
-        oldRevision: existingEntry.reactionRevision,
-        newRevision: result.revision,
-        pending,
-        contextStore: reactionContextStore,
-        activeRuns,
-        tracker: _reactionRunTracker,
-      });
-    }
     // F10/F11: Carry reaction metadata through to the run lifecycle
     const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
     if (wcId) {
@@ -1429,7 +1437,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             let message: string;
             let replyKind: 'no-work' | 'stopped' | 'fail-closed';
 
-            if (activeRuns.get(pipelineResult.scope) === undefined) {
+            // B2: current-work must cover queued (PendingQueue) + reserved
+            // (ActiveRuns reservation) + active (ActiveRuns handle) — not only
+            // the active handle. Otherwise a stop on a queued/reserved reaction
+            // misreports no-work and the old task still starts later.
+            const hasWork = activeRuns.hasActiveOrReserved(pipelineResult.scope)
+              || pending.pendingCount(pipelineResult.scope) > 0;
+            if (!hasWork) {
               message = '当前没有需要停止的任务。';
               replyKind = 'no-work';
             } else if (workChainStore.resolveCurrentChain(pipelineResult.targetMessageId) === undefined) {
@@ -2126,11 +2140,17 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
 
-  // ── Reaction lifecycle: consume metadata from barrier turn, wire into run ──
-  // Look up by firstMsg.messageId (which IS the unique turnId for reaction batches)
-  const reactionTurnMeta = consumeReactionTurnMeta(firstMsg.messageId);
+  // ── Run lifecycle: every input unit (ordinary + reaction) carries a
+  // workChain (Spec DD15) so its visible outputs register for stop correlation. ──
+  // Reaction batches look up by firstMsg.messageId (the unique turnId).
+  let reactionTurnMeta = consumeReactionTurnMeta(firstMsg.messageId);
+  // B1: isReactionTurn distinguishes reaction (revision-supersede + tracker)
+  // from ordinary (no tracker, no supersede).
+  const isReactionTurn = reactionTurnMeta !== undefined;
+  const runUnitId = handle.run.runId;
   if (reactionTurnMeta) {
     _workChainStore?.markCurrent(reactionTurnMeta.workChainId);
+    _workChainStore?.acquireUnit(reactionTurnMeta.workChainId, runUnitId); // B4
     const rkOpId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';
     const rkTgtId = reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '';
     _reactionRunTracker?.register({
@@ -2144,8 +2164,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     // Mark active once the run actually starts — only active entries are interruptible via shouldInterrupt.
     // The enqueue eviction path handles reserved entries via activeRuns.interrupt (Plan DD12).
     _reactionRunTracker?.markStatus(scope, rkOpId, rkTgtId, 'active');
+  } else {
+    // B1: ordinary input unit — allocate/inherit a workChain + acquire a unit
+    // so Card/Markdown/CoT/Text outputs register and stop can correlate.
+    const ordWcId = _workChainStore?.resolveOrAllocate(scope, firstMsg.replyToMessageId) ?? '';
+    if (ordWcId) {
+      _workChainStore?.markCurrent(ordWcId);
+      _workChainStore?.acquireUnit(ordWcId, runUnitId);
+      reactionTurnMeta = { workChainId: ordWcId, reactionKey: '', revision: 0 };
+    }
   }
-  // Register outbound on stream result
+  // Register outbound on stream result (applies to ordinary + reaction — both
+  // carry a workChain now, so all visible outputs are registered on creation).
   const _registerOutboundOnStream = (result: unknown): void => {
     if (reactionTurnMeta && result && typeof result === 'object' && 'messageId' in result) {
       registerOutboundLifecycle(reactionTurnMeta.workChainId, (result as { messageId: string }).messageId);
@@ -2353,7 +2383,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           cardRenderOptions,
         });
         _registerOutboundOnStream(cotResult);
-        finalizeReactionRun(scope, reactionTurnMeta);
+        finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
         return;
       }
       log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
@@ -2409,7 +2439,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         producerStarted: () => producerStarted,
         fallback: async (state) => {
           // F18: If this reaction run was superseded, mark the card state
-          const fallbackState = reactionTurnMeta ? markSuperseded(state) : state;
+          const fallbackState = isReactionTurn ? markSuperseded(state) : state;
           await channel.send(
             chatId,
             { card: renderCard(filterForPrefs(fallbackState), cardRenderOptions) },
@@ -2418,7 +2448,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
       });
       // Reaction lifecycle: mark terminal after render+stream complete
-      finalizeReactionRun(scope, reactionTurnMeta);
+      finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let latestMarkdown = renderMarkdownStreamText(latestState);
@@ -2531,7 +2561,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
       });
       // Reaction lifecycle: mark terminal after render+stream complete
-      finalizeReactionRun(scope, reactionTurnMeta);
+      finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -2557,10 +2587,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       });
       // Reaction lifecycle: register outbound for text mode
       _registerOutboundOnStream(sendResult);
-      finalizeReactionRun(scope, reactionTurnMeta);
+      finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
     }
   } catch (err) {
     log.fail('stream', err);
+    // B4: finalize on error too — release this run's in-flight unit so the
+    // chain doesn't stay current forever on an error path.
+    finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
   } finally {
     for (const admission of promptAdmissions) admission.finishWithoutIdentifier();
     activePolicyFingerprints.delete(scope);
