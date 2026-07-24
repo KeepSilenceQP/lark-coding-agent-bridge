@@ -296,6 +296,69 @@ describe('IM run flow', () => {
     expect(h.agent.runOptions).toEqual([]);
   });
 
+  it('reuses a queue-handoff reservation so stop during pre-prompt work prevents Agent start', async () => {
+    const h = await createHarness({ defaultWorkspace: true });
+    const service = await PromptSessionService.open({
+      profileDir: h.tmp.profile,
+      profile: 'test',
+      sessionCatalog: h.sessionCatalog,
+      sessionStore: h.sessions,
+    });
+    const handoffReservation = h.executor.reserveScope('chat-1');
+    expect(handoffReservation).toBeDefined();
+
+    let releasePreparation!: () => void;
+    const preparationStarted = new Promise<void>((resolve) => {
+      vi.spyOn(service, 'prepareSession').mockImplementation(async (input) => {
+        resolve();
+        await new Promise<void>((release) => {
+          releasePreparation = release;
+        });
+        if (input.signal?.aborted) {
+          const error = new Error('prompt session preparation interrupted');
+          error.name = 'AbortError';
+          throw error;
+        }
+        return { kind: 'dormant' };
+      });
+    });
+
+    const pending = startRunFlow({
+      scopeId: 'chat-1',
+      scope: { source: 'im', chatId: 'chat-1', actorId: 'ou_user' },
+      prompt: 'dynamic turn',
+      attachments: [],
+      access: { ok: true, reason: 'allowed-user' },
+      capability: claudeCapability(h.profileConfig),
+      profileConfig: h.profileConfig,
+      sessions: h.sessions,
+      sessionCatalog: h.sessionCatalog,
+      workspaces: h.workspaces,
+      executor: h.executor,
+      reservation: handoffReservation,
+      now: 1000,
+      promptSession: {
+        service,
+        origin: {
+          source: 'im',
+          scopeId: 'chat-1',
+          chatId: 'chat-1',
+          chatType: 'group',
+        },
+      },
+    });
+
+    await preparationStarted;
+    expect(h.activeRuns.interrupt('chat-1')).toBe(true);
+    releasePreparation();
+
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      rejectReason: { code: 'run-interrupted' },
+    });
+    expect(h.agent.runOptions).toEqual([]);
+  });
+
 });
 
 async function createHarness(options: { defaultWorkspace?: boolean } = {}): Promise<{

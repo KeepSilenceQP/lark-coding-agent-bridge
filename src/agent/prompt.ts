@@ -1,4 +1,4 @@
-export type BridgePromptSource = 'im' | 'card' | 'comment';
+export type BridgePromptSource = 'im' | 'card' | 'comment' | 'reaction';
 
 export interface BridgePromptMention {
   openId?: string;
@@ -81,6 +81,7 @@ export interface BuildAgentPromptInput {
   interactiveCards?: BridgePromptInteractiveCard[];
   comment?: BridgePromptComment;
   attachments?: BridgePromptAttachment[];
+  reactionContexts?: unknown[];
 }
 
 export function buildAgentPrompt(input: BuildAgentPromptInput): string {
@@ -99,6 +100,9 @@ export function buildAgentPrompt(input: BuildAgentPromptInput): string {
       ? promptSection('interactive_cards', input.interactiveCards)
       : undefined,
     input.comment ? promptSection('comment_context', input.comment) : undefined,
+    input.reactionContexts && input.reactionContexts.length > 0
+      ? promptSection('reaction_contexts', input.reactionContexts)
+      : undefined,
     promptSection('user_input', {
       text: input.userInput,
       ...(input.attachments && input.attachments.length > 0

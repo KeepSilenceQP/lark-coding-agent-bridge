@@ -16,6 +16,7 @@ import {
   type WorkingDirectoryResolveResult,
 } from '../policy/workspace';
 import type { RunExecution, RunExecutor } from '../runtime/run-executor';
+import type { RunReservation } from './active-runs';
 import { RunRejected, type RunRejectedCode } from '../runtime/errors';
 import type { SessionCatalog } from '../session/catalog';
 import type {
@@ -49,6 +50,8 @@ export interface StartRunFlowInput {
   };
   workspaces: WorkspaceStore;
   executor: RunExecutor;
+  /** Optional reservation acquired at the PendingQueue dequeue boundary. */
+  reservation?: RunReservation;
   now: number;
   stopGraceMs?: number;
   /** Opaque route ID for deferred self-restart. Bridge-internal, passed to AgentRunOptions. */
@@ -100,13 +103,23 @@ export interface RecordRunSessionEventInput {
 }
 
 export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFlowResult> {
-  const reservation = input.executor.reserveScope(input.scopeId);
+  const reservation = input.reservation ?? input.executor.reserveScope(input.scopeId);
   if (!reservation) {
     return {
       ok: false,
       rejectReason: {
         code: 'run-already-active',
         userVisible: '当前会话已有运行在执行，请稍后再试或先停止当前运行。',
+      },
+    };
+  }
+  if (reservation.signal.aborted) {
+    reservation.release();
+    return {
+      ok: false,
+      rejectReason: {
+        code: 'run-interrupted',
+        userVisible: '当前任务已中断。',
       },
     };
   }

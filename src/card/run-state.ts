@@ -15,7 +15,7 @@ export type Block =
   | { kind: 'tool'; tool: ToolEntry };
 
 export type FooterStatus = 'thinking' | 'tool_running' | 'streaming' | null;
-export type Terminal = 'running' | 'done' | 'interrupted' | 'error' | 'idle_timeout';
+export type Terminal = 'running' | 'done' | 'interrupted' | 'error' | 'idle_timeout' | 'superseded';
 
 export interface RunState {
   blocks: Block[];
@@ -154,6 +154,16 @@ export function markIdleTimeout(state: RunState, minutes: number): RunState {
     terminal: 'idle_timeout',
     footer: null,
     idleTimeoutMinutes: minutes,
+  };
+}
+
+export function markSuperseded(state: RunState): RunState {
+  return {
+    ...state,
+    blocks: closeStreamingText(state.blocks),
+    reasoning: { ...state.reasoning, active: false },
+    terminal: 'superseded',
+    footer: null,
   };
 }
 

@@ -193,13 +193,17 @@ function forwardToAgent(
     senderName: deps.evt.operator.name,
     content: `[card-click] ${JSON.stringify(merged)}`,
     rawContentType: 'card_action',
+    // The callback is a reply to the Bot card carrying the button. Keeping
+    // this on the NormalizedMessage lets PendingQueue inherit that card's
+    // workChain instead of allocating an unrelated top-level chain.
+    replyToMessageId: deps.evt.messageId,
     resources: [],
     mentions: [],
     mentionAll: false,
     mentionedBot: false,
     createTime: Date.now(),
   };
-  deps.pending.push(scope, synthetic);
+  deps.pending.push(scope, synthetic, { registerAsTrigger: false });
 }
 
 function verifyBridgeToken(

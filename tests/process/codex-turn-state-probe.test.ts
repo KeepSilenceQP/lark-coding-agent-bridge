@@ -26,10 +26,14 @@ describe('Codex app-server turn state probe', () => {
       finalText: 'persisted final answer',
       itemCount: 3,
     });
-    const requests = JSON.parse(await readFile(fake.recordPath, 'utf8')) as Array<{
-      method: string;
-      params?: unknown;
-    }>;
+    const requests = (await readFile(fake.recordPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as {
+        method: string;
+        params?: unknown;
+      });
     expect(requests).toMatchObject([
       { method: 'initialize' },
       { method: 'thread/read', params: { threadId: 'thread-1', includeTurns: true } },
@@ -49,16 +53,14 @@ async function createFakeAppServer(): Promise<{
     path,
     `#!/usr/bin/env node
 import { createInterface } from 'node:readline';
-import { writeFileSync } from 'node:fs';
-const requests = [];
-const persist = () => writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify(requests));
-process.on('SIGTERM', () => { persist(); process.exit(0); });
-process.on('exit', persist);
+import { appendFileSync } from 'node:fs';
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 rl.on('line', (line) => {
   const request = JSON.parse(line);
-  requests.push({ method: request.method, params: request.params });
-  persist();
+  appendFileSync(
+    ${JSON.stringify(recordPath)},
+    JSON.stringify({ method: request.method, params: request.params }) + '\\n',
+  );
   if (request.method === 'initialize') {
     process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + '\\n');
   }

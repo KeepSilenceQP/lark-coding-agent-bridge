@@ -26,6 +26,7 @@ import {
   initialState,
   markIdleTimeout,
   markInterrupted,
+  markSuperseded,
   reduce,
   type RunState,
 } from '../card/run-state';
@@ -92,7 +93,7 @@ import type {
   PromptSessionService,
 } from '../session/prompt-session-service';
 import type { WorkspaceStore } from '../workspace/store';
-import { ActiveRuns, type RunHandle } from './active-runs';
+import { ActiveRuns, type RunHandle, type RunReservation } from './active-runs';
 import { resolveRunIdleTimeoutMs, resolveRunStartupTimeoutMs } from './run-idle-timeout';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
@@ -104,11 +105,28 @@ import {
 } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
-import { PendingQueue } from './pending-queue';
+import { PendingQueue, type WorkLease } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
+import { handleReactionEvent } from './reaction/pipeline';
+import { isStopEmoji, lookupReactionSemantics } from './reaction/semantics';
+import {
+  reactionTurnIdOf,
+  withReactionTurnId,
+} from './reaction/turn-message';
+import { WorkChainStore } from './reaction/work-chain';
+import { ReactionContextStore } from './reaction/context-store';
+import { ReactionBuffer } from './reaction/buffer';
+import { reconcile } from './reaction/reconciler';
+import { loadReactionLedger } from './reaction/ledger';
+import type { ReactionLedger } from './reaction/ledger';
+import { loadStopControlLedger, stopEventFingerprint } from './reaction/control-ledger';
+import type { StopControlLedger } from './reaction/control-ledger';
+import { ReactionRunTracker } from './reaction/run-tracker';
+import { buildReactionTargetMessage } from './reaction/context-builder';
+import { decideStopAdded, executeStopAdded } from './reaction/stop-target';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -117,6 +135,402 @@ import {
   CotPublisher,
   finalAnswerOnlyState,
 } from './cot';
+
+// ── Reaction context store (module-level, set by startChannel) ──
+let _reactionContextStore: ReactionContextStore | null = null;
+function getReactionContexts(messageIds: string[]): unknown[] {
+  if (!_reactionContextStore) return [];
+  // messageIds are turnIds from the batch; each maps to exactly one reactionKey.
+  // This ensures one batch only consumes its own context — not all operators on the same target.
+  const result: unknown[] = [];
+  for (const turnId of messageIds) {
+    const reactionKey = _reactionTurnMetaByTurnId.get(turnId);
+    if (!reactionKey) continue;
+    const ctx = _reactionContextStore.get(reactionKey);
+    if (ctx) { result.push(...ctx); _reactionContextStore.delete(reactionKey); }
+  }
+  return result;
+}
+
+/** Test seam: check whether a turnId still has a resolvable reactionKey in the index. */
+export function hasTurnMetaForTurnId(turnId: string): boolean {
+  return _reactionTurnMetaByTurnId.has(turnId);
+}
+
+/** Test seam: check whether a reactionKey has a registered turnId. */
+export function hasTurnIdForKey(reactionKey: string): boolean {
+  return _reactionTurnIdByKey.has(reactionKey);
+}
+
+// ── Reaction lifecycle bridges (module-level, wired by startChannel) ──
+let _workChainStore: WorkChainStore | null = null;
+let _reactionRunTracker: ReactionRunTracker | null = null;
+/** reactionKey → { workChainId, scope, revision, turnId }
+ *  turnId is the unique barrier message ID (reactionKey + revision).
+ *  targetMessageId → Set<reactionKey> index for runAgentBatch lookup. */
+const _reactionTurnMeta = new Map<string, { workChainId: string; scope: string; revision: number; turnId: string }>();
+const _reactionTurnMetaByMsg = new Map<string, Set<string>>(); // targetMessageId → Set<reactionKey>
+const _reactionTurnMetaByTurnId = new Map<string, string>(); // turnId → reactionKey (1:1, for batch correspondence)
+const _reactionTurnIdByKey = new Map<string, string>(); // reactionKey → turnId (1:1, for cancelPending lookup)
+// turnIds that crossed PendingQueue but were invalidated before ActiveRuns
+// acquired a reservation. runAgentBatch consumes this tombstone before submit.
+const _invalidatedReactionTurnIds = new Set<string>();
+
+export function consumeInvalidatedReactionTurn(turnId: string): boolean {
+  if (!_invalidatedReactionTurnIds.has(turnId)) return false;
+  _invalidatedReactionTurnIds.delete(turnId);
+  return true;
+}
+
+export function setReactionTurnMeta(reactionKey: string, targetMessageId: string, scope: string, workChainId: string, revision: number, turnId: string): void {
+  _reactionTurnMeta.set(reactionKey, { workChainId, scope, revision, turnId });
+  let keys = _reactionTurnMetaByMsg.get(targetMessageId);
+  if (!keys) { keys = new Set(); _reactionTurnMetaByMsg.set(targetMessageId, keys); }
+  keys.add(reactionKey);
+  _reactionTurnMetaByTurnId.set(turnId, reactionKey);
+  _reactionTurnIdByKey.set(reactionKey, turnId);
+}
+export function deleteReactionTurnMeta(reactionKey: string): void {
+  // Remove from all indexes: main meta, turnId→key, key→turnId, target→key
+  const meta = _reactionTurnMeta.get(reactionKey);
+  _reactionTurnMeta.delete(reactionKey);
+  if (meta) {
+    _reactionTurnMetaByTurnId.delete(meta.turnId);
+    _reactionTurnIdByKey.delete(reactionKey);
+    for (const [msgId, keys] of _reactionTurnMetaByMsg) {
+      keys.delete(reactionKey);
+      if (keys.size === 0) _reactionTurnMetaByMsg.delete(msgId);
+    }
+  }
+}
+export function consumeReactionTurnMeta(turnId: string): { workChainId: string; reactionKey: string; revision: number } | undefined {
+  // turnId is the unique per-enqueue ID (reactionKey:revision). Look up the
+  // reactionKey directly — no Set-sweeping. Each batch gets only its own entry.
+  const reactionKey = _reactionTurnMetaByTurnId.get(turnId);
+  if (!reactionKey) return undefined;
+  const meta = _reactionTurnMeta.get(reactionKey);
+  if (!meta) return undefined;
+  _reactionTurnMetaByTurnId.delete(turnId);
+  _reactionTurnIdByKey.delete(reactionKey);
+  _reactionTurnMeta.delete(reactionKey);
+  // Clean up target→key index
+  for (const [msgId, keys] of _reactionTurnMetaByMsg) {
+    keys.delete(reactionKey);
+    if (keys.size === 0) _reactionTurnMetaByMsg.delete(msgId);
+  }
+  return { workChainId: meta.workChainId, reactionKey, revision: meta.revision };
+}
+function registerOutboundLifecycle(workChainId: string, messageId: string): void {
+  _workChainStore?.registerOutbound(workChainId, messageId);
+}
+
+// ── Ordinary input unit workChain (R2-F1/F3) ──
+// Ordinary messages carry a workChain from enqueue (intakeMessage) so a stop on
+// a queued/reserved ordinary reply resolves a current chain (Spec DD15).
+interface ReactionLifecycleCleanupDeps {
+  workChainStore?: Pick<WorkChainStore, 'releaseUnit'> | null;
+  reactionRunTracker?: Pick<ReactionRunTracker, 'unregister'> | null;
+  reactionContextStore?: Pick<ReactionContextStore, 'delete'> | null;
+}
+
+/**
+ * Release an enqueued Reaction unit's side-state on cancel/abort. WorkLease
+ * release is idempotent; context/meta/tracker cleanup must happen together so
+ * a cancelled unique reaction key cannot leak in the long-lived bridge.
+ */
+export function releaseEnqueuedTurn(
+  scope: string,
+  messageId: string,
+  overrides: ReactionLifecycleCleanupDeps = {},
+): void {
+  _invalidatedReactionTurnIds.delete(messageId);
+  const rMeta = consumeReactionTurnMeta(messageId);
+  if (!rMeta) return;
+  const workChainStore = overrides.workChainStore ?? _workChainStore;
+  const reactionRunTracker = overrides.reactionRunTracker ?? _reactionRunTracker;
+  const reactionContextStore = overrides.reactionContextStore ?? _reactionContextStore;
+  reactionContextStore?.delete(rMeta.reactionKey);
+  workChainStore?.releaseUnit(rMeta.workChainId, messageId);
+  if (rMeta.reactionKey) {
+    const opId = rMeta.reactionKey.split('\x1f')[1] ?? '';
+    const tgtId = rMeta.reactionKey.split('\x1f')[2] ?? '';
+    reactionRunTracker?.unregister(scope, opId, tgtId);
+  }
+}
+
+/** Production seam for asynchronous flush failures before normal run
+ * finalization owns cleanup. */
+export function releaseFlushedTurnAfterError(
+  scope: string,
+  messageId: string,
+  lease: WorkLease | undefined,
+  overrides: ReactionLifecycleCleanupDeps = {},
+): void {
+  const workChainStore = overrides.workChainStore ?? _workChainStore;
+  if (lease) workChainStore?.releaseUnit(lease.workChainId, lease.unitId);
+  releaseEnqueuedTurn(scope, messageId, overrides);
+}
+
+/** Stop a Reaction turn that left PendingQueue before its removal arrived but
+ * has not yet synchronously acquired an ActiveRuns reservation. */
+export function releaseInvalidatedReactionTurn(
+  scope: string,
+  messageId: string,
+  lease: WorkLease | undefined,
+  overrides: ReactionLifecycleCleanupDeps = {},
+): boolean {
+  if (!consumeInvalidatedReactionTurn(messageId)) return false;
+  const workChainStore = overrides.workChainStore ?? _workChainStore;
+  if (lease) workChainStore?.releaseUnit(lease.workChainId, lease.unitId);
+  releaseEnqueuedTurn(scope, messageId, overrides);
+  return true;
+}
+
+/** Own the queue→run handoff boundary, including synchronous callback throws. */
+export async function executePendingFlushWithCleanup(input: {
+  scope: string;
+  messageId: string;
+  lease: WorkLease | undefined;
+  run: () => void | Promise<void>;
+  onError?: (error: unknown) => void;
+  onFinally?: () => void | Promise<void>;
+  cleanupOverrides?: ReactionLifecycleCleanupDeps;
+}): Promise<void> {
+  try {
+    await input.run();
+  } catch (error) {
+    input.onError?.(error);
+    releaseFlushedTurnAfterError(
+      input.scope,
+      input.messageId,
+      input.lease,
+      input.cleanupOverrides,
+    );
+  } finally {
+    await input.onFinally?.();
+  }
+}
+/**
+ * Finalize a reaction run's lifecycle on terminal. Only marks the workChain
+ * terminal and unregisters the tracker entry if THIS run is still the latest
+ * revision for the key (B1/B2). A newer revision that superseded this run
+ * owns the shared workChain + tracker slot — rev1's terminal must not clear
+ * rev2's entry or prematurely terminal-mark the shared chain.
+ */
+function finalizeReactionRun(
+  scope: string,
+  reactionTurnMeta: { workChainId: string; reactionKey: string; revision: number } | undefined,
+  unitId: string,
+): void {
+  _invalidatedReactionTurnIds.delete(unitId);
+  if (!reactionTurnMeta) return;
+  // B4: release this run's in-flight unit; the chain goes historical only if
+  // this was the last in-flight unit on that chain (covers same-chain siblings
+  // — one run's terminal must not mark a shared chain historical while other
+  // queued/reserved/active units are still live).
+  _workChainStore?.releaseUnit(reactionTurnMeta.workChainId, unitId);
+  // Reaction-only (B1/B2): unregister the tracker entry iff this run is still
+  // the latest revision for the key — rev1's terminal must not clear rev2.
+  if (reactionTurnMeta.reactionKey) {
+    const opId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';
+    const tgtId = reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '';
+    if (_reactionRunTracker?.isLatest(scope, opId, tgtId, reactionTurnMeta.revision) ?? false) {
+      _reactionRunTracker?.unregister(scope, opId, tgtId);
+    }
+  }
+}
+
+// ── Reaction flush decision + executor (single seam, called by buffer handler) ──
+export type ReactionFlushDecision =
+  | { kind: 'drop'; reason: string }
+  | { kind: 'bridge-reply'; reason: 'reconciliation-failed' | 'net-zero' | 'empty-set'; message: string; targetMessageId: string; interrupt?: { scope: string } }
+  | { kind: 'enqueue-agent' };
+
+export function decideReactionFlush(params: {
+  reconciliationFailed: boolean;
+  noOp: boolean;
+  netZeroConsumed: boolean;
+  effectiveReactionSetLength: number;
+  hasMatchingInFlightRun: boolean;
+  targetMessageId: string;
+  scope: string;
+}): ReactionFlushDecision {
+  if (params.reconciliationFailed) {
+    return { kind: 'bridge-reply', reason: 'reconciliation-failed', message: '本次 Reaction 暂时无法确认，请重试。', targetMessageId: params.targetMessageId };
+  }
+  if (params.noOp) {
+    return { kind: 'drop', reason: 'no-op' };
+  }
+  if (params.netZeroConsumed) {
+    return { kind: 'bridge-reply', reason: 'net-zero', message: '已收到撤回。', targetMessageId: params.targetMessageId };
+  }
+  if (params.effectiveReactionSetLength === 0) {
+    return {
+      kind: 'bridge-reply', reason: 'empty-set',
+      message: '已收到撤回，已完成动作不会自动回滚。',
+      targetMessageId: params.targetMessageId,
+      ...(params.hasMatchingInFlightRun ? { interrupt: { scope: params.scope } } : {}),
+    };
+  }
+  return { kind: 'enqueue-agent' };
+}
+
+export interface ReactionFlushEffects {
+  cancelPendingForTarget: (scope: string, reactionKey: string) => number;
+  clearContextForTarget: (reactionKey: string) => void;
+  deleteTurnMetaForTarget: (reactionKey: string) => void;
+  unregisterTrackerForTarget: (scope: string, reactionKey: string) => void;
+  interruptActiveRun: (scope: string) => void;
+  setHandleSuperseded: (scope: string) => void;
+}
+
+export function createReactionFlushEffects(deps: {
+  pending: PendingQueue;
+  contextStore: ReactionContextStore;
+  activeRuns: ActiveRuns;
+  runTracker?: ReactionRunTracker;
+}): ReactionFlushEffects {
+  return {
+    cancelPendingForTarget: (scope, reactionKey) => {
+      const turnId = _reactionTurnIdByKey.get(reactionKey);
+      if (!turnId) return 0;
+      const removed = deps.pending.cancelMessage(scope, turnId).length;
+      if (removed === 0) _invalidatedReactionTurnIds.add(turnId);
+      return removed;
+    },
+    clearContextForTarget: (reactionKey) => {
+      deps.contextStore.delete(reactionKey);
+    },
+    deleteTurnMetaForTarget: (reactionKey) => {
+      deleteReactionTurnMeta(reactionKey);
+    },
+    interruptActiveRun: (scope) => {
+      deps.activeRuns.interrupt(scope);
+    },
+    setHandleSuperseded: (scope) => {
+      const handle = deps.activeRuns.get(scope);
+      if (handle) handle.superseded = true;
+    },
+    unregisterTrackerForTarget: (scope, reactionKey) => {
+      // R4-B3: clean the reaction tracker entry (queued/reserved/active) so a
+      // later same-key revision doesn't see a stale queued tracker → false
+      // reserved race that interrupts an unrelated new run.
+      const opId = reactionKey.split('\x1f')[1] ?? '';
+      const tgtId = reactionKey.split('\x1f')[2] ?? '';
+      (deps.runTracker ?? _reactionRunTracker)?.unregister(scope, opId, tgtId);
+    },
+  };
+}
+
+// ── Production executor: single seam called by buffer handler ──
+export async function executeReactionFlushDecision(
+  decision: ReactionFlushDecision,
+  deps: {
+    send: (chatId: string, markdown: string, replyTo: string) => Promise<void>;
+    effects: ReactionFlushEffects;
+    reactionKey: string;
+    targetMessageId: string;
+    scope: string;
+  },
+): Promise<void> {
+  if (decision.kind === 'drop') return;
+
+  if (decision.kind === 'bridge-reply') {
+    // Only empty-set removal triggers cleanup. reconciliationFailed/netZero do NOT.
+    if (decision.reason === 'empty-set') {
+      // A queued barrier can be cancelled without touching an unrelated active
+      // run in the same scope. If it is no longer in PendingQueue, it crossed
+      // the queue→prompt-prep boundary; abort the matching reservation/run.
+      const removedFromQueue = deps.effects.cancelPendingForTarget(
+        deps.scope,
+        deps.reactionKey,
+      );
+      if (decision.interrupt && removedFromQueue === 0) {
+        deps.effects.setHandleSuperseded(decision.interrupt.scope);
+        deps.effects.interruptActiveRun(decision.interrupt.scope);
+      }
+      deps.effects.clearContextForTarget(deps.reactionKey);
+      deps.effects.deleteTurnMetaForTarget(deps.reactionKey);
+      deps.effects.unregisterTrackerForTarget(deps.scope, deps.reactionKey);
+    }
+    await deps.send(deps.scope.split(':')[0] ?? deps.scope, decision.message, deps.targetMessageId);
+    return;
+  }
+
+  // enqueue-agent: caller builds context + pushBarrier after this returns
+}
+
+/**
+ * Evict any in-flight entry for a reaction key before enqueuing a new revision.
+ *
+ * Handles the tri-state lifecycle (queued|reserved|active):
+ * - queued: try cancelMessage; if 0 removed (barrier already flushed, now
+ *   reserved), fall through to interrupt the ActiveRuns reservation.
+ * - reserved / active: interrupt the scope via activeRuns.interrupt (aborts
+ *   both reservation and active streaming runs — Plan DD12).
+ *
+ * Returns whether the scope was interrupted (for test observability).
+ */
+export function evictInFlightReactionEntry(params: {
+  reactionKey: string;
+  scope: string;
+  opId: string;
+  tgtId: string;
+  existingStatus: 'queued' | 'reserved' | 'active';
+  oldRevision: number;
+  newRevision: number;
+  pending: import('./pending-queue').PendingQueue;
+  contextStore: import('./reaction/context-store').ReactionContextStore;
+  activeRuns: import('./active-runs').ActiveRuns;
+  tracker: import('./reaction/run-tracker').ReactionRunTracker;
+}): { needsInterrupt: boolean; removedFromQueue: number } {
+  const { reactionKey, scope, opId, tgtId, existingStatus, pending, contextStore, activeRuns, tracker } = params;
+  let needsInterrupt = existingStatus !== 'queued';
+  let removedFromQueue = 0;
+
+  if (existingStatus === 'queued') {
+    const oldTurnId = _reactionTurnIdByKey.get(reactionKey);
+    if (oldTurnId) {
+      const removed = pending.cancelMessage(scope, oldTurnId);
+      removedFromQueue = removed.length;
+      if (removed.length === 0) {
+        // Barrier was already flushed — it holds an ActiveRuns reservation now.
+        // There is a narrower queue→reservation window where interrupt() has
+        // nothing to abort yet; the run owner consumes this tombstone before
+        // startRunFlow so the superseded revision cannot start as ordinary IM.
+        _invalidatedReactionTurnIds.add(oldTurnId);
+        needsInterrupt = true;
+      }
+    }
+  }
+
+  // Atomically remove old context, meta, and tracker
+  contextStore.delete(reactionKey);
+  deleteReactionTurnMeta(reactionKey);
+  tracker.unregister(scope, opId, tgtId);
+
+  if (needsInterrupt) {
+    const handle = activeRuns.get(scope);
+    if (handle) handle.superseded = true;
+    activeRuns.interrupt(scope);
+    log.info('reaction', 'interrupting-inflight-run', {
+      scope,
+      key: reactionKey,
+      oldStatus: existingStatus,
+      oldRevision: params.oldRevision,
+      newRevision: params.newRevision,
+    });
+  } else {
+    log.info('reaction', 'cancelling-queued-run', {
+      scope,
+      key: reactionKey,
+      oldRevision: params.oldRevision,
+      newRevision: params.newRevision,
+    });
+  }
+
+  return { needsInterrupt, removedFromQueue };
+}
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
@@ -683,6 +1097,171 @@ export interface StartChannelDeps {
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
   const { cfg, agent, sessions, sessionCatalog, workspaces, controls } = deps;
   const activeRuns = new ActiveRuns();
+  // WorkChainStore: maps message→workChainId for stop reaction validation (DD15).
+  // In-memory store — restart fail-closed (all historical associations lost).
+  const workChainStore = new WorkChainStore();
+  // ReactionContextStore: keyed store carrying reconciled reaction contexts
+  // from pipeline to buildPrompt (F1).
+  const reactionContextStore = new ReactionContextStore();
+  _reactionContextStore = reactionContextStore;
+  _workChainStore = workChainStore;
+  // ReactionRunTracker: tracks active reaction runs by reaction key (F23).
+  const reactionRunTracker = new ReactionRunTracker();
+  _reactionRunTracker = reactionRunTracker;
+  // Ledgers: lazily loaded when profileDir is available (F3/F12).
+  let reactionLedger: ReactionLedger | null = null;
+  let stopControlLedger: StopControlLedger | null = null;
+  // ReactionBuffer: buffers non-stop events before reconciliation (F4/F5).
+  const reactionBuffer = new ReactionBuffer(async (key, events) => {
+    if (!reactionLedger) return;
+    const result = await reconcile(key, events, {
+      channel,
+      ledger: reactionLedger,
+      botOpenId: channel.botIdentity?.openId,
+      appId: cfg.accounts.app.id,
+    });
+
+    // ── Use the production decision+executor seam ──
+    // Any queued/reserved/active entry for the exact reaction key is relevant
+    // to empty-set invalidation. The executor decides whether a queued barrier
+    // was still cancellable or had already crossed into prompt preparation.
+    const hasMatchingInFlight = Boolean(
+      _reactionRunTracker?.get(
+        result.components.scope,
+        result.components.operatorOpenId,
+        result.components.targetMessageId,
+      ),
+    );
+
+    const decision = decideReactionFlush({
+      reconciliationFailed: result.reconciliationFailed,
+      noOp: result.noOp,
+      netZeroConsumed: result.netZeroConsumed,
+      effectiveReactionSetLength: result.effectiveReactionSet.length,
+      hasMatchingInFlightRun: hasMatchingInFlight,
+      targetMessageId: result.components.targetMessageId,
+      scope: result.components.scope,
+    });
+
+    if (decision.kind === 'drop' || decision.kind === 'bridge-reply') {
+      const effects = createReactionFlushEffects({
+        pending,
+        contextStore: reactionContextStore,
+        activeRuns,
+        runTracker: reactionRunTracker,
+      });
+      await executeReactionFlushDecision(decision, {
+        send: async (chatId, markdown, replyTo) => {
+          try { await channel.send(chatId, { markdown }, { replyTo }); } catch { /* best-effort */ }
+        },
+        effects,
+        reactionKey: result.key,
+        targetMessageId: result.components.targetMessageId,
+        scope: result.components.scope,
+      });
+      return;
+    }
+
+    // enqueue-agent path: build ReactionContext and push via pushBarrier
+    // F1(a): Fetch real target message content via fetchQuotedContext.
+    const targetMsg = await buildReactionTargetMessage(channel, result.components.targetMessageId);
+    if (!targetMsg) {
+      log.warn('reaction', 'target-route-failed', { messageId: result.components.targetMessageId });
+      return;
+    }
+
+    // B3: evict any previous in-flight entry for the same key FIRST — before
+    // writing rev2 context. evictInFlightReactionEntry calls
+    // contextStore.delete(reactionKey); if we set rev2 context first, evict
+    // would wipe it (same reactionKey). Evict-old-before-write-rev2 (invariant B).
+    const opId = result.components.operatorOpenId;
+    const tgtId = result.components.targetMessageId;
+    const existingEntry = _reactionRunTracker?.get(result.components.scope, opId, tgtId);
+    if (existingEntry && _reactionRunTracker) {
+      evictInFlightReactionEntry({
+        reactionKey: result.key,
+        scope: result.components.scope,
+        opId,
+        tgtId,
+        existingStatus: existingEntry.status,
+        oldRevision: existingEntry.reactionRevision,
+        newRevision: result.revision,
+        pending,
+        contextStore: reactionContextStore,
+        activeRuns,
+        tracker: _reactionRunTracker,
+      });
+    }
+
+    // Build ReactionContext (rev2) from reconciliation result with real target content.
+    // Written AFTER evict so it survives — rev2 is the only context for this key.
+    const sem = lookupReactionSemantics(events[0]?.emojiType ?? '');
+    const reactionContext = {
+      operatorOpenId: result.components.operatorOpenId,
+      reactionRevision: result.revision,
+      triggerReactions: result.triggerReactions,
+      effectiveReactionSet: result.effectiveReactionSet,
+      targetMessage: targetMsg,
+    };
+
+    // Store in contextStore keyed by reactionKey (not targetMessageId — different operators on same target get separate entries)
+    reactionContextStore.set(result.key, [reactionContext]);
+    // Generate unique opaque turnId: reactionKey + revision ensures each enqueue
+    // is uniquely identifiable, even for the same key re-enqueued at a higher revision.
+    const turnId = `${result.key}:${result.revision}`;
+    const normalizedMsg = withReactionTurnId({
+      // Keep the externally meaningful message id intact. The opaque turnId
+      // lives on a private symbol and in WorkLease.unitId.
+      messageId: result.components.targetMessageId,
+      chatId: result.components.scope.split(':')[0] ?? result.components.scope,
+      chatType: 'group' as const,
+      senderId: result.components.operatorOpenId,
+      content: `[reaction] ${events.map(e => e.emojiType).join(', ')}`,
+      rawContentType: 'reaction' as never,
+      resources: [] as never[],
+      mentions: [] as never[],
+      mentionAll: false,
+      mentionedBot: false,
+      createTime: Date.now(),
+    } satisfies import('@larksuite/channel').NormalizedMessage, turnId);
+    // F10/F11: Carry reaction metadata through to the run lifecycle
+    const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
+    if (wcId) {
+      _workChainStore?.markCurrent(wcId);
+      // A3: register the target→chain mapping here (after reconcile decided
+      // enqueue-agent + target body read succeeded) so stop correlation only
+      // resolves chains for actual in-flight work, not dropped events.
+      _workChainStore?.registerOutbound(wcId, result.components.targetMessageId);
+    }
+    // Per-key metadata. turnId links the barrier NormalizedMessage to its meta/context.
+    setReactionTurnMeta(result.key, result.components.targetMessageId, result.components.scope, wcId, result.revision, turnId);
+    // Register in tracker at queued/reserved time so empty-set removal can detect it
+    _reactionRunTracker?.register({
+      scope: result.components.scope,
+      operatorOpenId: result.components.operatorOpenId,
+      targetMessageId: result.components.targetMessageId,
+      reactionRevision: result.revision,
+      runId: `${result.components.scope}:${Date.now()}`,
+      status: 'queued',
+    });
+    // R2-F1: acquire the in-flight unit at ENQUEUE time (not run start) so the
+    // chain stays current while the turn is queued/reserved — a sibling run
+    // terminaling must not mark the shared chain historical while this queued
+    // unit is still in-flight.
+    // R3-F1: pass the lease (workChainId + unitId=turnId) to pushBarrier; the
+    // queue acquires the in-flight unit via leaseHooks. cancel/terminal release
+    // it by the same lease (no per-messageId side-map).
+    pending.pushBarrier(
+      result.components.scope,
+      normalizedMsg,
+      wcId ? { workChainId: wcId, unitId: turnId } : undefined,
+    );
+    log.info('reaction', 'reconciled-and-enqueued', {
+      key: result.key,
+      revision: result.revision,
+      netZero: result.netZeroConsumed,
+    });
+  });
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
   const chatModeCache = new ChatModeCache();
@@ -737,6 +1316,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         nonceStore: callbackNonceStore,
       })
     : undefined;
+  // F3/F12: Load reaction and stop-control ledgers when profileDir is available.
+  if (deps.appPaths?.profileDir) {
+    reactionLedger = await loadReactionLedger(deps.appPaths.profileDir);
+    stopControlLedger = await loadStopControlLedger(deps.appPaths.profileDir);
+  }
+
   const activePolicyFingerprints = new Map<string, string>();
   // Per-scope record of the model used on the last run, so a `/config` model
   // switch can inject a one-time "model changed" note into the next (resumed)
@@ -808,20 +1393,35 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // unblock arms a fresh quiet-window timer. Net effect: at most one run per
   // chat in flight, and everything sent during a run merges into the next
   // batch (only flushed once 600ms of silence has passed *after* the run).
-  const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch) => {
+  const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch, lease) => {
     const firstMsg = batch[0];
     if (!firstMsg) return;
+    const internalUnitId = reactionTurnIdOf(firstMsg) ?? firstMsg.messageId;
+    // Reserve synchronously at the dequeue boundary, before chat-mode/media/
+    // quote/prompt preparation can await. A stop Reaction can now abort this
+    // reservation throughout the complete queue→prompt-prep window.
+    const initialInterruptEpoch = activeRuns.interruptEpoch(scope);
+    const preparationReservation = executor.reserveScope(scope);
+    if (!preparationReservation) {
+      releaseFlushedTurnAfterError(scope, internalUnitId, lease);
+      log.warn('flush', 'reservation-unavailable-at-dequeue', { scope });
+      return;
+    }
     pending.block(scope);
     activeBatchCount += 1;
-    void withTrace({ chatId: firstMsg.chatId }, async () => {
-      log.info('flush', 'start', {
-        scope,
-        batchSize: batch.length,
-        chatId: firstMsg.chatId,
-        threadId: firstMsg.threadId,
-        msgId: firstMsg.messageId,
-      });
-      try {
+    void executePendingFlushWithCleanup({
+      scope,
+      messageId: internalUnitId,
+      lease,
+      run: () =>
+        withTrace({ chatId: firstMsg.chatId }, async () => {
+          log.info('flush', 'start', {
+            scope,
+            batchSize: batch.length,
+            chatId: firstMsg.chatId,
+            threadId: firstMsg.threadId,
+            msgId: firstMsg.messageId,
+          });
         const resolvedMode = await chatModeCache.resolve(channel, firstMsg.chatId);
         // Feishu/Lark converted topic groups may still resolve as `group` from
         // the chat info API/cache, while message events already carry threadId.
@@ -838,6 +1438,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         }
         await runAgentBatch({
           channel,
+          lease,
           executor,
           sessions,
           sessionCatalog,
@@ -853,18 +1454,37 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           scope,
           mode,
           profileDir: deps.appPaths?.profileDir,
-        });
-      } catch (err) {
-        log.fail('flush', err);
-      } finally {
+          preparationReservation,
+          initialInterruptEpoch,
+          });
+        }),
+      onError: (err) => log.fail('flush', err),
+      onFinally: async () => {
+        // Safe after success (ActiveRuns.register already consumed it), abort,
+        // or any pre-start failure.
+        preparationReservation.release();
         pending.unblock(scope);
         activeBatchCount = Math.max(0, activeBatchCount - 1);
         await maybeLaunchDeferredRestart().catch((err) =>
           log.fail('service', err, { step: 'deferred-restart' }),
         );
         log.info('flush', 'end');
-      }
+      },
     });
+  }, {
+    // leaseHooks resolve/acquire/release the in-flight work-chain unit.
+    // Resolution happens at PendingUnit creation (or while checking whether
+    // two explicit reply targets inherit the same chain); acquisition remains
+    // per-unit, not per-message.
+    resolveOrAllocate: (scope: string, replyTo?: string) => {
+      const wcId = _workChainStore?.resolveOrAllocate(scope, replyTo) ?? '';
+      if (wcId) _workChainStore?.markCurrent(wcId);
+      return wcId;
+    },
+    acquire: (l: WorkLease) => _workChainStore?.acquireUnit(l.workChainId, l.unitId),
+    release: (l: WorkLease) => _workChainStore?.releaseUnit(l.workChainId, l.unitId),
+    registerTrigger: (l: WorkLease, messageId: string) =>
+      _workChainStore?.registerTrigger(l.workChainId, messageId),
   });
 
   // Counter for stdout reconnect escalation; reset on `reconnected`.
@@ -934,57 +1554,168 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     reaction: async (evt) => {
       await withTrace({ chatId: evt.messageId }, async () => {
         try {
-          const r = await channel.rawClient.im.v1.message.get({
-            path: { message_id: evt.messageId },
+          // F1/F2: Guards pipeline: self-operator → route → own-message →
+          // permission (using chatModeCache for chatType, not oc_/ou_ guessing).
+          const pipelineResult = await handleReactionEvent(evt, {
+            channel,
+            botOpenId: channel.botIdentity?.openId,
+            appId: cfg.accounts.app.id,
+          }, {
+            checkAccess: (chatType, chatId, senderId) => {
+              if (chatType === 'p2p') {
+                return canUseDm(controls.profileConfig, controls, senderId);
+              }
+              return canUseGroup(controls.profileConfig, controls, chatId, senderId);
+            },
+            checkGroupResponse: (_chatType, chatId, senderId) => {
+              const decision = decideGroupResponse({
+                chatType: 'group',
+                mode: controls.profileConfig.access.groupResponseMode,
+                senderId,
+                botOwnerId: controls.botOwnerId,
+                ownerRefreshState: controls.ownerRefreshState,
+                mentionedBot: false,
+                mentionCount: 0,
+                mentionAll: false,
+                chatId,
+                ownerNoMentionChats: controls.profileConfig.access.ownerNoMentionChats,
+              });
+              return decision;
+            },
+            resolveChatMode: async (chatId) => {
+              return chatModeCache.resolve(channel, chatId);
+            },
+            resolveWorkChain: (_scope, _replyToMessageId) => {
+              // A3: do NOT allocate/register at pipeline time. Allocation +
+              // registerOutbound happen in the buffer flush handler, ONLY after
+              // reconcile decides enqueue-agent AND the target body read
+              // succeeds. This prevents allocating/registering a chain for
+              // events that later drop/noOp/net-zero/empty-set/reconciliationFailed.
+              return '';
+            },
           });
-          const item = r?.data?.items?.[0];
-          const chatId = item?.chat_id as string | undefined;
-          if (!chatId) {
-            log.warn('reaction', 'no-chatId', { messageId: evt.messageId });
-            return;
-          }
-          // Only forward reactions on THIS bot's messages.
-          // Compare both open_id (ou_xxx) and app client id (cli_xxx) —
-          // the message API returns bot senders in cli_xxx format.
-          const messageSenderId = item?.sender?.id as string | undefined;
-          const isOwnMessage =
-            messageSenderId === channel.botIdentity?.openId ||
-            messageSenderId === cfg.accounts.app.id;
-          if (!isOwnMessage) {
-            log.info('reaction', 'skip-other-sender', {
-              messageId: evt.messageId,
-              messageSenderId,
-              botOpenId: channel.botIdentity?.openId,
-              appId: cfg.accounts.app.id,
+
+          if (pipelineResult.kind === 'drop') return;
+
+          // F1/F4/F5: Non-stop → push into buffer for reconciliation
+          if (pipelineResult.kind === 'buffer-reaction') {
+            reactionBuffer.push(pipelineResult.key, evt);
+            log.info('reaction', 'buffered', {
+              key: pipelineResult.key,
+              emojiType: evt.emojiType,
+              action: evt.action,
             });
             return;
           }
-          const chatMode = await chatModeCache.resolve(channel, chatId);
-          const threadId = item?.thread_id as string | undefined;
-          const scope =
-            chatMode === 'topic' && threadId
-              ? `${chatId}:${threadId}`
-              : chatId;
-          const chatType = chatMode === 'p2p' ? 'p2p' as const : 'group' as const;
-          pending.push(scope, {
-            messageId: evt.messageId,
-            chatId,
-            chatType,
-            threadId,
-            senderId: evt.operator.openId,
-            content: `[reaction-${evt.action}] ${evt.emojiType} (on msg ${evt.messageId.slice(-8)})`,
-            rawContentType: 'reaction' as const,
-            resources: [],
-            mentions: [],
-            mentionAll: false,
-            mentionedBot: false,
-            createTime: evt.actionTime ?? Date.now(),
-          });
-          log.info('reaction', 'enqueued', {
-            scope,
-            emojiType: evt.emojiType,
-            action: evt.action,
-          });
+
+          // F3/F6/F7/F11/F12: Stop control plane with persistent ledger
+          if (pipelineResult.kind === 'stop-added-reply') {
+            const fp = stopEventFingerprint(
+              pipelineResult.operatorOpenId, pipelineResult.targetMessageId,
+              pipelineResult.emojiType, 'added',
+              pipelineResult.actionTime, pipelineResult.stableId,
+            );
+
+            // F3/F12: isConsumed check before any action
+            if (stopControlLedger?.isConsumed(fp)) return;
+
+            // Eligibility is target-class specific. Unknown/expired/restart-
+            // lost user messages are silent BEFORE no-work; Bot targets retain
+            // the existing visible no-work/fail-closed behavior.
+            // B2: current-work must cover queued (PendingQueue) + reserved
+            // (ActiveRuns reservation) + active (ActiveRuns handle) — not only
+            // the active handle. Otherwise a stop on a queued/reserved reaction
+            // misreports no-work and the old task still starts later.
+            const hasWork = activeRuns.hasActiveOrReserved(pipelineResult.scope)
+              || pending.pendingCount(pipelineResult.scope) > 0
+              // Covers the narrow timeout-cleanup/retry-handoff gap where the
+              // WorkLease is still current but ActiveRuns has no handle yet.
+              || workChainStore.hasCurrentWork(pipelineResult.scope);
+            const decision = decideStopAdded({
+              targetClass: pipelineResult.targetClass,
+              hasWork,
+              trigger: pipelineResult.targetClass === 'user'
+                ? workChainStore.resolveTrigger(
+                    pipelineResult.scope,
+                    pipelineResult.targetMessageId,
+                  )
+                : undefined,
+              botTargetIsCurrent: pipelineResult.targetClass === 'bot'
+                && workChainStore.resolveCurrentChain(pipelineResult.targetMessageId) !== undefined,
+            });
+
+            const execution = executeStopAdded(decision, {
+              interrupt: () => {
+                activeRuns.interrupt(pipelineResult.scope);
+              },
+              cancelPending: () => {
+                const removed = pending.cancel(pipelineResult.scope);
+                for (const m of removed) {
+                  releaseEnqueuedTurn(
+                    pipelineResult.scope,
+                    reactionTurnIdOf(m) ?? m.messageId,
+                  );
+                }
+              },
+            });
+
+            if (!execution) {
+              log.info('reaction', 'stop-user-target-ineligible', {
+                scope: pipelineResult.scope,
+                targetMessageId: pipelineResult.targetMessageId,
+                reason: decision.kind === 'silent-drop' ? decision.reason : 'unknown',
+              });
+              return;
+            }
+            const { message, replyKind } = execution;
+
+            // F12: Persist consumed state
+            if (stopControlLedger) {
+              await stopControlLedger.record(fp, 'added',
+                pipelineResult.operatorOpenId, pipelineResult.targetMessageId,
+                pipelineResult.emojiType, replyKind);
+            }
+
+            try {
+              await channel.send(pipelineResult.chatId, { markdown: message }, {
+                replyTo: pipelineResult.targetMessageId,
+              });
+            } catch (err) {
+              log.warn('reaction', 'stop-reply-failed', { err: String(err) });
+            }
+            return;
+          }
+
+          if (pipelineResult.kind === 'stop-removed-reply') {
+            const fp = stopEventFingerprint(
+              pipelineResult.operatorOpenId, pipelineResult.targetMessageId,
+              pipelineResult.emojiType, 'removed',
+              pipelineResult.actionTime, pipelineResult.stableId,
+            );
+
+            // F6/F7: Atomically consume exactly one unmatched stop-added.
+            // Unknown/silent added events never enter the ledger and therefore
+            // cannot borrow an older pair after restart.
+            if (stopControlLedger && !stopControlLedger.isConsumed(fp)) {
+              const removal = await stopControlLedger.recordMatchingRemoval(
+                fp,
+                pipelineResult.operatorOpenId,
+                pipelineResult.targetMessageId,
+                pipelineResult.emojiType,
+              );
+              if (removal) {
+                try {
+                  await channel.send(pipelineResult.chatId, {
+                    markdown: '撤回停止 Reaction 不会自动恢复工作。如需继续，请发送新的消息。',
+                  }, { replyTo: pipelineResult.targetMessageId });
+                } catch (err) {
+                  log.warn('reaction', 'stop-removed-reply-failed', { err: String(err) });
+                }
+              }
+              // F7: No matching added → silent no-op
+            }
+            return;
+          }
         } catch (err) {
           log.fail('reaction', err);
         }
@@ -1326,11 +2057,23 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   });
   if (handled) {
     const dropped = pending.cancel(scope);
+    // R4-B3: clean reaction side-state (meta/tracker/context) for dropped
+    // units — the queue released their WorkLease, but reaction entries in the
+    // tracker / turn-meta / contextStore are keyed by reactionKey and must be
+    // cleaned explicitly to avoid stale queued tracker → false reserved race.
+    for (const m of dropped) {
+      releaseEnqueuedTurn(scope, reactionTurnIdOf(m) ?? m.messageId);
+    }
     log.info('intake', 'command', { scope, droppedPending: dropped.length });
     return;
   }
 
-  const size = pending.push(scope, emsg);
+  // Every ordinary input unit (reply OR top-level) carries a workChain lease
+  // at enqueue (DD15). PendingQueue derives replyTo from the message so all
+  // producers use one inheritance contract.
+  const size = pending.push(scope, emsg, {
+    registerAsTrigger: shouldRegisterInboundTrigger(emsg),
+  });
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
 
@@ -1367,6 +2110,13 @@ interface RunBatchDeps {
   scope: string;
   mode: ChatMode;
   profileDir?: string;
+  /** Acquired synchronously when PendingQueue dequeues the unit. */
+  preparationReservation?: RunReservation;
+  /** Explicit-stop generation captured together with the dequeue reservation. */
+  initialInterruptEpoch?: number;
+  /** R3-F1: work-chain lease carried by the flushed PendingUnit (acquired at
+   *  enqueue; the run releases it on terminal/abort). */
+  lease?: WorkLease;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -1391,6 +2141,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const firstMsg = batch[0];
   const lastMsg = batch[batch.length - 1];
   if (!firstMsg || !lastMsg) return;
+  const isReactionBatch = lastMsg.rawContentType === ('reaction' as never);
+  const reactionTurnId = isReactionBatch
+    ? (reactionTurnIdOf(firstMsg) ?? deps.lease?.unitId)
+    : undefined;
+  const lifecycleUnitId = reactionTurnId ?? firstMsg.messageId;
+  if (releaseInvalidatedReactionTurn(scope, lifecycleUnitId, deps.lease)) return;
 
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
@@ -1480,6 +2236,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       ]
     : undefined;
 
+  // F1: Detect reaction batches and collect reactionContexts via internal store
+  const reactionContexts: unknown[] | undefined = isReactionBatch
+    ? getReactionContexts(reactionTurnId ? [reactionTurnId] : [])
+    : undefined;
+
   const prompt = buildPrompt(
     batch,
     attachments,
@@ -1487,6 +2248,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     topicContext,
     channel.botIdentity,
     extraInstructions,
+    (reactionContexts && reactionContexts.length > 0) ? reactionContexts : undefined,
   );
   log.info('prompt', 'built', {
     promptChars: prompt.length,
@@ -1498,8 +2260,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // For topic groups: thread the reply so it lands in the same topic as the
   // user's message. Otherwise the SDK posts at top level and the user's
   // topic discussion breaks visually.
+  // Reaction messages retain the real target `om_...` in messageId; the
+  // internal revision identity is carried separately by reactionTurnId.
+  const replyToId = lastMsg.messageId;
   const sendOpts = {
-    replyTo: lastMsg.messageId,
+    replyTo: replyToId,
     ...(mode === 'topic' && threadId ? { replyInThread: true } : {}),
   };
   log.info('flush', 'reply-target', {
@@ -1540,7 +2305,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     const lease = await createRouteLease(deps.profileDir, {
       chatId,
       threadId,
-      replyTo: lastMsg.messageId,
+      replyTo: replyToId,
       bridgePid: process.pid,
       runId: `${scope}:${Date.now()}`,
     });
@@ -1553,6 +2318,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const startFlow = (
     stage: 'submit' | 'startup-retry',
     reuseDecision?: PromptSessionDecision,
+    reservation?: RunReservation,
   ) =>
     startRunFlow({
       scopeId: scope,
@@ -1575,6 +2341,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         : {}),
       workspaces,
       executor,
+      ...(reservation
+        ? { reservation }
+        : stage === 'submit' && deps.preparationReservation
+          ? { reservation: deps.preparationReservation }
+          : {}),
       now: Date.now(),
       stopGraceMs: getAgentStopGraceMs(controls.cfg),
       routeId: routeLeaseId,
@@ -1585,8 +2356,29 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         stage,
       },
     });
+  // A removal may arrive while media/quote/prompt preparation is awaiting.
+  // Check once more immediately before startRunFlow synchronously reserves the
+  // scope; after this point ActiveRuns.interrupt can abort the reservation.
+  if (releaseInvalidatedReactionTurn(scope, lifecycleUnitId, deps.lease)) {
+    if (routeLeaseId && deps.profileDir) {
+      await deleteRouteLease(deps.profileDir, routeLeaseId).catch(() => {});
+    }
+    return;
+  }
   const flow = await startFlow('submit');
   if (!flow.ok) {
+    // R3-F2/F4: the run never starts — release the lease (unit) + clean
+    // reaction meta/tracker so no ghost current-chain/tracker remains.
+    if (deps.lease) _workChainStore?.releaseUnit(deps.lease.workChainId, deps.lease.unitId);
+    _invalidatedReactionTurnIds.delete(lifecycleUnitId);
+    const rMeta = reactionTurnId
+      ? consumeReactionTurnMeta(reactionTurnId)
+      : undefined;
+    if (rMeta?.reactionKey) {
+      const opId = rMeta.reactionKey.split('\x1f')[1] ?? '';
+      const tgtId = rMeta.reactionKey.split('\x1f')[2] ?? '';
+      _reactionRunTracker?.unregister(scope, opId, tgtId);
+    }
     // Clean up route lease if flow is rejected — no agent run will happen.
     if (routeLeaseId && deps.profileDir) {
       await deleteRouteLease(deps.profileDir, routeLeaseId).catch(() => {});
@@ -1607,6 +2399,53 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const promptAdmissions = flow.promptSession ? [flow.promptSession.admission] : [];
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
+
+  // ── Run lifecycle: every input unit (ordinary + reaction) carries a
+  // workChain (Spec DD15) so its visible outputs register for stop correlation. ──
+  // Reaction batches look up by the private turn id, never by the external
+  // Lark message id.
+  let reactionTurnMeta = reactionTurnId
+    ? consumeReactionTurnMeta(reactionTurnId)
+    : undefined;
+  // B1: isReactionTurn distinguishes reaction (revision-supersede + tracker)
+  // from ordinary (no tracker, no supersede).
+  const isReactionTurn = reactionTurnMeta !== undefined;
+  // R3-F1: unitId/workChainId come from the lease carried by the flushed
+  // PendingUnit (acquired at enqueue via leaseHooks). run start does NOT
+  // acquire — only marks current.
+  const runUnitId = deps.lease?.unitId ?? lifecycleUnitId;
+  if (reactionTurnMeta) {
+    _workChainStore?.markCurrent(reactionTurnMeta.workChainId); // idempotent (already current from enqueue)
+    const rkOpId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';
+    const rkTgtId = reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '';
+    _reactionRunTracker?.register({
+      scope,
+      operatorOpenId: rkOpId,
+      targetMessageId: rkTgtId,
+      reactionRevision: reactionTurnMeta.revision,
+      runId: `${scope}:${Date.now()}`,
+      status: 'reserved', // barrier flushed, ActiveRuns holds reservation
+    });
+    _reactionRunTracker?.markStatus(scope, rkOpId, rkTgtId, 'active');
+  } else if (deps.lease?.workChainId) {
+    // R4-B1: ordinary (reply or top-level) — workChain from the lease
+    // (allocated+acquired at intakeMessage enqueue via leaseHooks).
+    _workChainStore?.markCurrent(deps.lease.workChainId); // idempotent
+    reactionTurnMeta = { workChainId: deps.lease.workChainId, reactionKey: '', revision: 0 };
+  }
+  // Register outbound on stream result (applies to ordinary + reaction — both
+  // carry a workChain now, so all visible outputs are registered on creation).
+  const _registerOutboundOnStream = (result: unknown): void => {
+    if (reactionTurnMeta && result && typeof result === 'object' && 'messageId' in result) {
+      registerOutboundLifecycle(reactionTurnMeta.workChainId, (result as { messageId: string }).messageId);
+    }
+  };
+
+  // Everything after reaction metadata is consumed belongs to the run owner.
+  // Keep it under the same terminal catch/finally so a synchronous subscribe
+  // or prompt/render setup failure cannot strand tracker/lease state.
+  let reactionPromise: ReturnType<typeof addWorkingReaction> | undefined;
+  try {
   const eventStream = execution.subscribe();
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
@@ -1665,44 +2504,56 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   };
   let startupRetryUsed = false;
   const recoverStartupTimeout = async (): Promise<
-    { handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined
+    StartupRecoveryResult | undefined
   > => {
     if (capability.agentId !== 'codex' || startupRetryUsed) return undefined;
     startupRetryUsed = true;
-    await execution.stop();
-    const safe = await execution.run.canRetryAfterNoOutput?.() ?? false;
-    if (!safe) {
-      log.warn('agent', 'startup-timeout-retry-skipped', {
-        scope,
-        reason: execution.run.canRetryAfterNoOutput
-          ? 'turn-not-empty-terminal'
-          : 'agent-does-not-support-verification',
-      });
-      return undefined;
-    }
-    const replacement = await startFlow(
-      'startup-retry',
-      activeFlow.promptSession?.decision,
-    );
-    if (!replacement.ok) {
-      log.warn('agent', 'startup-timeout-retry-rejected', {
-        scope,
-        code: replacement.rejectReason.code,
-      });
-      return undefined;
-    }
-    log.warn('agent', 'startup-timeout-retry-started', {
+    return runStartupRetryWithStopGuard({
       scope,
-      previousRunId: execution.runId,
-      retryRunId: replacement.execution.runId,
-      threadId: replacement.resumeFrom,
+      initialInterruptEpoch: deps.initialInterruptEpoch
+        ?? executor.interruptEpoch(scope),
+      activeRuns: executor,
+      executor,
+      stopCurrent: () => execution.stop(),
+      canRetry: async () => {
+        const safe = await execution.run.canRetryAfterNoOutput?.() ?? false;
+        if (!safe) {
+          log.warn('agent', 'startup-timeout-retry-skipped', {
+            scope,
+            reason: execution.run.canRetryAfterNoOutput
+              ? 'turn-not-empty-terminal'
+              : 'agent-does-not-support-verification',
+          });
+        }
+        return safe;
+      },
+      startReplacement: async (retryReservation) => {
+        const replacement = await startFlow(
+          'startup-retry',
+          activeFlow.promptSession?.decision,
+          retryReservation,
+        );
+        if (!replacement.ok) {
+          log.warn('agent', 'startup-timeout-retry-rejected', {
+            scope,
+            code: replacement.rejectReason.code,
+          });
+          return undefined;
+        }
+        log.warn('agent', 'startup-timeout-retry-started', {
+          scope,
+          previousRunId: execution.runId,
+          retryRunId: replacement.execution.runId,
+          threadId: replacement.resumeFrom,
+        });
+        activeFlow = replacement;
+        if (replacement.promptSession) promptAdmissions.push(replacement.promptSession.admission);
+        return {
+          handle: replacement.execution.handle,
+          events: replacement.execution.subscribe(),
+        };
+      },
     });
-    activeFlow = replacement;
-    if (replacement.promptSession) promptAdmissions.push(replacement.promptSession.admission);
-    return {
-      handle: replacement.execution.handle,
-      events: replacement.execution.subscribe(),
-    };
   };
 
   // Resolve idle-timeout for this run: scope override (on SessionEntry) wins
@@ -1751,10 +2602,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // a first streamed token (markdown mode) or the whole run ends (text mode).
   // Add a "Typing" reaction to the triggering message as an instant ack, but
   // never let that outbound API call block agent event draining.
-  const reactionPromise =
+  reactionPromise =
     cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
 
-  try {
     if (cotEnabled) {
       const cotPublisher = new CotPublisher({
         client: cotClient,
@@ -1769,6 +2619,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         inputPreview: lastMsg.content,
       });
       await cotPublisher.start();
+      // A1: register the CoT bubble messageId immediately after start() so a
+      // stop reaction can correlate during streaming — not only at completion.
+      if (reactionTurnMeta && !cotPublisher.disabled && cotPublisher.ref) {
+        registerOutboundLifecycle(reactionTurnMeta.workChainId, cotPublisher.ref.messageId);
+      }
       if (!cotPublisher.disabled) {
         const cotDone = consumeCotEvents(execution.subscribe(), cotPublisher, {
           detail: cotMessages,
@@ -1793,7 +2648,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             reason: cotPublisher.degradedReason,
           });
         }
-        await sendFinalReply({
+        const cotResult = await sendFinalReply({
           channel,
           chatId,
           scope,
@@ -1802,6 +2657,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
           cardRenderOptions,
         });
+        _registerOutboundOnStream(cotResult);
+        finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
         return;
       }
       log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
@@ -1836,26 +2693,39 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             producer: async (ctrl) => {
               producerStarted = true;
               cardCtrl = ctrl;
+              // Register outbound IMMEDIATELY so stop can correlate during streaming.
+              _registerOutboundOnStream(ctrl);
               await ctrl.update(renderCard(filterForPrefs(latestState), cardRenderOptions));
               await renderDone;
             },
           },
         },
         sendOpts,
-      );
+      ).then((result) => {
+        // Fallback: register on stream completion (idempotent — does nothing if
+        // already registered at producer start).
+        _registerOutboundOnStream(result);
+        return result;
+      });
       await awaitRenderAwareStream({
         mode: replyMode,
         streamDone,
         renderDone,
         producerStarted: () => producerStarted,
         fallback: async (state) => {
-          await channel.send(
+          // F18: If this reaction run was superseded, mark the card state
+          const fallbackState = isReactionTurn ? markSuperseded(state) : state;
+          // R2-F4: register the fallback outbound so stop can correlate it.
+          const fbResult = await channel.send(
             chatId,
-            { card: renderCard(filterForPrefs(state), cardRenderOptions) },
+            { card: renderCard(filterForPrefs(fallbackState), cardRenderOptions) },
             sendOpts,
           );
+          _registerOutboundOnStream(fbResult);
         },
       });
+      // Reaction lifecycle: mark terminal after render+stream complete
+      finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let latestMarkdown = renderMarkdownStreamText(latestState);
@@ -1918,6 +2788,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             markdown: async (ctrl) => {
               producerStarted = true;
               markdownCtrl = ctrl;
+              // Register outbound IMMEDIATELY so stop can correlate during streaming.
+              _registerOutboundOnStream(ctrl);
               const initialMarkdown = renderMarkdownStreamText(filterForPrefs(latestState));
               await setMarkdownContent('initial', initialMarkdown);
               const finalState = await renderDone;
@@ -1936,6 +2808,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
         )
         .then((result) => {
+          _registerOutboundOnStream(result);
           log.info('stream', 'markdown-terminal-resolved', {
             chars: latestMarkdown.length,
             flushes: markdownFlushes,
@@ -1960,10 +2833,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         fallback: async (state) => {
           const body = renderText(filterForPrefs(state));
           if (body.trim()) {
-            await channel.send(chatId, { markdown: body }, sendOpts);
+            // R2-F4: register the fallback outbound so stop can correlate it.
+            const fbResult = await channel.send(chatId, { markdown: body }, sendOpts);
+            _registerOutboundOnStream(fbResult);
           }
         },
       });
+      // Reaction lifecycle: mark terminal after render+stream complete
+      finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -1978,7 +2855,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         async () => {},
         recoverStartupTimeout,
       );
-      await sendFinalReply({
+      const sendResult = await sendFinalReply({
         channel,
         chatId,
         scope,
@@ -1987,9 +2864,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         sendOpts,
         cardRenderOptions,
       });
+      // Reaction lifecycle: register outbound for text mode
+      _registerOutboundOnStream(sendResult);
+      finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
     }
   } catch (err) {
     log.fail('stream', err);
+    // B4: finalize on error too — release this run's in-flight unit so the
+    // chain doesn't stay current forever on an error path.
+    finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
   } finally {
     for (const admission of promptAdmissions) admission.finishWithoutIdentifier();
     activePolicyFingerprints.delete(scope);
@@ -2005,20 +2888,21 @@ async function sendFinalReply(input: {
   replyMode: ReturnType<typeof getMessageReplyMode>;
   sendOpts: { replyTo: string; replyInThread?: boolean };
   cardRenderOptions: { signCallback?: (action: string) => string };
-}): Promise<void> {
+}): Promise<unknown> {
   const body = renderText(input.state);
+  let lastResult: unknown;
 
   if (input.replyMode === 'card') {
-    const result = await input.channel.send(
+    lastResult = await input.channel.send(
       input.chatId,
       { card: renderCard(input.state, input.cardRenderOptions) },
       input.sendOpts,
     );
-    log.info('outbound', 'sent', outboundLogFields(input, 'card', body, result));
+    log.info('outbound', 'sent', outboundLogFields(input, 'card', body, lastResult as { messageId?: string } | undefined));
   } else if (input.replyMode === 'markdown') {
     if (body.trim()) {
       try {
-        await input.channel.stream(
+        lastResult = await input.channel.stream(
           input.chatId,
           {
             markdown: async (ctrl) => {
@@ -2027,27 +2911,28 @@ async function sendFinalReply(input: {
           },
           input.sendOpts,
         );
-        log.info('outbound', 'sent', outboundLogFields(input, 'markdown-stream', body));
+        log.info('outbound', 'sent', outboundLogFields(input, 'markdown-stream', body, lastResult as { messageId?: string } | undefined));
       } catch (err) {
         log.warn('outbound', 'markdown-stream-fallback', {
           err: err instanceof Error ? err.message : String(err),
         });
-        const result = await input.channel.send(
+        lastResult = await input.channel.send(
           input.chatId,
           { markdown: body },
           input.sendOpts,
         );
-        log.info('outbound', 'sent', outboundLogFields(input, 'markdown', body, result));
+        log.info('outbound', 'sent', outboundLogFields(input, 'markdown', body, lastResult as { messageId?: string } | undefined));
       }
     }
   } else if (body.trim()) {
-    const result = await input.channel.send(
+    lastResult = await input.channel.send(
       input.chatId,
       { markdown: body },
       input.sendOpts,
     );
-    log.info('outbound', 'sent', outboundLogFields(input, 'text', body, result));
+    log.info('outbound', 'sent', outboundLogFields(input, 'text', body, lastResult as { messageId?: string } | undefined));
   }
+  return lastResult;
 }
 
 async function sendCotDegradedNotice(input: {
@@ -2119,6 +3004,59 @@ function streamResultLogFields(result: unknown): Record<string, unknown> {
   };
 }
 
+export type StartupRecoveryResult =
+  | { handle: RunHandle; events: AsyncIterable<AgentEvent> }
+  | { interrupted: true };
+
+/**
+ * Preserve explicit-stop ownership across Codex's timeout cleanup/probe/retry
+ * gap. Internal timeout cleanup does not advance ActiveRuns.interruptEpoch;
+ * user/control-plane interrupt does, and also aborts the retry reservation.
+ */
+export async function runStartupRetryWithStopGuard(input: {
+  scope: string;
+  initialInterruptEpoch: number;
+  activeRuns: Pick<ActiveRuns, 'interruptEpoch'>;
+  executor: Pick<RunExecutor, 'reserveScope'>;
+  stopCurrent: () => Promise<void>;
+  canRetry: () => Promise<boolean>;
+  startReplacement: (
+    reservation: RunReservation,
+  ) => Promise<{ handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined>;
+}): Promise<StartupRecoveryResult | undefined> {
+  await input.stopCurrent();
+  if (input.activeRuns.interruptEpoch(input.scope) !== input.initialInterruptEpoch) {
+    return { interrupted: true };
+  }
+
+  // Acquire synchronously before the potentially slow persisted-turn probe.
+  // From this point stop_current_work sees hasWork and can abort the retry.
+  const retryReservation = input.executor.reserveScope(input.scope);
+  if (!retryReservation) return undefined;
+  try {
+    const safe = await input.canRetry();
+    if (
+      retryReservation.signal.aborted
+      || input.activeRuns.interruptEpoch(input.scope) !== input.initialInterruptEpoch
+    ) {
+      return { interrupted: true };
+    }
+    if (!safe) return undefined;
+
+    const replacement = await input.startReplacement(retryReservation);
+    if (
+      retryReservation.signal.aborted
+      || input.activeRuns.interruptEpoch(input.scope) !== input.initialInterruptEpoch
+    ) {
+      return { interrupted: true };
+    }
+    return replacement;
+  } finally {
+    // Idempotent after ActiveRuns.register consumes the reservation.
+    retryReservation.release();
+  }
+}
+
 /**
  * Drive the agent's event stream into a stateful RunState, calling `flush`
  * on every state transition. Used by both card and markdown reply modes —
@@ -2132,9 +3070,7 @@ export async function processAgentStream(
   startupTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void | Promise<void>,
   flush: (state: RunState) => Promise<void>,
-  recoverStartupTimeout?: () => Promise<
-    { handle: RunHandle; events: AsyncIterable<AgentEvent> } | undefined
-  >,
+  recoverStartupTimeout?: () => Promise<StartupRecoveryResult | undefined>,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = initialState;
@@ -2266,6 +3202,11 @@ export async function processAgentStream(
     try {
       const replacement = await recoverStartupTimeout();
       if (replacement) {
+        if ('interrupted' in replacement) {
+          state = markInterrupted(state);
+          await flush(state);
+          return state;
+        }
         log.warn('agent', 'startup-timeout-retrying', { scope });
         return processAgentStream(
           replacement.handle,
@@ -2291,7 +3232,7 @@ export async function processAgentStream(
       const timeoutMs = startupFired ? startupTimeoutMs! : idleTimeoutMs!;
       state = markIdleTimeout(state, Math.round(timeoutMs / 60_000));
     } else if (handle.interrupted) {
-      state = markInterrupted(state);
+      state = handle.superseded ? markSuperseded(state) : markInterrupted(state);
     } else {
       state = finalizeIfRunning(state);
     }
@@ -2813,9 +3754,13 @@ function buildPrompt(
   topicContext: QuotedContext[] = [],
   botIdentity?: { openId: string; name?: string },
   extraInstructions?: string[],
+  reactionContexts?: unknown[],
 ): string {
   const first = batch[0];
   if (!first) return '';
+
+  // Detect reaction batch: rawContentType === 'reaction' on first message
+  const isReactionBatch = first.rawContentType === ('reaction' as never);
 
   const fileKeys = batch.flatMap((m) => m.resources.map((r) => r.fileKey));
   // When the debounce window merged messages (possibly from several senders —
@@ -2850,7 +3795,7 @@ function buildPrompt(
       ...(mentions.length > 0 ? { mentions } : {}),
       ...(first.threadId ? { threadId: first.threadId } : {}),
       messageIds: batch.map((m) => m.messageId),
-      source: 'im',
+      source: isReactionBatch ? 'reaction' : 'im',
     },
     instructions:
       extraInstructions && extraInstructions.length > 0
@@ -2861,21 +3806,28 @@ function buildPrompt(
     quotedMessages: quotes.map(toPromptQuote),
     interactiveCards: batch.map(toPromptInteractiveCard).filter(isDefined),
     attachments: attachments.map(toPromptAttachment),
+    ...(reactionContexts && reactionContexts.length > 0 ? { reactionContexts } : {}),
   });
 }
 
 /**
- * Classify the sender as human or bot from the raw Feishu event
- * (`sender.sender_type`: 'user' = human, 'app' = bot). The normalizer drops
- * this field, so read it off `msg.raw` (`includeRawEvent: true` above).
- * Unknown / missing values return undefined — omit rather than guess.
+ * Classify the sender as human or bot from normalized senderType, with the raw
+ * Feishu event (`sender.sender_type`: 'user' = human, 'app' = bot) as a
+ * compatibility fallback. Unknown / missing values remain undefined.
  */
 function senderTypeOf(msg: NormalizedMessage): 'user' | 'bot' | undefined {
+  if (msg.senderType === 'user') return 'user';
+  if (msg.senderType === 'bot') return 'bot';
   const raw = msg.raw as { sender?: { sender_type?: unknown } } | undefined;
   const senderType = raw?.sender?.sender_type;
   if (senderType === 'user') return 'user';
   if (senderType === 'app' || senderType === 'bot') return 'bot';
   return undefined;
+}
+
+/** Only real human IM inputs may become user-target stop correlation entries. */
+export function shouldRegisterInboundTrigger(msg: NormalizedMessage): boolean {
+  return senderTypeOf(msg) === 'user';
 }
 
 function senderAnnotation(msg: NormalizedMessage): string {

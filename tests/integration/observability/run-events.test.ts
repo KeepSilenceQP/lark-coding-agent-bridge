@@ -4,6 +4,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { ProcessPool } from '../../../src/bot/process-pool.js';
 import { closeLogger, configureLogger, flushLogger } from '../../../src/core/logger.js';
+import type {
+  AgentAdapter,
+  AgentEvent,
+  AgentRun,
+  AgentRunOptions,
+} from '../../../src/agent/types.js';
 import type { RunPolicyAllow } from '../../../src/policy/run-policy.js';
 import { RunExecutor } from '../../../src/runtime/run-executor.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
@@ -53,12 +59,44 @@ describe('run observability events', () => {
       durationMs: 0,
     });
   });
+
+  it('records a control-plane stop as interrupted when the agent reports a normal tail', async () => {
+    const h = await createHarness(new StopCompletingAgent());
+
+    const execution = await h.executor.submit({
+      scopeId: 'chat-1',
+      policy: policy(h.tmp.workspace),
+      observability: {
+        profile: 'claude',
+        agent: 'claude',
+        source: 'im',
+        stage: 'submit',
+      },
+    });
+    const collecting = collect(execution.subscribe());
+
+    expect(h.activeRuns.interrupt('chat-1')).toBe(true);
+    await collecting;
+    await flushLogger();
+
+    const lines = (await readLogLines(h.logsDir)).filter((line) => line.phase === 'run');
+    expect(lines.at(-1)).toMatchObject({
+      event: 'completed',
+      runId: 'run-1',
+      result: 'interrupted',
+    });
+  });
 });
 
-async function createHarness(): Promise<{
+async function createHarness(
+  agent: AgentAdapter = new FakeAgentAdapter({
+    events: [[{ type: 'done', terminationReason: 'normal' }]],
+  }),
+): Promise<{
   tmp: TmpProfile;
   logsDir: string;
   executor: RunExecutor;
+  activeRuns: ActiveRuns;
 }> {
   const tmp = await createTmpProfile('run-events-');
   cleanups.push(tmp.cleanup);
@@ -67,18 +105,16 @@ async function createHarness(): Promise<{
     logsDir,
     now: () => new Date('2026-05-25T00:00:00.000Z'),
   });
-  const agent = new FakeAgentAdapter({
-    events: [[{ type: 'done', terminationReason: 'normal' }]],
-  });
+  const activeRuns = new ActiveRuns();
   const executor = new RunExecutor({
     agent,
     pool: new ProcessPool(() => 1),
-    activeRuns: new ActiveRuns(),
+    activeRuns,
     createRunId: () => 'run-1',
     now: () => 1_700_000_000_000,
     postDoneExitGraceMs: 1,
   });
-  return { tmp, logsDir, executor };
+  return { tmp, logsDir, executor, activeRuns };
 }
 
 function policy(cwd: string): RunPolicyAllow {
@@ -110,4 +146,36 @@ async function readLogLines(logsDir: string): Promise<Array<Record<string, unkno
     .split('\n')
     .filter(Boolean)
     .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+class StopCompletingAgent implements AgentAdapter {
+  readonly id = 'claude';
+  readonly displayName = 'Claude Code';
+
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+
+  run(opts: AgentRunOptions): AgentRun {
+    let releaseStop!: () => void;
+    const stopped = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const events: AsyncIterable<AgentEvent> = {
+      async *[Symbol.asyncIterator]() {
+        await stopped;
+        yield { type: 'done', terminationReason: 'normal' };
+      },
+    };
+    return {
+      runId: opts.runId,
+      events,
+      async stop() {
+        releaseStop();
+      },
+      async waitForExit() {
+        return true;
+      },
+    };
+  }
 }

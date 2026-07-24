@@ -20,6 +20,11 @@ export interface ReceiptSendResult {
   messageId?: string;
 }
 
+export interface ReceiptRetryResult extends ReceiptSendResult {
+  attempts: number;
+  lastError?: unknown;
+}
+
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
@@ -36,6 +41,12 @@ interface LarkApiResponse {
   code: number;
   msg?: string;
   data?: { message_id?: string };
+  error?: {
+    field_violations?: Array<{
+      field?: string;
+      description?: string;
+    }>;
+  };
 }
 
 /**
@@ -88,35 +99,66 @@ export async function sendRestartReceipt(
     return { ok: false };
   }
 
-  // Bounded retry loop for the actual send. Only truly transient errors
-  // (network, HTTP 5xx) are retried. Deterministic API errors (4xx, bad
-  // content) break immediately.
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const messageId = await sendLarkMessage(
+  const sendResult = await sendReceiptWithRetry(
+    () =>
+      sendLarkMessage(
         domain,
         token,
         params.returnRoute,
         body,
-      );
-      return { ok: true, messageId };
-    } catch (err) {
-      lastError = err;
-      if (!isRetryable(err)) break;
-      if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_DELAY_MS * attempt);
-      }
-    }
+      ),
+  );
+  if (sendResult.ok) {
+    return { ok: true, messageId: sendResult.messageId };
   }
 
   log.warn('receipt', 'send-failed', {
     receiptId: params.receiptId,
     kind: params.kind,
-    error: lastError instanceof Error ? lastError.message : String(lastError),
-    attempts: MAX_RETRIES,
+    error:
+      sendResult.lastError instanceof Error
+        ? sendResult.lastError.message
+        : String(sendResult.lastError),
+    attempts: sendResult.attempts,
   });
   return { ok: false };
+}
+
+/**
+ * Run the bounded receipt-send retry policy and report the attempts that
+ * actually occurred. Deterministic 4xx/content failures stop after one try.
+ */
+export async function sendReceiptWithRetry(
+  send: () => Promise<string>,
+  options: {
+    maxAttempts?: number;
+    retryDelayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<ReceiptRetryResult> {
+  const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_RETRIES);
+  const retryDelayMs = options.retryDelayMs ?? RETRY_DELAY_MS;
+  const wait = options.sleep ?? sleep;
+  let attempts = 0;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    attempts = attempt;
+    try {
+      const messageId = await send();
+      return { ok: true, messageId, attempts };
+    } catch (err) {
+      lastError = err;
+      if (!isRetryable(err)) break;
+      if (attempt < maxAttempts) {
+        await wait(retryDelayMs * attempt);
+      }
+    }
+  }
+  return {
+    ok: false,
+    attempts,
+    ...(lastError !== undefined ? { lastError } : {}),
+  };
 }
 
 /**
@@ -189,7 +231,10 @@ export async function sendLarkMessage(
   });
 
   if (!res.ok) {
-    throw new Error(`message reply failed: HTTP ${res.status}`);
+    const details = await readLarkErrorDetails(res);
+    throw new Error(
+      `message reply failed: HTTP ${res.status}${details ? ` ${details}` : ''}`,
+    );
   }
 
   const data = (await res.json()) as LarkApiResponse;
@@ -242,6 +287,33 @@ function formatReceiptText(params: ReceiptSendParams): string {
 function isRetryable(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /timeout|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|429|5\d\d/i.test(msg);
+}
+
+async function readLarkErrorDetails(res: Response): Promise<string> {
+  try {
+    const data = (await res.json()) as LarkApiResponse;
+    const parts: string[] = [];
+    if (typeof data.code === 'number') parts.push(`code=${data.code}`);
+    if (data.msg) parts.push(`msg=${sanitizeErrorText(data.msg)}`);
+    const violations = data.error?.field_violations
+      ?.slice(0, 5)
+      .map((item) => ({
+        ...(item.field ? { field: sanitizeErrorText(item.field) } : {}),
+        ...(item.description
+          ? { description: sanitizeErrorText(item.description) }
+          : {}),
+      }));
+    if (violations && violations.length > 0) {
+      parts.push(`field_violations=${JSON.stringify(violations)}`);
+    }
+    return parts.join(' ');
+  } catch {
+    return '';
+  }
+}
+
+function sanitizeErrorText(value: string): string {
+  return value.replace(/[\r\n\t]+/g, ' ').slice(0, 300);
 }
 
 function sleep(ms: number): Promise<void> {
