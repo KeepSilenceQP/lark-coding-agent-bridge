@@ -227,6 +227,7 @@ export class RunExecutor {
       dimensions,
       startedAt,
       now: this.now,
+      wasControlPlaneInterrupted: () => handle.controlPlaneInterrupted === true,
     }), async () => {
       await cleanup(!handle.interrupted);
     });
@@ -239,6 +240,7 @@ export class RunExecutor {
       subscribe: () => fanout.subscribe(),
       stop: async () => {
         handle.interrupted = true;
+        handle.controlPlaneInterrupted = true;
         await run.stop();
         await run.waitForExit(this.postDoneExitGraceMs);
         await cleanup(false);
@@ -253,6 +255,7 @@ function observeRunEvents(
     dimensions: Record<string, unknown>;
     startedAt: number;
     now: () => number;
+    wasControlPlaneInterrupted: () => boolean;
   },
 ): AsyncIterable<AgentEvent> {
   return {
@@ -261,7 +264,9 @@ function observeRunEvents(
         if (event.type === 'done') {
           log.info('run', 'completed', {
             ...opts.dimensions,
-            result: event.terminationReason,
+            result: opts.wasControlPlaneInterrupted()
+              ? 'interrupted'
+              : event.terminationReason,
             durationMs: opts.now() - opts.startedAt,
           });
           yield event;

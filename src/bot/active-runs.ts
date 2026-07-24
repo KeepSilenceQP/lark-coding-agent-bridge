@@ -3,6 +3,8 @@ import type { AgentRun } from '../agent/types';
 export interface RunHandle {
   run: AgentRun;
   interrupted: boolean;
+  /** Set when an explicit control-plane action requested termination. */
+  controlPlaneInterrupted?: boolean;
   /** Set when interrupted due to reaction revision supersede (not /stop). */
   superseded?: boolean;
 }
@@ -129,6 +131,7 @@ export class ActiveRuns {
     const h = this.handles.get(chatId);
     if (h) {
       h.interrupted = true;
+      h.controlPlaneInterrupted = true;
       this.handles.delete(chatId);
       void h.run.stop().catch(() => {
         /* stop errors are non-fatal */
@@ -146,7 +149,10 @@ export class ActiveRuns {
       reservation.controller.abort();
     }
     this.reservations.clear();
-    for (const h of all) h.interrupted = true;
+    for (const h of all) {
+      h.interrupted = true;
+      h.controlPlaneInterrupted = true;
+    }
     await Promise.allSettled(all.map((h) => h.run.stop()));
   }
 
