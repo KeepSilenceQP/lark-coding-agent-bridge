@@ -313,6 +313,74 @@ export async function executeReactionFlushDecision(
   // enqueue-agent: caller builds context + pushBarrier after this returns
 }
 
+/**
+ * Evict any in-flight entry for a reaction key before enqueuing a new revision.
+ *
+ * Handles the tri-state lifecycle (queued|reserved|active):
+ * - queued: try cancelMessage; if 0 removed (barrier already flushed, now
+ *   reserved), fall through to interrupt the ActiveRuns reservation.
+ * - reserved / active: interrupt the scope via activeRuns.interrupt (aborts
+ *   both reservation and active streaming runs — Plan DD12).
+ *
+ * Returns whether the scope was interrupted (for test observability).
+ */
+export function evictInFlightReactionEntry(params: {
+  reactionKey: string;
+  scope: string;
+  opId: string;
+  tgtId: string;
+  existingStatus: 'queued' | 'reserved' | 'active';
+  oldRevision: number;
+  newRevision: number;
+  pending: import('./pending-queue').PendingQueue;
+  contextStore: import('./reaction/context-store').ReactionContextStore;
+  activeRuns: import('./active-runs').ActiveRuns;
+  tracker: import('./reaction/run-tracker').ReactionRunTracker;
+}): { needsInterrupt: boolean; removedFromQueue: number } {
+  const { reactionKey, scope, opId, tgtId, existingStatus, pending, contextStore, activeRuns, tracker } = params;
+  let needsInterrupt = existingStatus !== 'queued';
+  let removedFromQueue = 0;
+
+  if (existingStatus === 'queued') {
+    const oldTurnId = _reactionTurnIdByKey.get(reactionKey);
+    if (oldTurnId) {
+      const removed = pending.cancelMessage(scope, oldTurnId);
+      removedFromQueue = removed.length;
+      if (removed.length === 0) {
+        // Barrier was already flushed — it holds an ActiveRuns reservation now.
+        needsInterrupt = true;
+      }
+    }
+  }
+
+  // Atomically remove old context, meta, and tracker
+  contextStore.delete(reactionKey);
+  deleteReactionTurnMeta(reactionKey);
+  tracker.unregister(scope, opId, tgtId);
+
+  if (needsInterrupt) {
+    const handle = activeRuns.get(scope);
+    if (handle) handle.superseded = true;
+    activeRuns.interrupt(scope);
+    log.info('reaction', 'interrupting-inflight-run', {
+      scope,
+      key: reactionKey,
+      oldStatus: existingStatus,
+      oldRevision: params.oldRevision,
+      newRevision: params.newRevision,
+    });
+  } else {
+    log.info('reaction', 'cancelling-queued-run', {
+      scope,
+      key: reactionKey,
+      oldRevision: params.oldRevision,
+      newRevision: params.newRevision,
+    });
+  }
+
+  return { needsInterrupt, removedFromQueue };
+}
+
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
 const FINAL_READBACK_RETRY_MS = 250;
@@ -967,64 +1035,26 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       mentionedBot: false,
       createTime: Date.now(),
     } satisfies import('@larksuite/channel').NormalizedMessage;
-    // F10/F11/F18: Before enqueuing the new revision, atomically evict any
-    // previous in-flight entry for the same key (queued/reserved/active).
-    //
-    // Lifecycle state machine:
-    //   queued   — barrier still in PendingQueue → cancelMessage can remove it
-    //   reserved — barrier flushed, ActiveRuns holds a reservation (prompt-prep
-    //              or pool-wait); cancelMessage returns 0 → must interrupt
-    //   active   — agent is streaming → must supersede + interrupt
-    //
-    // The tracker lag (queued between flush and markStatus) is handled by the
-    // cancelMessage result: if it returns 0 for a 'queued' entry, the barrier
-    // was flushed in the meantime → treat as reserved.
+    // F10/F11/F18: Atomically evict any previous in-flight entry for the same
+    // key before enqueuing the new revision. Uses the exported production seam
+    // evictInFlightReactionEntry (testable with real ActiveRuns/PendingQueue).
     const opId = result.components.operatorOpenId;
     const tgtId = result.components.targetMessageId;
     const existingEntry = _reactionRunTracker?.get(result.components.scope, opId, tgtId);
-    if (existingEntry) {
-      let needsInterrupt = existingEntry.status !== 'queued';
-
-      if (existingEntry.status === 'queued') {
-        // Try to cancel the barrier from PendingQueue
-        const oldTurnId = _reactionTurnIdByKey.get(result.key);
-        if (oldTurnId) {
-          const removed = pending.cancelMessage(result.components.scope, oldTurnId);
-          if (removed.length === 0) {
-            // Barrier was already flushed from the queue — it holds an
-            // ActiveRuns reservation now. Must interrupt to abort it.
-            needsInterrupt = true;
-          }
-        }
-      }
-
-      // Atomically remove old context, meta, and tracker before enqueuing new
-      reactionContextStore.delete(result.key);
-      deleteReactionTurnMeta(result.key);
-      _reactionRunTracker?.unregister(result.components.scope, opId, tgtId);
-
-      if (needsInterrupt) {
-        // Old run was reserved or active — supersede and interrupt scope.
-        // activeRuns.interrupt aborts both reservation (prompt-prep/pool-wait)
-        // and active streaming runs (Plan DD12).
-        const handle = activeRuns.get(result.components.scope);
-        if (handle) handle.superseded = true;
-        activeRuns.interrupt(result.components.scope);
-        log.info('reaction', 'interrupting-inflight-run', {
-          scope: result.components.scope,
-          key: result.key,
-          oldStatus: existingEntry.status,
-          oldRevision: existingEntry.reactionRevision,
-          newRevision: result.revision,
-        });
-      } else {
-        log.info('reaction', 'cancelling-queued-run', {
-          scope: result.components.scope,
-          key: result.key,
-          oldRevision: existingEntry.reactionRevision,
-          newRevision: result.revision,
-        });
-      }
+    if (existingEntry && _reactionRunTracker) {
+      evictInFlightReactionEntry({
+        reactionKey: result.key,
+        scope: result.components.scope,
+        opId,
+        tgtId,
+        existingStatus: existingEntry.status,
+        oldRevision: existingEntry.reactionRevision,
+        newRevision: result.revision,
+        pending,
+        contextStore: reactionContextStore,
+        activeRuns,
+        tracker: _reactionRunTracker,
+      });
     }
     // F10/F11: Carry reaction metadata through to the run lifecycle
     const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
