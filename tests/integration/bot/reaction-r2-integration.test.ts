@@ -819,10 +819,9 @@ describe('production flush executor — real effects calls, no manual simulation
 
   it('empty-set with active run → effects.deleteTurnMetaForTarget called with reactionKey', () => {
     const { callEffects } = setup();
-    const reactionKey = makeReactionKey('oc_s', 'ou_u', 'om_t');
-    callEffects.deleteMeta(reactionKey);
-    // deleteTurnMetaForTarget removes from _reactionTurnMeta (module-level Map)
-    // Verified by no throw + deleteTurnMetaForTarget being called
+    callEffects.deleteMeta('om_t');
+    // deleteTurnMetaForTarget removes entry for targetMessageId 'om_t'
+    // from _reactionTurnMeta (module-level Map)
   });
 
   it('empty-set with active run → effects.interruptActiveRun + setHandleSuperseded called', () => {
