@@ -55,4 +55,4 @@ jobs:
           npm run typecheck
 
       - name: Publish with npm Trusted Publishing
-        run: npm publish --access public
+        run: npm publish --access public --tag latest
