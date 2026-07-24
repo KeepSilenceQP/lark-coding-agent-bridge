@@ -126,9 +126,11 @@ Reaction 与普通消息使用同一套访问控制和群响应策略。Reaction
 
 Reaction handler 收到事件后，必须先做 self-operator guard：若 operator 等于当前 Bot 的 `open_id`、app client ID，或 raw event 明确表明 operator 是当前 app，则把它视为 Bridge 内部事件并静默丢弃。该过滤发生在权限、snapshot/revision、queue、interrupt 和任何回复之前；从 `im.reactions.list` 重建快照时也不得把当前 app 自己的 Reaction 混入用户集合。这保证 Bridge 添加/移除 `Typing` 等工作态 Reaction 不会反向触发 Agent。
 
-完成 self-operator guard 和安全路由后，普通语义继续先做当前 Bot 消息过滤；
-`stop_current_work` 可在目标为当前 chain 的 inbound trigger message 时绕过该过滤，但不能
-绕过下面的权限与 chain-correlation 校验。更新 Reaction 快照或产生任何副作用前，Bridge 必须：
+完成 self-operator guard 和安全路由后，普通语义继续先做当前 Bot 消息过滤。
+`stop_current_work added` 仅在目标是本进程已登记的 inbound trigger 时可绕过该过滤；
+`removed` 仅在持久 control ledger 存在匹配的已消费 added 时可绕过。两者都不能绕过下面
+的 Reaction 权限门禁；added 还必须通过 chain-correlation 校验。更新 Reaction 快照或产生
+任何副作用前，Bridge 必须：
 
 1. 私聊复用普通消息的 `canUseDm` 判定。
 2. 群聊先复用普通消息的 `canUseGroup` 判定，校验 operator 是否能在该群使用当前 Bot。
@@ -141,9 +143,12 @@ Reaction handler 收到事件后，必须先做 self-operator guard：若 operat
 
 任一权限门禁失败时必须静默拒绝：不更新 Reaction revision/快照、不进入 pending queue、不启动 Agent、不调用 stop/interrupt、不取消已有队列，也不发送非授权提示。日志只记录受限的 scope、operator 后缀和拒绝 reason。
 
-`stop_current_work` 也必须先通过完全相同的门禁，才允许进入控制面。未经授权的 `No`、`CrossMark` 或 `MinusOne` 不能停止其他人的任务。目标消息的 sender 只用于安全路由和
-workChain correlation，不额外授予 stop 权限；能否停止仍与同一 operator 在该 scope 使用
-`/stop` 的权限一致。
+`stop_current_work` 也必须先通过完全相同的 Reaction 门禁，才允许进入控制面。未经授权的
+`No`、`CrossMark` 或 `MinusOne` 不能停止其他人的任务。目标消息的 sender 只用于安全路由
+和 workChain correlation，不额外授予 stop 权限。停止后的**效果**与 `/stop` 相同，但权限
+不是“能发送带 @ 的 `/stop` 就能消费 Reaction”：Reaction 仍固定按
+`mentionedBot=false` 的 `decideGroupResponse` 计算，只允许能发送等价无 @ 普通输入的
+operator 消费，不得复用命令特例或结构化 @ 资格旁路。
 
 ### 4. Confirmed Predefined Semantics
 
@@ -163,7 +168,7 @@ workChain correlation，不额外授予 stop 权限；能否停止仍与同一 o
 
 ### 5. Batching、Revision、路由与回复关系
 
-- 只有目标消息发送者等于当前 Bot 的 `open_id` 或 app client ID 时，Reaction 才能进入 Agent 队列；其他 Bot 或用户消息上的**非停止** Reaction 继续静默跳过。`stop_current_work` 不进入 Agent 队列，可额外接受目标为当前 workChain inbound trigger 的用户消息；任意其他用户消息仍 fail closed。
+- 只有目标消息发送者等于当前 Bot 的 `open_id` 或 app client ID 时，Reaction 才能进入 Agent 队列；其他 Bot 或用户消息上的**非停止** Reaction 继续静默跳过。`stop_current_work` 不进入 Agent 队列，可额外接受目标为已登记 workChain inbound trigger 的用户消息；从未登记过的用户消息静默跳过，已知 historical trigger 在另一 current chain 存在时才按关联不匹配 fail closed。
 - Reaction 是 pending queue 的 batch barrier，不与普通消息合并。普通消息与 Reaction 在同一 debounce window 或 active run 期间到达时，按到达顺序保留为不同 input unit。
 - Reaction input unit 按 `scope + operatorOpenId + targetMessageId` 隔离。不同操作者或不同目标消息不得合并；每个 input unit 至多产生一个 Agent turn，并 `replyTo` 自己的目标消息。由 Bridge 确定性处理的控制/撤回状态不创建 Agent turn。话题消息继续留在原 `threadId`。
 - 每个通过权限并最终被消费的最新 Reaction 状态都必须有一条可见回复，并引用自己的目标消息。多个目标仍分别回复，不能用一条回复含混覆盖。重复/乱序 no-op 不是新的有效状态，不重复回复。
@@ -178,24 +183,41 @@ workChain correlation，不额外授予 stop 权限；能否停止仍与同一 o
 
 ## Stop Reaction Control Contract
 
-`stop_current_work` 的 added 和 removed 都不能依赖普通 Reaction → event buffer → pending queue → Agent run 链路。Bridge 为它们维护独立、持久的控制事件 ledger。它有两类合法目标：
+`stop_current_work` 的 added 和 removed 都不能依赖普通 Reaction → event buffer → pending queue → Agent run 链路。Bridge 为它们维护独立、持久的控制事件 ledger。`added` 有两类可识别目标：
 
 1. 已映射到当前 workChain 的 Bot 普通消息或卡片；以及
 2. 触发当前 queued/reserved/active input unit 的入站用户消息。
 
 第二类是流式卡片更新期间的主 stop 入口；只对 `No` / `CrossMark` / `MinusOne` 生效，
-不得让用户消息上的肯定、解释、完成或未映射 Reaction 进入 Agent。
+不得让用户消息上的肯定、解释、完成或未映射 Reaction 进入 Agent。对于 user target，
+Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `No` / `CrossMark` /
+`MinusOne` 解释为 stop；从未登记过的用户消息不具有 stop 语义。
 
-- 完成 self-operator、安全路由、目标 sender 分类、权限门禁、语义映射和控制事件防重后，`action=added` 按以下顺序处理：若当前 scope 完全没有 active/reserved/queued work，直接幂等回复“当前没有需要停止的任务”；只有 scope 存在 current work 时，才校验目标消息是否为 current workChain 的 trigger 或 outbound，关联通过后立即执行一次控制动作并持久标记 stop-added 已消费。它不等待普通 Reaction quiet window，也不能与紧随其后的 `removed` 相消。
-- `action=removed` 仍先通过 self-operator、安全路由、目标 sender 分类和权限门禁，但不要求该 chain 此刻仍为 current；它根据同一 operator/target/emoji 的 stop-added ledger 只回复一次“撤回停止 Reaction 不会自动恢复工作”，随后持久标记 stop-removed 已消费。它不撤销 interrupt、不恢复队列、不启动 Agent；没有匹配 stop-added 记录时静默 no-op。
+- 完成 self-operator、安全路由、目标 sender 分类、Reaction 权限门禁、语义映射和控制事件防重后，`action=added` 先做目标 eligibility，再判断 work 状态：
+  - user target 从未登记为该 scope 的 inbound trigger：静默丢弃，不回复、不写控制 ledger；
+  - user target 是仍受 retention 保护的 historical trigger，且 scope 完全无 work：幂等回复“当前没有需要停止的任务”并持久标记已消费；
+  - user target 是 historical trigger，但 scope 有另一 current chain：fail closed，不 interrupt、不取消队列，回复未停止及 `/stop` 提示并持久标记已消费；
+  - Bot target 沿用现有规则：scope 完全无 work 时先幂等回复无任务；存在 work 时再校验它是否映射到 current chain；
+  - target 是 current workChain 的 inbound trigger 或 Bot outbound：立即执行一次控制动作并持久标记 stop-added 已消费。
+  它不等待普通 Reaction quiet window，也不能与紧随其后的 `removed` 相消。
+- `action=removed` 仍先通过 self-operator、安全路由、目标 sender 分类和 Reaction 权限门禁，
+  但不依赖 target 仍为 current/historical，也不依赖运行期 correlation 尚存在。对于 user
+  target，只有持久控制 ledger 中存在同一 operator/target/emoji 的**已消费 added** 记录，
+  才允许绕过 own-message filter；匹配后只回复一次“撤回停止 Reaction 不会自动恢复工作”，
+  随后持久标记 stop-removed 已消费。它不撤销 interrupt、不恢复队列、不启动 Agent；
+  没有匹配 stop-added 记录时静默 no-op。
 - added/removed 都优先使用 reaction/event 中可用的稳定 ID 生成防重 fingerprint；缺少稳定 ID 时使用规范化事件字段和 action time 生成。重复投递、乱序重放或 Bridge 重启后的已消费事件均为静默 no-op，不能重复中断或回复。
 
 停止能力还必须校验目标消息与当前执行链路的关联，避免用户给历史消息添加否定 Reaction 时误停一个无关的新任务。关联使用 Bridge 内部的 `workChainId`，不交给模型推断：
 
-- 每个新入站 input unit 在进入 pending queue 时分配 `workChainId`，并立即登记其
-  `triggerMessageId → workChainId`；该 trigger 可以是普通用户消息、卡片回调 synthetic
-  message，或启动 Reaction turn 的 Bot 目标消息。显式回复或 Reaction 指向已有关联信息的
-  Bot 消息时继承该消息的 `workChainId`，无关联的新普通消息开启新 chain。
+- 每个新入站 input unit 在进入 pending queue 时分配 `workChainId`。一个 regular
+  PendingUnit 可以合并同 debounce window 的多条普通消息，因此必须登记该 unit 中**全部
+  真实、用户可见的 inbound message ID**，形成
+  `triggerMessageIds[] → workChainId`，不能只登记 first/last message。内部 synthetic
+  unit ID 不得替代用户实际能够添加 Reaction 的 message ID。启动 Reaction turn 的 Bot
+  目标消息继续通过 Bot outbound correlation 继承 chain；卡片回调若只有内部 synthetic
+  message，则不凭 synthetic ID 创建 user-trigger stop 入口。显式回复或 Reaction 指向已有
+  关联信息的 Bot 消息时继承该消息的 `workChainId`，无关联的新普通消息开启新 chain。
 - pending unit、run reservation、active run 都携带 `workChainId`。Bot outbound message ID 一旦创建，立即登记为该 run 的 `workChainId`；发起当前 work 的 Bot 确认/方案消息也属于被继续的同一 chain。
 - chain 只要仍有 queued/reserved/active work 就是 current；全部进入 terminal 后是 historical。后续有效回复或 Reaction 可以继承该 ID 重新继续此 chain，但在它重新产生 queued/reserved/active work 前不能停止另一个 current chain。
 - 当前 scope 存在 active/reserved/queued work 时，停止 Reaction 的目标 message ID 必须作为
@@ -204,9 +226,17 @@ workChain correlation，不额外授予 stop 权限；能否停止仍与同一 o
   属于 historical chain、不是该 chain 的 trigger/outbound、映射已过期，或 Bridge 重启后
   无法恢复关联时，一律 fail closed：不中断、不取消队列，并回复该 Reaction 未停止当前
   任务、如需停止可使用 `/stop`。该分支不得覆盖前述“scope 完全无 work”的幂等回复。
-- `workChainId` 和 message correlation 是有界运行期控制元数据；Bridge 重启后旧关联可以整体失效，不根据会话文本猜测重建。每次 outbound 登记、chain lifecycle 变化和 fail-closed reason 都写受限结构化日志。
+- inbound trigger 与 Bot outbound correlation 使用相同 chain 生命周期。queued/reserved/
+  active chain 的全部 trigger/outbound mapping 都是 current workload reference，不参与
+  historical TTL/LRU；最后一个 in-flight unit terminal 后才进入 historical retention。chain
+  因后续有效回复或 Reaction 重新 current 时，其仍保留的 trigger/outbound mapping 一并
+  恢复 current 保护。historical mapping 才受有界 TTL/LRU 裁剪；Bridge 重启后运行期
+  correlation 可以整体失效并 fail closed，不根据会话文本猜测重建。每次 trigger/outbound
+  登记、chain lifecycle 变化和 fail-closed reason 都写受限结构化日志。
 
-1. 权限判断与当前 scope 的 `/stop` 保持一致；Reaction 路径不能绕过现有访问控制。
+1. 权限严格使用 Reaction 的 `canUse* + mentionedBot=false 的 decideGroupResponse` 门禁；
+   只有 interrupt/cancel **效果**与当前 scope 的 `/stop` 一致。Reaction 路径不能复用命令
+   特例、结构化 @ 或绕过现有访问控制。
 2. 目标消息属于当前执行链路时，在进入普通 pending queue 前调用现有 active-run interrupt 能力，覆盖已启动的 run 和尚处于 reservation/prompt preparation 的 run。
 3. 关联校验通过后，效果与当前 scope 的 `/stop` 一致：取消该 scope 尚未开始的全部普通消息和 Reaction input units，包括同 scope 的 sibling queued unit，防止停止后又自动启动旧队列。`workChainId` 只用于防止历史/无关目标误触发，不把 `/stop` 改造成局部取消。
 4. 已有 run 按现有 `/stop` 生命周期收敛为 interrupted，流式卡片/文本回复不得继续写入成功终态。
@@ -299,6 +329,17 @@ workChain correlation，不额外授予 stop 权限；能否停止仍与同一 o
 | `No` / `CrossMark` / `MinusOne` 指向当前执行链路，且 scope 正在运行或准备运行 | 映射为 `stop_current_work`；在普通排队前触发与 `/stop` 等价的 interrupt，取消 pending，并由 Bridge 回复停止结果 |
 | 流式卡片仍在更新，operator 对触发当前任务的用户消息添加 `No` / `CrossMark` / `MinusOne` | trigger message 已在 enqueue 时映射到 current `workChainId`；允许立即 interrupt + cancel pending，不要求正在更新的卡片可添加 Reaction |
 | operator 对普通用户消息添加非停止 Reaction | 继续静默跳过；不进入 Agent、不建立普通 Reaction snapshot/revision |
+| scope 无 work，operator 对从未登记过的普通用户消息添加停止 Reaction | 静默丢弃；不回复、不写控制 ledger |
+| scope 无 work，operator 对仍在 retention 内的 known historical trigger 添加停止 Reaction | 幂等回复当前没有需要停止的任务并写已消费控制 ledger；不启动 Agent |
+| scope 有另一 current chain，operator 对 unrelated user message 添加停止 Reaction | 未知 user target 静默丢弃；已知 historical trigger 则 fail closed，均不 interrupt、不取消 pending |
+| `mention-only` 群内，operator 可以发送结构化 `@bot /stop`，但没有无 @ 豁免 | 文字命令按原规则处理；stop Reaction 固定按 `mentionedBot=false` 被拒绝，不借命令资格旁路 |
+| trigger 消息作者无 Reaction 权限 | sender 身份不授予权限；静默拒绝且不影响 run |
+| 另一 operator 通过 Reaction 无 @ 门禁，对 current trigger 添加停止 Reaction | target sender 不限制 operator；按与其无 @ 普通输入相同的权限允许 stop |
+| Reaction 事件解析出的 scope/thread 与 trigger correlation 不一致 | fail closed；不 interrupt、不取消 pending |
+| 同一 regular PendingUnit 合并用户消息 A、B | A、B 的真实 message ID 均映射同一 current chain；对任一消息添加 stop 均可停止，synthetic unit ID 不作为用户入口 |
+| current trigger 持续时间超过 historical TTL，或 current mapping 数量超过 historical cap | trigger mapping 仍受 current 保护，不被 TTL/LRU 淘汰；stop 继续可达 |
+| stop-added 后 chain terminal 或 trigger correlation 被 historical TTL/LRU 淘汰，再收到对应 removed | 仅凭持久 added ledger 匹配并只回复一次不恢复；不依赖运行期 correlation |
+| Bridge 在 stop-added 后重启，再收到 user-target removed | 从持久 added ledger 匹配并只回复一次不恢复；无匹配则静默 |
 | 当前任务已 terminal 后，operator 才对完成卡片添加停止 Reaction | scope 无 current work 时回复当前没有需要停止的任务；不回滚已完成动作、不启动 Agent |
 | `stop_current_work` 指向历史/无关消息，同时当前 scope 有另一条执行链路 | fail closed；不 interrupt、不取消当前 pending，并可见回复未停止及 `/stop` 提示 |
 | 当前 run 已产生 Bot 输出，停止 Reaction 指向该输出 | outbound message 与 active `workChainId` 匹配；允许 interrupt |
@@ -335,14 +376,18 @@ workChain correlation，不额外授予 stop 权限；能否停止仍与同一 o
 
 自动化测试至少覆盖 Reaction handler 路由、self-operator/`Typing` 回环保护、普通消息访问控制与四种群响应模式的同值矩阵、所有已授权 operator 共享同一预埋语义、未经授权的停止 Reaction、上述 11 个 `emojiType` 的精确预埋映射、未映射 Reaction（含 `Get`）透传、同 key event buffer 的 quiet/max flush、多个不同 Reaction 的有序 `triggerReactions`、同一 buffer 一增一减且最终非空、`rawClient.im.v1.messageReaction.list` 全分页 reconciliation、fingerprint 规范化/去重/确定性排序、list 越过中间状态的 added→removed 净零例外、ledger 重启恢复、重复/乱序/无状态变化 no-op、scope 缩权与读取失败、所有被消费 Reaction 的可见回复、prompt builder 序列化、共享 System Prompt 注入、目标消息规范化（含卡片/合并转发 wiring）、revision 失效/中断/最新快照替代、superseded 流式回复、`added`/`removed` 相消与独立撤回、两级目标消息读取失败、其他发送者过滤、batch barrier、按目标拆分和 reply target。
 
-`stop_current_work` 另需覆盖与 `/stop` 一致的权限判断、`workChainId` 在 inbound
-trigger/input/pending/reservation/active/outbound/terminal 生命周期中的关联、用户 trigger
-消息和 Bot outbound 两类合法目标、用户消息上的非停止 Reaction 仍被过滤、目标确认消息被
-Reaction 继续、同 scope sibling queued unit、重启后未知关联 fail closed、独立
-added/removed 控制 ledger 的重复投递与重启防重、active handle、run
-reservation/prompt preparation、scope pending queue 取消、无任务幂等、removed 不恢复、
-每种结果的可见 Bridge 回复、interrupted UI 终态，以及“停止 Reaction 不产生新的 Agent
-run”。
+`stop_current_work` 另需覆盖 Reaction 无 @ 权限门禁与 `/stop` interrupt/cancel 效果、
+`workChainId` 在 inbound
+trigger/input/pending/reservation/active/outbound/terminal 生命周期中的关联、同一 regular
+PendingUnit 全部真实 inbound message ID 的登记、current trigger mapping 不受 historical
+TTL/LRU、用户 trigger 和 Bot outbound 两类合法目标、未知 user target 静默、known
+historical trigger 的 no-work/fail-closed 分支、用户消息上的非停止 Reaction 仍被过滤、
+目标确认消息被 Reaction 继续、同 scope sibling queued unit、Reaction 无 @ 权限与
+`@bot /stop` 命令资格的差异、sender 不授予权限、scope/thread 不匹配、重启后未知关联
+fail closed、独立 added/removed 控制 ledger 的重复投递与重启防重、removed 在 correlation
+消失/淘汰/重启后仅凭 added ledger 匹配、active handle、run reservation/prompt
+preparation、scope pending queue 取消、无任务幂等、removed 不恢复、每种结果的可见
+Bridge 回复、interrupted UI 终态，以及“停止 Reaction 不产生新的 Agent run”。
 
 Claude 和 Codex 两条 adapter 路径都必须通过确定性的结构/注入测试。随后各使用验收时当前 profile 配置的一个真实模型完成同一组 live-model 对照；记录 Agent 类型、实际模型标识和时间，任一路径未执行都不能宣称全量完成。
 
