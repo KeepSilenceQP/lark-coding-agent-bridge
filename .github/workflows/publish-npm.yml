@@ -3,24 +3,32 @@ name: Publish npm package
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing release tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: npm-publish-${{ github.event.release.tag_name }}
+  group: npm-publish-${{ github.event.release.tag_name || inputs.tag_name }}
   cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
 
     steps:
       - name: Check out the released tag
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up Node and npm registry
         uses: actions/setup-node@v6
@@ -30,13 +38,13 @@ jobs:
           package-manager-cache: false
 
       - name: Use an OIDC-capable npm CLI
-        run: npm install --global "npm@^11.5.1"
+        run: npm install --global "npm@^11.5.1" "pnpm@10.33.0"
 
       - name: Verify tag and package version match
         shell: bash
         run: |
           package_version="$(node -p 'require("./package.json").version')"
-          test "${{ github.event.release.tag_name }}" = "v${package_version}"
+          test "${RELEASE_TAG}" = "v${package_version}"
 
       - name: Install the release layout
         run: npm install --install-links=true
