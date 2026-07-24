@@ -1,7 +1,7 @@
 # Correct Reaction Handling By Bridge Agents — Coding Plan
 
 Date: 2026-07-24
-Status: Spec amendment confirmed; Plan amendment pending independent review; runtime code and Unit 11 stop live frozen
+Status: Amendment Plan Review GO; Unit 12 implementation authorized; Code Review/deployment/Unit 11 stop live frozen
 Spec authority: `docs/specs/20260723-reaction-target-context-and-agent-semantics.md` (commit `526cbcb`，confirmed；`stop_current_work` trigger-message amendment independent review PASS)
 Target branch: `fix/bugfix` (synced to `526cbcb`)
 Harness protocol: `feishu-group-project-flow-v2`
@@ -31,6 +31,7 @@ Implementer: 小C（Unit 1-10）→ 小P（B9 R6-R8 接管及后续闭环）
 - 2026-07-24 Unit 11 stop live 暴露产品约束：流式卡片在编辑过程中无法添加 Reaction，故“对正在更新的 Bot 卡片添加 stop Reaction”不能作为唯一实时停止入口；当前实现又在 stop 分支之前做 own-message 过滤，导致对触发任务的用户消息添加 `No` 被静默丢弃。
 - 2026-07-24 小P修订 Spec 并完成三轮独立 SubAgent Review：R1 `76e6f02`、R2 `ab1fee0` BLOCKED；R3 `602bc7a` PASS/GO，最终确认提交 `526cbcb`。确认 user-trigger stop 的 eligibility-before-no-work、removed ledger bypass、PendingUnit 全部真实 trigger ID、current mapping TTL/LRU 保护、Reaction 无 @ 权限边界和负向验收；Plan、代码、部署与 live 均需重新过 gate。
 - 2026-07-24 Amendment Plan Review R1（`526cbcb..cf77468`）BLOCKED，5 项 finding 全部采纳：①普通 non-stop 必须 own-message-before-permission，stop 才走 user-target 权限/eligibility；②清除旧完成状态对 amendment 的误覆盖；③把过期 Current Evidence 明确标为 historical baseline；④trigger historical cap 独立于 outbound 256 预算；⑤补 unknown user target 在 no-work / another-current 两种状态下均静默的生产 seam。
+- 2026-07-24 Amendment Plan Review R2（`cf77468..9672b74`）GO：独立 SubAgent 确认上轮 5 项全部 CLOSED，Bot target 兼容、真实 inbound ID、synthetic 排除、current mapping 保护、removed ledger、Reaction 无 @ 权限及 live oracle 与 Spec `526cbcb` 一致；GO 仅放行 Unit 12 实现。
 
 ## Historical Baseline And Amendment Evidence
 
@@ -616,8 +617,8 @@ pnpm -s test
 
 Amendment Plan Review Gate（Spec `526cbcb`）：
 
-- [ ] 独立 SubAgent 审查本 Plan amendment 的 exact commit range；Reviewer 不修改 Plan/代码。
-- [ ] 确认 DD2/DD3/DD15/DD16、Unit 12、覆盖矩阵和 live oracle 与 Spec 一致，尤其不再出现 no-work-before-user-eligibility。
-- [ ] 确认 ordinary Bot-target Reaction、Bot stop target、`/stop`、PendingUnit lease/B9 R8 生命周期无静默回归。
-- [ ] 确认 negative cases 完整：非停止 user reaction、unknown/expired/restart-lost、removed 无 ledger、无权限/mention-only、scope/thread mismatch、多消息 unit。
-- [ ] Reviewer `GO` 后才允许修改运行代码；BLOCKER/HIGH 必须全部闭合。
+- [x] 独立 SubAgent 审查本 Plan amendment exact ranges `526cbcb..cf77468`、`cf77468..9672b74`；Reviewer 未修改 Plan/代码。
+- [x] 确认 DD2/DD3/DD15/DD16、Unit 12、覆盖矩阵和 live oracle 与 Spec 一致，尤其不再出现 no-work-before-user-eligibility。
+- [x] 确认 ordinary Bot-target Reaction、Bot stop target、`/stop`、PendingUnit lease/B9 R8 生命周期无静默回归。
+- [x] 确认 negative cases 完整：非停止 user reaction、unknown/expired/restart-lost、removed 无 ledger、无权限/mention-only、scope/thread mismatch、多消息 unit。
+- [x] R2 Reviewer `GO`；Unit 12 实现放行，Code Review/部署/live 仍冻结。
