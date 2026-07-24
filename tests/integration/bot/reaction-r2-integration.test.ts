@@ -1668,3 +1668,106 @@ describe('PendingQueue ordered-unit deque — interleaved arrival order', () => 
     expect(remaining.map(m => m.messageId)).toEqual(['B']);
   });
 });
+
+// ── WorkChainStore: single allocation + outbound registration + stop correlation ──
+// Exercises the production seam: pipeline resolveWorkChain must register the
+// target in the outbound map so that subsequent calls (flush, stop) hit the
+// same chain. ResolveCurrentChain must find queued/reserved/active chains.
+
+describe('WorkChainStore single allocation + outbound registration (production seam)', () => {
+  it('resolveOrAllocate + registerOutbound → subsequent resolveOrAllocate returns same chain', () => {
+    const store = new WorkChainStore();
+    const scope = 'oc_s';
+    const targetMsgId = 'om_confirm';
+
+    // First call (pipeline): allocate + register target
+    const chain1 = store.resolveOrAllocate(scope, targetMsgId);
+    store.registerOutbound(chain1, targetMsgId);
+
+    // Second call (flush): same target → same chain, no double allocation
+    const chain2 = store.resolveOrAllocate(scope, targetMsgId);
+    expect(chain2).toBe(chain1);
+  });
+
+  it('resolveOrAllocate without registerOutbound → second call allocates different chain (old bug)', () => {
+    const store = new WorkChainStore();
+    const scope = 'oc_s';
+    const targetMsgId = 'om_confirm';
+
+    // Old bug: pipeline allocates but forgets to register
+    const chain1 = store.resolveOrAllocate(scope, targetMsgId);
+    // (missing registerOutbound)
+
+    // Flush allocates again → different chain
+    const chain2 = store.resolveOrAllocate(scope, targetMsgId);
+    expect(chain2).not.toBe(chain1);
+  });
+
+  it('resolveCurrentChain finds chain when target registered and chain is current', () => {
+    const store = new WorkChainStore();
+    const scope = 'oc_s';
+    const targetMsgId = 'om_bot_output';
+
+    const chain = store.allocate(scope);
+    store.registerOutbound(chain, targetMsgId);
+
+    const resolved = store.resolveCurrentChain(targetMsgId);
+    expect(resolved).toBe(chain);
+  });
+
+  it('resolveCurrentChain returns undefined when target was never registered', () => {
+    const store = new WorkChainStore();
+    // No outbound mapping exists
+
+    const resolved = store.resolveCurrentChain('om_unknown');
+    expect(resolved).toBeUndefined();
+  });
+
+  it('resolveCurrentChain returns undefined for terminal (historical) chain', () => {
+    const store = new WorkChainStore();
+    const scope = 'oc_s';
+    const targetMsgId = 'om_old';
+
+    const chain = store.allocate(scope);
+    store.registerOutbound(chain, targetMsgId);
+    store.markTerminal(chain);
+
+    const resolved = store.resolveCurrentChain(targetMsgId);
+    expect(resolved).toBeUndefined();
+  });
+
+  it('pipeline→flush→stop: single chain across the full lifecycle', () => {
+    const store = new WorkChainStore();
+    const scope = 'oc_s';
+    const targetMsgId = 'om_approve_target';
+
+    // Pipeline: resolveOrAllocate + registerOutbound (as channel.ts now does)
+    const chain = store.resolveOrAllocate(scope, targetMsgId);
+    store.registerOutbound(chain, targetMsgId);
+    expect(store.isCurrent(chain)).toBe(true);
+
+    // Flush: resolveOrAllocate again → same chain
+    const flushChain = store.resolveOrAllocate(scope, targetMsgId);
+    expect(flushChain).toBe(chain);
+
+    // Stop: resolveCurrentChain → finds the chain (it's still current)
+    const stopResolved = store.resolveCurrentChain(targetMsgId);
+    expect(stopResolved).toBe(chain);
+  });
+
+  it('resolveCurrentChain marks chain as terminal → no longer current → resolve returns undefined', () => {
+    const store = new WorkChainStore();
+    const scope = 'oc_s';
+    const targetMsgId = 'om_done';
+
+    const chain = store.allocate(scope);
+    store.registerOutbound(chain, targetMsgId);
+
+    // While current → found
+    expect(store.resolveCurrentChain(targetMsgId)).toBe(chain);
+
+    // After terminal → not found
+    store.markTerminal(chain);
+    expect(store.resolveCurrentChain(targetMsgId)).toBeUndefined();
+  });
+});

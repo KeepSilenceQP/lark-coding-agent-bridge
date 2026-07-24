@@ -1366,7 +1366,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
               return chatModeCache.resolve(channel, chatId);
             },
             resolveWorkChain: (scope, replyToMessageId) => {
-              return workChainStore.resolveOrAllocate(scope, replyToMessageId);
+              const chain = workChainStore.resolveOrAllocate(scope, replyToMessageId);
+              // Register the reaction target as an outbound mapping so that
+              // subsequent pipeline/flush lookups and stop-current-work
+              // resolution hit the same chain (prevents double allocation).
+              if (replyToMessageId) {
+                workChainStore.registerOutbound(chain, replyToMessageId);
+              }
+              return chain;
             },
           });
 
@@ -2357,13 +2364,20 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             producer: async (ctrl) => {
               producerStarted = true;
               cardCtrl = ctrl;
+              // Register outbound IMMEDIATELY so stop can correlate during streaming.
+              _registerOutboundOnStream(ctrl);
               await ctrl.update(renderCard(filterForPrefs(latestState), cardRenderOptions));
               await renderDone;
             },
           },
         },
         sendOpts,
-      );
+      ).then((result) => {
+        // Fallback: register on stream completion (idempotent — does nothing if
+        // already registered at producer start).
+        _registerOutboundOnStream(result);
+        return result;
+      });
       await awaitRenderAwareStream({
         mode: replyMode,
         streamDone,
@@ -2448,6 +2462,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             markdown: async (ctrl) => {
               producerStarted = true;
               markdownCtrl = ctrl;
+              // Register outbound IMMEDIATELY so stop can correlate during streaming.
+              _registerOutboundOnStream(ctrl);
               const initialMarkdown = renderMarkdownStreamText(filterForPrefs(latestState));
               await setMarkdownContent('initial', initialMarkdown);
               const finalState = await renderDone;
