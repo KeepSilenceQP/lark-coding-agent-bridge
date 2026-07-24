@@ -9,6 +9,7 @@ import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { requestDeferredServiceRestart } from '../../../src/runtime/deferred-service-restart.js';
 import { readRouteLease } from '../../../src/runtime/route-lease.js';
 import { makeReactionKey } from '../../../src/bot/reaction/types.js';
+import { withReactionTurnId } from '../../../src/bot/reaction/turn-message.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
 
@@ -28,7 +29,11 @@ vi.mock('@larksuite/channel', async (importOriginal) => {
   };
 });
 
-import { setReactionTurnMeta, startChannel } from '../../../src/bot/channel.js';
+import {
+  hasTurnMetaForTurnId,
+  setReactionTurnMeta,
+  startChannel,
+} from '../../../src/bot/channel.js';
 
 interface MessageHandlerMap {
   message?: (msg: NormalizedMessage) => Promise<void> | void;
@@ -106,16 +111,25 @@ describe('markdown stream startup failures', () => {
     const turnId = `${reactionKey}:1`;
     setReactionTurnMeta(reactionKey, targetMessageId, scope, 'wc-receipt-route', 1, turnId);
 
-    await h.channel.handlers.message?.({
-      ...message(turnId, '[reaction] GoGoGo'),
-      rawContentType: 'reaction' as never,
-    });
+    const reactionMessage = withReactionTurnId(
+      {
+        ...message(targetMessageId, '[reaction] GoGoGo'),
+        rawContentType: 'reaction' as never,
+      },
+      turnId,
+    );
+    await h.channel.handlers.message?.(reactionMessage);
     await waitFor(() => h.agent.runOptions.length === 1);
+    await waitFor(() => !hasTurnMetaForTurnId(turnId));
 
     const routeId = h.agent.runOptions[0]?.routeId;
     expect(routeId).toBeTypeOf('string');
     const lease = await readRouteLease(h.tmp.profile, routeId!);
     expect(lease?.replyTo).toBe(targetMessageId);
+    expect(h.channel.rawClient.im.v1.messageReaction.create).toHaveBeenCalledWith({
+      path: { message_id: targetMessageId },
+      data: { reaction_type: { emoji_type: 'Typing' } },
+    });
   });
 
   it('does not leave the IM queue blocked when the agent exits before stream producer starts', async () => {

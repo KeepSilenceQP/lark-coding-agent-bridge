@@ -15,6 +15,10 @@ import {
 import { PendingQueue } from '../../../src/bot/pending-queue';
 import { ReactionContextStore } from '../../../src/bot/reaction/context-store';
 import { ReactionRunTracker } from '../../../src/bot/reaction/run-tracker';
+import {
+  reactionTurnIdOf,
+  withReactionTurnId,
+} from '../../../src/bot/reaction/turn-message';
 import { WorkChainStore } from '../../../src/bot/reaction/work-chain';
 import { makeReactionKey, type ReactionContext } from '../../../src/bot/reaction/types';
 
@@ -115,26 +119,35 @@ describe('Reaction lifecycle cleanup production seams', () => {
     pending.block(state.scope);
     pending.pushBarrier(
       state.scope,
-      {
-        messageId: state.turnId,
-        chatId: state.scope,
-        chatType: 'group',
-        senderId: state.operatorOpenId,
-        content: '[reaction] test',
-        rawContentType: 'reaction' as never,
-        resources: [],
-        mentions: [],
-        mentionAll: false,
-        mentionedBot: false,
-        createTime: Date.now(),
-      },
+      withReactionTurnId(
+        {
+          messageId: state.targetMessageId,
+          chatId: state.scope,
+          chatType: 'group',
+          senderId: state.operatorOpenId,
+          content: '[reaction] test',
+          rawContentType: 'reaction' as never,
+          resources: [],
+          mentions: [],
+          mentionAll: false,
+          mentionedBot: false,
+          createTime: Date.now(),
+        },
+        state.turnId,
+      ),
       { workChainId: state.workChainId, unitId: state.turnId },
     );
 
     const dropped = pending.cancel(state.scope);
-    for (const item of dropped) releaseEnqueuedTurn(state.scope, item.messageId, state);
+    for (const item of dropped) {
+      releaseEnqueuedTurn(
+        state.scope,
+        reactionTurnIdOf(item) ?? item.messageId,
+        state,
+      );
+    }
 
-    expect(dropped.map((item) => item.messageId)).toEqual([state.turnId]);
+    expect(dropped.map((item) => item.messageId)).toEqual([state.targetMessageId]);
     expectCleaned(state);
   });
 

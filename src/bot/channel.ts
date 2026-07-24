@@ -112,6 +112,10 @@ import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { handleReactionEvent } from './reaction/pipeline';
 import { isStopEmoji, lookupReactionSemantics } from './reaction/semantics';
+import {
+  reactionTurnIdOf,
+  withReactionTurnId,
+} from './reaction/turn-message';
 import { WorkChainStore } from './reaction/work-chain';
 import { ReactionContextStore } from './reaction/context-store';
 import { ReactionBuffer } from './reaction/buffer';
@@ -1205,8 +1209,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     // Generate unique opaque turnId: reactionKey + revision ensures each enqueue
     // is uniquely identifiable, even for the same key re-enqueued at a higher revision.
     const turnId = `${result.key}:${result.revision}`;
-    const normalizedMsg = {
-      messageId: turnId,
+    const normalizedMsg = withReactionTurnId({
+      // Keep the externally meaningful message id intact. The opaque turnId
+      // lives on a private symbol and in WorkLease.unitId.
+      messageId: result.components.targetMessageId,
       chatId: result.components.scope.split(':')[0] ?? result.components.scope,
       chatType: 'group' as const,
       senderId: result.components.operatorOpenId,
@@ -1217,7 +1223,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       mentionAll: false,
       mentionedBot: false,
       createTime: Date.now(),
-    } satisfies import('@larksuite/channel').NormalizedMessage;
+    } satisfies import('@larksuite/channel').NormalizedMessage, turnId);
     // F10/F11: Carry reaction metadata through to the run lifecycle
     const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
     if (wcId) {
@@ -1390,13 +1396,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch, lease) => {
     const firstMsg = batch[0];
     if (!firstMsg) return;
+    const internalUnitId = reactionTurnIdOf(firstMsg) ?? firstMsg.messageId;
     // Reserve synchronously at the dequeue boundary, before chat-mode/media/
     // quote/prompt preparation can await. A stop Reaction can now abort this
     // reservation throughout the complete queue→prompt-prep window.
     const initialInterruptEpoch = activeRuns.interruptEpoch(scope);
     const preparationReservation = executor.reserveScope(scope);
     if (!preparationReservation) {
-      releaseFlushedTurnAfterError(scope, firstMsg.messageId, lease);
+      releaseFlushedTurnAfterError(scope, internalUnitId, lease);
       log.warn('flush', 'reservation-unavailable-at-dequeue', { scope });
       return;
     }
@@ -1404,7 +1411,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     activeBatchCount += 1;
     void executePendingFlushWithCleanup({
       scope,
-      messageId: firstMsg.messageId,
+      messageId: internalUnitId,
       lease,
       run: () =>
         withTrace({ chatId: firstMsg.chatId }, async () => {
@@ -1644,7 +1651,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
               cancelPending: () => {
                 const removed = pending.cancel(pipelineResult.scope);
                 for (const m of removed) {
-                  releaseEnqueuedTurn(pipelineResult.scope, m.messageId);
+                  releaseEnqueuedTurn(
+                    pipelineResult.scope,
+                    reactionTurnIdOf(m) ?? m.messageId,
+                  );
                 }
               },
             });
@@ -2051,7 +2061,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     // units — the queue released their WorkLease, but reaction entries in the
     // tracker / turn-meta / contextStore are keyed by reactionKey and must be
     // cleaned explicitly to avoid stale queued tracker → false reserved race.
-    for (const m of dropped) releaseEnqueuedTurn(scope, m.messageId);
+    for (const m of dropped) {
+      releaseEnqueuedTurn(scope, reactionTurnIdOf(m) ?? m.messageId);
+    }
     log.info('intake', 'command', { scope, droppedPending: dropped.length });
     return;
   }
@@ -2129,7 +2141,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const firstMsg = batch[0];
   const lastMsg = batch[batch.length - 1];
   if (!firstMsg || !lastMsg) return;
-  if (releaseInvalidatedReactionTurn(scope, firstMsg.messageId, deps.lease)) return;
+  const isReactionBatch = lastMsg.rawContentType === ('reaction' as never);
+  const reactionTurnId = isReactionBatch
+    ? (reactionTurnIdOf(firstMsg) ?? deps.lease?.unitId)
+    : undefined;
+  const lifecycleUnitId = reactionTurnId ?? firstMsg.messageId;
+  if (releaseInvalidatedReactionTurn(scope, lifecycleUnitId, deps.lease)) return;
 
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
@@ -2220,9 +2237,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     : undefined;
 
   // F1: Detect reaction batches and collect reactionContexts via internal store
-  const isReactionBatch = lastMsg.rawContentType === ('reaction' as never);
   const reactionContexts: unknown[] | undefined = isReactionBatch
-    ? getReactionContexts(batch.map(m => m.messageId))
+    ? getReactionContexts(reactionTurnId ? [reactionTurnId] : [])
     : undefined;
 
   const prompt = buildPrompt(
@@ -2244,16 +2260,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // For topic groups: thread the reply so it lands in the same topic as the
   // user's message. Otherwise the SDK posts at top level and the user's
   // topic discussion breaks visually.
-  // F1: For reaction batches, replyTo targets the reaction's target message,
-  // not the last batch message (which uses the opaque turnId).
-  const replyToId = isReactionBatch
-    ? (() => {
-        const turnId = batch[0]?.messageId ?? '';
-        const rk = _reactionTurnMetaByTurnId.get(turnId);
-        // reactionKey format: scope\x1foperatorOpenId\x1ftargetMessageId
-        return rk ? (rk.split('\x1f')[2] ?? lastMsg.messageId) : lastMsg.messageId;
-      })()
-    : lastMsg.messageId;
+  // Reaction messages retain the real target `om_...` in messageId; the
+  // internal revision identity is carried separately by reactionTurnId.
+  const replyToId = lastMsg.messageId;
   const sendOpts = {
     replyTo: replyToId,
     ...(mode === 'topic' && threadId ? { replyInThread: true } : {}),
@@ -2350,7 +2359,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // A removal may arrive while media/quote/prompt preparation is awaiting.
   // Check once more immediately before startRunFlow synchronously reserves the
   // scope; after this point ActiveRuns.interrupt can abort the reservation.
-  if (releaseInvalidatedReactionTurn(scope, firstMsg.messageId, deps.lease)) {
+  if (releaseInvalidatedReactionTurn(scope, lifecycleUnitId, deps.lease)) {
     if (routeLeaseId && deps.profileDir) {
       await deleteRouteLease(deps.profileDir, routeLeaseId).catch(() => {});
     }
@@ -2361,8 +2370,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     // R3-F2/F4: the run never starts — release the lease (unit) + clean
     // reaction meta/tracker so no ghost current-chain/tracker remains.
     if (deps.lease) _workChainStore?.releaseUnit(deps.lease.workChainId, deps.lease.unitId);
-    _invalidatedReactionTurnIds.delete(firstMsg.messageId);
-    const rMeta = consumeReactionTurnMeta(firstMsg.messageId);
+    _invalidatedReactionTurnIds.delete(lifecycleUnitId);
+    const rMeta = reactionTurnId
+      ? consumeReactionTurnMeta(reactionTurnId)
+      : undefined;
     if (rMeta?.reactionKey) {
       const opId = rMeta.reactionKey.split('\x1f')[1] ?? '';
       const tgtId = rMeta.reactionKey.split('\x1f')[2] ?? '';
@@ -2391,15 +2402,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   // ── Run lifecycle: every input unit (ordinary + reaction) carries a
   // workChain (Spec DD15) so its visible outputs register for stop correlation. ──
-  // Reaction batches look up by firstMsg.messageId (the unique turnId).
-  let reactionTurnMeta = consumeReactionTurnMeta(firstMsg.messageId);
+  // Reaction batches look up by the private turn id, never by the external
+  // Lark message id.
+  let reactionTurnMeta = reactionTurnId
+    ? consumeReactionTurnMeta(reactionTurnId)
+    : undefined;
   // B1: isReactionTurn distinguishes reaction (revision-supersede + tracker)
   // from ordinary (no tracker, no supersede).
   const isReactionTurn = reactionTurnMeta !== undefined;
   // R3-F1: unitId/workChainId come from the lease carried by the flushed
   // PendingUnit (acquired at enqueue via leaseHooks). run start does NOT
   // acquire — only marks current.
-  const runUnitId = deps.lease?.unitId ?? firstMsg.messageId;
+  const runUnitId = deps.lease?.unitId ?? lifecycleUnitId;
   if (reactionTurnMeta) {
     _workChainStore?.markCurrent(reactionTurnMeta.workChainId); // idempotent (already current from enqueue)
     const rkOpId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';

@@ -41,6 +41,12 @@ interface LarkApiResponse {
   code: number;
   msg?: string;
   data?: { message_id?: string };
+  error?: {
+    field_violations?: Array<{
+      field?: string;
+      description?: string;
+    }>;
+  };
 }
 
 /**
@@ -225,7 +231,10 @@ export async function sendLarkMessage(
   });
 
   if (!res.ok) {
-    throw new Error(`message reply failed: HTTP ${res.status}`);
+    const details = await readLarkErrorDetails(res);
+    throw new Error(
+      `message reply failed: HTTP ${res.status}${details ? ` ${details}` : ''}`,
+    );
   }
 
   const data = (await res.json()) as LarkApiResponse;
@@ -278,6 +287,33 @@ function formatReceiptText(params: ReceiptSendParams): string {
 function isRetryable(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /timeout|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|429|5\d\d/i.test(msg);
+}
+
+async function readLarkErrorDetails(res: Response): Promise<string> {
+  try {
+    const data = (await res.json()) as LarkApiResponse;
+    const parts: string[] = [];
+    if (typeof data.code === 'number') parts.push(`code=${data.code}`);
+    if (data.msg) parts.push(`msg=${sanitizeErrorText(data.msg)}`);
+    const violations = data.error?.field_violations
+      ?.slice(0, 5)
+      .map((item) => ({
+        ...(item.field ? { field: sanitizeErrorText(item.field) } : {}),
+        ...(item.description
+          ? { description: sanitizeErrorText(item.description) }
+          : {}),
+      }));
+    if (violations && violations.length > 0) {
+      parts.push(`field_violations=${JSON.stringify(violations)}`);
+    }
+    return parts.join(' ');
+  } catch {
+    return '';
+  }
+}
+
+function sanitizeErrorText(value: string): string {
+  return value.replace(/[\r\n\t]+/g, ' ').slice(0, 300);
 }
 
 function sleep(ms: number): Promise<void> {

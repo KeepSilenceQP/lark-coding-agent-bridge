@@ -1,5 +1,6 @@
 import type { NormalizedMessage } from '@larksuite/channel';
 import { log } from '../core/logger';
+import { reactionTurnIdOf } from './reaction/turn-message';
 
 // ── Ordered-unit deque ──
 // Every arrival is appended as a unit. Consecutive regular messages merge into
@@ -240,7 +241,8 @@ export class PendingQueue {
           if (u.lease) this.releaseLease(u.lease);
         }
       } else {
-        if (u.message.messageId === messageId) {
+        const barrierId = reactionTurnIdOf(u.message) ?? u.message.messageId;
+        if (barrierId === messageId) {
           removed.push(u.message);
           if (u.lease) this.releaseLease(u.lease); // barrier removed → release (R3-F2)
         } else {

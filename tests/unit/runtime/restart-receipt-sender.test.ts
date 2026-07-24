@@ -195,6 +195,38 @@ describe('sendLarkMessage — uuid end-to-end', () => {
     ).rejects.toThrow(/HTTP 500/);
   });
 
+  it('preserves sanitized Lark error details for an HTTP 400 reply failure', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      fakeJsonResponse(
+        {
+          code: 99992354,
+          msg: 'invalid open_message_id',
+          error: {
+            field_violations: [
+              {
+                field: 'message_id',
+                value: 'om_bad',
+                description: 'id not exist',
+              },
+            ],
+          },
+        },
+        400,
+      ),
+    ) as typeof fetch;
+
+    await expect(
+      sendLarkMessage(
+        'https://open.feishu.cn',
+        't',
+        makeRoute({ replyTo: 'om_bad' }),
+        buildReceiptRequestBody(makeParams()),
+      ),
+    ).rejects.toThrow(
+      /HTTP 400.*code=99992354.*msg=invalid open_message_id.*field_violations=.*message_id.*id not exist/,
+    );
+  });
+
   it('throws on code=0 but missing data.message_id', async () => {
     globalThis.fetch = vi.fn(async () =>
       // API returns success code but no message_id — protocol error

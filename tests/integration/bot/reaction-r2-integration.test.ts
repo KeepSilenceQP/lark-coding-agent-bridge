@@ -11,6 +11,7 @@ import { detectNetZeroPair } from '../../../src/bot/reaction/reconciler';
 import type { BufferedReactionEvent, CanonicalReactionRecord } from '../../../src/bot/reaction/types';
 import { lookupReactionSemantics } from '../../../src/bot/reaction/semantics';
 import { makeReactionKey, parseReactionKey } from '../../../src/bot/reaction/types';
+import { withReactionTurnId } from '../../../src/bot/reaction/turn-message';
 import { createReactionFlushEffects, decideReactionFlush } from '../../../src/bot/channel';
 import type { ReactionFlushEffects } from '../../../src/bot/channel';
 
@@ -959,6 +960,26 @@ describe('PendingQueue.cancelMessage — real queue, no mocks', () => {
     const removed = queue.cancelMessage('oc_s', 'om_only');
     expect(removed).toHaveLength(1);
     expect(queue.cancel('oc_s')).toEqual([]); // scope gone
+  });
+
+  it('cancels a Reaction barrier by internal turnId without replacing the real messageId', () => {
+    const queue = new PendingQueue(10000, () => {});
+    const targetMessageId = 'om_target';
+    const turnId = 'oc_s\x1fou_u\x1fom_target:2';
+    const reactionMessage = withReactionTurnId(
+      msg(targetMessageId, 'reaction rev2'),
+      turnId,
+    );
+
+    queue.pushBarrier('oc_s', reactionMessage, {
+      workChainId: 'wc-reaction',
+      unitId: turnId,
+    });
+
+    const removed = queue.cancelMessage('oc_s', turnId);
+    expect(removed).toHaveLength(1);
+    expect(removed[0]?.messageId).toBe(targetMessageId);
+    expect(queue.cancel('oc_s')).toEqual([]);
   });
 });
 
