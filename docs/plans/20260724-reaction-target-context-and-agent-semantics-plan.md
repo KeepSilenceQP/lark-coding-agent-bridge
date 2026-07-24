@@ -1,7 +1,7 @@
 # Correct Reaction Handling By Bridge Agents — Coding Plan
 
 Date: 2026-07-24
-Status: Amendment Plan Review GO; Unit 12 implementation authorized; Code Review/deployment/Unit 11 stop live frozen
+Status: Amendment Code Review GO; deployment and Unit 11 stop live authorized; live completion pending
 Spec authority: `docs/specs/20260723-reaction-target-context-and-agent-semantics.md` (commit `526cbcb`，confirmed；`stop_current_work` trigger-message amendment independent review PASS)
 Target branch: `fix/bugfix` (synced to `526cbcb`)
 Harness protocol: `feishu-group-project-flow-v2`
@@ -32,6 +32,9 @@ Implementer: 小C（Unit 1-10）→ 小P（B9 R6-R8 接管及后续闭环）
 - 2026-07-24 小P修订 Spec 并完成三轮独立 SubAgent Review：R1 `76e6f02`、R2 `ab1fee0` BLOCKED；R3 `602bc7a` PASS/GO，最终确认提交 `526cbcb`。确认 user-trigger stop 的 eligibility-before-no-work、removed ledger bypass、PendingUnit 全部真实 trigger ID、current mapping TTL/LRU 保护、Reaction 无 @ 权限边界和负向验收；Plan、代码、部署与 live 均需重新过 gate。
 - 2026-07-24 Amendment Plan Review R1（`526cbcb..cf77468`）BLOCKED，5 项 finding 全部采纳：①普通 non-stop 必须 own-message-before-permission，stop 才走 user-target 权限/eligibility；②清除旧完成状态对 amendment 的误覆盖；③把过期 Current Evidence 明确标为 historical baseline；④trigger historical cap 独立于 outbound 256 预算；⑤补 unknown user target 在 no-work / another-current 两种状态下均静默的生产 seam。
 - 2026-07-24 Amendment Plan Review R2（`cf77468..9672b74`）GO：独立 SubAgent 确认上轮 5 项全部 CLOSED，Bot target 兼容、真实 inbound ID、synthetic 排除、current mapping 保护、removed ledger、Reaction 无 @ 权限及 live oracle 与 Spec `526cbcb` 一致；GO 仅放行 Unit 12 实现。
+- 2026-07-24 Amendment Code Review R1（`24b324b..eaa538b`）BLOCKED：独立 SubAgent 发现 queue→prompt-prep reservation 空窗、converted-topic scope 不一致、ordinary input 默认登记 Bot/synthetic trigger、removed 可重复借用旧 added 四项问题；全部采纳。
+- 2026-07-24 Amendment Code Review R2（`eaa538b..4696a2e`）BLOCKED：前述四项 CLOSED；独立 SubAgent 进一步发现 Codex startup-timeout cleanup→retry probe→replacement 空窗可在 Stop 后启动后继 Agent，要求 stop generation、retry reservation 与真实 `processAgentStream` 回归。
+- 2026-07-24 Amendment Code Review R3（`4696a2e..0ae2ae8`）GO：timeout cleanup、retry probe 与 replacement 三个竞态均由 per-scope interrupt epoch + abortable retry reservation 收敛；stop 的 current WorkChain fallback 覆盖 handoff 窄空窗；真实 `processAgentStream` 回归证明 Stop 后 terminal=`interrupted` 且 replacement=0。独立验证 typecheck 0、build success、1322 pass / 33 skip / 0 fail。非阻塞 LOW：`interruptEpochs` 对曾被 interrupt 的高基数 scope 会缓慢增长，后续仅可在确认无 in-flight handoff/retry 后安全回收。
 
 ## Historical Baseline And Amendment Evidence
 
@@ -335,14 +338,14 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 
 ### Unit 12 — stop target 扩展到真实 inbound trigger（Amendment，RED 先行）  Owner: 小P
 
-- [ ] `pipeline.ts` 重排为：self-operator → 安全路由/target sender 分类 → stop/non-stop 分类。non-stop 先 own-Bot-message gate，再调用 Reaction 无 @ 权限并进入普通流水线；stop 调用 Reaction 无 @ 权限后再做 added eligibility 或 removed ledger 匹配。禁止把 user-target stop 当普通 Reaction 送入 buffer/Agent。
-- [ ] `WorkChainStore` 增加带 target class 的 trigger correlation（或等价的显式 API），并让 `resolveStopTarget` 区分：current trigger、retained historical trigger、unknown/expired/restart-lost user target、Bot outbound。不得把 unknown user target 降级为 Bot fail-closed。
-- [ ] PendingQueue 新建 regular unit 时，把 unit 内全部真实 inbound message ID 登记到同一 lease/workChain；后续合并消息时增量登记；cancel/flush/terminal/重新激活与现有 per-unit lease 生命周期一致。synthetic unit/card callback ID 不创建 user-trigger stop 入口。
-- [ ] current trigger/outbound mapping 与 chain 一起免 TTL/LRU；terminal 后进入同一 historical retention/cap，重新 current 时恢复保护。历史裁剪后 user target 为 silent unknown；Bot target 维持可见 fail-closed。
-- [ ] stop-added 严格执行 eligibility-before-no-work：unknown/expired/restart-lost user target 静默且不写 ledger；retained historical user target 才可进入 no-work/fail-closed；current trigger/Bot outbound 才可 interrupt+cancel。Bot target 原 no-work/fail-closed 兼容不变。
-- [ ] stop-removed 对 user target 只以持久 control ledger 的匹配 consumed-added 为 own-message bypass，不依赖 trigger mapping 仍存在；无匹配静默，匹配只回复一次且不恢复。
-- [ ] 权限矩阵复用 Reaction 的 `canUseDm/canUseGroup + decideGroupResponse(mentionedBot=false, mentionCount=0, mentionAll=false)`；trigger 作者、原消息 @ Bot、或 `/stop` command 路径都不提供豁免。
-- [ ] RED/回归至少覆盖：
+- [x] `pipeline.ts` 重排为：self-operator → 安全路由/target sender 分类 → stop/non-stop 分类。non-stop 先 own-Bot-message gate，再调用 Reaction 无 @ 权限并进入普通流水线；stop 调用 Reaction 无 @ 权限后再做 added eligibility 或 removed ledger 匹配。禁止把 user-target stop 当普通 Reaction 送入 buffer/Agent。
+- [x] `WorkChainStore` 增加带 target class 的 trigger correlation（或等价的显式 API），并让 `resolveStopTarget` 区分：current trigger、retained historical trigger、unknown/expired/restart-lost user target、Bot outbound。不得把 unknown user target 降级为 Bot fail-closed。
+- [x] PendingQueue 新建 regular unit 时，把 unit 内全部真实 inbound message ID 登记到同一 lease/workChain；后续合并消息时增量登记；cancel/flush/terminal/重新激活与现有 per-unit lease 生命周期一致。synthetic unit/card callback ID 不创建 user-trigger stop 入口。
+- [x] current trigger/outbound mapping 与 chain 一起免 TTL/LRU；terminal 后进入同一 historical retention/cap，重新 current 时恢复保护。历史裁剪后 user target 为 silent unknown；Bot target 维持可见 fail-closed。
+- [x] stop-added 严格执行 eligibility-before-no-work：unknown/expired/restart-lost user target 静默且不写 ledger；retained historical user target 才可进入 no-work/fail-closed；current trigger/Bot outbound 才可 interrupt+cancel。Bot target 原 no-work/fail-closed 兼容不变。
+- [x] stop-removed 对 user target 只以持久 control ledger 的匹配 consumed-added 为 own-message bypass，不依赖 trigger mapping 仍存在；无匹配静默，匹配只回复一次且不恢复。
+- [x] 权限矩阵复用 Reaction 的 `canUseDm/canUseGroup + decideGroupResponse(mentionedBot=false, mentionCount=0, mentionAll=false)`；trigger 作者、原消息 @ Bot、或 `/stop` command 路径都不提供豁免。
+- [x] RED/回归至少覆盖：
   - current queued/reserved/active trigger 上 `No/CrossMark/MinusOne` → interrupt + cancel pending，无 Agent turn；
   - 一个 regular PendingUnit 的 first/middle/last 每个真实 message ID 都可命中同一 chain；
   - same scope 另一 operator 可/不可 stop 仅由 Reaction 无 @ 权限决定；
@@ -381,14 +384,14 @@ closed; this GO releases deployment and Unit 11 only, not live completion.
 
 Amendment gate（Spec `526cbcb`）：
 
-- [ ] Unit 12 实现与全部新增 RED/回归测试完成。
-- [ ] 独立 SubAgent Code Review exact commit range，确认 permission/eligibility/ledger/trigger mapping/lifecycle/live oracle 无缩减。
-- [ ] BLOCKER/HIGH 全部闭合后才重新 GO；此前禁止重新打包部署或继续 stop live。
+- [x] Unit 12 实现与全部新增 RED/回归测试完成（`eaa538b`、`4696a2e`、`0ae2ae8`）。
+- [x] 独立 SubAgent Code Review exact commit ranges，确认 permission/eligibility/ledger/trigger mapping/lifecycle/live oracle 无缩减。
+- [x] R1/R2 的 BLOCKER/HIGH 全部闭合，R3 `GO`；允许重新打包部署并继续 stop live。
 
 ### Unit 11 — 自动化全量 + live-model 对照验收（两路）  Owner: 小P（接管闭环）
 
 - [x] pre-amendment 自动化：`526cbcb` 之前的 Spec Acceptance/Next Phase 场景在 Claude 与 Codex 两路通过结构/注入测试。
-- [ ] amendment 自动化：Unit 12 的 user-trigger target、eligibility、permission、mapping lifecycle、removed ledger 与负向场景全部通过。
+- [x] amendment 自动化：Unit 12 的 user-trigger target、eligibility、permission、mapping lifecycle、removed ledger、startup-retry stop race 与负向场景全部通过（1322 pass / 33 skip / 0 fail）。
 - [ ] live-model：隔离可逆带唯一标记测试动作 X，按 Spec oracle 覆盖 4 个预埋 `semanticKey` 各一个代表 emoji + 一次未预埋 + 一次 removed；停止场景证明 interrupt 发生在旧 run 完成之前且无后继 Agent run 自动启动。
 - [ ] 每条验收保存：实际动态 prompt、共享 System Prompt 版本（DD10）、工具调用、可观察副作用、最终回复、飞书消息 ID；记录 Agent 类型、实际模型标识、时间。
 - [ ] 核对 UI 引用、Agent 输入、System Prompt、工具副作用、最终行为一致。
@@ -605,7 +608,7 @@ pnpm -s test
   - historical chain 重新 current 时同步移除其 outbound IDs 的 historical LRU 资格；prune 再防御性跳过 current chain，保证 DD15 current mappings 永不受 historical TTL/cap 淘汰。
   - 新增 reserved/prompt-prep empty-set、同步 handoff throw、相同未知 reply target、reactivated-current outbound cap 回归测试。
 - **B9 R8（独立 SubAgent 最终复审 GO）**：同 key 新 revision 的 `evictInFlightReactionEntry` 与 empty-set 共用 queue→reservation tombstone 约束；旧 barrier 已 flush、`ActiveRuns` 尚未 reserve 时，rev2 为 rev1 turnId 写 invalidation，rev1 在 run 入口/submit 前释放，不能以 ordinary synthetic Reaction 继续启动。新增 rev1-flushed/pre-reserve→rev2 replacement production-seam 回归测试。独立复审 `5c2682d..67b43d8` 确认 exact old turnId 被精准失效、rev2 不受影响，且 R7 的 5 项修复维持闭合；结论 `GO`，Code Review Gate 关闭，进入部署与 Unit 11 live。
-- **B10（OPEN，trigger-message stop amendment）**：当前 pipeline 在 stop 分类前 own-message drop；WorkChainStore 无 inbound trigger correlation；stop caller 先判 no-work，三者共同导致 user-trigger `No` 无法工作或产生错误可见结果。由 Unit 12 一次性闭合：target class/eligibility、全部真实 trigger ID、current lifecycle protection、removed ledger bypass、Reaction 无 @ 权限矩阵及 amended live oracle。Plan Review、实现、Code Review、部署和 live 必须依次通过。
+- **B10（CODE REVIEW CLOSED；deployment/live pending，trigger-message stop amendment）**：Unit 12 已在 `eaa538b`、`4696a2e`、`0ae2ae8` 闭合 target class/eligibility、全部真实 trigger ID、current lifecycle protection、removed ledger bypass、Reaction 无 @ 权限矩阵，以及 queue→prompt-prep 与 Codex startup-retry stop 竞态。独立 Code Review R3 `GO`；自动化 1322 pass / 33 skip / 0 fail。尚未完成重新打包部署、restart receipt 与 amended live oracle，因此不得宣称功能整体完成。
 
 ## Plan Review Gate  Owner: independent SubAgent Reviewer
 
