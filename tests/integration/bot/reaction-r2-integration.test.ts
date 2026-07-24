@@ -1451,157 +1451,181 @@ describe('evictInFlightReactionEntry — production seam with real reservation',
 // Exercises the real PendingQueue with block/unblock and multiple barriers
 // arriving during an active run. Verifies FIFO preservation and no barrier loss.
 
-describe('PendingQueue blocked-scope multi-barrier ordering', () => {
-  it('blocked scope: pushBarrier B → pushBarrier C → unblock flushes B then C in FIFO order', () => {
-    const scope = 'oc_s';
-    const flushed: { batch: string[] }[] = [];
-    const queue = new PendingQueue(9999, (_s, batch) => {
-      flushed.push({ batch: batch.map(m => m.messageId) });
-    });
-
-    const msg = (id: string) => ({
-      messageId: id, chatId: scope, chatType: 'group' as const,
-      senderId: '', content: '', rawContentType: 'reaction' as never,
-      resources: [], mentions: [], mentionAll: false, mentionedBot: false,
-      createTime: 0,
-    });
-
-    // Block the scope (simulates active run)
-    queue.block(scope);
-    expect(queue.isBlocked(scope)).toBe(true);
-
-    // Barrier B arrives during blocked state
-    queue.pushBarrier(scope, msg('turn_b'));
-    expect(queue.pendingCount(scope)).toBe(1);
-
-    // Barrier C arrives during blocked state
-    queue.pushBarrier(scope, msg('turn_c'));
-    expect(queue.pendingCount(scope)).toBe(2);
-
-    // Neither has been flushed
-    expect(flushed.length).toBe(0);
-
-    // Unblock — should arm timer for the first barrier
-    queue.unblock(scope);
-    expect(queue.isBlocked(scope)).toBe(false);
-
-    // Timer hasn't fired yet — nothing flushed
-    // Force immediate flush to verify ordering
-    const remaining = queue.cancel(scope);
-    expect(remaining.length).toBe(2);
-    // FIFO: B then C
-    expect(remaining[0]!.messageId).toBe('turn_b');
-    expect(remaining[1]!.messageId).toBe('turn_c');
+describe('PendingQueue ordered-unit deque — interleaved arrival order', () => {
+  // ── helpers ──
+  const reg = (scope: string, id: string): import('@larksuite/channel').NormalizedMessage => ({
+    messageId: id, chatId: scope, chatType: 'group' as const,
+    senderId: '', content: '', rawContentType: 'text' as never,
+    resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: 0,
+  });
+  const barrier = (scope: string, id: string): import('@larksuite/channel').NormalizedMessage => ({
+    messageId: id, chatId: scope, chatType: 'group' as const,
+    senderId: '', content: '', rawContentType: 'reaction' as never,
+    resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: 0,
   });
 
-  it('blocked scope: regular messages + barrier → unblock flushes messages first, then barrier', () => {
-    const scope = 'oc_s';
-    const flushed: { batch: string[] }[] = [];
-    const queue = new PendingQueue(9999, (_s, batch) => {
-      flushed.push({ batch: batch.map(m => m.messageId) });
-    });
-
-    const msg = (id: string) => ({
-      messageId: id, chatId: scope, chatType: 'group' as const,
-      senderId: '', content: '', rawContentType: 'text' as never,
-      resources: [], mentions: [], mentionAll: false, mentionedBot: false,
-      createTime: 0,
-    });
-    const barrier = (id: string) => ({
-      messageId: id, chatId: scope, chatType: 'group' as const,
-      senderId: '', content: '', rawContentType: 'reaction' as never,
-      resources: [], mentions: [], mentionAll: false, mentionedBot: false,
-      createTime: 0,
-    });
-
-    // Block scope (active run)
-    queue.block(scope);
-
-    // Regular messages arrive first
-    queue.push(scope, msg('reg_1'));
-    queue.push(scope, msg('reg_2'));
-    // Barrier arrives
-    queue.pushBarrier(scope, barrier('turn_b'));
-
-    // 3 items pending (2 regular + 1 barrier)
-    expect(queue.pendingCount(scope)).toBe(3);
-
-    // Unblock
-    queue.unblock(scope);
-
-    // Force flush and verify order
-    const remaining = queue.cancel(scope);
-    expect(remaining.length).toBe(3);
-    // Regular messages first, then barrier
-    expect(remaining[0]!.messageId).toBe('reg_1');
-    expect(remaining[1]!.messageId).toBe('reg_2');
-    expect(remaining[2]!.messageId).toBe('turn_b');
-  });
-
-  it('cancelMessage in blocked scope removes barrier from queue without affecting others', () => {
+  // ── 1) blocked: barrier B → ordinary C → barrier D → unblock → B, C, D ──
+  it('blocked scope: barrier→ordinary→barrier preserves interleaved arrival order', () => {
     const scope = 'oc_s';
     const queue = new PendingQueue(9999, () => {});
 
-    const msg = (id: string) => ({
-      messageId: id, chatId: scope, chatType: 'group' as const,
-      senderId: '', content: '', rawContentType: 'reaction' as never,
-      resources: [], mentions: [], mentionAll: false, mentionedBot: false,
-      createTime: 0,
-    });
-
     queue.block(scope);
-    queue.pushBarrier(scope, msg('turn_b'));
-    queue.pushBarrier(scope, msg('turn_c'));
-    expect(queue.pendingCount(scope)).toBe(2);
+    queue.pushBarrier(scope, barrier(scope, 'B'));
+    queue.push(scope, reg(scope, 'C'));
+    queue.pushBarrier(scope, barrier(scope, 'D'));
+    expect(queue.pendingCount(scope)).toBe(3);
 
-    // Cancel B from the barriers queue only
-    const removed = queue.cancelMessage(scope, 'turn_b');
-    expect(removed.length).toBe(1);
-    expect(removed[0]!.messageId).toBe('turn_b');
-
-    // C still pending
+    // cancel drains all units—verify FIFO arrival order
     const remaining = queue.cancel(scope);
-    expect(remaining.length).toBe(1);
-    expect(remaining[0]!.messageId).toBe('turn_c');
+    expect(remaining.map(m => m.messageId)).toEqual(['B', 'C', 'D']);
   });
 
-  it('non-blocked pushBarrier flushes existing content before enqueuing new barrier', () => {
+  // ── 2) unblocked: regular→B→C with onFlush calling block → only first unit flushes ──
+  it('non-blocked: onFlush calls block → only first unit flushes; B,C survive without concurrent onFlush', () => {
+    const scope = 'oc_s';
+    const flushed: string[][] = [];
+    const queue = new PendingQueue(1, (_s, batch) => {
+      flushed.push(batch.map(m => m.messageId));
+      // Real production behaviour: onFlush triggers runAgentBatch → block(scope)
+      queue.block(scope);
+    });
+
+    // Not blocked — regular message arrives
+    queue.push(scope, reg(scope, 'reg_1'));
+    // Barrier B arrives → flushes reg_1, enqueues B. onFlush blocks scope.
+    queue.pushBarrier(scope, barrier(scope, 'B'));
+    // Barrier C arrives while blocked → just enqueues
+    queue.pushBarrier(scope, barrier(scope, 'C'));
+
+    // Only reg_1 was flushed (one unit)
+    expect(flushed.length).toBe(1);
+    expect(flushed[0]).toEqual(['reg_1']);
+
+    // B and C are still pending (2 units)
+    expect(queue.pendingCount(scope)).toBe(2);
+
+    // Simulate run completion: unblock → flush B
+    queue.unblock(scope);
+    // Cancel drains remaining — B then C in order
+    const remaining = queue.cancel(scope);
+    expect(remaining.map(m => m.messageId)).toEqual(['B', 'C']);
+
+    // No concurrent onFlush happened — only 1 flush call total (for reg_1)
+    // B and C were returned by cancel(), not flushed via onFlush
+    expect(flushed.length).toBe(1);
+  });
+
+  // ── 3) blocked: two barriers → cancel() returns them in FIFO order ──
+  it('blocked scope: two barriers returned in FIFO order by cancel', () => {
+    const scope = 'oc_s';
+    const queue = new PendingQueue(9999, () => {});
+
+    queue.block(scope);
+    queue.pushBarrier(scope, barrier(scope, 'B'));
+    queue.pushBarrier(scope, barrier(scope, 'C'));
+    expect(queue.pendingCount(scope)).toBe(2);
+
+    const remaining = queue.cancel(scope);
+    expect(remaining.map(m => m.messageId)).toEqual(['B', 'C']);
+  });
+
+  // ── 4) cancelMessage preserves unit order ──
+  it('cancelMessage removes target barrier without changing other unit order', () => {
+    const scope = 'oc_s';
+    const queue = new PendingQueue(9999, () => {});
+
+    queue.block(scope);
+    queue.pushBarrier(scope, barrier(scope, 'B'));
+    queue.push(scope, reg(scope, 'C'));
+    queue.pushBarrier(scope, barrier(scope, 'D'));
+    expect(queue.pendingCount(scope)).toBe(3);
+
+    // Cancel C (the regular message in the middle)
+    const removed = queue.cancelMessage(scope, 'C');
+    expect(removed.length).toBe(1);
+    expect(removed[0]!.messageId).toBe('C');
+
+    // Remaining order: B, D
+    const remaining = queue.cancel(scope);
+    expect(remaining.map(m => m.messageId)).toEqual(['B', 'D']);
+  });
+
+  // ── 5) cancelMessage on barrier in middle preserves order ──
+  it('cancelMessage removes middle barrier, preserves surrounding units', () => {
+    const scope = 'oc_s';
+    const queue = new PendingQueue(9999, () => {});
+
+    queue.block(scope);
+    queue.pushBarrier(scope, barrier(scope, 'B'));
+    queue.pushBarrier(scope, barrier(scope, 'C'));
+    queue.push(scope, reg(scope, 'D'));
+    expect(queue.pendingCount(scope)).toBe(3);
+
+    // Cancel the middle barrier
+    const removed = queue.cancelMessage(scope, 'C');
+    expect(removed.length).toBe(1);
+    expect(removed[0]!.messageId).toBe('C');
+
+    // Remaining order: B, D
+    const remaining = queue.cancel(scope);
+    expect(remaining.map(m => m.messageId)).toEqual(['B', 'D']);
+  });
+
+  // ── 6) non-blocked pushBarrier only flushes one unit, never multiple ──
+  it('non-blocked pushBarrier flushes at most one unit (no flushAll)', () => {
     const scope = 'oc_s';
     const flushed: string[][] = [];
     const queue = new PendingQueue(9999, (_s, batch) => {
       flushed.push(batch.map(m => m.messageId));
     });
 
-    const msg = (id: string) => ({
-      messageId: id, chatId: scope, chatType: 'group' as const,
-      senderId: '', content: '', rawContentType: 'text' as never,
-      resources: [], mentions: [], mentionAll: false, mentionedBot: false,
-      createTime: 0,
-    });
-    const barrier = (id: string) => ({
-      messageId: id, chatId: scope, chatType: 'group' as const,
-      senderId: '', content: '', rawContentType: 'reaction' as never,
-      resources: [], mentions: [], mentionAll: false, mentionedBot: false,
-      createTime: 0,
-    });
+    // Not blocked. Push two regular messages (merge into one unit), then a barrier.
+    queue.push(scope, reg(scope, 'reg_1'));
+    queue.push(scope, reg(scope, 'reg_2'));
+    // One regular unit: [reg_1, reg_2]
 
-    // Not blocked — regular message arrives
-    queue.push(scope, msg('reg_1'));
-    // Barrier 1 arrives → flushes reg_1, enqueues barrier B
-    queue.pushBarrier(scope, barrier('turn_b'));
-    // Barrier 2 arrives → flushes barrier B, enqueues barrier C
-    queue.pushBarrier(scope, barrier('turn_c'));
+    // pushBarrier: flushes the regular unit, enqueues barrier B
+    queue.pushBarrier(scope, barrier(scope, 'B'));
+    expect(flushed.length).toBe(1);
+    expect(flushed[0]).toEqual(['reg_1', 'reg_2']);
 
-    // Both were flushed (flushAll in pushBarrier)
+    // B is pending
+    expect(queue.pendingCount(scope)).toBe(1);
+
+    // pushBarrier C: flushes B, enqueues C
+    queue.pushBarrier(scope, barrier(scope, 'C'));
     expect(flushed.length).toBe(2);
-    // First flush: regular messages
-    expect(flushed[0]).toEqual(['reg_1']);
-    // Second flush: barrier B (flushed by barrier C's pushBarrier)
-    expect(flushed[1]).toEqual(['turn_b']);
+    expect(flushed[1]).toEqual(['B']);
 
-    // Barrier C is still pending in the queue
+    // C is pending
     const remaining = queue.cancel(scope);
-    expect(remaining.length).toBe(1);
-    expect(remaining[0]!.messageId).toBe('turn_c');
+    expect(remaining.map(m => m.messageId)).toEqual(['C']);
+  });
+
+  // ── 7) blocked entry check after flushFirst — timer NOT armed while blocked ──
+  it('pushBarrier after flushFirst does NOT arm timer when onFlush blocked scope', () => {
+    const scope = 'oc_s';
+    const queue = new PendingQueue(1, (_s, batch) => {
+      // Real production: onFlush → runAgentBatch → block(scope)
+      queue.block(scope);
+    });
+
+    // Regular message enqueued
+    queue.push(scope, reg(scope, 'reg_1'));
+    expect(queue.isBlocked(scope)).toBe(false);
+
+    // pushBarrier: flushFirst reg_1, onFlush blocks scope, then enqueue B
+    queue.pushBarrier(scope, barrier(scope, 'B'));
+
+    // Scope should be blocked after onFlush
+    expect(queue.isBlocked(scope)).toBe(true);
+    // B should be pending (1 unit), no timer armed
+    expect(queue.pendingCount(scope)).toBe(1);
+
+    // Verify B wasn't flushed while blocked
+    // Unblock and drain
+    queue.unblock(scope);
+    const remaining = queue.cancel(scope);
+    expect(remaining.map(m => m.messageId)).toEqual(['B']);
   });
 });

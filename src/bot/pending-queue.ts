@@ -1,16 +1,29 @@
 import type { NormalizedMessage } from '@larksuite/channel';
 import { log } from '../core/logger';
 
+// ── Ordered-unit deque ──
+// Every arrival is appended as a unit. Consecutive regular messages merge into
+// the tail regular unit (debounce). Barriers are always independent units and
+// never merge. This preserves exact arrival order for interleaved regular +
+// barrier traffic.
+
+type PendingUnit =
+  | { kind: 'regular'; messages: NormalizedMessage[] }
+  | { kind: 'barrier'; message: NormalizedMessage };
+
+function unitLength(u: PendingUnit): number {
+  return u.kind === 'regular' ? u.messages.length : 1;
+}
+
 interface PendingEntry {
-  /** Accumulated regular (non-barrier) messages. Flushed as a single batch. */
-  messages: NormalizedMessage[];
-  /** FIFO queue of barrier messages. Each is flushed as its own batch, never merged. */
-  barriers: NormalizedMessage[];
+  units: PendingUnit[]; // FIFO ordered
   timer?: NodeJS.Timeout;
 }
 
 function totalLength(entry: PendingEntry): number {
-  return entry.messages.length + entry.barriers.length;
+  let n = 0;
+  for (const u of entry.units) n += unitLength(u);
+  return n;
 }
 
 export type FlushHandler = (scope: string, batch: NormalizedMessage[]) => void;
@@ -18,21 +31,20 @@ export type FlushHandler = (scope: string, batch: NormalizedMessage[]) => void;
 /**
  * Per-scope debounce queue. `scope` is the session scope string (typically
  * `chatId` for p2p / regular group, `chatId:threadId` for topic groups).
- * Accumulates messages within the same scope inside a quiet window, then
- * flushes as a single batch.
  *
- * `block(scope)` pauses the debounce timer while an agent run is active on
- * that scope — pushed messages still accumulate but no flush fires until
- * `unblock(scope)`, which arms a fresh quiet window.
+ * Internally stores arrivals as ordered FIFO units. Consecutive regular
+ * messages merge into the tail regular unit (standard debounce). Barriers are
+ * always independent units and never merge — this guarantees that a barrier
+ * arriving after a regular message is flushed after it, and vice versa.
  *
- * Commands should bypass this queue — they're cheap and should be responsive.
+ * `block(scope)` pauses the timer while an agent run is active.  Arrivals
+ * still accumulate. `unblock(scope)` arms a fresh quiet window if anything is
+ * queued.
  *
- * ## Reaction barrier (DD11)
- *
- * `pushBarrier(scope, msg)` creates an independent entry that never merges
- * with regular messages. When the scope is blocked (active run in progress),
- * barriers are queued FIFO and flushed one at a time after each unblock.
- * This preserves ordered delivery of multiple reaction turns during a run.
+ * Only ONE unit is ever flushed per call — never multiple units in one go.
+ * The onFlush callback is expected to call block(scope) synchronously, which
+ * prevents the next unit from firing until the run finishes and unblock is
+ * called.
  */
 export class PendingQueue {
   private readonly map = new Map<string, PendingEntry>();
@@ -45,98 +57,108 @@ export class PendingQueue {
     this.onFlush = onFlush;
   }
 
+  // ── push (regular message) ──
+
   push(scope: string, msg: NormalizedMessage): number {
     const existing = this.map.get(scope);
     if (existing) {
       if (existing.timer) clearTimeout(existing.timer);
-      existing.messages.push(msg);
+      const last = existing.units[existing.units.length - 1];
+      if (last && last.kind === 'regular') {
+        last.messages.push(msg);
+      } else {
+        existing.units.push({ kind: 'regular', messages: [msg] });
+      }
       existing.timer = this.blocked.has(scope) ? undefined : this.armTimer(scope);
       return totalLength(existing);
     }
     this.map.set(scope, {
-      messages: [msg],
-      barriers: [],
+      units: [{ kind: 'regular', messages: [msg] }],
       timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
     });
     return 1;
   }
 
-  /**
-   * Push a barrier entry (e.g. Reaction turn). When the scope is NOT blocked,
-   * flushes any pending messages + barriers first, then enqueues the new
-   * barrier. When blocked, the barrier is appended to a FIFO queue — no
-   * flush fires until unblock. This ensures barriers are never lost or
-   * reordered during an active run.
-   */
+  // ── pushBarrier (reaction turn — independent unit, never merged) ──
+
   pushBarrier(scope: string, msg: NormalizedMessage): void {
     if (this.blocked.has(scope)) {
-      // Active run in progress — queue the barrier, don't flush anything.
+      // Active run in progress — append to queue, don't flush anything.
       const existing = this.map.get(scope);
       if (existing) {
-        existing.barriers.push(msg);
+        existing.units.push({ kind: 'barrier', message: msg });
       } else {
-        this.map.set(scope, { messages: [], barriers: [msg] });
+        this.map.set(scope, { units: [{ kind: 'barrier', message: msg }] });
       }
       return;
     }
-    // Not blocked: drain everything that arrived before this barrier,
-    // then enqueue the new barrier as its own entry.
-    this.flushAll(scope);
+
+    // Not blocked: flush the FIRST pending unit (if any) so that messages
+    // arriving before this barrier are delivered first.  onFlush will call
+    // block(scope) — only one unit is ever consumed here.
+    this.flushFirstUnit(scope);
+
+    // flushFirstUnit may have triggered onFlush → block(scope).  Re-check
+    // before arming a timer so the new barrier doesn't fire during the run.
     this.map.set(scope, {
-      messages: [],
-      barriers: [msg],
-      timer: this.armTimer(scope),
+      units: [{ kind: 'barrier', message: msg }],
+      timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
     });
   }
+
+  // ── cancel / cancelMessage ──
 
   cancel(scope: string): NormalizedMessage[] {
     const entry = this.map.get(scope);
     if (!entry) return [];
     if (entry.timer) clearTimeout(entry.timer);
     this.map.delete(scope);
-    return [...entry.messages, ...entry.barriers];
+    const out: NormalizedMessage[] = [];
+    for (const u of entry.units) {
+      if (u.kind === 'regular') out.push(...u.messages);
+      else out.push(u.message);
+    }
+    return out;
   }
 
   /**
-   * Per-key cancel: remove only messages matching a specific messageId
-   * within a scope. Searches both regular messages and barriers.
-   * Does NOT cancel other keys or regular messages in the same scope.
+   * Per-key cancel: remove only messages matching a specific messageId.
+   * Searches all units while preserving order of remaining units.
    */
   cancelMessage(scope: string, messageId: string): NormalizedMessage[] {
     const entry = this.map.get(scope);
     if (!entry) return [];
     const removed: NormalizedMessage[] = [];
+    const kept: PendingUnit[] = [];
 
-    // Search regular messages
-    const keptMsgs: NormalizedMessage[] = [];
-    for (const m of entry.messages) {
-      if (m.messageId === messageId) {
-        removed.push(m);
+    for (const u of entry.units) {
+      if (u.kind === 'regular') {
+        const keptMsgs: NormalizedMessage[] = [];
+        for (const m of u.messages) {
+          if (m.messageId === messageId) removed.push(m);
+          else keptMsgs.push(m);
+        }
+        if (keptMsgs.length > 0) kept.push({ kind: 'regular', messages: keptMsgs });
       } else {
-        keptMsgs.push(m);
+        if (u.message.messageId === messageId) {
+          removed.push(u.message);
+        } else {
+          kept.push(u);
+        }
       }
     }
-    entry.messages = keptMsgs;
-
-    // Search barriers
-    const keptBarriers: NormalizedMessage[] = [];
-    for (const b of entry.barriers) {
-      if (b.messageId === messageId) {
-        removed.push(b);
-      } else {
-        keptBarriers.push(b);
-      }
-    }
-    entry.barriers = keptBarriers;
 
     if (removed.length === 0) return [];
 
-    if (totalLength(entry) === 0) {
+    if (kept.length === 0) {
       if (entry.timer) clearTimeout(entry.timer);
       this.map.delete(scope);
-    } else if (!this.blocked.has(scope)) {
-      if (entry.timer) clearTimeout(entry.timer);
-      entry.timer = this.armTimer(scope);
+    } else {
+      entry.units = kept;
+      if (!this.blocked.has(scope)) {
+        if (entry.timer) clearTimeout(entry.timer);
+        entry.timer = this.armTimer(scope);
+      }
     }
     return removed;
   }
@@ -149,7 +171,8 @@ export class PendingQueue {
     this.blocked.clear();
   }
 
-  /** Pause the debounce timer; pushed messages keep accumulating. */
+  // ── block / unblock ──
+
   block(scope: string): void {
     if (this.blocked.has(scope)) return;
     this.blocked.add(scope);
@@ -161,97 +184,99 @@ export class PendingQueue {
     log.info('queue', 'blocked', { scope, queued: entry ? totalLength(entry) : 0 });
   }
 
-  /** Resume the debounce timer; arms a fresh quiet window if anything queued. */
   unblock(scope: string): void {
     if (!this.blocked.has(scope)) return;
     this.blocked.delete(scope);
     const entry = this.map.get(scope);
     log.info('queue', 'unblocked', { scope, queued: entry ? totalLength(entry) : 0 });
-    if (!entry || totalLength(entry) === 0) return;
+    if (!entry || entry.units.length === 0) return;
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = this.armTimer(scope);
   }
 
-  /** Number of pending items (messages + barriers) for a scope. */
+  // ── query ──
+
   pendingCount(scope: string): number {
     const entry = this.map.get(scope);
     return entry ? totalLength(entry) : 0;
   }
 
-  /** True if the scope is currently blocked. */
   isBlocked(scope: string): boolean {
     return this.blocked.has(scope);
   }
 
   // ── private ──
 
-  /** Flush everything for a scope: regular messages first, then barriers one by one. */
-  private flushAll(scope: string): void {
+  /** Flush the FIRST unit only. If more units remain and scope is NOT blocked, arm timer. */
+  private flushFirstUnit(scope: string): void {
     const entry = this.map.get(scope);
-    if (!entry) return;
-    this.map.delete(scope);
-    if (entry.timer) clearTimeout(entry.timer);
-    if (entry.messages.length > 0) {
-      try {
-        this.onFlush(scope, entry.messages);
-      } catch (err) {
-        log.fail('queue', err, { scope, batchSize: entry.messages.length });
-      }
+    if (!entry || entry.units.length === 0) return;
+
+    const unit = entry.units.shift()!;
+
+    if (entry.units.length === 0) {
+      this.map.delete(scope);
+      if (entry.timer) clearTimeout(entry.timer);
+    } else if (!this.blocked.has(scope)) {
+      // Scope not yet blocked (onFlush hasn't fired).  Arm timer so the
+      // next unit fires after the quiet window.  If onFlush calls block(),
+      // the timer will be cleared synchronously — safe.
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.timer = this.armTimer(scope);
     }
-    for (const barrier of entry.barriers) {
+    // else: scope is already blocked — remaining units stay queued, no timer.
+
+    if (unit.kind === 'regular') {
       try {
-        this.onFlush(scope, [barrier]);
+        this.onFlush(scope, unit.messages);
+      } catch (err) {
+        log.fail('queue', err, { scope, batchSize: unit.messages.length });
+      }
+    } else {
+      try {
+        this.onFlush(scope, [unit.message]);
       } catch (err) {
         log.fail('queue', err, { scope, batchSize: 1 });
       }
     }
   }
+
+  // ── timer ──
 
   private armTimer(scope: string): NodeJS.Timeout {
     return setTimeout(() => this.flush(scope), this.delayMs);
   }
 
+  /** Timer callback: flush ONE unit. If more remain, arm next timer. */
   private flush(scope: string): void {
     const entry = this.map.get(scope);
-    if (!entry) return;
+    if (!entry || entry.units.length === 0) return;
 
-    // Flush regular messages first (FIFO — they arrived before any barriers)
-    if (entry.messages.length > 0) {
-      const msgs = entry.messages;
-      entry.messages = [];
-      if (totalLength(entry) === 0) {
-        this.map.delete(scope);
-        if (entry.timer) clearTimeout(entry.timer);
-      }
-      try {
-        this.onFlush(scope, msgs);
-      } catch (err) {
-        log.fail('queue', err, { scope, batchSize: msgs.length });
-      }
-      return;
+    const unit = entry.units.shift()!;
+
+    if (entry.units.length === 0) {
+      this.map.delete(scope);
+      if (entry.timer) clearTimeout(entry.timer);
+    } else {
+      // Arm timer for the next unit.  onFlush calls block() which clears
+      // the timer synchronously, so this is effectively a no-op when the
+      // scope is about to become active.
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.timer = this.armTimer(scope);
     }
 
-    // Flush the first barrier as its own batch (never merged)
-    if (entry.barriers.length > 0) {
-      const barrier = entry.barriers.shift()!;
-      if (totalLength(entry) === 0) {
-        this.map.delete(scope);
-        if (entry.timer) clearTimeout(entry.timer);
-      } else {
-        // More barriers or messages pending — re-arm the timer
-        if (entry.timer) clearTimeout(entry.timer);
-        entry.timer = this.armTimer(scope);
-      }
+    if (unit.kind === 'regular') {
       try {
-        this.onFlush(scope, [barrier]);
+        this.onFlush(scope, unit.messages);
+      } catch (err) {
+        log.fail('queue', err, { scope, batchSize: unit.messages.length });
+      }
+    } else {
+      try {
+        this.onFlush(scope, [unit.message]);
       } catch (err) {
         log.fail('queue', err, { scope, batchSize: 1 });
       }
-      return;
     }
-
-    // Both empty — clean up
-    this.map.delete(scope);
-    if (entry.timer) clearTimeout(entry.timer);
   }
 }
