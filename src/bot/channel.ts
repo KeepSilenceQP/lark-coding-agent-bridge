@@ -490,6 +490,10 @@ export function evictInFlightReactionEntry(params: {
       removedFromQueue = removed.length;
       if (removed.length === 0) {
         // Barrier was already flushed — it holds an ActiveRuns reservation now.
+        // There is a narrower queue→reservation window where interrupt() has
+        // nothing to abort yet; the run owner consumes this tombstone before
+        // startRunFlow so the superseded revision cannot start as ordinary IM.
+        _invalidatedReactionTurnIds.add(oldTurnId);
         needsInterrupt = true;
       }
     }

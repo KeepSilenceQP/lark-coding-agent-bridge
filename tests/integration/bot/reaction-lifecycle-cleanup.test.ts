@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ActiveRuns } from '../../../src/bot/active-runs';
 import {
   createReactionFlushEffects,
+  evictInFlightReactionEntry,
   executeReactionFlushDecision,
   executePendingFlushWithCleanup,
   hasTurnMetaForTurnId,
@@ -259,6 +260,37 @@ describe('Reaction lifecycle cleanup production seams', () => {
     );
 
     expect(reservation?.signal.aborted).toBe(true);
+    expect(
+      releaseInvalidatedReactionTurn(
+        state.scope,
+        state.turnId,
+        { workChainId: state.workChainId, unitId: state.turnId },
+        state,
+      ),
+    ).toBe(true);
+    expectCleaned(state);
+  });
+
+  it('rev2 replacement tombstones rev1 after barrier flush but before reservation', () => {
+    const state = setup(108);
+    const pending = new PendingQueue(60_000, () => {});
+    const activeRuns = new ActiveRuns();
+
+    const result = evictInFlightReactionEntry({
+      reactionKey: state.reactionKey,
+      scope: state.scope,
+      opId: state.operatorOpenId,
+      tgtId: state.targetMessageId,
+      existingStatus: 'queued',
+      oldRevision: 108,
+      newRevision: 109,
+      pending,
+      contextStore: state.reactionContextStore,
+      activeRuns,
+      tracker: state.reactionRunTracker,
+    });
+
+    expect(result).toEqual({ needsInterrupt: true, removedFromQueue: 0 });
     expect(
       releaseInvalidatedReactionTurn(
         state.scope,

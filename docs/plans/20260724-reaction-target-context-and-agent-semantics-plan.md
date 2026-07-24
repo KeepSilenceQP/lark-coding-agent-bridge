@@ -526,6 +526,7 @@ pnpm -s test
   - `runAgentBatch` 从 consume Reaction meta 后即进入统一 terminal try/catch；`executePendingFlushWithCleanup` 覆盖 queue→trace/run 的同步与异步异常，均清 lease/context/meta/tracker。
   - historical chain 重新 current 时同步移除其 outbound IDs 的 historical LRU 资格；prune 再防御性跳过 current chain，保证 DD15 current mappings 永不受 historical TTL/cap 淘汰。
   - 新增 reserved/prompt-prep empty-set、同步 handoff throw、相同未知 reply target、reactivated-current outbound cap 回归测试。
+- **B9 R8（R7 独立复审 BLOCKED 后修复，待复审）**：同 key 新 revision 的 `evictInFlightReactionEntry` 与 empty-set 共用 queue→reservation tombstone 约束；旧 barrier 已 flush、`ActiveRuns` 尚未 reserve 时，rev2 为 rev1 turnId 写 invalidation，rev1 在 run 入口/submit 前释放，不能以 ordinary synthetic Reaction 继续启动。新增 rev1-flushed/pre-reserve→rev2 replacement production-seam 回归测试。
 
 ## Plan Review Gate  Owner: 小P
 
