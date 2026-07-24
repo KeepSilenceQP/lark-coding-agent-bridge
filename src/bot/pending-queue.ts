@@ -3,13 +3,27 @@ import { log } from '../core/logger';
 
 // ── Ordered-unit deque ──
 // Every arrival is appended as a unit. Consecutive regular messages merge into
-// the tail regular unit (debounce). Barriers are always independent units and
-// never merge. This preserves exact arrival order for interleaved regular +
-// barrier traffic.
+// the tail regular unit (debounce) — when both carry a lease, only if they
+// share the same workChainId (same target/chain). Barriers are always
+// independent units and never merge. This preserves exact arrival order for
+// interleaved regular + barrier traffic.
+
+/**
+ * Work-chain lifecycle token carried by a PendingUnit (R3-F1). When present,
+ * the queue acquires it at unit creation and releases it on cancel; on flush
+ * it is TRANSFERRED to the run (onFlush receives it) which releases it on
+ * terminal/abort. This replaces the per-messageId side-map approach which
+ * leaked merged messages' lifecycle (only firstMsg was released).
+ *
+ * `lease` is optional so queue-mechanics tests (which don't exercise the
+ * work-chain lifecycle) can call push/pushBarrier without it; production paths
+ * (intakeMessage / reaction flush handler) always provide it.
+ */
+export type WorkLease = { workChainId: string; unitId: string };
 
 type PendingUnit =
-  | { kind: 'regular'; messages: NormalizedMessage[] }
-  | { kind: 'barrier'; message: NormalizedMessage };
+  | { kind: 'regular'; messages: NormalizedMessage[]; lease: WorkLease | undefined }
+  | { kind: 'barrier'; message: NormalizedMessage; lease: WorkLease | undefined };
 
 function unitLength(u: PendingUnit): number {
   return u.kind === 'regular' ? u.messages.length : 1;
@@ -26,93 +40,108 @@ function totalLength(entry: PendingEntry): number {
   return n;
 }
 
-export type FlushHandler = (scope: string, batch: NormalizedMessage[]) => void;
+/** Hooks that acquire/release a lease on the work-chain store. */
+export interface LeaseHooks {
+  acquire: (lease: WorkLease) => void;
+  release: (lease: WorkLease) => void;
+}
 
-/**
- * Per-scope debounce queue. `scope` is the session scope string (typically
- * `chatId` for p2p / regular group, `chatId:threadId` for topic groups).
- *
- * Internally stores arrivals as ordered FIFO units. Consecutive regular
- * messages merge into the tail regular unit (standard debounce). Barriers are
- * always independent units and never merge — this guarantees that a barrier
- * arriving after a regular message is flushed after it, and vice versa.
- *
- * `block(scope)` pauses the timer while an agent run is active.  Arrivals
- * still accumulate. `unblock(scope)` arms a fresh quiet window if anything is
- * queued.
- *
- * Only ONE unit is ever flushed per call — never multiple units in one go.
- * The onFlush callback is expected to call block(scope) synchronously, which
- * prevents the next unit from firing until the run finishes and unblock is
- * called.
- */
+export type FlushHandler = (
+  scope: string,
+  batch: NormalizedMessage[],
+  lease: WorkLease | undefined,
+) => void;
+
 export class PendingQueue {
   private readonly map = new Map<string, PendingEntry>();
   private readonly blocked = new Set<string>();
   private readonly delayMs: number;
   private readonly onFlush: FlushHandler;
+  private readonly leaseHooks: LeaseHooks | undefined;
+  private unitIdSeq = 0;
 
-  constructor(delayMs: number, onFlush: FlushHandler) {
+  constructor(delayMs: number, onFlush: FlushHandler, leaseHooks?: LeaseHooks) {
     this.delayMs = delayMs;
     this.onFlush = onFlush;
+    this.leaseHooks = leaseHooks;
+  }
+
+  private nextUnitId(): string {
+    this.unitIdSeq += 1;
+    return `u${this.unitIdSeq}`;
+  }
+
+  private acquireLease(lease: WorkLease): void {
+    this.leaseHooks?.acquire(lease);
+  }
+
+  /** Release a unit's lease (idempotent via the store's releaseUnit Set). */
+  releaseLease(lease: WorkLease): void {
+    this.leaseHooks?.release(lease);
   }
 
   // ── push (regular message) ──
+  // workChainId is optional: production (intakeMessage) passes it so the unit
+  // acquires a work-chain lease; queue-mechanics tests omit it (no lease).
 
-  push(scope: string, msg: NormalizedMessage): number {
+  push(scope: string, msg: NormalizedMessage, workChainId?: string): number {
     const existing = this.map.get(scope);
+    const lease: WorkLease | undefined = workChainId
+      ? { workChainId, unitId: this.nextUnitId() }
+      : undefined;
     if (existing) {
       if (existing.timer) clearTimeout(existing.timer);
       const last = existing.units[existing.units.length - 1];
-      if (last && last.kind === 'regular') {
+      // Merge into the tail regular unit ONLY when both have the same
+      // workChainId (same target chain). Different chain (or lease/no-lease
+      // mismatch) → new unit, so terminal/cancel can release each unit's lease
+      // precisely (R3-F1).
+      const sameChain =
+        last &&
+        last.kind === 'regular' &&
+        (last.lease?.workChainId ?? '') === (workChainId ?? '');
+      if (sameChain) {
         last.messages.push(msg);
+        // shared lease — no new acquire
       } else {
-        existing.units.push({ kind: 'regular', messages: [msg] });
+        if (lease) this.acquireLease(lease);
+        existing.units.push({ kind: 'regular', messages: [msg], lease });
       }
       existing.timer = this.blocked.has(scope) ? undefined : this.armTimer(scope);
       return totalLength(existing);
     }
+    if (lease) this.acquireLease(lease);
     this.map.set(scope, {
-      units: [{ kind: 'regular', messages: [msg] }],
+      units: [{ kind: 'regular', messages: [msg], lease }],
       timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
     });
     return 1;
   }
 
   // ── pushBarrier (reaction turn — independent unit, never merged) ──
+  // lease is optional (production provides workChainId+unitId=turnId).
 
-  pushBarrier(scope: string, msg: NormalizedMessage): void {
+  pushBarrier(scope: string, msg: NormalizedMessage, lease?: WorkLease): void {
+    if (lease) this.acquireLease(lease);
     if (this.blocked.has(scope)) {
-      // Active run in progress — append to queue, don't flush anything.
       const existing = this.map.get(scope);
       if (existing) {
-        existing.units.push({ kind: 'barrier', message: msg });
+        existing.units.push({ kind: 'barrier', message: msg, lease });
       } else {
-        this.map.set(scope, { units: [{ kind: 'barrier', message: msg }] });
+        this.map.set(scope, { units: [{ kind: 'barrier', message: msg, lease }] });
       }
       return;
     }
-
-    // Not blocked: flush the FIRST pending unit (if any) so that messages
-    // arriving before this barrier are delivered first.  onFlush will call
-    // block(scope) — only one unit is ever consumed here.
     this.flushFirstUnit(scope);
-
-    // flushFirstUnit may have consumed the first unit but left remaining
-    // units in the entry.  Append to tail instead of overwriting — otherwise
-    // a multi-unit queue (e.g. unblocked B,C,D with timer still ticking)
-    // would silently lose C,D when a new barrier E arrives.
     const existing = this.map.get(scope);
     if (existing) {
-      existing.units.push({ kind: 'barrier', message: msg });
-      // If not blocked and no timer is armed yet (unit was only one just
-      // flushed, or all prior units were already drained), arm one.
+      existing.units.push({ kind: 'barrier', message: msg, lease });
       if (!this.blocked.has(scope) && !existing.timer) {
         existing.timer = this.armTimer(scope);
       }
     } else {
       this.map.set(scope, {
-        units: [{ kind: 'barrier', message: msg }],
+        units: [{ kind: 'barrier', message: msg, lease }],
         timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
       });
     }
@@ -127,6 +156,8 @@ export class PendingQueue {
     this.map.delete(scope);
     const out: NormalizedMessage[] = [];
     for (const u of entry.units) {
+      // R3-F1/F2/F3: release each cancelled unit's lease.
+      if (u.lease) this.releaseLease(u.lease);
       if (u.kind === 'regular') out.push(...u.messages);
       else out.push(u.message);
     }
@@ -135,7 +166,8 @@ export class PendingQueue {
 
   /**
    * Per-key cancel: remove only messages matching a specific messageId.
-   * Searches all units while preserving order of remaining units.
+   * Releases the lease of any unit that is fully removed (barrier match, or a
+   * regular unit that becomes empty after removing matching messages).
    */
   cancelMessage(scope: string, messageId: string): NormalizedMessage[] {
     const entry = this.map.get(scope);
@@ -150,10 +182,16 @@ export class PendingQueue {
           if (m.messageId === messageId) removed.push(m);
           else keptMsgs.push(m);
         }
-        if (keptMsgs.length > 0) kept.push({ kind: 'regular', messages: keptMsgs });
+        if (keptMsgs.length > 0) {
+          kept.push({ kind: 'regular', messages: keptMsgs, lease: u.lease });
+        } else {
+          // Unit fully emptied → release its lease (R3-F2).
+          if (u.lease) this.releaseLease(u.lease);
+        }
       } else {
         if (u.message.messageId === messageId) {
           removed.push(u.message);
+          if (u.lease) this.releaseLease(u.lease); // barrier removed → release (R3-F2)
         } else {
           kept.push(u);
         }
@@ -178,6 +216,7 @@ export class PendingQueue {
   cancelAll(): void {
     for (const entry of this.map.values()) {
       if (entry.timer) clearTimeout(entry.timer);
+      for (const u of entry.units) if (u.lease) this.releaseLease(u.lease);
     }
     this.map.clear();
     this.blocked.clear();
@@ -219,7 +258,6 @@ export class PendingQueue {
 
   // ── private ──
 
-  /** Flush the FIRST unit only. If more units remain and scope is NOT blocked, arm timer. */
   private flushFirstUnit(scope: string): void {
     const entry = this.map.get(scope);
     if (!entry || entry.units.length === 0) return;
@@ -230,36 +268,19 @@ export class PendingQueue {
       this.map.delete(scope);
       if (entry.timer) clearTimeout(entry.timer);
     } else if (!this.blocked.has(scope)) {
-      // Scope not yet blocked (onFlush hasn't fired).  Arm timer so the
-      // next unit fires after the quiet window.  If onFlush calls block(),
-      // the timer will be cleared synchronously — safe.
       if (entry.timer) clearTimeout(entry.timer);
       entry.timer = this.armTimer(scope);
     }
-    // else: scope is already blocked — remaining units stay queued, no timer.
 
-    if (unit.kind === 'regular') {
-      try {
-        this.onFlush(scope, unit.messages);
-      } catch (err) {
-        log.fail('queue', err, { scope, batchSize: unit.messages.length });
-      }
-    } else {
-      try {
-        this.onFlush(scope, [unit.message]);
-      } catch (err) {
-        log.fail('queue', err, { scope, batchSize: 1 });
-      }
-    }
+    // Transfer the unit's lease to the run (onFlush). The run releases it on
+    // terminal/abort — the queue does NOT release here.
+    this.invokeFlush(scope, unit);
   }
-
-  // ── timer ──
 
   private armTimer(scope: string): NodeJS.Timeout {
     return setTimeout(() => this.flush(scope), this.delayMs);
   }
 
-  /** Timer callback: flush ONE unit. If more remain, arm next timer. */
   private flush(scope: string): void {
     const entry = this.map.get(scope);
     if (!entry || entry.units.length === 0) return;
@@ -270,25 +291,29 @@ export class PendingQueue {
       this.map.delete(scope);
       if (entry.timer) clearTimeout(entry.timer);
     } else {
-      // Arm timer for the next unit.  onFlush calls block() which clears
-      // the timer synchronously, so this is effectively a no-op when the
-      // scope is about to become active.
       if (entry.timer) clearTimeout(entry.timer);
       entry.timer = this.armTimer(scope);
     }
 
-    if (unit.kind === 'regular') {
-      try {
-        this.onFlush(scope, unit.messages);
-      } catch (err) {
-        log.fail('queue', err, { scope, batchSize: unit.messages.length });
+    this.invokeFlush(scope, unit);
+  }
+
+  private invokeFlush(scope: string, unit: PendingUnit): void {
+    const lease = unit.lease;
+    try {
+      if (unit.kind === 'regular') {
+        this.onFlush(scope, unit.messages, lease);
+      } else {
+        this.onFlush(scope, [unit.message], lease);
       }
-    } else {
-      try {
-        this.onFlush(scope, [unit.message]);
-      } catch (err) {
-        log.fail('queue', err, { scope, batchSize: 1 });
-      }
+    } catch (err) {
+      // onFlush threw before the run could take ownership of the lease →
+      // release it here so the chain doesn't stay current forever (R3-F4).
+      if (lease) this.releaseLease(lease);
+      log.fail('queue', err, {
+        scope,
+        batchSize: unit.kind === 'regular' ? unit.messages.length : 1,
+      });
     }
   }
 }

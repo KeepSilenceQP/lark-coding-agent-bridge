@@ -105,7 +105,7 @@ import {
 } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
-import { PendingQueue } from './pending-queue';
+import { PendingQueue, type WorkLease } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
@@ -1142,8 +1142,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     // chain stays current while the turn is queued/reserved — a sibling run
     // terminaling must not mark the shared chain historical while this queued
     // unit is still in-flight.
-    if (wcId) _workChainStore?.acquireUnit(wcId, turnId);
-    pending.pushBarrier(result.components.scope, normalizedMsg);
+    // R3-F1: pass the lease (workChainId + unitId=turnId) to pushBarrier; the
+    // queue acquires the in-flight unit via leaseHooks. cancel/terminal release
+    // it by the same lease (no per-messageId side-map).
+    pending.pushBarrier(
+      result.components.scope,
+      normalizedMsg,
+      wcId ? { workChainId: wcId, unitId: turnId } : undefined,
+    );
     log.info('reaction', 'reconciled-and-enqueued', {
       key: result.key,
       revision: result.revision,
@@ -1281,7 +1287,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // unblock arms a fresh quiet-window timer. Net effect: at most one run per
   // chat in flight, and everything sent during a run merges into the next
   // batch (only flushed once 600ms of silence has passed *after* the run).
-  const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch) => {
+  const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch, lease) => {
     const firstMsg = batch[0];
     if (!firstMsg) return;
     pending.block(scope);
@@ -1311,6 +1317,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         }
         await runAgentBatch({
           channel,
+          lease,
           executor,
           sessions,
           sessionCatalog,
@@ -1338,6 +1345,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         log.info('flush', 'end');
       }
     });
+  }, {
+    // R3-F1: leaseHooks acquire/release the in-flight work-chain unit when a
+    // PendingUnit is created/cancelled. On flush the lease is transferred to
+    // the run (onFlush receives it); the run releases it on terminal/abort.
+    acquire: (l: WorkLease) => _workChainStore?.acquireUnit(l.workChainId, l.unitId),
+    release: (l: WorkLease) => _workChainStore?.releaseUnit(l.workChainId, l.unitId),
   });
 
   // Counter for stdout reconnect escalation; reset on `reconnected`.
@@ -1887,16 +1900,15 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
-  // R2-F1/F3: ordinary input unit carries a workChain at ENQUEUE time (not run
-  // start) so a stop on a queued/reserved ordinary reply resolves a current
-  // chain (Spec DD15). Allocate/inherit + acquire the in-flight unit now.
-  const ordWcId = _workChainStore?.resolveOrAllocate(scope, emsg.replyToMessageId) ?? '';
-  if (ordWcId) {
-    _workChainStore?.markCurrent(ordWcId);
-    _workChainStore?.acquireUnit(ordWcId, emsg.messageId);
-    setOrdinaryTurnMeta(emsg.messageId, ordWcId);
-  }
-  const size = pending.push(scope, emsg);
+  // R3-F1/F3: ordinary REPLY (replyTo a Bot message) carries a workChain lease
+  // at enqueue so a stop on the target resolves the current chain while queued.
+  // Top-level messages (no replyTo) have no stop target while queued — they
+  // acquire a chain at run start (B1) and merge as before (no lease).
+  const ordWcId = emsg.replyToMessageId
+    ? (_workChainStore?.resolveOrAllocate(scope, emsg.replyToMessageId) ?? '')
+    : '';
+  if (ordWcId) _workChainStore?.markCurrent(ordWcId);
+  const size = pending.push(scope, emsg, ordWcId);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
 
@@ -1933,6 +1945,9 @@ interface RunBatchDeps {
   scope: string;
   mode: ChatMode;
   profileDir?: string;
+  /** R3-F1: work-chain lease carried by the flushed PendingUnit (acquired at
+   *  enqueue; the run releases it on terminal/abort). */
+  lease?: WorkLease;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -2170,9 +2185,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     });
   const flow = await startFlow('submit');
   if (!flow.ok) {
-    // R2-F2: the run never starts — release the enqueued unit's in-flight
-    // lifecycle (acquired at enqueue) so no ghost current-chain/tracker remains.
-    releaseEnqueuedTurn(scope, firstMsg.messageId);
+    // R3-F2/F4: the run never starts — release the lease (unit) + clean
+    // reaction meta/tracker so no ghost current-chain/tracker remains.
+    if (deps.lease) _workChainStore?.releaseUnit(deps.lease.workChainId, deps.lease.unitId);
+    const rMeta = consumeReactionTurnMeta(firstMsg.messageId);
+    if (rMeta?.reactionKey) {
+      const opId = rMeta.reactionKey.split('\x1f')[1] ?? '';
+      const tgtId = rMeta.reactionKey.split('\x1f')[2] ?? '';
+      _reactionRunTracker?.unregister(scope, opId, tgtId);
+    }
     // Clean up route lease if flow is rejected — no agent run will happen.
     if (routeLeaseId && deps.profileDir) {
       await deleteRouteLease(deps.profileDir, routeLeaseId).catch(() => {});
@@ -2201,10 +2222,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // B1: isReactionTurn distinguishes reaction (revision-supersede + tracker)
   // from ordinary (no tracker, no supersede).
   const isReactionTurn = reactionTurnMeta !== undefined;
-  // R2-F1: unitId is the barrier/queue message id (reaction turnId or ordinary
-  // messageId) — the SAME id acquired at enqueue. run start does NOT acquire
-  // (the unit is in-flight from enqueue); it only transitions status.
-  const runUnitId = firstMsg.messageId;
+  // R3-F1: unitId/workChainId come from the lease carried by the flushed
+  // PendingUnit (acquired at enqueue via leaseHooks). run start does NOT
+  // acquire — only marks current.
+  const runUnitId = deps.lease?.unitId ?? firstMsg.messageId;
   if (reactionTurnMeta) {
     _workChainStore?.markCurrent(reactionTurnMeta.workChainId); // idempotent (already current from enqueue)
     const rkOpId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';
@@ -2217,15 +2238,17 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       runId: `${scope}:${Date.now()}`,
       status: 'reserved', // barrier flushed, ActiveRuns holds reservation
     });
-    // Mark active once the run actually starts — only active entries are interruptible via shouldInterrupt.
-    // The enqueue eviction path handles reserved entries via activeRuns.interrupt (Plan DD12).
     _reactionRunTracker?.markStatus(scope, rkOpId, rkTgtId, 'active');
+  } else if (deps.lease?.workChainId) {
+    // R3-F1/F3: ordinary reply with lease (acquired at intakeMessage enqueue).
+    _workChainStore?.markCurrent(deps.lease.workChainId); // idempotent
+    reactionTurnMeta = { workChainId: deps.lease.workChainId, reactionKey: '', revision: 0 };
   } else {
-    // R2-F1/F3: ordinary — consume the workChain allocated at intakeMessage
-    // enqueue (the unit was acquired there; run start only marks current).
-    const ordWcId = consumeOrdinaryTurnMeta(firstMsg.messageId);
+    // Ordinary top-level (no lease) — allocate+acquire at run start (B1).
+    const ordWcId = _workChainStore?.resolveOrAllocate(scope, firstMsg.replyToMessageId) ?? '';
     if (ordWcId) {
-      _workChainStore?.markCurrent(ordWcId); // idempotent
+      _workChainStore?.markCurrent(ordWcId);
+      _workChainStore?.acquireUnit(ordWcId, runUnitId);
       reactionTurnMeta = { workChainId: ordWcId, reactionKey: '', revision: 0 };
     }
   }
