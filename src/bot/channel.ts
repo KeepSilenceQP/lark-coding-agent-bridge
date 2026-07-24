@@ -213,35 +213,23 @@ function registerOutboundLifecycle(workChainId: string, messageId: string): void
 // ── Ordinary input unit workChain (R2-F1/F3) ──
 // Ordinary messages carry a workChain from enqueue (intakeMessage) so a stop on
 // a queued/reserved ordinary reply resolves a current chain (Spec DD15).
-const _ordinaryTurnMeta = new Map<string, string>(); // messageId → workChainId
-function setOrdinaryTurnMeta(messageId: string, workChainId: string): void {
-  _ordinaryTurnMeta.set(messageId, workChainId);
-}
-function consumeOrdinaryTurnMeta(messageId: string): string | undefined {
-  const wcId = _ordinaryTurnMeta.get(messageId);
-  if (wcId) _ordinaryTurnMeta.delete(messageId);
-  return wcId;
-}
-
 /**
- * R2-F2: release an enqueued unit's in-flight lifecycle on cancel/abort (stop
- * cancel of a queued unit, or startFlow reject/abort before the run starts).
- * Consumes the turn meta (reaction or ordinary) and releases the in-flight
- * unit + tracker entry so no ghost current-chain/tracker remains.
+ * R2-F2/R4-B2/B3: release an enqueued REACTION unit's side-state on
+ * cancel/abort (stop cancel, command cancel, onFlush throw, startFlow reject).
+ * The WorkLease (unit lifecycle) is released by the PendingQueue's cancel; this
+ * cleans the reaction-specific side-state (turn meta + tracker) keyed by
+ * reactionKey. Ordinary units have no reaction side-state (their lifecycle is
+ * fully on the PendingUnit lease), so this is reaction-only.
  */
 function releaseEnqueuedTurn(scope: string, messageId: string): void {
   const rMeta = consumeReactionTurnMeta(messageId);
-  if (rMeta) {
-    _workChainStore?.releaseUnit(rMeta.workChainId, messageId);
-    if (rMeta.reactionKey) {
-      const opId = rMeta.reactionKey.split('\x1f')[1] ?? '';
-      const tgtId = rMeta.reactionKey.split('\x1f')[2] ?? '';
-      _reactionRunTracker?.unregister(scope, opId, tgtId);
-    }
-    return;
+  if (!rMeta) return;
+  _workChainStore?.releaseUnit(rMeta.workChainId, messageId);
+  if (rMeta.reactionKey) {
+    const opId = rMeta.reactionKey.split('\x1f')[1] ?? '';
+    const tgtId = rMeta.reactionKey.split('\x1f')[2] ?? '';
+    _reactionRunTracker?.unregister(scope, opId, tgtId);
   }
-  const ordWcId = consumeOrdinaryTurnMeta(messageId);
-  if (ordWcId) _workChainStore?.releaseUnit(ordWcId, messageId);
 }
 /**
  * Finalize a reaction run's lifecycle on terminal. Only marks the workChain
@@ -311,6 +299,7 @@ export interface ReactionFlushEffects {
   cancelPendingForTarget: (scope: string, reactionKey: string) => void;
   clearContextForTarget: (reactionKey: string) => void;
   deleteTurnMetaForTarget: (reactionKey: string) => void;
+  unregisterTrackerForTarget: (scope: string, reactionKey: string) => void;
   interruptActiveRun: (scope: string) => void;
   setHandleSuperseded: (scope: string) => void;
 }
@@ -338,6 +327,14 @@ export function createReactionFlushEffects(deps: {
       const handle = deps.activeRuns.get(scope);
       if (handle) handle.superseded = true;
     },
+    unregisterTrackerForTarget: (scope, reactionKey) => {
+      // R4-B3: clean the reaction tracker entry (queued/reserved/active) so a
+      // later same-key revision doesn't see a stale queued tracker → false
+      // reserved race that interrupts an unrelated new run.
+      const opId = reactionKey.split('\x1f')[1] ?? '';
+      const tgtId = reactionKey.split('\x1f')[2] ?? '';
+      _reactionRunTracker?.unregister(scope, opId, tgtId);
+    },
   };
 }
 
@@ -364,6 +361,7 @@ export async function executeReactionFlushDecision(
       deps.effects.cancelPendingForTarget(deps.scope, deps.reactionKey);
       deps.effects.clearContextForTarget(deps.reactionKey);
       deps.effects.deleteTurnMetaForTarget(deps.reactionKey);
+      deps.effects.unregisterTrackerForTarget(deps.scope, deps.reactionKey);
     }
     await deps.send(deps.scope.split(':')[0] ?? deps.scope, decision.message, deps.targetMessageId);
     return;
@@ -1336,6 +1334,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         });
       } catch (err) {
         log.fail('flush', err);
+        // R4-B2: async run threw (chatMode resolve / startFlow / stream) before
+        // or without taking ownership of the lease — release it + clean any
+        // unconsumed reaction meta/tracker so the chain doesn't stay current.
+        if (lease) _workChainStore?.releaseUnit(lease.workChainId, lease.unitId);
+        releaseEnqueuedTurn(scope, firstMsg.messageId);
       } finally {
         pending.unblock(scope);
         activeBatchCount = Math.max(0, activeBatchCount - 1);
@@ -1346,9 +1349,15 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       }
     });
   }, {
-    // R3-F1: leaseHooks acquire/release the in-flight work-chain unit when a
-    // PendingUnit is created/cancelled. On flush the lease is transferred to
-    // the run (onFlush receives it); the run releases it on terminal/abort.
+    // R3-F1/R4-B1: leaseHooks allocate/acquire/release the in-flight work-chain
+    // unit. allocate is called when a new PendingUnit is created (per-unit, not
+    // per-message) so top-level ordinary units also carry a chain at enqueue
+    // (DD15). On flush the lease is transferred to the run.
+    allocate: (scope: string, replyTo?: string) => {
+      const wcId = _workChainStore?.resolveOrAllocate(scope, replyTo) ?? '';
+      if (wcId) _workChainStore?.markCurrent(wcId);
+      return wcId;
+    },
     acquire: (l: WorkLease) => _workChainStore?.acquireUnit(l.workChainId, l.unitId),
     release: (l: WorkLease) => _workChainStore?.releaseUnit(l.workChainId, l.unitId),
   });
@@ -1896,19 +1905,20 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   });
   if (handled) {
     const dropped = pending.cancel(scope);
+    // R4-B3: clean reaction side-state (meta/tracker/context) for dropped
+    // units — the queue released their WorkLease, but reaction entries in the
+    // tracker / turn-meta / contextStore are keyed by reactionKey and must be
+    // cleaned explicitly to avoid stale queued tracker → false reserved race.
+    for (const m of dropped) releaseEnqueuedTurn(scope, m.messageId);
     log.info('intake', 'command', { scope, droppedPending: dropped.length });
     return;
   }
 
-  // R3-F1/F3: ordinary REPLY (replyTo a Bot message) carries a workChain lease
-  // at enqueue so a stop on the target resolves the current chain while queued.
-  // Top-level messages (no replyTo) have no stop target while queued — they
-  // acquire a chain at run start (B1) and merge as before (no lease).
-  const ordWcId = emsg.replyToMessageId
-    ? (_workChainStore?.resolveOrAllocate(scope, emsg.replyToMessageId) ?? '')
-    : '';
-  if (ordWcId) _workChainStore?.markCurrent(ordWcId);
-  const size = pending.push(scope, emsg, ordWcId);
+  // R4-B1: every ordinary input unit (reply OR top-level) carries a workChain
+  // lease at enqueue (DD15). The queue allocates per-unit via leaseHooks
+  // (merged same-replyTo messages share one unit/lease); intakeMessage passes
+  // replyTo. Top-level (no replyTo) messages merge into one unit + share lease.
+  const size = pending.push(scope, emsg, emsg.replyToMessageId);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
 
@@ -2240,17 +2250,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     });
     _reactionRunTracker?.markStatus(scope, rkOpId, rkTgtId, 'active');
   } else if (deps.lease?.workChainId) {
-    // R3-F1/F3: ordinary reply with lease (acquired at intakeMessage enqueue).
+    // R4-B1: ordinary (reply or top-level) — workChain from the lease
+    // (allocated+acquired at intakeMessage enqueue via leaseHooks).
     _workChainStore?.markCurrent(deps.lease.workChainId); // idempotent
     reactionTurnMeta = { workChainId: deps.lease.workChainId, reactionKey: '', revision: 0 };
-  } else {
-    // Ordinary top-level (no lease) — allocate+acquire at run start (B1).
-    const ordWcId = _workChainStore?.resolveOrAllocate(scope, firstMsg.replyToMessageId) ?? '';
-    if (ordWcId) {
-      _workChainStore?.markCurrent(ordWcId);
-      _workChainStore?.acquireUnit(ordWcId, runUnitId);
-      reactionTurnMeta = { workChainId: ordWcId, reactionKey: '', revision: 0 };
-    }
   }
   // Register outbound on stream result (applies to ordinary + reaction — both
   // carry a workChain now, so all visible outputs are registered on creation).

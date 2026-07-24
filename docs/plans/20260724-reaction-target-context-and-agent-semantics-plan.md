@@ -509,7 +509,12 @@ pnpm -s test
   - R3-F2（evict/empty-set 释放旧 unit）：`cancelMessage`/`cancel` 现经 leaseHooks release 被移除 unit 的 lease——evict 的 cancelMessage、empty-set 的 cancelPendingForTarget 自动释放 rev1 unit（不再裸 deleteReactionTurnMeta）。`executeReactionFlushDecision` empty-set / `evictInFlightReactionEntry` queued 路径覆盖。
   - R3-F3（命令路径 cancel 释放）：`pending.cancel(scope)` 释放所有 unit lease（queue 内置）；`intakeMessage` handled=true 的 `pending.cancel` 同样释放。stop Reaction 分支保留 releaseEnqueuedTurn 清 reaction meta/tracker。
   - R3-F4（startFlow throw 释放）：onFlush 的 `invokeFlush` catch 释放 lease；`runAgentBatch` `!flow.ok` 释放 `deps.lease` + 清 reaction meta/tracker。
-  - R3-F5（测试+Plan）：B4 acquireUnit/releaseUnit per-unit sibling 测试 + hasActiveOrReserved + isLatest 已存。typecheck=0、reaction+runtime+executor 364/364。完整 lease-on-PendingUnit 端到端 production-seam 测试（ordinary-pending→stop、reservation-abort→全清、fallback-resolve）仍建议跟进（核心逻辑已单测+生产 wiring 已接）。Plan B9 保持 OPEN，未写"已覆盖"。
+  - R3-F5（测试+Plan）：B4 acquireUnit/releaseUnit per-unit sibling 测试 + hasActiveOrReserved + isLatest 已存。typecheck=0、reaction+runtime+executor 364/364。完整 lease-on-PendingUnit 端到端 production-seam 测试仍建议跟进。Plan B9 保持 OPEN。
+- **B9 R5（云上C总 Implementer，待小P Review）**：R4 Review（738c6f5..041b300）BLOCKED 3 项，R5 修复：
+  - B1（top-level 普通 unit 也带 lease，DD15）：`leaseHooks` 加 `allocate(scope, replyTo)`；`push(scope, msg, replyTo?)` 按 replyTo 合并（同 replyTo/top-level 合一 unit），新 unit 经 allocate 分配 chain+lease（per-unit 非 per-message）。`intakeMessage` 传 `emsg.replyToMessageId`（top-level 与 reply 都带 lease）。`runAgentBatch` 去 top-level B1 fallback（lease 覆盖）。
+  - B2（async onFlush catch 释放 lease）：onFlush handler 的 catch 释放 `lease`（workChainStore.releaseUnit）+ `releaseEnqueuedTurn`（清 reaction meta/tracker），覆盖 chatMode resolve/startFlow/stream 异步 throw。
+  - B3（命令 cancel / empty-set 清 reaction side-state）：`intakeMessage` handled cancel 对每个 dropped msg 调 `releaseEnqueuedTurn`；`executeReactionFlushDecision` empty-set 加 `unregisterTrackerForTarget` effect 清 tracker。统一 lease（queue）+ reaction side-state（releaseEnqueuedTurn）释放。
+  - 死 side-map 清理：移除 `_ordinaryTurnMeta`/`setOrdinaryTurnMeta`/`consumeOrdinaryTurnMeta`；`releaseEnqueuedTurn` 简化为 reaction-only（ordinary lifecycle 完全在 PendingUnit lease）。typecheck=0、reaction+runtime+executor 364/364。
 
 ## Plan Review Gate  Owner: 小P
 

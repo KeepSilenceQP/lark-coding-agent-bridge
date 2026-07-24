@@ -22,7 +22,7 @@ import { log } from '../core/logger';
 export type WorkLease = { workChainId: string; unitId: string };
 
 type PendingUnit =
-  | { kind: 'regular'; messages: NormalizedMessage[]; lease: WorkLease | undefined }
+  | { kind: 'regular'; messages: NormalizedMessage[]; lease: WorkLease | undefined; replyTo: string | undefined }
   | { kind: 'barrier'; message: NormalizedMessage; lease: WorkLease | undefined };
 
 function unitLength(u: PendingUnit): number {
@@ -40,8 +40,9 @@ function totalLength(entry: PendingEntry): number {
   return n;
 }
 
-/** Hooks that acquire/release a lease on the work-chain store. */
+/** Hooks that allocate/acquire/release a lease on the work-chain store. */
 export interface LeaseHooks {
+  allocate: (scope: string, replyTo?: string) => string;
   acquire: (lease: WorkLease) => void;
   release: (lease: WorkLease) => void;
 }
@@ -84,38 +85,43 @@ export class PendingQueue {
   // workChainId is optional: production (intakeMessage) passes it so the unit
   // acquires a work-chain lease; queue-mechanics tests omit it (no lease).
 
-  push(scope: string, msg: NormalizedMessage, workChainId?: string): number {
+  push(scope: string, msg: NormalizedMessage, replyTo?: string): number {
     const existing = this.map.get(scope);
-    const lease: WorkLease | undefined = workChainId
-      ? { workChainId, unitId: this.nextUnitId() }
-      : undefined;
     if (existing) {
       if (existing.timer) clearTimeout(existing.timer);
       const last = existing.units[existing.units.length - 1];
-      // Merge into the tail regular unit ONLY when both have the same
-      // workChainId (same target chain). Different chain (or lease/no-lease
-      // mismatch) → new unit, so terminal/cancel can release each unit's lease
-      // precisely (R3-F1).
-      const sameChain =
-        last &&
-        last.kind === 'regular' &&
-        (last.lease?.workChainId ?? '') === (workChainId ?? '');
-      if (sameChain) {
+      // Merge into the tail regular unit ONLY when it has the same replyTo
+      // (same target chain, or both top-level). Different replyTo → new unit,
+      // so terminal/cancel can release each unit's lease precisely (R3-F1).
+      // R4-B1: top-level (replyTo undefined) messages merge into one unit and
+      // share the unit's lease (allocated once on unit creation) — DD15.
+      const sameUnit = last && last.kind === 'regular' && last.replyTo === replyTo;
+      if (sameUnit) {
         last.messages.push(msg);
         // shared lease — no new acquire
       } else {
+        const lease = this.allocateLease(scope, replyTo);
         if (lease) this.acquireLease(lease);
-        existing.units.push({ kind: 'regular', messages: [msg], lease });
+        existing.units.push({ kind: 'regular', messages: [msg], lease, replyTo });
       }
       existing.timer = this.blocked.has(scope) ? undefined : this.armTimer(scope);
       return totalLength(existing);
     }
+    const lease = this.allocateLease(scope, replyTo);
     if (lease) this.acquireLease(lease);
     this.map.set(scope, {
-      units: [{ kind: 'regular', messages: [msg], lease }],
+      units: [{ kind: 'regular', messages: [msg], lease, replyTo }],
       timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
     });
     return 1;
+  }
+
+  /** Allocate a workChainId + lease for a new unit (R4-B1). Per-unit (not
+   *  per-message): merged messages share the unit's lease. */
+  private allocateLease(scope: string, replyTo?: string): WorkLease | undefined {
+    const workChainId = this.leaseHooks?.allocate(scope, replyTo) ?? '';
+    if (!workChainId) return undefined;
+    return { workChainId, unitId: this.nextUnitId() };
   }
 
   // ── pushBarrier (reaction turn — independent unit, never merged) ──
@@ -183,7 +189,7 @@ export class PendingQueue {
           else keptMsgs.push(m);
         }
         if (keptMsgs.length > 0) {
-          kept.push({ kind: 'regular', messages: keptMsgs, lease: u.lease });
+          kept.push({ kind: 'regular', messages: keptMsgs, lease: u.lease, replyTo: u.replyTo });
         } else {
           // Unit fully emptied → release its lease (R3-F2).
           if (u.lease) this.releaseLease(u.lease);

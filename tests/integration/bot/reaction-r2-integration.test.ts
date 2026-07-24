@@ -1077,6 +1077,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
       deleteTurnMetaForTarget: (key) => { deleteCalls.push(key); },
       interruptActiveRun: (scope) => { interruptCalls.push(scope); },
       setHandleSuperseded: (scope) => { supersedeCalls.push(scope); },
+      unregisterTrackerForTarget: () => {},
     };
 
     const { executeReactionFlushDecision } = await import('../../../src/bot/channel');
@@ -1102,6 +1103,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
       deleteTurnMetaForTarget: () => {},
       interruptActiveRun: () => {},
       setHandleSuperseded: () => {},
+      unregisterTrackerForTarget: () => {},
     };
 
     const { executeReactionFlushDecision } = await import('../../../src/bot/channel');
@@ -1123,6 +1125,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
       deleteTurnMetaForTarget: () => {},
       interruptActiveRun: () => {},
       setHandleSuperseded: () => {},
+      unregisterTrackerForTarget: () => {},
     };
 
     const { executeReactionFlushDecision } = await import('../../../src/bot/channel');
