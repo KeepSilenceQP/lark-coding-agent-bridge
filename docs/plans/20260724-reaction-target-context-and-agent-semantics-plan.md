@@ -503,11 +503,12 @@ pnpm -s test
 - **B5（实现注意）**：`NormalizedMessage` 为 vendored SDK 类型不易扩展；Reaction turn 经 `PendingQueue` barrier 条目携带 `ReactionTurn` 而非扩展 `NormalizedMessage`（DD11），`<reaction_contexts>` 数据经侧信道 plumbed 到 `buildAgentPrompt`。
 - **B6（实现注意）**：`ActiveRuns` 仅按 scope 键，无 per-run (operator,target,revision,workChainId) 元数据；DD12/DD15 需在其外加 per-run 元数据注册或扩展 `RunHandle`，注意与现有 `interrupt`/`unregister` 生命周期一致。
 - **B7（实现注意，第 3 版；v4 修订）**：DD15 的 `workChainId` 常量（`MAX_CHAINS_PER_SCOPE=16`、`MAX_OUTBOUND_MAP_PER_SCOPE=256`、`HISTORICAL_CHAIN_TTL_MS=1_800_000`）为 Plan 定义默认值，小C 实现时可同量级调整。**16/256 是 historical cache 上限，非总 Map 硬上限**；current chains 及其 outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，仅 terminal 后进入 historical retention 并按 LRU/TTL 裁剪；不引入 pending admission/drop/backpressure。
-- **B8（Unit 11 live blocker）**：普通 Reaction reconciliation 产生空
-  `effectiveReactionSet` 时，生产 buffer flush 当前仍无条件 enqueue Agent
-  turn。修复必须在真实 `channel.ts` wiring seam 证明 terminal 后 removed
-  只由 Bridge 回复且不启动 Agent；in-flight/queued removal 使旧 revision
-  失效、空集合不启动替代 turn；净零和重复投递仍各自遵守 DD7/DD14 防重。
+- **B8（Unit 11 live blocker，已修复）**：普通 Reaction reconciliation 产生空 `effectiveReactionSet` 时，buffer flush 经 `decideReactionFlush` 走 `bridge-reply`(empty-set) 分支——Bridge 回复"已收到撤回"+interrupt(若有 active)+cancelPending+clearContext+deleteTurnMeta，**不 enqueue Agent**（channel.ts `executeReactionFlushDecision`）。terminal 后 removed 只由 Bridge 回复；in-flight/queued removal 经 `evictInFlightReactionEntry`(tri-state) 使旧 revision 失效；空集合不启动替代 turn；净零/重复投递遵守 DD7/DD14 防重。已由 B8 fix + 本轮 invariants 修复覆盖。
+- **B9（本轮 invariants 修复，云上C总 Implementer）**：面向不变量修复 workChain/revision 生命周期：
+  - A1：CoT path 在 `await cotPublisher.start()` 后即时登记 `cotPublisher.ref.messageId`（此前仅 completion 登记 final reply，streaming 期间无 outbound 映射，stop 无法关联）。
+  - A3：`resolveWorkChain` callback 改为不分配（`return ''`）；allocation+`registerOutbound(target)` 移到 buffer flush handler，仅在 `decideReactionFlush=enqueue-agent` 且 `buildReactionTargetMessage` 成功后执行——drop/noOp/net-zero/empty-set/reconciliationFailed 不再分配或登记 chain（不变量 A）。
+  - B1/B2：新增 `ReactionRunTracker.isLatest`；4 个 terminal 块经 `finalizeReactionRun` helper 门控——仅当本 run 仍是该 key 最新 revision 时才 `markTerminal`+`unregister`，避免 rev1 terminal 清掉 rev2 的 tracker entry 或把共享 workChain 过早标 terminal（不变量 B）。
+  - 测试：`reaction-revision-superseded.test.ts` 补 `isLatest` gate 测试；typecheck=0、reaction 182/182 通过。A1(CoT)/A3(allocation) 完整 production-seam e2e 测试建议作为 Unit 11 live 期间跟进。
 
 ## Plan Review Gate  Owner: 小P
 

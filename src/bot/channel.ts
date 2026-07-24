@@ -213,6 +213,26 @@ function markTerminalLifecycle(workChainId: string): void {
   _workChainStore?.markTerminal(workChainId);
 }
 
+/**
+ * Finalize a reaction run's lifecycle on terminal. Only marks the workChain
+ * terminal and unregisters the tracker entry if THIS run is still the latest
+ * revision for the key (B1/B2). A newer revision that superseded this run
+ * owns the shared workChain + tracker slot — rev1's terminal must not clear
+ * rev2's entry or prematurely terminal-mark the shared chain.
+ */
+function finalizeReactionRun(
+  scope: string,
+  reactionTurnMeta: { workChainId: string; reactionKey: string; revision: number } | undefined,
+): void {
+  if (!reactionTurnMeta) return;
+  const opId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';
+  const tgtId = reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '';
+  if (_reactionRunTracker?.isLatest(scope, opId, tgtId, reactionTurnMeta.revision) ?? false) {
+    markTerminalLifecycle(reactionTurnMeta.workChainId);
+    _reactionRunTracker?.unregister(scope, opId, tgtId);
+  }
+}
+
 // ── Reaction flush decision + executor (single seam, called by buffer handler) ──
 export type ReactionFlushDecision =
   | { kind: 'drop'; reason: string }
@@ -1058,7 +1078,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     }
     // F10/F11: Carry reaction metadata through to the run lifecycle
     const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
-    if (wcId) _workChainStore?.markCurrent(wcId);
+    if (wcId) {
+      _workChainStore?.markCurrent(wcId);
+      // A3: register the target→chain mapping here (after reconcile decided
+      // enqueue-agent + target body read succeeded) so stop correlation only
+      // resolves chains for actual in-flight work, not dropped events.
+      _workChainStore?.registerOutbound(wcId, result.components.targetMessageId);
+    }
     // Per-key metadata. turnId links the barrier NormalizedMessage to its meta/context.
     setReactionTurnMeta(result.key, result.components.targetMessageId, result.components.scope, wcId, result.revision, turnId);
     // Register in tracker at queued/reserved time so empty-set removal can detect it
@@ -1365,15 +1391,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             resolveChatMode: async (chatId) => {
               return chatModeCache.resolve(channel, chatId);
             },
-            resolveWorkChain: (scope, replyToMessageId) => {
-              const chain = workChainStore.resolveOrAllocate(scope, replyToMessageId);
-              // Register the reaction target as an outbound mapping so that
-              // subsequent pipeline/flush lookups and stop-current-work
-              // resolution hit the same chain (prevents double allocation).
-              if (replyToMessageId) {
-                workChainStore.registerOutbound(chain, replyToMessageId);
-              }
-              return chain;
+            resolveWorkChain: (_scope, _replyToMessageId) => {
+              // A3: do NOT allocate/register at pipeline time. Allocation +
+              // registerOutbound happen in the buffer flush handler, ONLY after
+              // reconcile decides enqueue-agent AND the target body read
+              // succeeds. This prevents allocating/registering a chain for
+              // events that later drop/noOp/net-zero/empty-set/reconciliationFailed.
+              return '';
             },
           });
 
@@ -2290,6 +2314,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         inputPreview: lastMsg.content,
       });
       await cotPublisher.start();
+      // A1: register the CoT bubble messageId immediately after start() so a
+      // stop reaction can correlate during streaming — not only at completion.
+      if (reactionTurnMeta && !cotPublisher.disabled && cotPublisher.ref) {
+        registerOutboundLifecycle(reactionTurnMeta.workChainId, cotPublisher.ref.messageId);
+      }
       if (!cotPublisher.disabled) {
         const cotDone = consumeCotEvents(execution.subscribe(), cotPublisher, {
           detail: cotMessages,
@@ -2324,12 +2353,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           cardRenderOptions,
         });
         _registerOutboundOnStream(cotResult);
-        if (reactionTurnMeta) {
-          markTerminalLifecycle(reactionTurnMeta.workChainId);
-          _reactionRunTracker?.unregister(scope,
-            reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
-            reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '');
-        }
+        finalizeReactionRun(scope, reactionTurnMeta);
         return;
       }
       log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
@@ -2394,12 +2418,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
       });
       // Reaction lifecycle: mark terminal after render+stream complete
-      if (reactionTurnMeta) {
-        markTerminalLifecycle(reactionTurnMeta.workChainId);
-        _reactionRunTracker?.unregister(scope,
-          reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
-          reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '');
-      }
+      finalizeReactionRun(scope, reactionTurnMeta);
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let latestMarkdown = renderMarkdownStreamText(latestState);
@@ -2512,12 +2531,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
       });
       // Reaction lifecycle: mark terminal after render+stream complete
-      if (reactionTurnMeta) {
-        markTerminalLifecycle(reactionTurnMeta.workChainId);
-        _reactionRunTracker?.unregister(scope,
-          reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
-          reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '');
-      }
+      finalizeReactionRun(scope, reactionTurnMeta);
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -2543,12 +2557,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       });
       // Reaction lifecycle: register outbound for text mode
       _registerOutboundOnStream(sendResult);
-      if (reactionTurnMeta) {
-        markTerminalLifecycle(reactionTurnMeta.workChainId);
-        _reactionRunTracker?.unregister(scope,
-          reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
-          reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '');
-      }
+      finalizeReactionRun(scope, reactionTurnMeta);
     }
   } catch (err) {
     log.fail('stream', err);

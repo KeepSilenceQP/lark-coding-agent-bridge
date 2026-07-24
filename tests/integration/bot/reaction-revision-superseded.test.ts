@@ -247,4 +247,27 @@ describe('revision invalidation contract', () => {
     // The pipeline should handle this by not creating an Agent turn
     // when effectiveReactionSet is empty
   });
+
+  it('isLatest gates terminal cleanup so rev1 terminal does not clear rev2 (B1/B2)', () => {
+    const tracker = new ReactionRunTracker();
+    const scope = 'oc_s', opId = 'ou_u', tgtId = 'om_t';
+
+    // rev1 active
+    tracker.register({ scope, operatorOpenId: opId, targetMessageId: tgtId, reactionRevision: 1, runId: 'r1', status: 'active' });
+    expect(tracker.isLatest(scope, opId, tgtId, 1)).toBe(true);
+
+    // rev2 supersedes rev1 (evict unregisters rev1, then rev2 registers)
+    tracker.unregister(scope, opId, tgtId);
+    tracker.register({ scope, operatorOpenId: opId, targetMessageId: tgtId, reactionRevision: 2, runId: 'r2', status: 'queued' });
+
+    // rev1's terminal checks isLatest(rev1) → false (rev2 is latest) → skip unregister/markTerminal
+    expect(tracker.isLatest(scope, opId, tgtId, 1)).toBe(false);
+    expect(tracker.isLatest(scope, opId, tgtId, 2)).toBe(true);
+    // rev2's entry survives rev1's terminal
+    expect(tracker.get(scope, opId, tgtId)?.reactionRevision).toBe(2);
+
+    // No entry → isLatest false (already cleared)
+    tracker.unregister(scope, opId, tgtId);
+    expect(tracker.isLatest(scope, opId, tgtId, 2)).toBe(false);
+  });
 });

@@ -79,6 +79,18 @@ export class ReactionRunTracker {
   }
 
   /**
+   * Is the run for this key still the latest revision?
+   * Returns false when no entry exists (already superseded/unregistered) or
+   * when a newer revision has been registered. Used by terminal handlers to
+   * avoid clearing a successor run's tracker entry / shared workChain (B1/B2).
+   */
+  isLatest(scope: string, operatorOpenId: string, targetMessageId: string, revision: number): boolean {
+    const current = this.get(scope, operatorOpenId, targetMessageId);
+    if (!current) return false;
+    return current.reactionRevision === revision;
+  }
+
+  /**
    * Check if a new revision should interrupt an ACTIVE run for the same key.
    * Only active runs (not queued/reserved) are interruptible.
    */
