@@ -730,10 +730,6 @@ describe('decideReactionFlush production caller verification', () => {
 
 // ── Production effects tests: call real effects executor with spies ──
 
-import { createReactionFlushEffects, decideReactionFlush } from '../../../src/bot/channel';
-import { ReactionContextStore } from '../../../src/bot/reaction/context-store';
-import { makeReactionKey } from '../../../src/bot/reaction/types';
-
 describe('production flush executor — real effects calls, no manual simulation', () => {
   function setup() {
     const cancelCalls: string[] = []; // targetMessageId cancelled
@@ -894,3 +890,58 @@ describe('production flush executor — real effects calls, no manual simulation
 
 // Remove the old "Production seam" section and "production caller verification" if they're duplicative.
 // The tests above replace all prior attempt sections with one cohesive test block.
+
+// ── Real PendingQueue cancelMessage isolation test ──
+
+describe('PendingQueue.cancelMessage — real queue, no mocks', () => {
+  function msg(id: string, content = '') {
+    return { messageId: id, chatId: 'oc_s', chatType: 'group' as const, senderId: 'ou_u', content,
+      rawContentType: 'reaction' as never, resources: [], mentions: [], mentionAll: false,
+      mentionedBot: false, createTime: Date.now() };
+  }
+
+  it('cancelMessage removes only matching messageId, keeps others in same scope', () => {
+    const queue = new PendingQueue(10000, () => {});
+    queue.push('oc_s', msg('om_a', 'key A'));
+    queue.push('oc_s', msg('om_b', 'key B'));
+    queue.push('oc_s', msg('om_c', 'ordinary C'));
+
+    // Cancel only key B
+    const removed = queue.cancelMessage('oc_s', 'om_b');
+    expect(removed).toHaveLength(1);
+    expect(removed[0]!.messageId).toBe('om_b');
+    expect(removed[0]!.content).toBe('key B');
+
+    // Key A and ordinary C still present
+    const remaining = queue.cancel('oc_s');
+    expect(remaining).toHaveLength(2);
+    const ids = remaining.map(m => m.messageId);
+    expect(ids).toContain('om_a');
+    expect(ids).toContain('om_c');
+    expect(ids).not.toContain('om_b');
+  });
+
+  it('cancelMessage returns empty array for non-existent messageId', () => {
+    const queue = new PendingQueue(10000, () => {});
+    queue.push('oc_s', msg('om_a'));
+    const removed = queue.cancelMessage('oc_s', 'om_nonexistent');
+    expect(removed).toEqual([]);
+    // Original untouched
+    const all = queue.cancel('oc_s');
+    expect(all).toHaveLength(1);
+    expect(all[0]!.messageId).toBe('om_a');
+  });
+
+  it('cancelMessage on empty scope returns empty array', () => {
+    const queue = new PendingQueue(10000, () => {});
+    expect(queue.cancelMessage('oc_s', 'om_x')).toEqual([]);
+  });
+
+  it('cancelMessage with all matching → scope fully removed', () => {
+    const queue = new PendingQueue(10000, () => {});
+    queue.push('oc_s', msg('om_only'));
+    const removed = queue.cancelMessage('oc_s', 'om_only');
+    expect(removed).toHaveLength(1);
+    expect(queue.cancel('oc_s')).toEqual([]); // scope gone
+  });
+});

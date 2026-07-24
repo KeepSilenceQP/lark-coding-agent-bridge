@@ -84,19 +84,26 @@ export class PendingQueue {
   cancelMessage(scope: string, messageId: string): NormalizedMessage[] {
     const entry = this.map.get(scope);
     if (!entry) return [];
-    const before = entry.messages.length;
-    entry.messages = entry.messages.filter((m) => m.messageId !== messageId);
+    // Collect actually removed messages, not fake placeholders
+    const removed: NormalizedMessage[] = [];
+    const kept: NormalizedMessage[] = [];
+    for (const m of entry.messages) {
+      if (m.messageId === messageId) {
+        removed.push(m);
+      } else {
+        kept.push(m);
+      }
+    }
+    if (removed.length === 0) return [];
+    entry.messages = kept;
     if (entry.messages.length === 0) {
       if (entry.timer) clearTimeout(entry.timer);
       this.map.delete(scope);
-    } else if (before > entry.messages.length && !this.blocked.has(scope)) {
-      // Reset quiet window if we removed some but not all
+    } else if (!this.blocked.has(scope)) {
       if (entry.timer) clearTimeout(entry.timer);
       entry.timer = this.armTimer(scope);
     }
-    return before > entry.messages.length
-      ? [{ messageId, chatId: '', chatType: 'group' as const, senderId: '', content: '', rawContentType: 'text' as const, resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: 0 }]
-      : [];
+    return removed;
   }
 
   cancelAll(): void {
