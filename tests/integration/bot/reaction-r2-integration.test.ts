@@ -375,14 +375,14 @@ describe('reconcile e2e with real nested API', () => {
 describe('F17: streaming production path — supersede on revision invalidation', () => {
   it('ReactionRunTracker detects same-key higher revision → shouldInterrupt=true', () => {
     const tracker = new ReactionRunTracker();
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_u', targetMessageId: 'om_t', reactionRevision: 1, runId: 'run-1' });
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_u', targetMessageId: 'om_t', reactionRevision: 1, runId: 'run-1', active: true });
     expect(tracker.shouldInterrupt('oc_s', 'ou_u', 'om_t', 2)).toBe(true);
     expect(tracker.shouldInterrupt('oc_s', 'ou_u', 'om_t', 1)).toBe(false);
   });
 
   it('different key (different operator) → shouldInterrupt=false, no false supersede', () => {
     const tracker = new ReactionRunTracker();
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_t', reactionRevision: 1, runId: 'run-1' });
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_t', reactionRevision: 1, runId: 'run-1', active: true });
     // Different operator should NOT interrupt
     expect(tracker.shouldInterrupt('oc_s', 'ou_b', 'om_t', 2)).toBe(false);
   });
@@ -401,9 +401,9 @@ describe('F17: streaming production path — supersede on revision invalidation'
   it('two keys interleaved: key A terminal does not clobber key B active metadata', () => {
     const tracker = new ReactionRunTracker();
     // Key A: active run
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_a', reactionRevision: 1, runId: 'run-a' });
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_a', targetMessageId: 'om_a', reactionRevision: 1, runId: 'run-a', active: false });
     // Key B: active run, same scope but different operator
-    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_b', targetMessageId: 'om_b', reactionRevision: 1, runId: 'run-b' });
+    tracker.register({ scope: 'oc_s', operatorOpenId: 'ou_b', targetMessageId: 'om_b', reactionRevision: 1, runId: 'run-b', active: false });
     // Key A terminal — unregister should not affect key B
     tracker.unregister('oc_s', 'ou_a', 'om_a');
     expect(tracker.get('oc_s', 'ou_a', 'om_a')).toBeUndefined();
@@ -796,12 +796,17 @@ describe('production flush executor — real effects calls, no manual simulation
   });
 
   // ── 2) empty-set with active → cleanup + interrupt ──
-  it('empty-set with active run → effects.cancelPendingForTarget called via real executor', () => {
+  it('empty-set with active run → effects.cancelPendingForTarget called via real executor', async () => {
     const { callEffects, cancelCalls } = setup();
-    callEffects.cancelForTarget('oc_s', 'om_t');
-    // cancelPendingForTarget should call cancelMessage with the targetMessageId
+    // Set up reaction turn meta so cancelPendingForTarget can look up the turnId
+    const { setReactionTurnMeta } = await import('../../../src/bot/channel');
+    const rk = 'oc_s\x1fou_u\x1fom_t';
+    const turnId = `${rk}:1`;
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 1, turnId);
+    callEffects.cancelForTarget('oc_s', rk);
+    // cancelPendingForTarget calls cancelMessage(scope, turnId)
     expect(cancelCalls.length).toBe(1);
-    expect(cancelCalls[0]).toBe('om_t');
+    expect(cancelCalls[0]).toBe(turnId);
   });
 
   it('empty-set with active run → effects.clearContextForTarget called', () => {
@@ -828,13 +833,19 @@ describe('production flush executor — real effects calls, no manual simulation
   });
 
   // ── 3) empty-set NO active → cleanup only, no interrupt ──
-  it('empty-set no active → cancel + clear + delete, NO interrupt', () => {
+  it('empty-set no active → cancel + clear + delete, NO interrupt', async () => {
     const { callEffects, cancelCalls, clearCalls, interruptCalls } = setup();
-    callEffects.cancelForTarget('oc_s', 'om_t');
+    // Set up reaction turn meta
+    const { setReactionTurnMeta } = await import('../../../src/bot/channel');
+    const rk = 'oc_s\x1fou_u\x1fom_t';
+    const turnId = `${rk}:1`;
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 1, turnId);
+    callEffects.cancelForTarget('oc_s', rk);
     callEffects.clearContext('om_t');
     // No interrupt called
     expect(interruptCalls.length).toBe(0);
     expect(cancelCalls.length).toBe(1);
+    expect(cancelCalls[0]).toBe(turnId);
     expect(clearCalls.length).toBe(1);
   });
 
@@ -850,17 +861,22 @@ describe('production flush executor — real effects calls, no manual simulation
   });
 
   // ── 5) active A + queued B + remove B → A preserved ──
-  it('per-key cancel: cancelMessage only removes matching messageId, not whole scope', () => {
+  it('per-key cancel: cancelMessage only removes matching messageId, not whole scope', async () => {
     const scope = 'oc_s';
     const msgA = { messageId: 'om_a', chatId: scope, chatType: 'group' as const, senderId: '', content: '', rawContentType: 'reaction' as never, resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: 0 };
     const msgB = { messageId: 'om_b', chatId: scope, chatType: 'group' as const, senderId: '', content: '', rawContentType: 'reaction' as never, resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: 0 };
 
     const { callEffects, cancelCalls } = setup();
-    // Cancel only B's barrier — calls cancelMessage(scope, 'om_b')
-    callEffects.cancelForTarget(scope, 'om_b');
+    // Set up reaction turn meta for key B with turnId 'om_b_turn'
+    const { setReactionTurnMeta } = await import('../../../src/bot/channel');
+    const rkB = 'oc_s\x1fou_b\x1fom_b';
+    const turnIdB = `${rkB}:1`;
+    setReactionTurnMeta(rkB, 'om_b', scope, 'wc-b', 1, turnIdB);
+    // Cancel only B's barrier — calls cancelMessage(scope, turnId)
+    callEffects.cancelForTarget(scope, rkB);
     expect(cancelCalls.length).toBe(1);
-    expect(cancelCalls[0]).toBe('om_b');
-    // cancelMessage only removes msg with messageId='om_b' — msgA survives
+    expect(cancelCalls[0]).toBe(turnIdB);
+    // cancelMessage only removes msg with messageId='turnIdB' — msgA survives
     void msgA; // msgA not cancelled — still in queue
     void msgB; // msgB was cancelled
   });
@@ -1030,9 +1046,8 @@ describe('bridge-reply reason-based cleanup policy', () => {
     const supersedeCalls: string[] = [];
 
     const effects: import('../../../src/bot/channel').ReactionFlushEffects = {
-      sendBridgeReply: async () => {},
-      cancelPendingForTarget: (_s, msgId) => { cancelCalls.push(msgId); },
-      clearContextForTarget: (msgId) => { clearCalls.push(msgId); },
+      cancelPendingForTarget: (_s, rk) => { cancelCalls.push(rk); },
+      clearContextForTarget: (rk) => { clearCalls.push(rk); },
       deleteTurnMetaForTarget: (key) => { deleteCalls.push(key); },
       interruptActiveRun: (scope) => { interruptCalls.push(scope); },
       setHandleSuperseded: (scope) => { supersedeCalls.push(scope); },
@@ -1056,8 +1071,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
   it('executeReactionFlushDecision — reconciliationFailed sends reply but calls NO effects', async () => {
     const cancelCalls: string[] = [];
     const effects: import('../../../src/bot/channel').ReactionFlushEffects = {
-      sendBridgeReply: async () => {},
-      cancelPendingForTarget: (_s, msgId) => { cancelCalls.push(msgId); },
+      cancelPendingForTarget: (_s, rk) => { cancelCalls.push(rk); },
       clearContextForTarget: () => {},
       deleteTurnMetaForTarget: () => {},
       interruptActiveRun: () => {},
@@ -1078,8 +1092,7 @@ describe('bridge-reply reason-based cleanup policy', () => {
   it('executeReactionFlushDecision — netZero sends reply but calls NO effects', async () => {
     const cancelCalls: string[] = [];
     const effects: import('../../../src/bot/channel').ReactionFlushEffects = {
-      sendBridgeReply: async () => {},
-      cancelPendingForTarget: (_s, msgId) => { cancelCalls.push(msgId); },
+      cancelPendingForTarget: (_s, rk) => { cancelCalls.push(rk); },
       clearContextForTarget: () => {},
       deleteTurnMetaForTarget: () => {},
       interruptActiveRun: () => {},

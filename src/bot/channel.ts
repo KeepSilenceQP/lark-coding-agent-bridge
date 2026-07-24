@@ -134,38 +134,66 @@ import {
 // ── Reaction context store (module-level, set by startChannel) ──
 let _reactionContextStore: ReactionContextStore | null = null;
 function getReactionContexts(messageIds: string[]): unknown[] {
-  return _reactionContextStore ? _reactionContextStore.consume(messageIds) : [];
+  if (!_reactionContextStore) return [];
+  // messageIds are turnIds from the batch; each maps to exactly one reactionKey.
+  // This ensures one batch only consumes its own context — not all operators on the same target.
+  const result: unknown[] = [];
+  for (const turnId of messageIds) {
+    const reactionKey = _reactionTurnMetaByTurnId.get(turnId);
+    if (!reactionKey) continue;
+    const ctx = _reactionContextStore.get(reactionKey);
+    if (ctx) { result.push(...ctx); _reactionContextStore.delete(reactionKey); }
+  }
+  return result;
 }
 
 // ── Reaction lifecycle bridges (module-level, wired by startChannel) ──
 let _workChainStore: WorkChainStore | null = null;
 let _reactionRunTracker: ReactionRunTracker | null = null;
-/** reactionKey → { workChainId, scope, revision }
- *  Keyed by full reaction identity (scope\x1foperator\x1ftarget).
- *  targetMessageId→reactionKey index allows runAgentBatch to find its entry
- *  via batch[0].messageId. */
-const _reactionTurnMeta = new Map<string, { workChainId: string; scope: string; revision: number }>();
-const _reactionTurnMetaByMsg = new Map<string, string>(); // targetMessageId → reactionKey
+/** reactionKey → { workChainId, scope, revision, turnId }
+ *  turnId is the unique barrier message ID (reactionKey + revision).
+ *  targetMessageId → Set<reactionKey> index for runAgentBatch lookup. */
+const _reactionTurnMeta = new Map<string, { workChainId: string; scope: string; revision: number; turnId: string }>();
+const _reactionTurnMetaByMsg = new Map<string, Set<string>>(); // targetMessageId → Set<reactionKey>
+const _reactionTurnMetaByTurnId = new Map<string, string>(); // turnId → reactionKey (1:1, for batch correspondence)
+const _reactionTurnIdByKey = new Map<string, string>(); // reactionKey → turnId (1:1, for cancelPending lookup)
 
-function setReactionTurnMeta(reactionKey: string, targetMessageId: string, scope: string, workChainId: string, revision: number): void {
-  _reactionTurnMeta.set(reactionKey, { workChainId, scope, revision });
-  _reactionTurnMetaByMsg.set(targetMessageId, reactionKey);
+export function setReactionTurnMeta(reactionKey: string, targetMessageId: string, scope: string, workChainId: string, revision: number, turnId: string): void {
+  _reactionTurnMeta.set(reactionKey, { workChainId, scope, revision, turnId });
+  let keys = _reactionTurnMetaByMsg.get(targetMessageId);
+  if (!keys) { keys = new Set(); _reactionTurnMetaByMsg.set(targetMessageId, keys); }
+  keys.add(reactionKey);
+  _reactionTurnMetaByTurnId.set(turnId, reactionKey);
+  _reactionTurnIdByKey.set(reactionKey, turnId);
 }
 function deleteReactionTurnMeta(reactionKey: string): void {
-  // Also clean up the message→key index
-  for (const [msgId, rKey] of _reactionTurnMetaByMsg) {
-    if (rKey === reactionKey) { _reactionTurnMetaByMsg.delete(msgId); break; }
-  }
+  // Remove from all indexes: main meta, turnId→key, key→turnId, target→key
+  const meta = _reactionTurnMeta.get(reactionKey);
   _reactionTurnMeta.delete(reactionKey);
+  if (meta) {
+    _reactionTurnMetaByTurnId.delete(meta.turnId);
+    _reactionTurnIdByKey.delete(reactionKey);
+    for (const [msgId, keys] of _reactionTurnMetaByMsg) {
+      keys.delete(reactionKey);
+      if (keys.size === 0) _reactionTurnMetaByMsg.delete(msgId);
+    }
+  }
 }
-function consumeReactionTurnMeta(batchMessageId: string): { workChainId: string; reactionKey: string; revision: number } | undefined {
-  // Look up reactionKey via targetMessageId index, then get meta by reactionKey
-  const reactionKey = _reactionTurnMetaByMsg.get(batchMessageId);
+function consumeReactionTurnMeta(turnId: string): { workChainId: string; reactionKey: string; revision: number } | undefined {
+  // turnId is the unique per-enqueue ID (reactionKey:revision). Look up the
+  // reactionKey directly — no Set-sweeping. Each batch gets only its own entry.
+  const reactionKey = _reactionTurnMetaByTurnId.get(turnId);
   if (!reactionKey) return undefined;
   const meta = _reactionTurnMeta.get(reactionKey);
   if (!meta) return undefined;
-  _reactionTurnMetaByMsg.delete(batchMessageId);
+  _reactionTurnMetaByTurnId.delete(turnId);
+  _reactionTurnIdByKey.delete(reactionKey);
   _reactionTurnMeta.delete(reactionKey);
+  // Clean up target→key index
+  for (const [msgId, keys] of _reactionTurnMetaByMsg) {
+    keys.delete(reactionKey);
+    if (keys.size === 0) _reactionTurnMetaByMsg.delete(msgId);
+  }
   return { workChainId: meta.workChainId, reactionKey, revision: meta.revision };
 }
 function registerOutboundLifecycle(workChainId: string, messageId: string): void {
@@ -211,9 +239,8 @@ export function decideReactionFlush(params: {
 }
 
 export interface ReactionFlushEffects {
-  sendBridgeReply: (chatId: string, message: string, replyToMessageId: string) => Promise<void>;
-  cancelPendingForTarget: (scope: string, targetMessageId: string) => void;
-  clearContextForTarget: (targetMessageId: string) => void;
+  cancelPendingForTarget: (scope: string, reactionKey: string) => void;
+  clearContextForTarget: (reactionKey: string) => void;
   deleteTurnMetaForTarget: (reactionKey: string) => void;
   interruptActiveRun: (scope: string) => void;
   setHandleSuperseded: (scope: string) => void;
@@ -225,12 +252,12 @@ export function createReactionFlushEffects(deps: {
   activeRuns: ActiveRuns;
 }): ReactionFlushEffects {
   return {
-    sendBridgeReply: async (_chatId, _message, _replyToMessageId) => {},
-    cancelPendingForTarget: (scope, targetMessageId) => {
-      deps.pending.cancelMessage(scope, targetMessageId);
+    cancelPendingForTarget: (scope, reactionKey) => {
+      const turnId = _reactionTurnIdByKey.get(reactionKey);
+      if (turnId) deps.pending.cancelMessage(scope, turnId);
     },
-    clearContextForTarget: (targetMessageId) => {
-      deps.contextStore.delete(targetMessageId);
+    clearContextForTarget: (reactionKey) => {
+      deps.contextStore.delete(reactionKey);
     },
     deleteTurnMetaForTarget: (reactionKey) => {
       deleteReactionTurnMeta(reactionKey);
@@ -265,8 +292,8 @@ export async function executeReactionFlushDecision(
         deps.effects.setHandleSuperseded(decision.interrupt.scope);
         deps.effects.interruptActiveRun(decision.interrupt.scope);
       }
-      deps.effects.cancelPendingForTarget(deps.scope, deps.targetMessageId);
-      deps.effects.clearContextForTarget(deps.targetMessageId);
+      deps.effects.cancelPendingForTarget(deps.scope, deps.reactionKey);
+      deps.effects.clearContextForTarget(deps.reactionKey);
       deps.effects.deleteTurnMetaForTarget(deps.reactionKey);
     }
     await deps.send(deps.scope.split(':')[0] ?? deps.scope, decision.message, deps.targetMessageId);
@@ -912,10 +939,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       targetMessage: targetMsg,
     };
 
-    // Store in contextStore and enqueue via pushBarrier
-    reactionContextStore.set(result.components.targetMessageId, [reactionContext]);
+    // Store in contextStore keyed by reactionKey (not targetMessageId — different operators on same target get separate entries)
+    reactionContextStore.set(result.key, [reactionContext]);
+    // Generate unique opaque turnId: reactionKey + revision ensures each enqueue
+    // is uniquely identifiable, even for the same key re-enqueued at a higher revision.
+    const turnId = `${result.key}:${result.revision}`;
     const normalizedMsg = {
-      messageId: result.components.targetMessageId,
+      messageId: turnId,
       chatId: result.components.scope.split(':')[0] ?? result.components.scope,
       chatType: 'group' as const,
       senderId: result.components.operatorOpenId,
@@ -944,8 +974,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     // F10/F11: Carry reaction metadata through to the run lifecycle
     const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
     if (wcId) _workChainStore?.markCurrent(wcId);
-    // Per-key metadata (keyed by targetMessageId so runAgentBatch finds via batch[0].messageId)
-    setReactionTurnMeta(result.key, result.components.targetMessageId, result.components.scope, wcId, result.revision);
+    // Per-key metadata. turnId links the barrier NormalizedMessage to its meta/context.
+    setReactionTurnMeta(result.key, result.components.targetMessageId, result.components.scope, wcId, result.revision, turnId);
     // Register in tracker at queued/reserved time so empty-set removal can detect it
     _reactionRunTracker?.register({
       scope: result.components.scope,
@@ -953,6 +983,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       targetMessageId: result.components.targetMessageId,
       reactionRevision: result.revision,
       runId: `${result.components.scope}:${Date.now()}`,
+      active: false, // queued, not yet active
     });
     pending.pushBarrier(result.components.scope, normalizedMsg);
     log.info('reaction', 'reconciled-and-enqueued', {
@@ -1860,8 +1891,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // user's message. Otherwise the SDK posts at top level and the user's
   // topic discussion breaks visually.
   // F1: For reaction batches, replyTo targets the reaction's target message,
-  // not the last batch message (which is the synthetic reaction placeholder).
-  const replyToId = isReactionBatch ? (batch[0]?.messageId ?? lastMsg.messageId) : lastMsg.messageId;
+  // not the last batch message (which uses the opaque turnId).
+  const replyToId = isReactionBatch
+    ? (() => {
+        const turnId = batch[0]?.messageId ?? '';
+        const rk = _reactionTurnMetaByTurnId.get(turnId);
+        // reactionKey format: scope\x1foperatorOpenId\x1ftargetMessageId
+        return rk ? (rk.split('\x1f')[2] ?? lastMsg.messageId) : lastMsg.messageId;
+      })()
+    : lastMsg.messageId;
   const sendOpts = {
     replyTo: replyToId,
     ...(mode === 'topic' && threadId ? { replyInThread: true } : {}),
@@ -1973,17 +2011,22 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const handle = execution.handle;
 
   // ── Reaction lifecycle: consume metadata from barrier turn, wire into run ──
-  // Look up by firstMsg.messageId (which IS the targetMessageId for reaction batches)
+  // Look up by firstMsg.messageId (which IS the unique turnId for reaction batches)
   const reactionTurnMeta = consumeReactionTurnMeta(firstMsg.messageId);
   if (reactionTurnMeta) {
     _workChainStore?.markCurrent(reactionTurnMeta.workChainId);
+    const rkOpId = reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '';
+    const rkTgtId = reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '';
     _reactionRunTracker?.register({
       scope,
-      operatorOpenId: reactionTurnMeta.reactionKey.split('\x1f')[1] ?? '',
-      targetMessageId: reactionTurnMeta.reactionKey.split('\x1f')[2] ?? '',
+      operatorOpenId: rkOpId,
+      targetMessageId: rkTgtId,
       reactionRevision: reactionTurnMeta.revision,
       runId: `${scope}:${Date.now()}`,
+      active: false, // queued/reserved, not yet active
     });
+    // Mark active once the run actually starts — only active entries are interruptible.
+    _reactionRunTracker?.markActive(scope, rkOpId, rkTgtId);
   }
   // Register outbound on stream result
   const _registerOutboundOnStream = (result: unknown): void => {

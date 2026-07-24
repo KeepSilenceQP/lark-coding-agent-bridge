@@ -20,6 +20,8 @@ export interface ReactionRunMeta {
   targetMessageId: string;
   reactionRevision: number;
   runId: string;
+  /** true when the run is actually active (not just queued/reserved). Only active entries can be interrupted. */
+  active: boolean;
 }
 
 /**
@@ -80,6 +82,10 @@ export class ReactionRunTracker {
    * - There IS an active run for this reaction key
    * - The new revision is HIGHER than the active run's revision
    */
+  /**
+   * Check if a new revision should interrupt an ACTIVE run for the same key.
+   * Only active runs (not queued/reserved) are interruptible.
+   */
   shouldInterrupt(
     scope: string,
     operatorOpenId: string,
@@ -88,7 +94,14 @@ export class ReactionRunTracker {
   ): boolean {
     const current = this.get(scope, operatorOpenId, targetMessageId);
     if (!current) return false;
+    if (!current.active) return false; // queued/reserved — not interruptible
     return newRevision > current.reactionRevision;
+  }
+
+  /** Mark a queued/reserved entry as active when the run actually starts. */
+  markActive(scope: string, operatorOpenId: string, targetMessageId: string): void {
+    const current = this.get(scope, operatorOpenId, targetMessageId);
+    if (current) current.active = true;
   }
 
   /**
