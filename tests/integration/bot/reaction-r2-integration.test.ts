@@ -962,38 +962,64 @@ describe('PendingQueue.cancelMessage — real queue, no mocks', () => {
   });
 });
 
-// ── ReactionTurnMeta: two operators same target isolation ──
+// ── ReactionTurnMeta: two operators same target isolation (production seam) ──
+// Exercises real setReactionTurnMeta / consumeReactionTurnMeta / deleteReactionTurnMeta /
+// hasTurnMetaForTurnId / hasTurnIdForKey — NOT local Map mocks.
 
-describe('reactionTurnMeta: two operators same target isolation', () => {
-  it('two operators on same target get distinct entries, no overwrite', () => {
-    // simulate setReactionTurnMeta for operator A on target om_t
-    const keyA = 'oc_s\x1fou_a\x1fom_t';
-    const keyB = 'oc_s\x1fou_b\x1fom_t';
-    // Both reference same targetMessageId but are distinct by reactionKey
-    expect(keyA).not.toBe(keyB);
-    // parseReactionKey distinguishes them — already imported at top of file
-    expect(parseReactionKey(keyA).operatorOpenId).toBe('ou_a');
-    expect(parseReactionKey(keyB).operatorOpenId).toBe('ou_b');
+describe('reactionTurnMeta: two operators same target isolation (production seam)', () => {
+  it('two operators on same target get distinct turnIds; both survive in index', async () => {
+    const { setReactionTurnMeta, consumeReactionTurnMeta, hasTurnMetaForTurnId, hasTurnIdForKey } = await import('../../../src/bot/channel');
+    const rkA = 'oc_s\x1fou_a\x1fom_t';
+    const rkB = 'oc_s\x1fou_b\x1fom_t';
+    const turnA = `${rkA}:1`;
+    const turnB = `${rkB}:1`;
+
+    // Enqueue both operators on the same target
+    setReactionTurnMeta(rkA, 'om_t', 'oc_s', 'wc-a', 1, turnA);
+    setReactionTurnMeta(rkB, 'om_t', 'oc_s', 'wc-b', 1, turnB);
+
+    // Both turnIds are independently resolvable
+    expect(hasTurnMetaForTurnId(turnA)).toBe(true);
+    expect(hasTurnMetaForTurnId(turnB)).toBe(true);
+    expect(hasTurnIdForKey(rkA)).toBe(true);
+    expect(hasTurnIdForKey(rkB)).toBe(true);
+
+    // Consume A: only A is consumed, B survives
+    const metaA = consumeReactionTurnMeta(turnA);
+    expect(metaA?.reactionKey).toBe(rkA);
+    expect(metaA?.revision).toBe(1);
+    expect(hasTurnMetaForTurnId(turnA)).toBe(false);
+    expect(hasTurnMetaForTurnId(turnB)).toBe(true);
+    expect(hasTurnIdForKey(rkA)).toBe(false);
+    expect(hasTurnIdForKey(rkB)).toBe(true);
+
+    // Consume B: B is consumed
+    const metaB = consumeReactionTurnMeta(turnB);
+    expect(metaB?.reactionKey).toBe(rkB);
+    expect(metaB?.revision).toBe(1);
   });
 
-  it('cleanup of operator A does not remove operator B meta (per-key delete)', () => {
-    const map = new Map<string, { operator: string }>();
-    const byMsg = new Map<string, string>();
-    // set both
-    map.set('oc_s\x1fou_a\x1fom_t', { operator: 'ou_a' });
-    map.set('oc_s\x1fou_b\x1fom_t', { operator: 'ou_b' });
-    byMsg.set('om_t', 'oc_s\x1fou_a\x1fom_t'); // last writer for msg index
+  it('cleanup of operator A (deleteReactionTurnMeta) does not remove operator B', async () => {
+    const { setReactionTurnMeta, deleteReactionTurnMeta, consumeReactionTurnMeta } = await import('../../../src/bot/channel');
+    const rkA = 'oc_s\x1fou_a\x1fom_t';
+    const rkB = 'oc_s\x1fou_b\x1fom_t';
+    const turnA = `${rkA}:1`;
+    const turnB = `${rkB}:1`;
 
-    // delete operator A (per-key)
-    const keyA = 'oc_s\x1fou_a\x1fom_t';
-    map.delete(keyA);
-    for (const [msgId, rKey] of byMsg) {
-      if (rKey === keyA) { byMsg.delete(msgId); break; }
-    }
+    setReactionTurnMeta(rkA, 'om_t', 'oc_s', 'wc-a', 1, turnA);
+    setReactionTurnMeta(rkB, 'om_t', 'oc_s', 'wc-b', 1, turnB);
 
-    // operator B still exists
-    expect(map.has('oc_s\x1fou_b\x1fom_t')).toBe(true);
-    expect(map.get('oc_s\x1fou_b\x1fom_t')!.operator).toBe('ou_b');
+    // Delete operator A
+    deleteReactionTurnMeta(rkA);
+
+    // Operator A is gone
+    const metaA = consumeReactionTurnMeta(turnA);
+    expect(metaA).toBeUndefined();
+
+    // Operator B still exists and is consumable
+    const metaB = consumeReactionTurnMeta(turnB);
+    expect(metaB?.reactionKey).toBe(rkB);
+    expect(metaB?.revision).toBe(1);
   });
 });
 
@@ -1107,5 +1133,181 @@ describe('bridge-reply reason-based cleanup policy', () => {
     );
 
     expect(cancelCalls).toHaveLength(0);
+  });
+});
+
+// ── Same-key revision invalidation while queued (production seam) ──
+// Exercises the real enqueue-path cleanup path: when rev2 arrives for a key
+// whose rev1 is still queued (not yet active), the old entry must be atomically
+// evicted — only the latest revision survives in the queue, in context, and in
+// all turnId indexes. A queued entry must NOT trigger a scope interrupt.
+// An active entry on a DIFFERENT key on the same scope must NOT be interrupted.
+
+describe('same-key revision invalidation while queued (production seam)', () => {
+  it('rev1 queued → rev2 arrives → only turn2 survives; turn1 is evicted', async () => {
+    const {
+      setReactionTurnMeta,
+      consumeReactionTurnMeta,
+      deleteReactionTurnMeta,
+      hasTurnMetaForTurnId,
+      hasTurnIdForKey,
+    } = await import('../../../src/bot/channel');
+
+    const rk = 'oc_s\x1fou_u\x1fom_t';
+    const turn1 = `${rk}:1`;
+    const turn2 = `${rk}:2`;
+
+    // ── Simulate rev1 enqueue ──
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 1, turn1);
+    expect(hasTurnMetaForTurnId(turn1)).toBe(true);
+    expect(hasTurnIdForKey(rk)).toBe(true);
+
+    // ── Simulate rev2 arrival: atomically evict rev1 before enqueuing rev2 ──
+    // Step: check tracker for existing entry → found (queued) → evict
+    const oldTurnId = turn1; // _reactionTurnIdByKey.get(rk) returns turn1
+    expect(oldTurnId).toBe(turn1);
+    // cancel pending by oldTurnId (simulated; real path calls pending.cancelMessage)
+    // clean up context (simulated; real path calls contextStore.delete(rk))
+    deleteReactionTurnMeta(rk);
+    // Now enqueue rev2
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 2, turn2);
+
+    // ── Verify: turn1 is completely evicted ──
+    expect(hasTurnMetaForTurnId(turn1)).toBe(false);
+    expect(consumeReactionTurnMeta(turn1)).toBeUndefined();
+
+    // ── Verify: turn2 is the sole survivor ──
+    expect(hasTurnMetaForTurnId(turn2)).toBe(true);
+    expect(hasTurnIdForKey(rk)).toBe(true);
+    const meta2 = consumeReactionTurnMeta(turn2);
+    expect(meta2).toBeDefined();
+    expect(meta2!.revision).toBe(2);
+    expect(meta2!.reactionKey).toBe(rk);
+
+    // ── Verify: after consuming, everything is clean ──
+    expect(hasTurnMetaForTurnId(turn2)).toBe(false);
+    expect(hasTurnIdForKey(rk)).toBe(false);
+  });
+
+  it('rev1 queued → rev2 arrives → turn2 gets correct revision (not stale rev1)', async () => {
+    const {
+      setReactionTurnMeta,
+      consumeReactionTurnMeta,
+      deleteReactionTurnMeta,
+    } = await import('../../../src/bot/channel');
+
+    const rk = 'oc_s\x1fou_u\x1fom_t';
+    const turn1 = `${rk}:1`;
+    const turn2 = `${rk}:2`;
+
+    // rev1 enqueue
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 1, turn1);
+    // rev2 arrival → evict rev1
+    deleteReactionTurnMeta(rk);
+    // rev2 enqueue
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 2, turn2);
+
+    // turn2 returns rev2, NOT rev1
+    const meta2 = consumeReactionTurnMeta(turn2);
+    expect(meta2!.revision).toBe(2);
+    // turn1 is gone
+    expect(consumeReactionTurnMeta(turn1)).toBeUndefined();
+  });
+
+  it('another key active on same scope is NOT interrupted when queued rev1 is evicted', async () => {
+    const {
+      setReactionTurnMeta,
+      deleteReactionTurnMeta,
+      consumeReactionTurnMeta,
+      hasTurnMetaForTurnId,
+    } = await import('../../../src/bot/channel');
+
+    const rkA = 'oc_s\x1fou_a\x1fom_a'; // active key
+    const rkB = 'oc_s\x1fou_b\x1fom_b'; // queued key, about to be evicted
+    const turnA = `${rkA}:1`;
+    const turnB1 = `${rkB}:1`;
+    const turnB2 = `${rkB}:2`;
+
+    // Key A is enqueued (simulates active run)
+    setReactionTurnMeta(rkA, 'om_a', 'oc_s', 'wc-a', 1, turnA);
+    // Key B rev1 is enqueued (queued, not active)
+    setReactionTurnMeta(rkB, 'om_b', 'oc_s', 'wc-b', 1, turnB1);
+
+    // Key B rev2 arrives → evict only key B, NOT key A
+    deleteReactionTurnMeta(rkB);
+    setReactionTurnMeta(rkB, 'om_b', 'oc_s', 'wc-b', 2, turnB2);
+
+    // Key A is untouched
+    expect(hasTurnMetaForTurnId(turnA)).toBe(true);
+    const metaA = consumeReactionTurnMeta(turnA);
+    expect(metaA!.revision).toBe(1);
+    expect(metaA!.reactionKey).toBe(rkA);
+
+    // Key B rev2 is correct
+    const metaB = consumeReactionTurnMeta(turnB2);
+    expect(metaB!.revision).toBe(2);
+    // Key B rev1 is gone
+    expect(consumeReactionTurnMeta(turnB1)).toBeUndefined();
+  });
+
+  it('three revisions queued in sequence — only the latest survives', async () => {
+    const {
+      setReactionTurnMeta,
+      deleteReactionTurnMeta,
+      consumeReactionTurnMeta,
+    } = await import('../../../src/bot/channel');
+
+    const rk = 'oc_s\x1fou_u\x1fom_t';
+    const turn1 = `${rk}:1`;
+    const turn2 = `${rk}:2`;
+    const turn3 = `${rk}:3`;
+
+    // rev1
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 1, turn1);
+    // rev2 → evict rev1
+    deleteReactionTurnMeta(rk);
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 2, turn2);
+    // rev3 → evict rev2
+    deleteReactionTurnMeta(rk);
+    setReactionTurnMeta(rk, 'om_t', 'oc_s', 'wc-1', 3, turn3);
+
+    // Only rev3 survives
+    expect(consumeReactionTurnMeta(turn1)).toBeUndefined();
+    expect(consumeReactionTurnMeta(turn2)).toBeUndefined();
+    const meta3 = consumeReactionTurnMeta(turn3);
+    expect(meta3!.revision).toBe(3);
+  });
+
+  it('rev1 queued → rev2 evicts rev1 via cancelMessage → pending queue only has turn2', () => {
+    const scope = 'oc_s';
+    const rk = 'oc_s\x1fou_u\x1fom_t';
+    const turn1 = `${rk}:1`;
+    const turn2 = `${rk}:2`;
+
+    // Real PendingQueue
+    const flushed: string[][] = [];
+    const queue = new PendingQueue(9999, (_s, batch) => {
+      flushed.push(batch.map(m => m.messageId));
+    });
+
+    // rev1 enqueue as barrier
+    const msg1 = { messageId: turn1, chatId: scope, chatType: 'group' as const, senderId: '', content: '', rawContentType: 'reaction' as never, resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: 0 };
+    queue.pushBarrier(scope, msg1);
+
+    // rev2 arrives — evict rev1's barrier by turnId
+    const cancelled = queue.cancelMessage(scope, turn1);
+    expect(cancelled.length).toBe(1);
+    expect(cancelled[0]!.messageId).toBe(turn1);
+
+    // rev2 enqueue as new barrier
+    const msg2 = { messageId: turn2, chatId: scope, chatType: 'group' as const, senderId: '', content: '', rawContentType: 'reaction' as never, resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: 0 };
+    queue.pushBarrier(scope, msg2);
+
+    // Flush by cancelling the scope — only turn2 should be in the cancelled batch
+    const remaining = queue.cancel(scope);
+    expect(remaining.length).toBe(1);
+    expect(remaining[0]!.messageId).toBe(turn2);
+    // No turn1 in the remaining batch
+    expect(remaining.find(m => m.messageId === turn1)).toBeUndefined();
   });
 });

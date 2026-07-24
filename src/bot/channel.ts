@@ -147,6 +147,16 @@ function getReactionContexts(messageIds: string[]): unknown[] {
   return result;
 }
 
+/** Test seam: check whether a turnId still has a resolvable reactionKey in the index. */
+export function hasTurnMetaForTurnId(turnId: string): boolean {
+  return _reactionTurnMetaByTurnId.has(turnId);
+}
+
+/** Test seam: check whether a reactionKey has a registered turnId. */
+export function hasTurnIdForKey(reactionKey: string): boolean {
+  return _reactionTurnIdByKey.has(reactionKey);
+}
+
 // ── Reaction lifecycle bridges (module-level, wired by startChannel) ──
 let _workChainStore: WorkChainStore | null = null;
 let _reactionRunTracker: ReactionRunTracker | null = null;
@@ -166,7 +176,7 @@ export function setReactionTurnMeta(reactionKey: string, targetMessageId: string
   _reactionTurnMetaByTurnId.set(turnId, reactionKey);
   _reactionTurnIdByKey.set(reactionKey, turnId);
 }
-function deleteReactionTurnMeta(reactionKey: string): void {
+export function deleteReactionTurnMeta(reactionKey: string): void {
   // Remove from all indexes: main meta, turnId→key, key→turnId, target→key
   const meta = _reactionTurnMeta.get(reactionKey);
   _reactionTurnMeta.delete(reactionKey);
@@ -179,7 +189,7 @@ function deleteReactionTurnMeta(reactionKey: string): void {
     }
   }
 }
-function consumeReactionTurnMeta(turnId: string): { workChainId: string; reactionKey: string; revision: number } | undefined {
+export function consumeReactionTurnMeta(turnId: string): { workChainId: string; reactionKey: string; revision: number } | undefined {
   // turnId is the unique per-enqueue ID (reactionKey:revision). Look up the
   // reactionKey directly — no Set-sweeping. Each batch gets only its own entry.
   const reactionKey = _reactionTurnMetaByTurnId.get(turnId);
@@ -957,19 +967,43 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       mentionedBot: false,
       createTime: Date.now(),
     } satisfies import('@larksuite/channel').NormalizedMessage;
-    // F10/F11/F18: Check for revision invalidation — supersede old run if same key
+    // F10/F11/F18: Before enqueuing the new revision, atomically evict any
+    // previous in-flight entry for the same key (queued/reserved OR active).
+    // A queued entry must be cancelled without a scope interrupt; only an
+    // active same-key entry triggers supersede + interrupt.
     const opId = result.components.operatorOpenId;
     const tgtId = result.components.targetMessageId;
-    if (_reactionRunTracker?.shouldInterrupt(result.components.scope, opId, tgtId, result.revision)) {
-      // Old run for the same key → mark superseded before interrupt
-      const handle = activeRuns.get(result.components.scope);
-      if (handle) handle.superseded = true;
-      activeRuns.interrupt(result.components.scope);
-      log.info('reaction', 'superseding-old-run', {
-        scope: result.components.scope,
-        key: result.key,
-        newRevision: result.revision,
-      });
+    const existingEntry = _reactionRunTracker?.get(result.components.scope, opId, tgtId);
+    if (existingEntry) {
+      // Cancel old pending barrier by its turnId (precise — only this key)
+      const oldTurnId = _reactionTurnIdByKey.get(result.key);
+      if (oldTurnId) {
+        pending.cancelMessage(result.components.scope, oldTurnId);
+      }
+      // Atomically remove old context, meta, and tracker before enqueuing new
+      reactionContextStore.delete(result.key);
+      deleteReactionTurnMeta(result.key);
+      _reactionRunTracker?.unregister(result.components.scope, opId, tgtId);
+
+      if (existingEntry.active) {
+        // Old run was active — supersede and interrupt scope
+        const handle = activeRuns.get(result.components.scope);
+        if (handle) handle.superseded = true;
+        activeRuns.interrupt(result.components.scope);
+        log.info('reaction', 'superseding-active-run', {
+          scope: result.components.scope,
+          key: result.key,
+          oldRevision: existingEntry.reactionRevision,
+          newRevision: result.revision,
+        });
+      } else {
+        log.info('reaction', 'cancelling-queued-run', {
+          scope: result.components.scope,
+          key: result.key,
+          oldRevision: existingEntry.reactionRevision,
+          newRevision: result.revision,
+        });
+      }
     }
     // F10/F11: Carry reaction metadata through to the run lifecycle
     const wcId = _workChainStore?.resolveOrAllocate(result.components.scope, result.components.targetMessageId) ?? '';
