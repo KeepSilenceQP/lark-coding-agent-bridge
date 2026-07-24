@@ -1,6 +1,6 @@
 {
   "name": "@penn.qp/lark-channel-bridge",
-  "version": "0.5.9-qp.3",
+  "version": "0.5.9-qp.4",
   "description": "Bridge Feishu/Lark messenger with local CLI coding agents",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
