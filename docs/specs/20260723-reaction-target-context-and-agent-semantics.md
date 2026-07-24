@@ -222,17 +222,18 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
 - chain 只要仍有 queued/reserved/active work 就是 current；全部进入 terminal 后是 historical。后续有效回复或 Reaction 可以继承该 ID 重新继续此 chain，但在它重新产生 queued/reserved/active work 前不能停止另一个 current chain。
 - 当前 scope 存在 active/reserved/queued work 时，停止 Reaction 的目标 message ID 必须作为
   inbound trigger 或 Bot outbound 映射到其中某个 current `workChainId`，才允许执行 stop
-  控制动作；active/reserved chain 或尚在 pending 的 sibling chain 都属于 current。目标只
-  属于 historical chain、不是该 chain 的 trigger/outbound、映射已过期，或 Bridge 重启后
-  无法恢复关联时，一律 fail closed：不中断、不取消队列，并回复该 Reaction 未停止当前
-  任务、如需停止可使用 `/stop`。该分支不得覆盖前述“scope 完全无 work”的幂等回复。
+  控制动作；active/reserved chain 或尚在 pending 的 sibling chain 都属于 current。目标是
+  retained historical trigger/outbound、且 scope 有另一 current chain 时，fail closed：
+  不中断、不取消队列，并回复该 Reaction 未停止当前任务、如需停止可使用 `/stop`。Bot
+  target 映射已过期或 Bridge 重启后未知时沿用该可见 fail-closed；user target 映射已过期、
+  从未登记或重启后未知时无法证明它具有 stop 语义，必须静默丢弃且不写控制 ledger。
 - inbound trigger 与 Bot outbound correlation 使用相同 chain 生命周期。queued/reserved/
   active chain 的全部 trigger/outbound mapping 都是 current workload reference，不参与
   historical TTL/LRU；最后一个 in-flight unit terminal 后才进入 historical retention。chain
   因后续有效回复或 Reaction 重新 current 时，其仍保留的 trigger/outbound mapping 一并
   恢复 current 保护。historical mapping 才受有界 TTL/LRU 裁剪；Bridge 重启后运行期
   correlation 可以整体失效并 fail closed，不根据会话文本猜测重建。每次 trigger/outbound
-  登记、chain lifecycle 变化和 fail-closed reason 都写受限结构化日志。
+  登记、chain lifecycle 变化和 fail-closed/drop reason 都写受限结构化日志。
 
 1. 权限严格使用 Reaction 的 `canUse* + mentionedBot=false 的 decideGroupResponse` 门禁；
    只有 interrupt/cancel **效果**与当前 scope 的 `/stop` 一致。Reaction 路径不能复用命令
@@ -241,7 +242,9 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
 3. 关联校验通过后，效果与当前 scope 的 `/stop` 一致：取消该 scope 尚未开始的全部普通消息和 Reaction input units，包括同 scope 的 sibling queued unit，防止停止后又自动启动旧队列。`workChainId` 只用于防止历史/无关目标误触发，不把 `/stop` 改造成局部取消。
 4. 已有 run 按现有 `/stop` 生命周期收敛为 interrupted，流式卡片/文本回复不得继续写入成功终态。
 5. 停止 Reaction 本身不再启动一个新 Agent run，也不生成“是否真的停止”的模型确认；Bridge 在 interrupt 请求收敛后回复明确的可见停止结果。
-6. 当前 scope 没有 active/reserved/queued work 时，操作幂等地结束，不启动 Agent，并回复当前没有需要停止的任务。
+6. 只有 target 已通过上述 eligibility（Bot target，或仍可识别的 current/historical user
+   trigger）后，当前 scope 没有 active/reserved/queued work 时才幂等回复当前没有需要
+   停止的任务；unknown/expired/restart-lost user target 在此前已静默丢弃。
 7. `action=removed` 按独立控制 ledger 处理，不恢复被停止的 run、不重建被取消的队列；Bridge 只回复一次撤回停止 Reaction 不会自动恢复工作。若用户要继续，需新的普通消息或新的 `approve_continue` Reaction。
 
 其他三个预埋语义及所有未预埋 Reaction 仍走结构化 Agent 上下文路径。只有 `stop_current_work` 因实时控制要求走确定性 Bridge 控制面；这不是过滤未预埋 Reaction 的先例。
@@ -299,7 +302,7 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
 
 - 普通 IM、显式引用、topic context、交互卡片和评论 prompt 结构保持兼容；没有 Reaction 时不输出 `<reaction_contexts>`。
 - Reaction 路由元数据读取、`im.reactions.list` 分页 reconciliation、ledger 读写和目标正文规范化失败都不能导致整个 Bridge 队列崩溃。日志记录目标消息 ID、失败阶段和 trace 信息，不记录凭据或无界原文。
-- `im:message.reactions:read` 不可用或普通 Reaction reconciliation 在有限重试后仍失败时，不得仅凭 delta 执行普通语义或 revision 中断；保持旧 ledger 不变并回复本次 Reaction 暂时无法确认。`stop_current_work` added/removed 是控制面例外：added 在安全门禁和控制 ledger 防重后，先判断 scope 是否完全无 work；存在 current work 时再校验目标 chain 关联并直接 interrupt；removed 在安全门禁、匹配 stop-added ledger 和防重后直接回复不恢复。两者都不依赖 list 中间状态。
+- `im:message.reactions:read` 不可用或普通 Reaction reconciliation 在有限重试后仍失败时，不得仅凭 delta 执行普通语义或 revision 中断；保持旧 ledger 不变并回复本次 Reaction 暂时无法确认。`stop_current_work` added/removed 是控制面例外：added 在安全门禁和控制 ledger 防重后，**先按 sender class 与运行期 mapping 判断 target eligibility**；unknown/expired/restart-lost user target 静默丢弃，eligible target 才进入 no-work/current/historical 分支，current 关联通过后直接 interrupt。removed 在安全门禁、匹配已消费 stop-added ledger 和防重后直接回复不恢复，不依赖当前 correlation。两者都不依赖 list 中间状态。
 - 最大风险是把未预埋或情绪性 emoji 误判为命令，或把 `removed` 当成新的执行请求；通过“预埋语义 + 未映射透传”的双层模型、结构化目标上下文、batch barrier、明确行为规则和高风险时澄清收敛。
 - 回滚时可停止输出 `<reaction_contexts>` 并恢复现有合成消息行为；Reaction 权限门禁、self-operator guard、路由过滤和飞书回复引用关系不得随之回退。
 
@@ -338,6 +341,7 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
 | Reaction 事件解析出的 scope/thread 与 trigger correlation 不一致 | fail closed；不 interrupt、不取消 pending |
 | 同一 regular PendingUnit 合并用户消息 A、B | A、B 的真实 message ID 均映射同一 current chain；对任一消息添加 stop 均可停止，synthetic unit ID 不作为用户入口 |
 | current trigger 持续时间超过 historical TTL，或 current mapping 数量超过 historical cap | trigger mapping 仍受 current 保护，不被 TTL/LRU 淘汰；stop 继续可达 |
+| user trigger 已 terminal 且 mapping 被 TTL/LRU 淘汰，或 Bridge 重启后 correlation 丢失，再收到新的 user-target stop-added | 无法证明 target eligibility；静默丢弃，不回复、不写控制 ledger |
 | stop-added 后 chain terminal 或 trigger correlation 被 historical TTL/LRU 淘汰，再收到对应 removed | 仅凭持久 added ledger 匹配并只回复一次不恢复；不依赖运行期 correlation |
 | Bridge 在 stop-added 后重启，再收到 user-target removed | 从持久 added ledger 匹配并只回复一次不恢复；无匹配则静默 |
 | 当前任务已 terminal 后，operator 才对完成卡片添加停止 Reaction | scope 无 current work 时回复当前没有需要停止的任务；不回滚已完成动作、不启动 Agent |
