@@ -1,4 +1,5 @@
 import type { Block, RunState, ToolEntry } from './run-state';
+import { renderLocalFileLinksAsPaths } from './markdown-links';
 import { toolHeaderText } from './tool-render';
 
 /**
@@ -43,7 +44,7 @@ export function renderText(
 
 function renderBlock(block: Block): string {
   if (block.kind === 'text') {
-    return block.content.trim();
+    return renderLocalFileLinksAsPaths(block.content.trim());
   }
   return toolLine(block.tool);
 }
