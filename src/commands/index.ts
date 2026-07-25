@@ -74,6 +74,13 @@ import {
   type LiveBotMember,
 } from '../project/dispatch';
 import type { BootstrapResult } from '../project/bot-registry';
+import {
+  disableProjectRoleAssignment,
+  readProjectRoleAssignmentState,
+  updateProjectRoleAssignment,
+  type ProjectBotActor,
+  type ProjectRoleAssignmentState,
+} from '../project/store';
 import { setSecret } from '../config/keystore';
 import { buildEncryptedAccountConfig, saveConfig } from '../config/store';
 import { log, reportMetric } from '../core/logger';
@@ -658,10 +665,24 @@ async function handleWsRemove(name: string, ctx: CommandContext): Promise<void> 
 
 // ────────────── /project — project workspace lifecycle ──────────────
 
-const projectStartInFlight = new Set<string>();
+const projectBootstrapQueues = new Map<string, Promise<void>>();
 
-function projectStartIdempotencyKey(scope: string, path: string): string {
-  return `${scope}::${path}`;
+async function withProjectBootstrapLock(
+  chatId: string,
+  task: () => Promise<void>,
+): Promise<void> {
+  const previous = projectBootstrapQueues.get(chatId) ?? Promise.resolve();
+  const current = previous
+    .catch(() => undefined)
+    .then(task);
+  projectBootstrapQueues.set(chatId, current);
+  try {
+    await current;
+  } finally {
+    if (projectBootstrapQueues.get(chatId) === current) {
+      projectBootstrapQueues.delete(chatId);
+    }
+  }
 }
 
 async function handleProject(args: string, ctx: CommandContext): Promise<void> {
@@ -672,7 +693,7 @@ async function handleProject(args: string, ctx: CommandContext): Promise<void> {
     case 'bootstrap':
       return handleProjectBootstrap(rest, ctx);
     default:
-      await reply(ctx, '用法：`/project bootstrap <workspace> <HistoryRedactedBot1|云上HistoryRedactedBot1>`');
+      await reply(ctx, '用法：`/project bootstrap <workspace> <implementer> <plan-writer>`');
   }
 }
 
@@ -680,31 +701,31 @@ async function handleProject(args: string, ctx: CommandContext): Promise<void> {
 
 interface ProjectBootstrapRequest {
   workspacePath: string;
-  targetBot: string;
+  implementer: string;
+  planWriter: string;
   slug: string;
 }
 
-const IMPLEMENTER_BOTS = new Set(['HistoryRedactedBot1', '云上HistoryRedactedBot1']);
-const BOOTSTRAP_REQUIRED_BOTS = new Set(['HistoryRedactedBot2']);
 const BOOTSTRAP_INVITE_DISCOVERY_ATTEMPTS = 4;
 const BOOTSTRAP_INVITE_DISCOVERY_DELAY_MS = 150;
 
 function parseProjectBootstrapRequest(args: string): { ok: true; value: ProjectBootstrapRequest } | { ok: false; reason: string } {
   const parts = args.trim().split(/\s+/).filter(Boolean);
-  if (parts.length !== 2) {
+  if (parts.length !== 3) {
     return {
       ok: false,
-      reason: '用法：`/project bootstrap <workspace> <HistoryRedactedBot1|云上HistoryRedactedBot1>`',
+      reason: '用法：`/project bootstrap <workspace> <implementer> <plan-writer>`',
     };
   }
 
   const workspaceInput = parts[0]!;
   const workspacePath = workspaceInput;
-  const targetBot = normalizeBootstrapTarget(parts[1]!);
-  if (!IMPLEMENTER_BOTS.has(targetBot)) {
+  const implementer = normalizeBootstrapTarget(parts[1]!);
+  const planWriter = normalizeBootstrapTarget(parts[2]!);
+  if (implementer.normalize('NFC') === planWriter.normalize('NFC')) {
     return {
       ok: false,
-      reason: 'targetBot 只能是 `HistoryRedactedBot1` 或 `云上HistoryRedactedBot1`。',
+      reason: 'Implementer 和 Plan Writer 必须是不同 Bot。',
     };
   }
 
@@ -712,7 +733,8 @@ function parseProjectBootstrapRequest(args: string): { ok: true; value: ProjectB
     ok: true,
     value: {
       workspacePath,
-      targetBot,
+      implementer,
+      planWriter,
       slug: workspaceSlugFromPath(workspacePath),
     },
   };
@@ -728,13 +750,31 @@ function workspaceSlugFromPath(path: string): string {
   return slug || 'workspace';
 }
 
-function selectBootstrapTargetRegistry(registry: BotRegistryEntry[], targetBot: string): BotRegistryEntry[] {
-  const normalized = targetBot.normalize('NFC');
-  return registry.filter((entry) =>
-    BOOTSTRAP_REQUIRED_BOTS.has(entry.canonicalName) ||
+function resolveBootstrapRoleEntry(
+  registry: BotRegistryEntry[],
+  requestedName: string,
+  role: 'Implementer' | 'Plan Writer',
+): { ok: true; entry: BotRegistryEntry } | { ok: false; reason: string } {
+  const normalized = requestedName.normalize('NFC');
+  const matches = registry.filter((entry) =>
     entry.canonicalName.normalize('NFC') === normalized ||
     entry.aliases.some((alias) => alias.normalize('NFC') === normalized),
   );
+  if (matches.length === 0) {
+    return { ok: false, reason: `未在 Bot Registry 中找到 ${role}：\`${requestedName}\`` };
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: `${role} 名称存在歧义：\`${requestedName}\`` };
+  }
+  return { ok: true, entry: matches[0]! };
+}
+
+function projectBotActor(
+  entry: BotRegistryEntry,
+  liveMembers: LiveBotMember[],
+): ProjectBotActor | undefined {
+  const live = findBootstrapLiveMember(entry, liveMembers);
+  return live ? { botId: live.openId, name: live.name } : undefined;
 }
 
 function resolveCoordinatorBootstrapWorkspaceInput(
@@ -753,12 +793,11 @@ function resolveCoordinatorBootstrapWorkspaceInput(
   return localRoot ? join(localRoot, workspacePath) : workspacePath;
 }
 
-async function maybeSwitchBootstrapCoordinatorWorkspace(
-  ctx: CommandContext,
+async function resolveBootstrapCoordinatorWorkspace(
   workspacePath: string,
   registry: BotRegistryEntry[],
   coordinatorName: string,
-): Promise<void> {
+): Promise<{ ok: true; cwdRealpath: string } | { ok: false; reason: string }> {
   const requested = resolveCoordinatorBootstrapWorkspaceInput(workspacePath, registry, coordinatorName);
   const workspace = await resolveWorkingDirectory(requested);
   if (!workspace.ok) {
@@ -767,15 +806,23 @@ async function maybeSwitchBootstrapCoordinatorWorkspace(
       requested,
       reason: workspace.reason,
     });
-    return;
+    return { ok: false, reason: workspace.reason };
   }
 
+  return { ok: true, cwdRealpath: workspace.cwdRealpath };
+}
+
+function switchBootstrapCoordinatorWorkspace(
+  ctx: CommandContext,
+  workspacePath: string,
+  cwdRealpath: string,
+): void {
   ctx.activeRuns.interrupt(ctx.scope);
-  ctx.workspaces.setCwd(ctx.scope, workspace.cwdRealpath);
+  ctx.workspaces.setCwd(ctx.scope, cwdRealpath);
   ctx.sessions.clear(ctx.scope);
   log.info('project', 'bootstrap-coordinator-workspace-set', {
     workspacePath,
-    cwdRealpath: workspace.cwdRealpath,
+    cwdRealpath,
   });
 }
 
@@ -925,6 +972,24 @@ function bootstrapLarkCliEnv(ctx: CommandContext): NodeJS.ProcessEnv {
   };
 }
 
+async function replyProjectBootstrapPreflightFailure(
+  ctx: CommandContext,
+  reason: string,
+): Promise<void> {
+  const projectsFile = commandProfilePaths(ctx).projectsFile;
+  const previous = await readProjectRoleAssignmentState(dirname(projectsFile), ctx.msg.chatId)
+    .then((state) => ({ known: true as const, state }))
+    .catch(() => ({ known: false as const, state: undefined }));
+  const bindingState = !previous.known
+    ? '无法读取现有绑定状态；未执行任何准备副作用。'
+    : previous.state.usable
+      ? '旧绑定记录未改变且仍可安全使用；未执行任何准备副作用。'
+      : previous.state.assignment
+        ? '旧绑定记录未改变，但此前已被禁用，当前不可用于 Agent 注入；未执行任何准备副作用。'
+      : '当前群仍没有可用绑定；未执行任何准备副作用。';
+  await reply(ctx, `❌ ${reason}\n${bindingState}`);
+}
+
 async function handleProjectBootstrap(args: string, ctx: CommandContext): Promise<void> {
   // /project bootstrap is human-admin gated.
   if (!canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok) {
@@ -934,29 +999,99 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
 
   const parsed = parseProjectBootstrapRequest(args);
   if (!parsed.ok) {
-    await reply(ctx, `❌ ${parsed.reason}`);
+    await replyProjectBootstrapPreflightFailure(ctx, parsed.reason);
     return;
   }
-  const { workspacePath, targetBot, slug } = parsed.value;
+  const { workspacePath, implementer, planWriter, slug } = parsed.value;
   const slugResult = validateSlug(slug);
   if (!slugResult.ok) {
-    await reply(ctx, `❌ ${slugResult.reason}`);
+    await replyProjectBootstrapPreflightFailure(ctx, slugResult.reason);
     return;
   }
 
   if (ctx.chatMode === 'p2p') {
-    await reply(ctx, '❌ /project bootstrap 只能在项目群里使用。');
+    await replyProjectBootstrapPreflightFailure(ctx, '/project bootstrap 只能在普通项目群里使用。');
+    return;
+  }
+  if (ctx.chatMode === 'topic') {
+    await replyProjectBootstrapPreflightFailure(
+      ctx,
+      'Topic 群按话题隔离 workspace，当前不支持 /project bootstrap；请在普通群中使用。',
+    );
     return;
   }
 
-  const key = projectStartIdempotencyKey(ctx.scope, `${workspacePath}::${targetBot}`);
-  if (projectStartInFlight.has(key)) {
-    await reply(ctx, '⏳ 该项目的 bootstrap 已在执行中，请等待完成。');
+  const coordinatorIdentity = (ctx.channel as {
+    botIdentity?: { openId?: string; name?: string };
+  }).botIdentity;
+  if (!coordinatorIdentity?.openId || !coordinatorIdentity.name) {
+    await replyProjectBootstrapPreflightFailure(ctx, '无法确认当前 Coordinator Bot 身份。');
     return;
   }
-  projectStartInFlight.add(key);
+  const coordinatorName = coordinatorIdentity.name;
+  const coordinatorOpenId = coordinatorIdentity.openId;
 
-  try {
+  const mergedRegistry = mergeRegistry(
+    defaultRegistry(),
+    (ctx.controls.profileConfig as { botRegistry?: BotRegistryEntry[] }).botRegistry ?? [],
+  );
+  const implementerResult = resolveBootstrapRoleEntry(mergedRegistry, implementer, 'Implementer');
+  if (!implementerResult.ok) {
+    await replyProjectBootstrapPreflightFailure(ctx, implementerResult.reason);
+    return;
+  }
+  const planWriterResult = resolveBootstrapRoleEntry(mergedRegistry, planWriter, 'Plan Writer');
+  if (!planWriterResult.ok) {
+    await replyProjectBootstrapPreflightFailure(ctx, planWriterResult.reason);
+    return;
+  }
+  if (implementerResult.entry.canonicalName === planWriterResult.entry.canonicalName) {
+    await replyProjectBootstrapPreflightFailure(
+      ctx,
+      'Implementer 和 Plan Writer 解析到了同一个 Bot。',
+    );
+    return;
+  }
+  const coordinatorEntry = mergedRegistry.find((entry) =>
+    entry.canonicalName.normalize('NFC') === coordinatorName.normalize('NFC') ||
+    entry.aliases.some((alias) => alias.normalize('NFC') === coordinatorName.normalize('NFC')),
+  );
+  if (
+    coordinatorEntry &&
+    [implementerResult.entry, planWriterResult.entry]
+      .some((entry) => entry.canonicalName === coordinatorEntry.canonicalName)
+  ) {
+    await replyProjectBootstrapPreflightFailure(
+      ctx,
+      'Coordinator、Implementer 和 Plan Writer 必须由三个不同 Bot 承担。',
+    );
+    return;
+  }
+  const registry = [implementerResult.entry, planWriterResult.entry];
+
+  await withProjectBootstrapLock(ctx.msg.chatId, async () => {
+    const projectsFile = commandProfilePaths(ctx).projectsFile;
+    const previousState = await readProjectRoleAssignmentState(
+      dirname(projectsFile),
+      ctx.msg.chatId,
+    ).catch((): ProjectRoleAssignmentState => ({ usable: false }));
+    const effects: string[] = [];
+    const fail = async (reason: string): Promise<void> => {
+      const bindingState = effects.length > 0
+        ? previousState.assignment
+          ? '旧绑定记录未被新绑定覆盖，但已禁用；当前不可用于 Agent 注入，必须完整 bootstrap 成功后才能继续。'
+          : '当前群没有已完成的绑定，且已阻断 Agent 注入；必须完整 bootstrap 成功后才能继续。'
+        : previousState.usable
+          ? '旧绑定记录未改变且仍可安全使用。'
+          : previousState.assignment
+            ? '旧绑定记录未改变，但此前已被禁用，当前不可用于 Agent 注入。'
+            : '当前群仍没有可用绑定。';
+      const effectState = effects.length > 0
+        ? `已发生部分准备副作用：${effects.join('、')}；这些副作用不代表 bootstrap 成功。`
+        : '未记录到部分准备副作用。';
+      await reply(ctx, `❌ ${reason}\n${bindingState}\n${effectState}`);
+    };
+
     // B1: live discovery via typed seam
     const larkCliEnv = bootstrapLarkCliEnv(ctx);
     const discovery = createSdkLiveDiscovery((ctx.channel as { rawClient?: unknown }).rawClient, larkCliEnv);
@@ -971,37 +1106,51 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
 
     // If discovery itself failed, all bots are blocked(discovery_failed)
     if (discoveryFailed) {
-      const mergedRegistry = mergeRegistry(
-        defaultRegistry(),
-        (ctx.controls.profileConfig as { botRegistry?: BotRegistryEntry[] }).botRegistry ?? [],
-      );
-      const registry = selectBootstrapTargetRegistry(mergedRegistry, targetBot);
-      if (!registry.length) {
-        await reply(ctx, `❌ 未找到实现方：\`${targetBot}\``);
-        return;
-      }
       log.warn('project', 'bootstrap-discovery-failed', {
         slug,
         bots: registry.map((e) => e.canonicalName),
       });
-      await reply(ctx, '❌ /project bootstrap 无法读取群内 bot 列表，未派发任何命令。');
+      await fail('/project bootstrap 无法读取群内 bot 列表，未派发任何命令。');
       return;
     }
 
-    const mergedRegistry = mergeRegistry(
-      defaultRegistry(),
-      (ctx.controls.profileConfig as { botRegistry?: BotRegistryEntry[] }).botRegistry ?? [],
+    const coordinatorWorkspace = await resolveBootstrapCoordinatorWorkspace(
+      workspacePath,
+      mergedRegistry,
+      coordinatorName,
     );
-    const registry = selectBootstrapTargetRegistry(mergedRegistry, targetBot);
-    if (!registry.length) {
-      await reply(ctx, `❌ 未找到实现方：\`${targetBot}\``);
+    if (!coordinatorWorkspace.ok) {
+      await fail(`Coordinator workspace 无法准备：${coordinatorWorkspace.reason}`);
       return;
     }
-    const coordinatorName = (ctx.channel as { botIdentity?: { name?: string } }).botIdentity?.name ?? 'HistoryRedactedBot4';
-    const coordinatorOpenId = (ctx.channel as { botIdentity?: { openId?: string } }).botIdentity?.openId ?? ctx.msg.senderId;
 
-    await maybeSwitchBootstrapCoordinatorWorkspace(ctx, workspacePath, mergedRegistry, coordinatorName);
-    await ensureBootstrapCoordinatorAllowedChat(ctx);
+    try {
+      await disableProjectRoleAssignment(
+        projectsFile,
+        ctx.msg.chatId,
+        'bootstrap_incomplete',
+      );
+    } catch (err) {
+      await fail(
+        `无法在准备环境前禁用现有绑定，未产生准备副作用：${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+
+    switchBootstrapCoordinatorWorkspace(
+      ctx,
+      workspacePath,
+      coordinatorWorkspace.cwdRealpath,
+    );
+    effects.push(`Coordinator cwd 已切换到 ${coordinatorWorkspace.cwdRealpath}`);
+
+    try {
+      await ensureBootstrapCoordinatorAllowedChat(ctx);
+      effects.push('当前群已加入 Coordinator 准入列表');
+    } catch (err) {
+      await fail(`Coordinator 群准入准备失败：${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
 
     const inviteState = await inviteMissingBootstrapBots(
       ctx.msg.chatId,
@@ -1010,6 +1159,9 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       coordinatorName,
       larkCliEnv,
     );
+    if (inviteState.invitedAny) {
+      effects.push('至少一个目标 Bot 已被邀请进群');
+    }
     if (inviteState.invitedAny) {
       try {
         liveMembers = await rediscoverBootstrapBotsAfterInvite(
@@ -1022,6 +1174,17 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
         // Keep the original discovery result; remaining missing bots will be
         // reported as not in group, while explicit invite failures are kept.
       }
+    }
+
+    const implementerActor = projectBotActor(implementerResult.entry, liveMembers);
+    const planWriterActor = projectBotActor(planWriterResult.entry, liveMembers);
+    if (
+      (implementerActor && implementerActor.botId === coordinatorOpenId) ||
+      (planWriterActor && planWriterActor.botId === coordinatorOpenId) ||
+      (implementerActor && planWriterActor && implementerActor.botId === planWriterActor.botId)
+    ) {
+      await fail('Coordinator、Implementer 和 Plan Writer 必须解析为三个不同 Bot。');
+      return;
     }
 
     const plan = planBootstrap({
@@ -1053,6 +1216,12 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
           text: `<at user_id="${instr.targetOpenId}">${instr.targetName}</at> /cd ${instr.workspacePath}`,
         }).then(() => true).catch(() => false);
 
+        if (inviteSent) {
+          effects.push(`${instr.targetName} 已收到群准入命令`);
+        }
+        if (cdSent) {
+          effects.push(`${instr.targetName} 已收到 /cd 命令`);
+        }
         if (inviteSent && cdSent) {
           dispatchResults.set(instr.targetName, {
             botName: instr.targetName,
@@ -1081,9 +1250,53 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       results: finalResults.length,
       blocked: finalResults.filter((r) => r.status === 'blocked').length,
     });
-  } finally {
-    projectStartInFlight.delete(key);
-  }
+    const blocked = finalResults.filter((result) => result.status === 'blocked');
+    if (blocked.length > 0 || !implementerActor || !planWriterActor) {
+      const details = blocked
+        .map((result) => `${result.botName}: ${result.blockedReason ?? 'blocked'}`)
+        .join('；');
+      await fail(`project bootstrap 未完成，未保存新绑定。${details ? ` ${details}` : ''}`);
+      return;
+    }
+
+    const coordinatorActor = {
+      botId: coordinatorOpenId,
+      name: coordinatorName,
+    };
+    try {
+      await updateProjectRoleAssignment(projectsFile, ctx.msg.chatId, {
+        workspace: workspacePath,
+        decisionOwner: {
+          openId: ctx.msg.senderId,
+          ...(ctx.msg.senderName ? { name: ctx.msg.senderName } : {}),
+        },
+        coordinator: coordinatorActor,
+        planWriter: planWriterActor,
+        implementer: implementerActor,
+      });
+    } catch (err) {
+      log.fail('project', err, { step: 'persist-role-assignment' });
+      await fail('环境准备已发生，但新角色绑定保存失败。');
+      return;
+    }
+
+    log.info('project', 'role-assignment-saved', {
+      chatId: ctx.msg.chatId,
+      coordinator: coordinatorActor.name,
+      planWriter: planWriterActor.name,
+      implementer: implementerActor.name,
+    });
+    await reply(
+      ctx,
+      [
+        '✓ project bootstrap 完成并保存基础角色绑定：',
+        `- Coordinator：${coordinatorActor.name}`,
+        `- Plan Writer：${planWriterActor.name}`,
+        `- Implementer：${implementerActor.name}`,
+        '- 此命令只准备环境，不会自动启动任何项目工作流。',
+      ].join('\n'),
+    );
+  });
 }
 
 async function ensureBootstrapCoordinatorAllowedChat(ctx: CommandContext): Promise<void> {

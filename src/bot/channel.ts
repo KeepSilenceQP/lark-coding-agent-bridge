@@ -129,6 +129,7 @@ import { buildReactionTargetMessage } from './reaction/context-builder';
 import { decideStopAdded, executeStopAdded } from './reaction/stop-target';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
+import { readProjectRoleAssignment } from '../project/store';
 import {
   consumeCotEvents,
   CotClient,
@@ -2240,6 +2241,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const reactionContexts: unknown[] | undefined = isReactionBatch
     ? getReactionContexts(reactionTurnId ? [reactionTurnId] : [])
     : undefined;
+  // Project bootstrap binds one ordinary-group workspace. Topic sessions use
+  // `chatId:threadId` cwd scope, so a chat-level assignment must never be
+  // injected into them.
+  const projectRoleAssignment = deps.profileDir && mode !== 'topic'
+    ? await readProjectRoleAssignment(deps.profileDir, chatId).catch((err) => {
+        log.warn('project', 'read-role-assignment-failed', {
+          chatId,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        return undefined;
+      })
+    : undefined;
 
   const prompt = buildPrompt(
     batch,
@@ -2249,6 +2262,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     channel.botIdentity,
     extraInstructions,
     (reactionContexts && reactionContexts.length > 0) ? reactionContexts : undefined,
+    projectRoleAssignment,
   );
   log.info('prompt', 'built', {
     promptChars: prompt.length,
@@ -3755,6 +3769,7 @@ function buildPrompt(
   botIdentity?: { openId: string; name?: string },
   extraInstructions?: string[],
   reactionContexts?: unknown[],
+  projectRoleAssignment?: import('../project/store').ProjectRoleAssignment,
 ): string {
   const first = batch[0];
   if (!first) return '';
@@ -3793,6 +3808,7 @@ function buildPrompt(
       ...(senderType ? { senderType } : {}),
       ...(botIdentity?.openId ? { botOpenId: botIdentity.openId } : {}),
       ...(mentions.length > 0 ? { mentions } : {}),
+      ...(projectRoleAssignment ? { projectRoleAssignment } : {}),
       ...(first.threadId ? { threadId: first.threadId } : {}),
       messageIds: batch.map((m) => m.messageId),
       source: isReactionBatch ? 'reaction' : 'im',

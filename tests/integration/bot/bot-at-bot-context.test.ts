@@ -6,6 +6,7 @@ import { createDefaultProfileConfig } from '../../../src/config/profile-schema.j
 import type { Controls } from '../../../src/commands/index.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
+import { ProjectStore } from '../../../src/project/store.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
 
@@ -84,6 +85,98 @@ describe('bot identity injection into the agent adapter', () => {
 });
 
 describe('sender identity in bridge_context', () => {
+  it('injects the persisted project role assignment for the current group', async () => {
+    const h = await createHarness();
+    const projects = new ProjectStore(join(h.tmp.profile, 'projects.json'));
+    projects.set('oc_chat', {
+      workspace: 'repo-one',
+      decisionOwner: { openId: 'ou_user', name: 'User' },
+      coordinator: { botId: 'ou_bot', name: 'Bridge' },
+      planWriter: { botId: 'ou_writer', name: 'Writer' },
+      implementer: { botId: 'ou_impl', name: 'Implementer' },
+    });
+    await projects.flush();
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_project_roles',
+        content: '@Bridge 开始执行 Harness',
+        rawSenderType: 'user',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    const context = readSection(h.agent.runOptions[0]?.prompt ?? '', 'bridge_context') as {
+      projectRoleAssignment?: unknown;
+    };
+    expect(context.projectRoleAssignment).toEqual({
+      workspace: 'repo-one',
+      decisionOwner: { openId: 'ou_user', name: 'User' },
+      coordinator: { botId: 'ou_bot', name: 'Bridge' },
+      planWriter: { botId: 'ou_writer', name: 'Writer' },
+      implementer: { botId: 'ou_impl', name: 'Implementer' },
+    });
+  });
+
+  it('does not inject a chat-level project assignment into a Topic session', async () => {
+    const h = await createHarness();
+    const projects = new ProjectStore(join(h.tmp.profile, 'projects.json'));
+    projects.set('oc_chat', {
+      workspace: 'repo-one',
+      decisionOwner: { openId: 'ou_user', name: 'User' },
+      coordinator: { botId: 'ou_bot', name: 'Bridge' },
+      planWriter: { botId: 'ou_writer', name: 'Writer' },
+      implementer: { botId: 'ou_impl', name: 'Implementer' },
+    });
+    await projects.flush();
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_topic_project_roles',
+        threadId: 'omt_topic_a',
+        content: '@Bridge 话题内执行',
+        rawSenderType: 'user',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    const context = readSection(h.agent.runOptions[0]?.prompt ?? '', 'bridge_context') as {
+      projectRoleAssignment?: unknown;
+    };
+    expect(context).not.toHaveProperty('projectRoleAssignment');
+  });
+
+  it('does not inject a project assignment disabled by an incomplete bootstrap', async () => {
+    const h = await createHarness();
+    const projects = new ProjectStore(join(h.tmp.profile, 'projects.json'));
+    projects.set('oc_chat', {
+      workspace: 'repo-one',
+      decisionOwner: { openId: 'ou_user', name: 'User' },
+      coordinator: { botId: 'ou_bot', name: 'Bridge' },
+      planWriter: { botId: 'ou_writer', name: 'Writer' },
+      implementer: { botId: 'ou_impl', name: 'Implementer' },
+    });
+    projects.disable('oc_chat', 'bootstrap_incomplete');
+    await projects.flush();
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_disabled_project_roles',
+        content: '@Bridge 继续执行',
+        rawSenderType: 'user',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    const context = readSection(h.agent.runOptions[0]?.prompt ?? '', 'bridge_context') as {
+      projectRoleAssignment?: unknown;
+    };
+    expect(context).not.toHaveProperty('projectRoleAssignment');
+  });
+
   it('marks a bot sender via raw sender_type and injects botOpenId and mentions', async () => {
     const h = await createHarness();
     await startTestBridge(h);
@@ -376,6 +469,7 @@ async function createHarness(): Promise<{
 }
 
 async function startTestBridge(h: {
+  tmp: TmpProfile;
   profileConfig: ReturnType<typeof createDefaultProfileConfig>;
   agent: FakeAgentAdapter;
   sessions: SessionStore;
@@ -388,6 +482,12 @@ async function startTestBridge(h: {
     sessions: h.sessions,
     workspaces: h.workspaces,
     controls: h.controls,
+    appPaths: {
+      profileDir: h.tmp.profile,
+      secretsFile: join(h.tmp.profile, 'secrets.enc'),
+      keystoreSaltFile: join(h.tmp.profile, '.keystore.salt'),
+      mediaDir: join(h.tmp.profile, 'media'),
+    },
   });
   cleanups.push(() => bridge.disconnect());
 }
@@ -463,6 +563,7 @@ function createControls(profileConfig: ReturnType<typeof createDefaultProfileCon
 
 function message(input: {
   messageId: string;
+  threadId?: string;
   content: string;
   senderId?: string;
   senderName?: string;
@@ -474,6 +575,7 @@ function message(input: {
   return {
     messageId: input.messageId,
     chatId: 'oc_chat',
+    ...(input.threadId ? { threadId: input.threadId } : {}),
     chatType: 'group',
     senderId: input.senderId ?? 'ou_user',
     senderName: input.senderName ?? 'User',

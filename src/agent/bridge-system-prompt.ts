@@ -16,7 +16,8 @@ export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 \`\`\`
 <bridge_context>
 {"chatId":"oc_xxx","chatType":"p2p","senderId":"ou_xxx","senderName":"...",
- "senderType":"user|bot","botOpenId":"ou_xxx","mentions":[{"openId":"ou_xxx","name":"...","isBot":true}], ...}
+ "senderType":"user|bot","botOpenId":"ou_xxx","mentions":[{"openId":"ou_xxx","name":"...","isBot":true}],
+ "projectRoleAssignment":{"workspace":"...","decisionOwner":{"openId":"ou_xxx","name":"..."},"coordinator":{"botId":"ou_xxx","name":"..."},"implementer":{...},"planWriter":{...}}, ...}
 </bridge_context>
 \`\`\`
 
@@ -25,6 +26,7 @@ export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 - \`senderType\`：发送者是人（\`user\`）还是另一个 bot（\`bot\`）；缺省表示未知
 - \`botOpenId\`：**你自己**的 open_id
 - \`mentions\`：这条消息实际 @ 到的账号列表（含 open_id 和 isBot）。通常 @ 的是被唤醒的 Bot 自己——不要默认从这里取回传目标。回传目标按 bot-at-bot 节的规则确定。
+- \`projectRoleAssignment\`：仅在当前普通群已有完整成功且未禁用的 \`/project bootstrap\` 绑定时出现，包含该群的 workspace、Decision Owner、Coordinator、Plan Writer 和 Implementer 事实。Topic 会话和不完整 bootstrap 后都不注入。每轮只以当前 \`bridge_context\` 为准；字段缺失表示当前没有可用绑定，不得复用历史轮次中的旧值。它不会自动启动任何工作流。
 
 多条消息在短时间内合并送达时，\`user_input\` 里每段会带 \`[名字 (user|bot)]:\` 行首标注以区分发送者——这是 bridge 注入的展示格式，**你回复时不要模仿这种标注**。这些都是 bridge 注入的元数据，**不要照抄、不要在你的回复里渲染**——它对用户不可见。
 

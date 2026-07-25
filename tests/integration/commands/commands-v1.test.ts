@@ -9,9 +9,11 @@ import {
   type Controls,
 } from '../../../src/commands/index.js';
 import { createDefaultProfileConfig, type ProfileConfig } from '../../../src/config/profile-schema.js';
+import { resolveAppPaths } from '../../../src/config/app-paths.js';
 import { createRootConfig, loadRootConfig, saveRootConfig } from '../../../src/config/profile-store.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
+import { ProjectStore } from '../../../src/project/store.js';
 import { createFakeAgent } from '../../helpers/fake-agent.js';
 import { createFakeChannel, type FakeChannel } from '../../helpers/fake-channel.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
@@ -619,10 +621,11 @@ describe('Bridge command contracts', () => {
 
   it('dispatches /project bootstrap bridge commands as invite-before-cd slash commands', async () => {
     const h = await createHarness();
+    await mkdir(join(h.tmp.root, 'repo-one'), { recursive: true });
     configureSingleBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'repo-one');
 
     await expect(
-      h.run('/project bootstrap repo-one @HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-one @HistoryRedactedBot1 @HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -647,6 +650,236 @@ describe('Bridge command contracts', () => {
       .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-one'));
   });
 
+  it('persists coordinator, implementer, and plan-writer role bindings from project bootstrap', async () => {
+    const h = await createHarness();
+    await mkdir(join(h.tmp.root, 'repo-roles'), { recursive: true });
+    configureRoleBotsBootstrap(h, [
+      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
+      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+    ]);
+
+    await expect(
+      h.run('/project bootstrap repo-roles HistoryRedactedBot1 云上HistoryRedactedBot1', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    const store = new ProjectStore(resolveAppPaths({
+      rootDir: h.tmp.root,
+      profile: h.controls.profile,
+    }).projectsFile);
+    await store.load();
+    expect(store.get('oc-project')).toEqual({
+      workspace: 'repo-roles',
+      decisionOwner: { openId: 'ou-admin', name: 'User' },
+      coordinator: { botId: 'ou-self', name: 'HistoryRedactedBot4' },
+      planWriter: { botId: 'ou-plan-writer', name: '云上HistoryRedactedBot1' },
+      implementer: { botId: 'ou-implementer', name: 'HistoryRedactedBot1' },
+    });
+
+    const textMessages = h.channel.sent
+      .map((m) => (m.content as { text?: string }).text)
+      .filter((text): text is string => typeof text === 'string');
+    expect(textMessages).toContain('<at user_id="ou-plan-writer">云上HistoryRedactedBot1</at> /cd repo-roles');
+    expect(textMessages.join('\n')).not.toContain('HistoryRedactedBot2');
+  });
+
+  it('rejects the legacy two-argument project bootstrap form', async () => {
+    const h = await createHarness();
+
+    await expect(
+      h.run('/project bootstrap repo-legacy HistoryRedactedBot1', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    expect(lastMarkdown(h.channel)).toContain('<plan-writer>');
+  });
+
+  it('serializes different bootstrap requests for the same chat', async () => {
+    const h = await createHarness();
+    await Promise.all([
+      mkdir(join(h.tmp.root, 'repo-first'), { recursive: true }),
+      mkdir(join(h.tmp.root, 'repo-second'), { recursive: true }),
+    ]);
+    configureRoleBotsBootstrap(h, [
+      { name: 'HistoryRedactedBot1', openId: 'ou-implementer-a' },
+      { name: '云上HistoryRedactedBot1', openId: 'ou-implementer-b' },
+      { name: 'HistoryRedactedBot2', openId: 'ou-plan-writer' },
+    ]);
+
+    await Promise.all([
+      h.run('/project bootstrap repo-first HistoryRedactedBot1 HistoryRedactedBot2', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+      h.run('/project bootstrap repo-second 云上HistoryRedactedBot1 HistoryRedactedBot2', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ]);
+
+    const store = new ProjectStore(resolveAppPaths({
+      rootDir: h.tmp.root,
+      profile: h.controls.profile,
+    }).projectsFile);
+    await store.load();
+    expect(store.get('oc-project')?.workspace).toBe('repo-second');
+
+    const commands = h.channel.sent
+      .map((message) => (message.content as { text?: string }).text)
+      .filter((text): text is string => typeof text === 'string');
+    const firstLast = commands.map((text) => text.includes('repo-first')).lastIndexOf(true);
+    const secondFirst = commands.findIndex((text) => text.includes('repo-second'));
+    expect(firstLast).toBeGreaterThanOrEqual(0);
+    expect(secondFirst).toBeGreaterThan(firstLast);
+  });
+
+  it('keeps the old binding usable when a rebind fails before any preparation side effect', async () => {
+    const h = await createHarness();
+    await mkdir(join(h.tmp.root, 'repo-stable'), { recursive: true });
+    configureRoleBotsBootstrap(h, [
+      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
+      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+    ]);
+    const runOptions = {
+      chatId: 'oc-project',
+      scope: 'oc-project',
+      chatMode: 'group' as const,
+    };
+
+    await h.run('/project bootstrap repo-stable HistoryRedactedBot1 云上HistoryRedactedBot1', runOptions);
+    await h.run('/project bootstrap repo-missing 云上HistoryRedactedBot1 HistoryRedactedBot1', runOptions);
+
+    const store = new ProjectStore(resolveAppPaths({
+      rootDir: h.tmp.root,
+      profile: h.controls.profile,
+    }).projectsFile);
+    await store.load();
+    expect(store.get('oc-project')?.workspace).toBe('repo-stable');
+    expect(store.getState('oc-project').usable).toBe(true);
+    expect(lastMarkdown(h.channel)).toContain('旧绑定记录未改变且仍可安全使用');
+    expect(lastMarkdown(h.channel)).toContain('Coordinator workspace 无法准备');
+  });
+
+  it('disables the old binding and reports partial side effects when target dispatch fails', async () => {
+    const h = await createHarness();
+    const rebindWorkspace = join(h.tmp.root, 'repo-rebind');
+    await Promise.all([
+      mkdir(join(h.tmp.root, 'repo-stable'), { recursive: true }),
+      mkdir(rebindWorkspace, { recursive: true }),
+    ]);
+    configureRoleBotsBootstrap(h, [
+      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
+      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+    ]);
+    const runOptions = {
+      chatId: 'oc-project',
+      scope: 'oc-project',
+      chatMode: 'group' as const,
+    };
+    await h.run('/project bootstrap repo-stable HistoryRedactedBot1 云上HistoryRedactedBot1', runOptions);
+
+    const originalSend = h.channel.send.bind(h.channel);
+    h.channel.send = async (chatId, content, options) => {
+      const text = (content as { text?: string }).text ?? '';
+      if (text.includes(`/cd ${rebindWorkspace}`)) {
+        throw new Error('forced dispatch failure');
+      }
+      return originalSend(chatId, content, options);
+    };
+    await h.run(`/project bootstrap ${rebindWorkspace} 云上HistoryRedactedBot1 HistoryRedactedBot1`, runOptions);
+
+    const store = new ProjectStore(resolveAppPaths({
+      rootDir: h.tmp.root,
+      profile: h.controls.profile,
+    }).projectsFile);
+    await store.load();
+    expect(store.get('oc-project')).toBeUndefined();
+    expect(store.getState('oc-project')).toMatchObject({
+      assignment: { workspace: 'repo-stable' },
+      usable: false,
+      disabledReason: 'bootstrap_incomplete',
+    });
+    expect(lastMarkdown(h.channel)).toContain('旧绑定记录未被新绑定覆盖，但已禁用');
+    expect(lastMarkdown(h.channel)).toContain('当前不可用于 Agent 注入');
+    expect(lastMarkdown(h.channel)).toContain('已发生部分准备副作用');
+    expect(lastMarkdown(h.channel)).not.toContain('bootstrap 完成');
+  });
+
+  it('keeps the old record disabled when new-binding persistence fails after preparation', async () => {
+    const h = await createHarness();
+    const rebindWorkspace = join(h.tmp.root, 'repo-persist-fail');
+    await Promise.all([
+      mkdir(join(h.tmp.root, 'repo-stable'), { recursive: true }),
+      mkdir(rebindWorkspace, { recursive: true }),
+    ]);
+    configureRoleBotsBootstrap(h, [
+      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
+      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+    ]);
+    const runOptions = {
+      chatId: 'oc-project',
+      scope: 'oc-project',
+      chatMode: 'group' as const,
+    };
+    await h.run('/project bootstrap repo-stable HistoryRedactedBot1 云上HistoryRedactedBot1', runOptions);
+
+    const projectProfileDir = join(h.tmp.root, 'profiles', h.controls.profile);
+    const originalSend = h.channel.send.bind(h.channel);
+    let persistenceBlocked = false;
+    h.channel.send = async (chatId, content, options) => {
+      const text = (content as { text?: string }).text ?? '';
+      const result = await originalSend(chatId, content, options);
+      if (!persistenceBlocked && text.includes(`/cd ${rebindWorkspace}`)) {
+        persistenceBlocked = true;
+        await chmod(projectProfileDir, 0o500);
+      }
+      return result;
+    };
+    try {
+      await h.run(`/project bootstrap ${rebindWorkspace} 云上HistoryRedactedBot1 HistoryRedactedBot1`, runOptions);
+    } finally {
+      await chmod(projectProfileDir, 0o700);
+    }
+    expect(persistenceBlocked).toBe(true);
+
+    const store = new ProjectStore(resolveAppPaths({
+      rootDir: h.tmp.root,
+      profile: h.controls.profile,
+    }).projectsFile);
+    await store.load();
+    expect(store.get('oc-project')).toBeUndefined();
+    expect(store.getState('oc-project')).toMatchObject({
+      assignment: { workspace: 'repo-stable' },
+      usable: false,
+      disabledReason: 'bootstrap_incomplete',
+    });
+    expect(lastMarkdown(h.channel)).toContain('旧绑定记录未被新绑定覆盖，但已禁用');
+    expect(lastMarkdown(h.channel)).toContain('新角色绑定保存失败');
+    expect(lastMarkdown(h.channel)).toContain('已发生部分准备副作用');
+  });
+
+  it('rejects role assignments that would self-review', async () => {
+    const h = await createHarness();
+
+    await expect(
+      h.run('/project bootstrap repo-conflict HistoryRedactedBot1 HistoryRedactedBot1', {
+        chatId: 'oc-project',
+        scope: 'oc-project',
+        chatMode: 'group',
+      }),
+    ).resolves.toBe(true);
+
+    expect(lastMarkdown(h.channel)).toContain('必须是不同 Bot');
+  });
+
   it('sets the coordinator cwd during project bootstrap without rewriting dispatched workspace text', async () => {
     const h = await createHarness();
     configureSingleBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'repo-one');
@@ -655,7 +888,7 @@ describe('Bridge command contracts', () => {
     h.sessions.set('oc-project', 'stale-session', h.tmp.workspace);
 
     await expect(
-      h.run('/project bootstrap repo-one HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-one HistoryRedactedBot1 HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -678,7 +911,7 @@ describe('Bridge command contracts', () => {
     configureSingleBridgeBotBootstrap(h, '云上HistoryRedactedBot1', 'ou-cloud-c', 'sayToLittleP');
 
     await expect(
-      h.run('/project bootstrap ~/repo/sayToLittleP 云上HistoryRedactedBot1', {
+      h.run('/project bootstrap ~/repo/sayToLittleP 云上HistoryRedactedBot1 HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -696,10 +929,11 @@ describe('Bridge command contracts', () => {
 
   it('adds the project group to coordinator allowedChats before bootstrap dispatch', async () => {
     const h = await createHarness();
+    await mkdir(join(h.tmp.root, 'repo-allow'), { recursive: true });
     configureSingleBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'repo-allow');
 
     await expect(
-      h.run('/project bootstrap repo-allow HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-allow HistoryRedactedBot1 HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -714,19 +948,53 @@ describe('Bridge command contracts', () => {
   it('rejects /project bootstrap in p2p because it initializes a project group', async () => {
     const h = await createHarness();
 
-    await expect(h.run('/project bootstrap repo-p2p HistoryRedactedBot1')).resolves.toBe(true);
+    await expect(h.run('/project bootstrap repo-p2p HistoryRedactedBot1 HistoryRedactedBot2')).resolves.toBe(true);
 
-    expect(lastMarkdown(h.channel)).toContain('只能在项目群里使用');
+    expect(lastMarkdown(h.channel)).toContain('只能在普通项目群里使用');
+  });
+
+  it('rejects Topic bootstrap without binding writes or preparation side effects', async () => {
+    const h = await createHarness();
+    await mkdir(join(h.tmp.root, 'repo-stable'), { recursive: true });
+    configureRoleBotsBootstrap(h, [
+      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
+      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+    ]);
+    await h.run('/project bootstrap repo-stable HistoryRedactedBot1 云上HistoryRedactedBot1', {
+      chatId: 'oc-project',
+      scope: 'oc-project',
+      chatMode: 'group',
+    });
+    const sentBeforeTopic = h.channel.sent.length;
+
+    await h.run('/project bootstrap repo-topic 云上HistoryRedactedBot1 HistoryRedactedBot1', {
+      chatId: 'oc-project',
+      scope: 'oc-project:thread-a',
+      chatMode: 'topic',
+    });
+
+    const store = new ProjectStore(resolveAppPaths({
+      rootDir: h.tmp.root,
+      profile: h.controls.profile,
+    }).projectsFile);
+    await store.load();
+    expect(store.get('oc-project')?.workspace).toBe('repo-stable');
+    expect(store.getState('oc-project').usable).toBe(true);
+    expect(h.workspaces.cwdFor('oc-project:thread-a')).toBeUndefined();
+    expect(h.channel.sent.slice(sentBeforeTopic)).toHaveLength(1);
+    expect(lastMarkdown(h.channel)).toContain('Topic 群按话题隔离 workspace');
+    expect(lastMarkdown(h.channel)).toContain('未执行任何准备副作用');
   });
 
   it('invites missing project bootstrap bots by app_id before dispatching', async () => {
     const h = await createHarness();
+    await mkdir(join(h.tmp.root, 'repo-invite'), { recursive: true });
     const inviteLog = join(h.tmp.root, 'fake-lark-cli.log');
     await installFakeLarkCli(h, inviteLog);
     configureMissingThenPresentBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'cli_target_c', 'repo-invite');
 
     await expect(
-      h.run('/project bootstrap repo-invite HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-invite HistoryRedactedBot1 HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -753,12 +1021,13 @@ describe('Bridge command contracts', () => {
 
   it('does not rediscover bootstrap bots before invite succeeds', async () => {
     const h = await createHarness();
+    await mkdir(join(h.tmp.root, 'repo-order'), { recursive: true });
     const inviteLog = join(h.tmp.root, 'fake-lark-cli-order.log');
     await installFakeLarkCli(h, inviteLog);
     configureBootstrapBotsAppearOnlyAfterInvite(h, 'HistoryRedactedBot1', 'ou-live-c', 'cli_target_c', 'repo-order', inviteLog);
 
     await expect(
-      h.run('/project bootstrap repo-order HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-order HistoryRedactedBot1 HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -780,12 +1049,13 @@ describe('Bridge command contracts', () => {
 
   it('retries bootstrap discovery after invite before dispatching cd commands', async () => {
     const h = await createHarness();
+    await mkdir(join(h.tmp.root, 'repo-retry'), { recursive: true });
     const inviteLog = join(h.tmp.root, 'fake-lark-cli-retry.log');
     await installFakeLarkCli(h, inviteLog);
     configureBootstrapBotsAppearAfterInviteRetry(h, 'HistoryRedactedBot1', 'ou-live-c', 'cli_target_c', 'repo-retry', inviteLog);
 
     await expect(
-      h.run('/project bootstrap repo-retry HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-retry HistoryRedactedBot1 HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -807,12 +1077,13 @@ describe('Bridge command contracts', () => {
 
   it('falls back to lark-cli bot discovery when raw SDK discovery fails', async () => {
     const h = await createHarness();
+    await mkdir(join(h.tmp.root, 'repo-fallback'), { recursive: true });
     const inviteLog = join(h.tmp.root, 'fake-lark-cli-fallback.log');
     await installFakeLarkCliDiscoveryFallback(h, inviteLog);
     configureThrowingRawSdkBootstrap(h, 'HistoryRedactedBot1', 'cli_target_c', 'repo-fallback');
 
     await expect(
-      h.run('/project bootstrap repo-fallback HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-fallback HistoryRedactedBot1 HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -841,7 +1112,7 @@ describe('Bridge command contracts', () => {
     configureThrowingRawSdkBootstrap(h, 'HistoryRedactedBot1', 'cli_target_c', 'repo-fail');
 
     await expect(
-      h.run('/project bootstrap repo-fail HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-fail HistoryRedactedBot1 HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -863,7 +1134,7 @@ describe('Bridge command contracts', () => {
     h.controls.profileConfig.access.botAdmins = ['ou-bot-admin'];
 
     await expect(
-      h.run('/project bootstrap repo-two HistoryRedactedBot1', { senderId: 'ou-bot-admin' }),
+      h.run('/project bootstrap repo-two HistoryRedactedBot1 HistoryRedactedBot2', { senderId: 'ou-bot-admin' }),
     ).resolves.toBe(true);
 
     expect(lastMarkdown(h.channel)).toContain('仅管理员可用');
@@ -1036,6 +1307,48 @@ function configureSingleBridgeBotBootstrap(
       projectRoot,
     },
   ];
+}
+
+function configureRoleBotsBootstrap(
+  h: Harness,
+  bots: Array<{ name: string; openId: string }>,
+): void {
+  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
+    openId: 'ou-self',
+    name: 'HistoryRedactedBot4',
+  };
+  (h.channel.rawClient.im.v1 as unknown as {
+    chatMembers: {
+      bots(params: unknown): Promise<unknown>;
+    };
+  }).chatMembers = {
+    async bots(): Promise<unknown> {
+      return {
+        data: {
+          items: bots.map((bot) => ({
+            member_id_type: 'bot',
+            member_id: bot.openId,
+            name: bot.name,
+          })),
+        },
+      };
+    },
+  };
+  (h.controls.profileConfig as unknown as {
+    botRegistry: Array<{
+      canonicalName: string;
+      aliases: string[];
+      role: 'bridge';
+      machines: Array<{ kind: 'local'; root: string }>;
+      projectRoot: string;
+    }>;
+  }).botRegistry = [{
+    canonicalName: 'HistoryRedactedBot4',
+    aliases: [],
+    role: 'bridge',
+    machines: [{ kind: 'local', root: h.tmp.root }],
+    projectRoot: 'repo-roles',
+  }];
 }
 
 async function installFakeLarkCli(h: Harness, logFile?: string): Promise<void> {
@@ -1217,6 +1530,14 @@ function configureMissingThenPresentBridgeBotBootstrap(
     }>;
   }).botRegistry = [
     {
+      canonicalName: 'HistoryRedactedBot4',
+      aliases: [],
+      appId: 'cli_self',
+      role: 'bridge',
+      machines: [{ kind: 'local', root: h.tmp.root }],
+      projectRoot,
+    },
+    {
       canonicalName: name,
       aliases: [],
       appId,
@@ -1256,6 +1577,14 @@ function configureThrowingRawSdkBootstrap(
       projectRoot: string;
     }>;
   }).botRegistry = [
+    {
+      canonicalName: 'HistoryRedactedBot4',
+      aliases: [],
+      appId: 'cli_self',
+      role: 'bridge',
+      machines: [{ kind: 'local', root: h.tmp.root }],
+      projectRoot,
+    },
     {
       canonicalName: name,
       aliases: [],
@@ -1318,6 +1647,14 @@ function configureBootstrapBotsAppearOnlyAfterInvite(
       projectRoot: string;
     }>;
   }).botRegistry = [
+    {
+      canonicalName: 'HistoryRedactedBot4',
+      aliases: [],
+      appId: 'cli_self',
+      role: 'bridge',
+      machines: [{ kind: 'local', root: h.tmp.root }],
+      projectRoot,
+    },
     {
       canonicalName: name,
       aliases: [],
@@ -1382,6 +1719,14 @@ function configureBootstrapBotsAppearAfterInviteRetry(
       projectRoot: string;
     }>;
   }).botRegistry = [
+    {
+      canonicalName: 'HistoryRedactedBot4',
+      aliases: [],
+      appId: 'cli_self',
+      role: 'bridge',
+      machines: [{ kind: 'local', root: h.tmp.root }],
+      projectRoot,
+    },
     {
       canonicalName: name,
       aliases: [],

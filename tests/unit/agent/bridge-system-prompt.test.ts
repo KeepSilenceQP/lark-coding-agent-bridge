@@ -35,6 +35,14 @@ describe('bridge system prompt bot collaboration rules', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toContain('mentions');
   });
 
+  it('documents the persisted project role assignment context field', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('projectRoleAssignment');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('不会自动启动');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('不得复用历史轮次中的旧值');
+    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('Plan Reviewer');
+    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('Code Reviewer');
+  });
+
   it('uses platform-neutral actors when a target bot identity is missing', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toContain('请用户、消息发起方补充');
     expect(BRIDGE_SYSTEM_PROMPT).not.toContain('HistoryRedactedBot4');

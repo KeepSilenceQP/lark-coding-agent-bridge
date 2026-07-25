@@ -17,7 +17,7 @@ Lark coding sessions:
 
 | Area | What this fork adds | Problem it solves |
 |---|---|---|
-| **Multi-bot project bootstrap** | `/botAdmin` and `/project bootstrap` discover and invite the required Bridge bots, bind the project workspace, and dispatch the startup commands for a project group. | Starting a multi-bot project previously required several manual invitations, permission changes, and working-directory commands, with no single validated entry point. |
+| **Multi-bot project environment preparation** | `/botAdmin` and `/project bootstrap` discover and invite selected Bridge bots, prepare their workspace, and persist the group's base actor assignment without starting a workflow. | Preparing a multi-bot project previously required several manual invitations, permission changes, and working-directory commands, with no single validated entry point. |
 | **Native bot-to-bot handoff** | `lark-channel-bridge at-bot` validates the target against the current group's live bot list and sends a native structured mention with the current profile's bot identity. | Plain-text `@name`, hand-built mention JSON, stale `open_id` values, and replying to the wrong bot could silently lose a handoff while the agent still claimed it had notified the target. |
 | **Per-group behavior** | Group-scoped operator prompts and four response modes (`mention-only`, `owner-default`, `all-messages`, and per-chat `owner-allowlist`) let each bot behave differently by group without opening access to everyone. | One global prompt and one global mention policy could not serve project groups with different roles; bots either stayed silent when the owner expected a reply or responded too broadly. |
 | **Structured agent context** | The Bridge injects message, sender/bot identity, quote, card, and return-route context, and sends Bridge rules to Codex as developer instructions on every run. | Protocol rules mixed into ordinary user text were easier to ignore or misinterpret, especially for quoted messages, interactive cards, bot senders, and resumed Codex sessions. |
@@ -196,7 +196,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/remove user @name`, `/remove admin @name`, `/remove group` | Remove access entries |
 | `/remove owner-default group` | Remove the current group from the owner no-mention allowlist |
 | `/botAdmin add <bot>`, `/botAdmin remove <bot>`, `/botAdmin list` | Manage bots allowed to run operational group commands |
-| `/project bootstrap <workspace> <implementer>` | Discover/invite the project bots, bind the workspace, and start project-group collaboration |
+| `/project bootstrap <workspace> <implementer> <plan-writer>` | In an ordinary group, prepare the chat-scoped workspace and persist the Decision Owner, receiving Coordinator, selected Implementer, and selected Plan Writer; Topic groups are rejected and it does not start a workflow |
 | `/stop` | Stop the current run, including the card stop button |
 | `/timeout [N\|off\|default]` | Set or clear the current session idle watchdog |
 | `/ps` | List local bridge processes |
@@ -273,6 +273,7 @@ The legacy `sandbox` field is still readable for old configs. After the bridge s
 | `~/.lark-channel/profiles/<profile>/sessions.json` | Session state |
 | `~/.lark-channel/profiles/<profile>/sessions.json.catalog.json` | Agent-aware session catalog |
 | `~/.lark-channel/profiles/<profile>/workspaces.json` | Current and named workspace bindings |
+| `~/.lark-channel/profiles/<profile>/projects.json` | Per-ordinary-group project workspace and role records, including injection-disabled state after incomplete preparation |
 | `~/.lark-channel/profiles/<profile>/secrets.enc` | Profile-local encrypted secrets |
 | `~/.lark-channel/profiles/<profile>/lark-cli/` | Profile-local lark-cli directory |
 | `~/.lark-channel/profiles/<profile>/media/` | Attachment cache |
