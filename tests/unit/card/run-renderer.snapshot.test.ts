@@ -114,6 +114,54 @@ describe('run card renderer snapshots', () => {
     expect(card).toContain(sensitivePath);
     expect(text).toContain(sensitivePath);
   });
+
+  it('keeps web links clickable and renders local file links as paths', () => {
+    const answer = [
+      '[Web docs](https://example.com/docs?q=bridge)',
+      '[Original sample](/Users/example/repo/AGENT_LOOP_GUIDE.md:412)',
+      '[POSIX file](</Users/example/repo/Guide (draft).md:12>)',
+      '[Titled spaced file](</Users/example/repo/Guide (draft).md:13> "source")',
+      '[File URI](file:///Users/example/repo/src/main.ts)',
+      '[Windows file](C:/repo/src/main.ts:7)',
+      '[Titled file](/Users/example/repo/titled.ts "source")',
+      '`[Inline example](/Users/example/repo/inline.ts:3)`',
+      '`cross-line code',
+      '[Cross-line example](/Users/example/repo/cross-line.ts:5)`',
+      'still code`',
+      '    [Indented example](/Users/example/repo/indented.ts:6)',
+      '```markdown',
+      '[Fenced example](/Users/example/repo/fenced.ts:4)',
+      '```',
+      'An unmatched ` stays literal.',
+      '[After unmatched](/Users/example/repo/after-unmatched.ts:8)',
+    ].join('\n');
+    const state = stateFrom([
+      { type: 'text', delta: answer },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+
+    for (const rendered of [renderText(state), JSON.stringify(renderCard(state))]) {
+      expect(rendered).toContain('[Web docs](https://example.com/docs?q=bridge)');
+      expect(rendered).toContain('`/Users/example/repo/AGENT_LOOP_GUIDE.md:412`');
+      expect(rendered).toContain('`/Users/example/repo/Guide (draft).md:12`');
+      expect(rendered).toContain('`/Users/example/repo/Guide (draft).md:13`');
+      expect(rendered).toContain('`/Users/example/repo/src/main.ts`');
+      expect(rendered).toContain('`C:/repo/src/main.ts:7`');
+      expect(rendered).toContain('`/Users/example/repo/titled.ts`');
+      expect(rendered).toContain('`/Users/example/repo/after-unmatched.ts:8`');
+      expect(rendered).not.toContain('[Original sample](');
+      expect(rendered).not.toContain('[POSIX file](');
+      expect(rendered).not.toContain('[Titled spaced file](');
+      expect(rendered).not.toContain('[File URI](');
+      expect(rendered).not.toContain('[Windows file](');
+      expect(rendered).not.toContain('[Titled file](');
+      expect(rendered).not.toContain('[After unmatched](');
+      expect(rendered).toContain('`[Inline example](/Users/example/repo/inline.ts:3)`');
+      expect(rendered).toContain('[Cross-line example](/Users/example/repo/cross-line.ts:5)');
+      expect(rendered).toContain('[Indented example](/Users/example/repo/indented.ts:6)');
+      expect(rendered).toContain('[Fenced example](/Users/example/repo/fenced.ts:4)');
+    }
+  });
 });
 
 function stateFrom(events: AgentEvent[]): RunState {
