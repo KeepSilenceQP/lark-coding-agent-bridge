@@ -1,7 +1,7 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: G8 GO（Unit 10 live acceptance awaits Decision Owner authorization）
+Status: Complete（Unit 10 live acceptance PASS；G11 仍为本需求范围外的单独授权 gate）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
 Plan Writer: Planner Bot（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
@@ -37,6 +37,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - 2026-07-26 Unit 9 Receiving：Codex Subagent 提交 `3f83aa3`，新增协调升级/回滚 runbook、历史源码与当前源码的隔离 child-process runner、三路径集成测试和受控证据。Coordinator 独立复核 temp-only 路径、Bridge 环境隔离、仅管理自建 child、历史 serializer 真实执行与证据边界，并补跑 new install / upgrade / rollback→re-upgrade 集成 1/1 全绿；复用同源提交 `pnpm ci:local`（143 files，1478 passed / 33 skipped，typecheck + build success）及完整 denylist tree/dist/tgz 零命中、同一 tgz 净安装证据。Unit 9 完成，G8 尚未开始。
 - 2026-07-26 G8 独立 Code Review：结论 `NO-GO`，无 blocker、2 条 high。Finding 1：existing-profile upgrade/plaintext-secret、service materialize 与 account update 仍存在锁外 RootConfig read-modify-write，可与 Registry 写入形成 lost update；要求统一同锁内最终重读/合并/保存并补竞态测试。Finding 2：首次 live discovery 已可识别的多匹配或同 open_id 冲突在禁用旧绑定与环境准备后才阻断；要求在任何副作用前预检，邀请后重复唯一性检查，并补旧绑定仍 usable、零副作用测试。G8 保持未通过，待 Implementer 修复后由独立 Reviewer 复审。
 - 2026-07-26 G8 Fix + Re-review：Implementer 提交 `a601904`，闭合四类锁外 RootConfig RMW 与 bootstrap 初始 live 冲突副作用时点，新增四类受控 interleaving 和初始/邀请后身份冲突回归；`pnpm ci:local` 为 144 files / 1483 passed / 33 skipped，完整隐私与同一 tgz gate 通过。独立 Reviewer 复审结论 `GO`：原 2 条 high 均 Closed，无新 blocker/high；复审定向 3 files / 83 tests 全绿。G8 完成，Unit 10 尚未开始。
+- 2026-07-27 Unit 10 Receiving：Decision Owner 在场授权并完成真实安装迁移与当前群 live acceptance。Coordinator 复核同一 Root Config 下两个 live profile、共享 Registry 且无 profile-local 副本；将一个已登记 Bot 临时移出后，仅凭 Registry 名称完成邀请、重新发现 live `open_id`、原生 `/invite group` → `/cd` 派发与角色绑定持久化，另一已在群 Bot 未重复邀请；下一轮 `bridge_context.projectRoleAssignment` 注入与磁盘绑定一致。定向 4 files / 140 tests 全绿；`pnpm ci:local` 为 144 files / 1483 passed / 33 skipped，typecheck + build 成功；真实同一 tgz 完成 tree/dist/tarball 扫描与净安装；最终远端 commit 的 Linux、macOS、Windows、package smoke 四项 check 均成功。Unit 10 完成，本需求范围完成；G11 未授权且未执行。
 
 ## Current Code Evidence
 
@@ -246,7 +247,7 @@ Implementer 每单元只正式回传结果、diff 边界与验证证据，不自
 
 ### Unit 10 — live acceptance + 全量验证 Owner: Implementer（live 由 Decision Owner 在场授权执行）
 
-- [ ] 完成
+- [x] 完成
 
 **目标**：Spec Runtime Acceptance 全行。
 **步骤**：新装或按 Unit 9 runbook 升级的安装上：两 profile 首次取得身份后同 Root Config 出现两条 entry 且无 profile-local 副本；注册一个不在测试群的 Bridge Bot，仅凭名称完成邀请/discovery/原生派发/绑定；已注册 Bot 在群内时不重复邀请、直接用 live `open_id`；真实群验收记录命令文本、邀请前后 Bot 列表、解析出的 live `open_id`、两条派发结果、最终 `projectRoleAssignment`，证据区分「邀请成功」「派发成功」「绑定持久化成功」。
