@@ -1,7 +1,7 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: Complete（Unit 10 live acceptance PASS；G11 仍为本需求范围外的单独授权 gate）
+Status: Complete / Closed（Unit 10 live acceptance 与扩展失败/恢复/跨群隔离矩阵 PASS；G11 仍为本需求范围外的单独授权 gate）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
 Plan Writer: Planner Bot（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
@@ -38,6 +38,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - 2026-07-26 G8 独立 Code Review：结论 `NO-GO`，无 blocker、2 条 high。Finding 1：existing-profile upgrade/plaintext-secret、service materialize 与 account update 仍存在锁外 RootConfig read-modify-write，可与 Registry 写入形成 lost update；要求统一同锁内最终重读/合并/保存并补竞态测试。Finding 2：首次 live discovery 已可识别的多匹配或同 open_id 冲突在禁用旧绑定与环境准备后才阻断；要求在任何副作用前预检，邀请后重复唯一性检查，并补旧绑定仍 usable、零副作用测试。G8 保持未通过，待 Implementer 修复后由独立 Reviewer 复审。
 - 2026-07-26 G8 Fix + Re-review：Implementer 提交 `a601904`，闭合四类锁外 RootConfig RMW 与 bootstrap 初始 live 冲突副作用时点，新增四类受控 interleaving 和初始/邀请后身份冲突回归；`pnpm ci:local` 为 144 files / 1483 passed / 33 skipped，完整隐私与同一 tgz gate 通过。独立 Reviewer 复审结论 `GO`：原 2 条 high 均 Closed，无新 blocker/high；复审定向 3 files / 83 tests 全绿。G8 完成，Unit 10 尚未开始。
 - 2026-07-27 Unit 10 Receiving：Decision Owner 在场授权并完成真实安装迁移与当前群 live acceptance。Coordinator 复核同一 Root Config 下两个 live profile、共享 Registry 且无 profile-local 副本；将一个已登记 Bot 临时移出后，仅凭 Registry 名称完成邀请、重新发现 live `open_id`、原生 `/invite group` → `/cd` 派发与角色绑定持久化，另一已在群 Bot 未重复邀请；下一轮 `bridge_context.projectRoleAssignment` 注入与磁盘绑定一致。定向 4 files / 140 tests 全绿；`pnpm ci:local` 为 144 files / 1483 passed / 33 skipped，typecheck + build 成功；真实同一 tgz 完成 tree/dist/tarball 扫描与净安装；最终远端 commit 的 Linux、macOS、Windows、package smoke 四项 check 均成功。Unit 10 完成，本需求范围完成；G11 未授权且未执行。
+- 2026-07-27 Unit 10 扩展 live closeout：Decision Owner 在测试群完成正常 bootstrap、准备前 workspace 失败、准备后受控 `invite_failed`、旧绑定禁用与停止注入、完整 bootstrap 恢复、A/B 群可区分 workspace 隔离及最终恢复。准备前失败保持旧绑定可用且无部分副作用；准备后失败未覆盖旧绑定、准确记录部分副作用并停止 `projectRoleAssignment` 注入；恢复后完整注入重新出现。测试群临时绑定 repository `src` 子目录期间，原项目群仍注入 repository root，证明 chat 级绑定未串读；测试群随后恢复 repository root。临时 Registry entry 已删除，Root Config 与测试前备份 SHA-256 一致，Git 工作树干净。收口 tracked delta 仅为本 Plan 验收回写；`pnpm ci:local` 再次通过（144 files / 1483 passed / 33 skipped，typecheck + build success），tree/dist/实际 tarball 10 项受保护模式均零命中，同一 tarball 净安装通过。G8 实现审查结论保持 `GO`，Unit 10 在证据回写后重新关闭；全部计划内功能测试完成，环境恢复，无剩余 live 操作。
 
 ## Current Code Evidence
 
@@ -253,6 +254,7 @@ Implementer 每单元只正式回传结果、diff 边界与验证证据，不自
 **步骤**：新装或按 Unit 9 runbook 升级的安装上：两 profile 首次取得身份后同 Root Config 出现两条 entry 且无 profile-local 副本；注册一个不在测试群的 Bridge Bot，仅凭名称完成邀请/discovery/原生派发/绑定；已注册 Bot 在群内时不重复邀请、直接用 live `open_id`；真实群验收记录命令文本、邀请前后 Bot 列表、解析出的 live `open_id`、两条派发结果、最终 `projectRoleAssignment`，证据区分「邀请成功」「派发成功」「绑定持久化成功」。
 **依赖**：Gate G8。
 **完成条件**：上述证据齐备；`pnpm ci:local` 通过；最终远端 commit CI 绿；对最终待发布 commit 重做 Unit 7 tree/dist + 实际 tarball 扫描。Unit 10 原则上只采集外部/未跟踪 live 证据；若为修复验收问题或沉淀证据产生任何 tracked 修改，必须回到 G8 对 G0 后最终全量 diff 重新 Review，通过后才能重新完成 Unit 10。
+**扩展 closeout 证据**：正常路径、准备前 fail-closed、准备后部分失败与绑定禁用、恢复注入、A/B 群可区分隔离、最终 workspace/Registry/Root Config/Git 恢复均已通过。workspace 切换暴露的 session 连续性问题记录于「Known Issues / Blockers」，不改变本 Unit 的角色绑定与隔离验收结论。
 
 ### Gate G11 — 远端历史 remediation（Decision Owner 单独授权，不属于本需求执行范围）
 
@@ -291,6 +293,8 @@ Implementer 每单元只正式回传结果、diff 边界与验证证据，不自
 | 新装空共享 Registry；两 profile 首次身份后同 Root Config 无 profile-local 副本 | Unit 2/3 + Unit 10 |
 | 仅名称邀请不在群 Bot 完成邀请/discovery/派发/绑定 | Unit 10（live） |
 | 已在群不重复邀请，直接用 live `open_id` | Unit 10（live） |
+| 准备前失败保持旧绑定且零部分副作用；准备后失败禁用旧绑定并停止注入；完整 bootstrap 恢复注入 | Unit 10（扩展 live failure/recovery matrix） |
+| 测试群使用可区分 workspace 时原项目群保持自身 workspace/角色；测试后两群恢复预期绑定 | Unit 10（扩展 cross-chat isolation） |
 | 真实群验收完整证据链 | Unit 10 |
 | `pnpm ci:local` + 最终 commit CI + G0 后全部 tracked 增量独立 Review | G0 起每单元 + Unit 9 + G8 + Unit 10；Unit 10 有 tracked 修改则重跑 G8 |
 | tracked tree/dist 零豁免扫描 + 实际 `npm pack` tarball 扫描 + 远端可达范围 + 两类状态分别报告 | Unit 7 + G8 + Unit 10 终审 |
@@ -325,7 +329,9 @@ git ls-remote origin                            # 坏 commit 可达范围记录�
 
 ## Known Issues / Blockers
 
-无（Planning 阶段）。G0 若出现非预期冲突或基线红，按 G0 完成条件停止并回传，即转为 blocker。
+无交付 blocker。
+
+非阻塞 follow-up：`/project bootstrap` 派发 `/cd` 切换 workspace 时，Bridge 会进入该 workspace 对应的 agent session；切回旧 workspace 时可能恢复旧 session 的陈旧流程上下文。扩展验收中，角色绑定、失败状态机与跨群隔离均按当前 `bridge_context.projectRoleAssignment` 正确工作，但 Coordinator 曾因 workspace session 间缺少持久化测试阶段而重复给出切换指令。后续应把多步骤操作的 phase、预期 workspace 与 operation/test ID 持久化到不随 workspace session 切换丢失的状态，或随 bootstrap 回执携带；该 follow-up 不扩大本 Spec，也不阻塞本需求关闭。
 
 ## Plan Review Gate
 
