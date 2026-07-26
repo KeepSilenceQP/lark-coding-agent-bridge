@@ -625,7 +625,7 @@ describe('Bridge command contracts', () => {
     configureSingleBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'repo-one');
 
     await expect(
-      h.run('/project bootstrap repo-one @HistoryRedactedBot1 @HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-one --implementer @HistoryRedactedBot1 --plan-writer @HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -659,7 +659,7 @@ describe('Bridge command contracts', () => {
     ]);
 
     await expect(
-      h.run('/project bootstrap repo-roles HistoryRedactedBot1 云上HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-roles --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -686,18 +686,20 @@ describe('Bridge command contracts', () => {
     expect(textMessages.join('\n')).not.toContain('HistoryRedactedBot2');
   });
 
-  it('rejects the legacy two-argument project bootstrap form', async () => {
+  it('explicitly rejects the legacy three-positional project bootstrap form', async () => {
     const h = await createHarness();
 
     await expect(
-      h.run('/project bootstrap repo-legacy HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-legacy HistoryRedactedBot1 HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
       }),
     ).resolves.toBe(true);
 
-    expect(lastMarkdown(h.channel)).toContain('<plan-writer>');
+    expect(lastMarkdown(h.channel)).toContain('旧语法已废弃，请使用具名参数');
+    expect(lastMarkdown(h.channel)).toContain('--plan-writer');
+    expect(lastMarkdown(h.channel)).toContain('未执行任何准备副作用');
   });
 
   it('serializes different bootstrap requests for the same chat', async () => {
@@ -713,12 +715,12 @@ describe('Bridge command contracts', () => {
     ]);
 
     await Promise.all([
-      h.run('/project bootstrap repo-first HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-first --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
       }),
-      h.run('/project bootstrap repo-second 云上HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-second --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -754,8 +756,14 @@ describe('Bridge command contracts', () => {
       chatMode: 'group' as const,
     };
 
-    await h.run('/project bootstrap repo-stable HistoryRedactedBot1 云上HistoryRedactedBot1', runOptions);
-    await h.run('/project bootstrap repo-missing 云上HistoryRedactedBot1 HistoryRedactedBot1', runOptions);
+    await h.run(
+      '/project bootstrap repo-stable --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1',
+      runOptions,
+    );
+    await h.run(
+      '/project bootstrap repo-missing --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot1',
+      runOptions,
+    );
 
     const store = new ProjectStore(resolveAppPaths({
       rootDir: h.tmp.root,
@@ -784,7 +792,10 @@ describe('Bridge command contracts', () => {
       scope: 'oc-project',
       chatMode: 'group' as const,
     };
-    await h.run('/project bootstrap repo-stable HistoryRedactedBot1 云上HistoryRedactedBot1', runOptions);
+    await h.run(
+      '/project bootstrap repo-stable --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1',
+      runOptions,
+    );
 
     const originalSend = h.channel.send.bind(h.channel);
     h.channel.send = async (chatId, content, options) => {
@@ -794,7 +805,10 @@ describe('Bridge command contracts', () => {
       }
       return originalSend(chatId, content, options);
     };
-    await h.run(`/project bootstrap ${rebindWorkspace} 云上HistoryRedactedBot1 HistoryRedactedBot1`, runOptions);
+    await h.run(
+      `/project bootstrap ${rebindWorkspace} --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot1`,
+      runOptions,
+    );
 
     const store = new ProjectStore(resolveAppPaths({
       rootDir: h.tmp.root,
@@ -829,7 +843,10 @@ describe('Bridge command contracts', () => {
       scope: 'oc-project',
       chatMode: 'group' as const,
     };
-    await h.run('/project bootstrap repo-stable HistoryRedactedBot1 云上HistoryRedactedBot1', runOptions);
+    await h.run(
+      '/project bootstrap repo-stable --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1',
+      runOptions,
+    );
 
     const projectProfileDir = join(h.tmp.root, 'profiles', h.controls.profile);
     const originalSend = h.channel.send.bind(h.channel);
@@ -844,7 +861,10 @@ describe('Bridge command contracts', () => {
       return result;
     };
     try {
-      await h.run(`/project bootstrap ${rebindWorkspace} 云上HistoryRedactedBot1 HistoryRedactedBot1`, runOptions);
+      await h.run(
+        `/project bootstrap ${rebindWorkspace} --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot1`,
+        runOptions,
+      );
     } finally {
       await chmod(projectProfileDir, 0o700);
     }
@@ -870,7 +890,7 @@ describe('Bridge command contracts', () => {
     const h = await createHarness();
 
     await expect(
-      h.run('/project bootstrap repo-conflict HistoryRedactedBot1 HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-conflict --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot1', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -888,7 +908,7 @@ describe('Bridge command contracts', () => {
     h.sessions.set('oc-project', 'stale-session', h.tmp.workspace);
 
     await expect(
-      h.run('/project bootstrap repo-one HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-one --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -911,11 +931,14 @@ describe('Bridge command contracts', () => {
     configureSingleBridgeBotBootstrap(h, '云上HistoryRedactedBot1', 'ou-cloud-c', 'sayToLittleP');
 
     await expect(
-      h.run('/project bootstrap ~/repo/sayToLittleP 云上HistoryRedactedBot1 HistoryRedactedBot2', {
-        chatId: 'oc-project',
-        scope: 'oc-project',
-        chatMode: 'group',
-      }),
+      h.run(
+        '/project bootstrap ~/repo/sayToLittleP --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot2',
+        {
+          chatId: 'oc-project',
+          scope: 'oc-project',
+          chatMode: 'group',
+        },
+      ),
     ).resolves.toBe(true);
 
     const textMessages = h.channel.sent
@@ -933,7 +956,7 @@ describe('Bridge command contracts', () => {
     configureSingleBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'repo-allow');
 
     await expect(
-      h.run('/project bootstrap repo-allow HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-allow --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -948,7 +971,9 @@ describe('Bridge command contracts', () => {
   it('rejects /project bootstrap in p2p because it initializes a project group', async () => {
     const h = await createHarness();
 
-    await expect(h.run('/project bootstrap repo-p2p HistoryRedactedBot1 HistoryRedactedBot2')).resolves.toBe(true);
+    await expect(
+      h.run('/project bootstrap repo-p2p --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2'),
+    ).resolves.toBe(true);
 
     expect(lastMarkdown(h.channel)).toContain('只能在普通项目群里使用');
   });
@@ -960,14 +985,14 @@ describe('Bridge command contracts', () => {
       { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
       { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
     ]);
-    await h.run('/project bootstrap repo-stable HistoryRedactedBot1 云上HistoryRedactedBot1', {
+    await h.run('/project bootstrap repo-stable --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1', {
       chatId: 'oc-project',
       scope: 'oc-project',
       chatMode: 'group',
     });
     const sentBeforeTopic = h.channel.sent.length;
 
-    await h.run('/project bootstrap repo-topic 云上HistoryRedactedBot1 HistoryRedactedBot1', {
+    await h.run('/project bootstrap repo-topic --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot1', {
       chatId: 'oc-project',
       scope: 'oc-project:thread-a',
       chatMode: 'topic',
@@ -994,7 +1019,7 @@ describe('Bridge command contracts', () => {
     configureMissingThenPresentBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'cli_target_c', 'repo-invite');
 
     await expect(
-      h.run('/project bootstrap repo-invite HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-invite --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1027,7 +1052,7 @@ describe('Bridge command contracts', () => {
     configureBootstrapBotsAppearOnlyAfterInvite(h, 'HistoryRedactedBot1', 'ou-live-c', 'cli_target_c', 'repo-order', inviteLog);
 
     await expect(
-      h.run('/project bootstrap repo-order HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-order --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1055,7 +1080,7 @@ describe('Bridge command contracts', () => {
     configureBootstrapBotsAppearAfterInviteRetry(h, 'HistoryRedactedBot1', 'ou-live-c', 'cli_target_c', 'repo-retry', inviteLog);
 
     await expect(
-      h.run('/project bootstrap repo-retry HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-retry --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1083,7 +1108,7 @@ describe('Bridge command contracts', () => {
     configureThrowingRawSdkBootstrap(h, 'HistoryRedactedBot1', 'cli_target_c', 'repo-fallback');
 
     await expect(
-      h.run('/project bootstrap repo-fallback HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-fallback --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1112,7 +1137,7 @@ describe('Bridge command contracts', () => {
     configureThrowingRawSdkBootstrap(h, 'HistoryRedactedBot1', 'cli_target_c', 'repo-fail');
 
     await expect(
-      h.run('/project bootstrap repo-fail HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-fail --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1134,7 +1159,10 @@ describe('Bridge command contracts', () => {
     h.controls.profileConfig.access.botAdmins = ['ou-bot-admin'];
 
     await expect(
-      h.run('/project bootstrap repo-two HistoryRedactedBot1 HistoryRedactedBot2', { senderId: 'ou-bot-admin' }),
+      h.run(
+        '/project bootstrap repo-two --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2',
+        { senderId: 'ou-bot-admin' },
+      ),
     ).resolves.toBe(true);
 
     expect(lastMarkdown(h.channel)).toContain('仅管理员可用');

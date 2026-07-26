@@ -73,6 +73,11 @@ import {
   planBootstrap,
   type LiveBotMember,
 } from '../project/dispatch';
+import {
+  parseBootstrapCommand,
+  PROJECT_BOOTSTRAP_USAGE,
+  tokenizeBootstrapArgs,
+} from '../project/bootstrap-args';
 import type { BootstrapResult } from '../project/bot-registry';
 import {
   disableProjectRoleAssignment,
@@ -686,14 +691,14 @@ async function withProjectBootstrapLock(
 }
 
 async function handleProject(args: string, ctx: CommandContext): Promise<void> {
-  const parts = args.trim().split(/\s+/);
-  const sub = parts[0] ?? '';
-  const rest = parts.slice(1).join(' ').trim();
+  const match = args.trim().match(/^(\S+)(?:\s+([\s\S]*))?$/);
+  const sub = match?.[1] ?? '';
+  const rest = match?.[2] ?? '';
   switch (sub) {
     case 'bootstrap':
       return handleProjectBootstrap(rest, ctx);
     default:
-      await reply(ctx, '用法：`/project bootstrap <workspace> <implementer> <plan-writer>`');
+      await reply(ctx, PROJECT_BOOTSTRAP_USAGE);
   }
 }
 
@@ -710,19 +715,18 @@ const BOOTSTRAP_INVITE_DISCOVERY_ATTEMPTS = 4;
 const BOOTSTRAP_INVITE_DISCOVERY_DELAY_MS = 150;
 
 function parseProjectBootstrapRequest(args: string): { ok: true; value: ProjectBootstrapRequest } | { ok: false; reason: string } {
-  const parts = args.trim().split(/\s+/).filter(Boolean);
-  if (parts.length !== 3) {
+  const tokenized = tokenizeBootstrapArgs(args);
+  if (!tokenized.ok) {
     return {
       ok: false,
-      reason: '用法：`/project bootstrap <workspace> <implementer> <plan-writer>`',
+      reason: `${tokenized.reason}\n${PROJECT_BOOTSTRAP_USAGE}`,
     };
   }
-
-  const workspaceInput = parts[0]!;
-  const workspacePath = workspaceInput;
-  const implementer = normalizeBootstrapTarget(parts[1]!);
-  const planWriter = normalizeBootstrapTarget(parts[2]!);
-  if (implementer.normalize('NFC') === planWriter.normalize('NFC')) {
+  const parsed = parseBootstrapCommand(tokenized.tokens);
+  if (!parsed.ok) {
+    return parsed;
+  }
+  if (parsed.value.implementer === parsed.value.planWriter) {
     return {
       ok: false,
       reason: 'Implementer 和 Plan Writer 必须是不同 Bot。',
@@ -732,16 +736,10 @@ function parseProjectBootstrapRequest(args: string): { ok: true; value: ProjectB
   return {
     ok: true,
     value: {
-      workspacePath,
-      implementer,
-      planWriter,
-      slug: workspaceSlugFromPath(workspacePath),
+      ...parsed.value,
+      slug: workspaceSlugFromPath(parsed.value.workspacePath),
     },
   };
-}
-
-function normalizeBootstrapTarget(input: string): string {
-  return input.trim().replace(/^@+/, '');
 }
 
 function workspaceSlugFromPath(path: string): string {
