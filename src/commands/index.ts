@@ -25,7 +25,13 @@ import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
 import { requestScopeGrantLink } from '../bot/wizard';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
-import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
+import type {
+  AppConfig,
+  AppPreferences,
+  MessageReplyMode,
+  SecretsConfig,
+  TenantBrand,
+} from '../config/schema';
 import {
   getAgentStopGraceMs,
   getCotMessages,
@@ -775,8 +781,62 @@ function projectBotActor(
   entry: BotRegistryEntry,
   liveMembers: LiveBotMember[],
 ): ProjectBotActor | undefined {
-  const live = findBootstrapLiveMember(entry, liveMembers);
+  const matches = matchingBootstrapLiveMembers(entry, liveMembers);
+  const live = matches.length === 1 ? matches[0] : undefined;
   return live ? { botId: live.openId, name: live.name } : undefined;
+}
+
+function resolveBootstrapLiveActors(
+  registry: [BotRegistryEntry, BotRegistryEntry],
+  liveMembers: LiveBotMember[],
+  coordinatorOpenId: string,
+):
+  | {
+      ok: true;
+      implementerActor: ProjectBotActor | undefined;
+      planWriterActor: ProjectBotActor | undefined;
+    }
+  | { ok: false; reason: string } {
+  const [implementerEntry, planWriterEntry] = registry;
+  const implementerMatches = matchingBootstrapLiveMembers(implementerEntry, liveMembers);
+  const planWriterMatches = matchingBootstrapLiveMembers(planWriterEntry, liveMembers);
+
+  if (implementerMatches.length > 1) {
+    return {
+      ok: false,
+      reason: `Implementer「${implementerEntry.name}」在当前群内匹配到多个 Bot，无法唯一确认身份。`,
+    };
+  }
+  if (planWriterMatches.length > 1) {
+    return {
+      ok: false,
+      reason: `Plan Writer「${planWriterEntry.name}」在当前群内匹配到多个 Bot，无法唯一确认身份。`,
+    };
+  }
+
+  const implementerActor = projectBotActor(implementerEntry, liveMembers);
+  const planWriterActor = projectBotActor(planWriterEntry, liveMembers);
+  if (
+    implementerActor?.botId === coordinatorOpenId ||
+    planWriterActor?.botId === coordinatorOpenId
+  ) {
+    return {
+      ok: false,
+      reason: 'Coordinator、Implementer 和 Plan Writer 必须解析为三个不同 Bot。',
+    };
+  }
+  if (
+    implementerActor &&
+    planWriterActor &&
+    implementerActor.botId === planWriterActor.botId
+  ) {
+    return {
+      ok: false,
+      reason: 'Implementer 和 Plan Writer 在当前群内解析到了同一个 Bot。',
+    };
+  }
+
+  return { ok: true, implementerActor, planWriterActor };
 }
 
 function resolveCoordinatorBootstrapWorkspaceInput(
@@ -827,7 +887,7 @@ async function inviteMissingBootstrapBots(
   let invitedAny = false;
 
   for (const entry of registry) {
-    if (findBootstrapLiveMember(entry, liveMembers)) continue;
+    if (matchingBootstrapLiveMembers(entry, liveMembers).length > 0) continue;
 
     const invited = await inviteBotAppToChat(chatId, entry.appId, larkCliEnv);
     if (invited) {
@@ -844,12 +904,12 @@ async function inviteMissingBootstrapBots(
   return { inviteFailed, invitedAny };
 }
 
-function findBootstrapLiveMember(
+function matchingBootstrapLiveMembers(
   entry: BotRegistryEntry,
   liveMembers: LiveBotMember[],
-): LiveBotMember | undefined {
+): LiveBotMember[] {
   const names = [entry.name, ...entry.aliases].map((name) => name.normalize('NFC'));
-  return liveMembers.find((member) => names.includes(member.name.normalize('NFC')));
+  return liveMembers.filter((member) => names.includes(member.name.normalize('NFC')));
 }
 
 async function inviteBotAppToChat(
@@ -1061,7 +1121,10 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       );
       return;
     }
-    const registry = [implementerResult.entry, planWriterResult.entry];
+    const registry: [BotRegistryEntry, BotRegistryEntry] = [
+      implementerResult.entry,
+      planWriterResult.entry,
+    ];
 
     const projectsFile = commandProfilePaths(ctx).projectsFile;
     const previousState = await readProjectRoleAssignmentState(
@@ -1106,6 +1169,16 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       return;
     }
 
+    const initialActors = resolveBootstrapLiveActors(
+      registry,
+      liveMembers,
+      coordinatorOpenId,
+    );
+    if (!initialActors.ok) {
+      await fail(initialActors.reason);
+      return;
+    }
+
     const coordinatorWorkspace = await resolveBootstrapCoordinatorWorkspace(
       workspacePath,
     );
@@ -1135,8 +1208,10 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
     effects.push(`Coordinator cwd 已切换到 ${coordinatorWorkspace.cwdRealpath}`);
 
     try {
-      await ensureBootstrapCoordinatorAllowedChat(ctx);
-      effects.push('当前群已加入 Coordinator 准入列表');
+      const allowedChatAdded = await ensureBootstrapCoordinatorAllowedChat(ctx);
+      if (allowedChatAdded) {
+        effects.push('当前群已加入 Coordinator 准入列表');
+      }
     } catch (err) {
       await fail(`Coordinator 群准入准备失败：${err instanceof Error ? err.message : String(err)}`);
       return;
@@ -1164,16 +1239,16 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       }
     }
 
-    const implementerActor = projectBotActor(implementerResult.entry, liveMembers);
-    const planWriterActor = projectBotActor(planWriterResult.entry, liveMembers);
-    if (
-      (implementerActor && implementerActor.botId === coordinatorOpenId) ||
-      (planWriterActor && planWriterActor.botId === coordinatorOpenId) ||
-      (implementerActor && planWriterActor && implementerActor.botId === planWriterActor.botId)
-    ) {
-      await fail('Coordinator、Implementer 和 Plan Writer 必须解析为三个不同 Bot。');
+    const finalActors = resolveBootstrapLiveActors(
+      registry,
+      liveMembers,
+      coordinatorOpenId,
+    );
+    if (!finalActors.ok) {
+      await fail(finalActors.reason);
       return;
     }
+    const { implementerActor, planWriterActor } = finalActors;
 
     const plan = planBootstrap({
       slug,
@@ -1282,15 +1357,18 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
   });
 }
 
-async function ensureBootstrapCoordinatorAllowedChat(ctx: CommandContext): Promise<void> {
+async function ensureBootstrapCoordinatorAllowedChat(ctx: CommandContext): Promise<boolean> {
   const chatId = ctx.msg.chatId;
+  let added = false;
   await saveAccessConfig(ctx, (current) => {
     if (current.allowedChats.includes(chatId)) return current;
+    added = true;
     return {
       ...current,
       allowedChats: [...current.allowedChats, chatId],
     };
   });
+  return added;
 }
 
 async function rediscoverBootstrapBotsAfterInvite(
@@ -1315,7 +1393,7 @@ function bootstrapRegistryPresent(
   registry: BotRegistryEntry[],
   liveMembers: LiveBotMember[],
 ): boolean {
-  return registry.every((entry) => Boolean(findBootstrapLiveMember(entry, liveMembers)));
+  return registry.every((entry) => matchingBootstrapLiveMembers(entry, liveMembers).length > 0);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -3380,25 +3458,69 @@ async function saveAccountConfig(
   plaintextSecret: string,
 ): Promise<void> {
   const appPaths = commandProfilePaths(ctx);
+  const expectedAccount = structuredClone(ctx.controls.cfg.accounts.app);
   await setSecret(secretKeyForApp(newCfg.accounts.app.id), plaintextSecret, appPaths);
 
-  const root = await loadRootConfig(ctx.controls.configPath);
-  if (!root) {
-    await saveConfig(newCfg, ctx.controls.configPath);
-    ctx.controls.cfg = newCfg;
-    return;
-  }
+  await withConfigFileLock(ctx.controls.configPath, async () => {
+    const latest = await loadRootConfig(ctx.controls.configPath);
+    if (!latest) {
+      await saveConfig(newCfg, ctx.controls.configPath);
+      ctx.controls.cfg = newCfg;
+      return;
+    }
 
-  const profile = root.profiles[ctx.controls.profile];
-  if (!profile) throw new Error(`profile not found: ${ctx.controls.profile}`);
-  root.profiles[ctx.controls.profile] = {
-    ...profile,
-    accounts: newCfg.accounts,
+    const profile = latest.profiles[ctx.controls.profile];
+    if (!profile) throw new Error(`profile not found: ${ctx.controls.profile}`);
+    if (!sameCommandAppCredentials(profile.accounts.app, expectedAccount)) {
+      throw new Error('account changed concurrently; reopen /account and retry');
+    }
+    const mergedSecrets = mergeCommandSecretsConfig(latest.secrets, newCfg.secrets);
+    const nextRoot = {
+      ...latest,
+      ...(mergedSecrets ? { secrets: mergedSecrets } : {}),
+      profiles: {
+        ...latest.profiles,
+        [ctx.controls.profile]: {
+          ...profile,
+          accounts: newCfg.accounts,
+        },
+      },
+    };
+    await saveRootConfig(nextRoot, ctx.controls.configPath);
+    ctx.controls.profileConfig = nextRoot.profiles[ctx.controls.profile]!;
+    ctx.controls.cfg = runtimeProfileConfig(nextRoot, ctx.controls.profile);
+  });
+}
+
+function sameCommandAppCredentials(
+  left: AppConfig['accounts']['app'],
+  right: AppConfig['accounts']['app'],
+): boolean {
+  if (left.id !== right.id || left.tenant !== right.tenant) return false;
+  if (typeof left.secret === 'string' || typeof right.secret === 'string') {
+    return left.secret === right.secret;
+  }
+  return (
+    left.secret.source === right.secret.source &&
+    left.secret.provider === right.secret.provider &&
+    left.secret.id === right.secret.id
+  );
+}
+
+function mergeCommandSecretsConfig(
+  current: SecretsConfig | undefined,
+  prepared: SecretsConfig | undefined,
+): SecretsConfig | undefined {
+  if (!current) return prepared;
+  if (!prepared) return current;
+  return {
+    ...(current.providers || prepared.providers
+      ? { providers: { ...current.providers, ...prepared.providers } }
+      : {}),
+    ...(current.defaults || prepared.defaults
+      ? { defaults: { ...current.defaults, ...prepared.defaults } }
+      : {}),
   };
-  if (newCfg.secrets) root.secrets = newCfg.secrets;
-  await saveRootConfig(root, ctx.controls.configPath);
-  ctx.controls.profileConfig = root.profiles[ctx.controls.profile]!;
-  ctx.controls.cfg = runtimeProfileConfig(root, ctx.controls.profile);
 }
 
 async function savePreferencesConfig(

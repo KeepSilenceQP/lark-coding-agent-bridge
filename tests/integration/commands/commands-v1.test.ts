@@ -1005,35 +1005,79 @@ describe('Bridge command contracts', () => {
     expect(h.workspaces.cwdFor('oc-project')).toBeUndefined();
   });
 
-  it('rejects role names that resolve to the same live open_id', async () => {
+  it('keeps a usable old binding and all preparation state when two roles initially share one live open_id', async () => {
     const h = await createHarness();
-    const workspacePath = join(h.tmp.root, 'same-live-id');
-    await mkdir(workspacePath, { recursive: true });
+    const stableWorkspace = join(h.tmp.root, 'same-live-id-stable');
+    const rebindWorkspace = join(h.tmp.root, 'same-live-id-rebind');
+    await Promise.all([
+      mkdir(stableWorkspace, { recursive: true }),
+      mkdir(rebindWorkspace, { recursive: true }),
+    ]);
+    configureRoleBotsBootstrap(h, [
+      { name: 'ImplementerBot', openId: 'ou_implementer' },
+      { name: 'AlternateBot', openId: 'ou_plan_writer' },
+    ]);
+    const runOptions = { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' as const };
+    await h.run(
+      `/project bootstrap ${stableWorkspace} --implementer ImplementerBot --plan-writer AlternateBot`,
+      runOptions,
+    );
+    h.sessions.set('oc-project', 'stable-session', stableWorkspace);
+    const cwdBefore = h.workspaces.cwdFor('oc-project');
+    const accessBefore = structuredClone(h.controls.profileConfig.access);
+    const sentBefore = h.channel.sent.length;
+    const inviteLog = join(h.tmp.root, 'same-live-id-invite.log');
+    await installFakeLarkCli(h, inviteLog);
     configureRoleBotsBootstrap(h, [
       { name: 'ImplementerBot', openId: 'ou_shared_role' },
       { name: 'PlannerBot', openId: 'ou_shared_role' },
     ]);
 
     await h.run(
-      `/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`,
-      { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' },
+      `/project bootstrap ${rebindWorkspace} --implementer ImplementerBot --plan-writer PlannerBot`,
+      runOptions,
     );
 
-    expect(lastMarkdown(h.channel)).toContain('解析为三个不同 Bot');
-    expect(lastMarkdown(h.channel)).toContain('已发生部分准备副作用');
+    expect(lastMarkdown(h.channel)).toContain('解析到了同一个 Bot');
+    expect(lastMarkdown(h.channel)).toContain('旧绑定记录未改变且仍可安全使用');
+    expect(lastMarkdown(h.channel)).toContain('未记录到部分准备副作用');
     const store = new ProjectStore(resolveAppPaths({
       rootDir: h.tmp.root,
       profile: h.controls.profile,
     }).projectsFile);
     await store.load();
-    expect(store.get('oc-project')).toBeUndefined();
-    expect(store.getState('oc-project').disabledReason).toBe('bootstrap_incomplete');
+    expect(store.get('oc-project')?.workspace).toBe(stableWorkspace);
+    expect(store.getState('oc-project').usable).toBe(true);
+    expect(h.workspaces.cwdFor('oc-project')).toBe(cwdBefore);
+    expect(h.sessions.resumeFor('oc-project', stableWorkspace)).toBe('stable-session');
+    expect(h.controls.profileConfig.access).toEqual(accessBefore);
+    expect(h.channel.sent).toHaveLength(sentBefore + 1);
+    await expect(readFile(inviteLog, 'utf8').catch(() => '')).resolves.toBe('');
   });
 
-  it('blocks duplicate live matches instead of guessing an open_id', async () => {
+  it('keeps a usable old binding and all preparation state on initial duplicate live matches', async () => {
     const h = await createHarness();
-    const workspacePath = join(h.tmp.root, 'duplicate-live-name');
-    await mkdir(workspacePath, { recursive: true });
+    const stableWorkspace = join(h.tmp.root, 'duplicate-live-stable');
+    const rebindWorkspace = join(h.tmp.root, 'duplicate-live-rebind');
+    await Promise.all([
+      mkdir(stableWorkspace, { recursive: true }),
+      mkdir(rebindWorkspace, { recursive: true }),
+    ]);
+    configureRoleBotsBootstrap(h, [
+      { name: 'ImplementerBot', openId: 'ou_implementer' },
+      { name: 'AlternateBot', openId: 'ou_plan_writer' },
+    ]);
+    const runOptions = { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' as const };
+    await h.run(
+      `/project bootstrap ${stableWorkspace} --implementer ImplementerBot --plan-writer AlternateBot`,
+      runOptions,
+    );
+    h.sessions.set('oc-project', 'stable-session', stableWorkspace);
+    const cwdBefore = h.workspaces.cwdFor('oc-project');
+    const accessBefore = structuredClone(h.controls.profileConfig.access);
+    const sentBefore = h.channel.sent.length;
+    const inviteLog = join(h.tmp.root, 'duplicate-live-invite.log');
+    await installFakeLarkCli(h, inviteLog);
     configureRoleBotsBootstrap(h, [
       { name: 'ImplementerBot', openId: 'ou_implementer_first' },
       { name: 'ImplementerBot', openId: 'ou_implementer_second' },
@@ -1041,18 +1085,93 @@ describe('Bridge command contracts', () => {
     ]);
 
     await h.run(
-      `/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`,
-      { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' },
+      `/project bootstrap ${rebindWorkspace} --implementer ImplementerBot --plan-writer PlannerBot`,
+      runOptions,
     );
 
-    expect(lastMarkdown(h.channel)).toContain('ImplementerBot: ambiguous_name');
+    expect(lastMarkdown(h.channel)).toContain('匹配到多个 Bot');
+    expect(lastMarkdown(h.channel)).toContain('旧绑定记录未改变且仍可安全使用');
+    expect(lastMarkdown(h.channel)).toContain('未记录到部分准备副作用');
+    const store = new ProjectStore(resolveAppPaths({
+      rootDir: h.tmp.root,
+      profile: h.controls.profile,
+    }).projectsFile);
+    await store.load();
+    expect(store.get('oc-project')?.workspace).toBe(stableWorkspace);
+    expect(store.getState('oc-project').usable).toBe(true);
+    expect(h.workspaces.cwdFor('oc-project')).toBe(cwdBefore);
+    expect(h.sessions.resumeFor('oc-project', stableWorkspace)).toBe('stable-session');
+    expect(h.controls.profileConfig.access).toEqual(accessBefore);
+    expect(h.channel.sent).toHaveLength(sentBefore + 1);
+    await expect(readFile(inviteLog, 'utf8').catch(() => '')).resolves.toBe('');
+  });
+
+  it('marks bootstrap incomplete when role identity conflict appears only after invite', async () => {
+    const h = await createHarness();
+    const stableWorkspace = join(h.tmp.root, 'post-invite-conflict-stable');
+    const rebindWorkspace = join(h.tmp.root, 'post-invite-conflict-rebind');
+    await Promise.all([
+      mkdir(stableWorkspace, { recursive: true }),
+      mkdir(rebindWorkspace, { recursive: true }),
+    ]);
+    configureRoleBotsBootstrap(h, [
+      { name: 'ImplementerBot', openId: 'ou_implementer' },
+      { name: 'AlternateBot', openId: 'ou_plan_writer' },
+    ]);
+    const runOptions = { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' as const };
+    await h.run(
+      `/project bootstrap ${stableWorkspace} --implementer ImplementerBot --plan-writer AlternateBot`,
+      runOptions,
+    );
+    h.sessions.set('oc-project', 'stale-session', stableWorkspace);
+    const sentBefore = h.channel.sent.length;
+    const inviteLog = join(h.tmp.root, 'post-invite-conflict.log');
+    await installFakeLarkCli(h, inviteLog);
+    configureBootstrapCoordinatorIdentity(h);
+    let discoveryCalls = 0;
+    (h.channel.rawClient.im.v1 as unknown as {
+      chatMembers: { bots(): Promise<unknown> };
+    }).chatMembers = {
+      async bots(): Promise<unknown> {
+        discoveryCalls += 1;
+        return {
+          data: {
+            items: discoveryCalls === 1
+              ? []
+              : [
+                { member_id_type: 'bot', member_id: 'ou_shared_after_invite', name: 'ImplementerBot' },
+                { member_id_type: 'bot', member_id: 'ou_shared_after_invite', name: 'PlannerBot' },
+              ],
+          },
+        };
+      },
+    };
+
+    await h.run(
+      `/project bootstrap ${rebindWorkspace} --implementer ImplementerBot --plan-writer PlannerBot`,
+      runOptions,
+    );
+
     const store = new ProjectStore(resolveAppPaths({
       rootDir: h.tmp.root,
       profile: h.controls.profile,
     }).projectsFile);
     await store.load();
     expect(store.get('oc-project')).toBeUndefined();
-    expect(store.getState('oc-project').disabledReason).toBe('bootstrap_incomplete');
+    expect(store.getState('oc-project')).toMatchObject({
+      assignment: { workspace: stableWorkspace },
+      usable: false,
+      disabledReason: 'bootstrap_incomplete',
+    });
+    expect(lastMarkdown(h.channel)).toContain('解析到了同一个 Bot');
+    expect(lastMarkdown(h.channel)).toContain('已发生部分准备副作用');
+    expect(lastMarkdown(h.channel)).toContain('Coordinator cwd 已切换');
+    expect(lastMarkdown(h.channel)).toContain('至少一个目标 Bot 已被邀请进群');
+    expect(lastMarkdown(h.channel)).not.toContain('当前群已加入 Coordinator 准入列表');
+    expect(h.workspaces.cwdFor('oc-project')).toBe(await realpath(rebindWorkspace));
+    expect(h.sessions.resumeFor('oc-project', stableWorkspace)).toBeUndefined();
+    expect(h.channel.sent).toHaveLength(sentBefore + 1);
+    expect(await readFile(inviteLog, 'utf8')).toContain('chat.members create');
   });
 
   it('sets the coordinator cwd during project bootstrap without rewriting dispatched workspace text', async () => {
