@@ -21,6 +21,16 @@ afterEach(async () => {
 });
 
 describe('pack-and-verify runner', () => {
+  it('fails closed when protected input is missing', () => {
+    const result = spawnSync(process.execPath, [runner], {
+      encoding: 'utf8',
+      env: {},
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('privacy denylist input is required');
+  });
+
   it('packs, scans, and clean-installs the same real tarball', async () => {
     const root = await temporaryRoot();
     const source = join(root, 'source');

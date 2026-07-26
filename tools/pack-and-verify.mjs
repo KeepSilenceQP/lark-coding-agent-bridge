@@ -14,7 +14,6 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { extractPrivacyDenylist } from './extract-privacy-denylist.mjs';
 import {
   loadPrivacyPatterns,
   PRIVACY_PATTERN_ENV,
@@ -33,12 +32,12 @@ export async function packAndVerify({
   const temporaryRoot = await mkdtemp(join(tmpdir(), 'bridge-package-verify-'));
   try {
     const requestedInput = patternFile ?? process.env[PRIVACY_PATTERN_ENV];
-    const protectedInput = requestedInput
-      ? resolve(requestedInput)
-      : await extractPrivacyDenylist({
-        root: sourceRoot,
-        output: join(temporaryRoot, 'privacy-denylist.json'),
-      });
+    if (!requestedInput) {
+      throw new Error(
+        `privacy denylist input is required via --patterns-file or ${PRIVACY_PATTERN_ENV}`,
+      );
+    }
+    const protectedInput = resolve(requestedInput);
     const patterns = await loadPrivacyPatterns(protectedInput);
     const releaseSource = join(temporaryRoot, 'source');
     await copyReleaseSource(sourceRoot, releaseSource);

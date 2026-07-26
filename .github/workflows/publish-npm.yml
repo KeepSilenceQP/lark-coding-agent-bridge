@@ -58,10 +58,18 @@ jobs:
       - name: Build and verify the exact package artifact
         id: package
         shell: bash
+        env:
+          PRIVACY_DENYLIST_JSON: ${{ secrets.LARK_BRIDGE_PRIVACY_DENYLIST_JSON }}
         run: |
           patterns="$RUNNER_TEMP/privacy-denylist.json"
           artifact="$RUNNER_TEMP/verified-package.tgz"
-          node tools/extract-privacy-denylist.mjs --output "$patterns"
+          if [ -z "${PRIVACY_DENYLIST_JSON:-}" ]; then
+            echo "::error::LARK_BRIDGE_PRIVACY_DENYLIST_JSON is not configured"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$PRIVACY_DENYLIST_JSON" > "$patterns"
+          unset PRIVACY_DENYLIST_JSON
           npm run build
           node tools/pack-and-verify.mjs \
             --patterns-file "$patterns" \

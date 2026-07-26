@@ -12,11 +12,13 @@ The release gate covers the complete fixed denylist:
 - 4 personal Bot names
 
 The protected values are not stored in the current tracked tree. For local and CI
-verification, `tools/extract-privacy-denylist.mjs` derives the complete input at
-runtime from the two known historical commits into a mode-0600 temporary file.
-The scanner fails closed when the input is absent, unreadable, incomplete,
-duplicated, or contains unexpected categories. Test fixtures use only fictional
-values.
+verification, the complete input is supplied from a mode-0600 local file or the
+`LARK_BRIDGE_PRIVACY_DENYLIST_JSON` GitHub Actions secret. CI materializes that
+secret only into its runner's temporary directory with a restrictive umask. The
+scanner and real pack-and-verify runner fail closed when the protected input is
+absent, unreadable, incomplete, duplicated, or contains unexpected categories.
+They do not recover the values from repository history. Test fixtures use only
+fictional values.
 
 ## Current-content cleanup
 
