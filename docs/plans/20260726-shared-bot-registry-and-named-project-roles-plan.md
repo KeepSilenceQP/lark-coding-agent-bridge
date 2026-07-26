@@ -1,7 +1,7 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: Plan Review GO（Implementation Ready）
+Status: In Progress（G0 complete；Unit 1 next）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
 Plan Writer: HistoryRedactedBot2（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
@@ -26,6 +26,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - 2026-07-26 Coordinator Plan Review：结论为 CHANGES REQUESTED，共 5 条 finding，涉及 tracked tree 隐私口径、create-time 锁边界、真实 tarball 扫描生命周期、最终 Code Review 顺序和 Plan 进度责任。
 - 2026-07-26 本地 Codex subagent：原 Writer HistoryRedactedBot2 unavailable 后临时接替 Plan Writer，逐条 Receiving 并修订本 Plan；未担任 Plan Reviewer，未实施代码、测试、配置、部署或远端历史操作。
 - 2026-07-26 Coordinator 独立复审：5 条 finding 均已闭合，Plan Review `GO`；允许从 G0 开始，尚未授权或完成任何 Execution Unit。
+- 2026-07-26 G0 Receiving：Implementer 将 `origin/main@593f0dc` 合入本分支，merge commit `8edc5c7`；Coordinator 复核本地/远端 HEAD 一致、工作树干净、main 为祖先，复用 Implementer 回传的 `git diff --check`、`pnpm test`（1346 passed / 33 skipped）、`pnpm typecheck`、`pnpm build` 全绿证据。G0 完成，Unit 1 尚未开始。
 
 ## Current Code Evidence
 
@@ -133,11 +134,11 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 
 ## Execution Units
 
-所有单元初始未完成。Implementer 每单元只正式回传结果、diff 边界与验证证据，不自行编辑本 Plan checkbox/status；Coordinator 按完成条件 Receiving，更新对应 checkbox/status并提交该同步后，才派发下一单元。未满足完成条件时由 Coordinator 保持未勾选并回传缺口。
+Implementer 每单元只正式回传结果、diff 边界与验证证据，不自行编辑本 Plan checkbox/status；Coordinator 按完成条件 Receiving，更新对应 checkbox/status并提交该同步后，才派发下一单元。未满足完成条件时由 Coordinator 保持未勾选并回传缺口。
 
 ### Gate G0 — Base-sync（实现前必须过） Owner: Implementer
 
-- [ ] 完成
+- [x] 完成
 
 **目标**：把 `origin/main@593f0dc` 合入 `feat/project-role-assignment`，让实现在最新 base 上进行。
 **依据**：merge-base `9688914`；main 领先 6、分支领先 2；改动文件零重叠（勘察实证），预期无冲突。
