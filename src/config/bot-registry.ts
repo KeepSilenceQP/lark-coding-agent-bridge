@@ -184,3 +184,61 @@ export function matchRegistryEntry(registry: BotRegistry, rawName: string): Matc
   }
   return { found: false, reason: 'ambiguous' };
 }
+
+export type SelfRegistrationResult =
+  | { kind: 'created'; registry: BotRegistry; entry: BotRegistryEntry }
+  | { kind: 'noop'; registry: BotRegistry; entry: BotRegistryEntry }
+  | { kind: 'conflict'; message: string };
+
+/**
+ * Add the current profile's bot identity without silently changing an existing
+ * registry entry. The returned registry is a validated copy; the input is not
+ * mutated.
+ */
+export function upsertSelfRegistration(
+  registry: BotRegistry,
+  identity: { name: string; appId: string },
+): SelfRegistrationResult {
+  const current = validateBotRegistry(registry);
+  let candidate: BotRegistryEntry;
+  try {
+    candidate = validateBotRegistry({
+      entries: [{ name: identity.name, aliases: [], appId: identity.appId }],
+    }).entries[0]!;
+  } catch (err) {
+    return {
+      kind: 'conflict',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+  const existingByAppId = current.entries.find((entry) => entry.appId === candidate.appId);
+
+  if (existingByAppId) {
+    if (existingByAppId.name === candidate.name) {
+      return { kind: 'noop', registry: current, entry: existingByAppId };
+    }
+    return {
+      kind: 'conflict',
+      message:
+        `appId "${candidate.appId}" is already registered as "${existingByAppId.name}" ` +
+        'with different registry data',
+    };
+  }
+
+  const existingByName = current.entries.find(
+    (entry) => entry.name === candidate.name || entry.aliases.includes(candidate.name),
+  );
+  if (existingByName) {
+    return {
+      kind: 'conflict',
+      message:
+        `name "${candidate.name}" is already registered to appId "${existingByName.appId}"`,
+    };
+  }
+
+  return {
+    kind: 'created',
+    registry: { entries: [...current.entries, candidate] },
+    entry: candidate,
+  };
+}

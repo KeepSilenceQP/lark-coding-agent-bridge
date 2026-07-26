@@ -9,6 +9,7 @@ import {
   resolveBootstrapWorkspace,
 } from '../cli/profile-bootstrap';
 import { promptPassword } from '../cli/prompt';
+import { upsertSelfRegistration } from '../config/bot-registry';
 import { setSecret } from '../config/keystore';
 import { resolveAppPaths, type AppPaths } from '../config/app-paths';
 import {
@@ -26,6 +27,7 @@ import {
   readActiveProfile,
   runtimeProfileConfig,
   saveRootConfig,
+  withConfigFileLock,
   writeActiveProfile,
 } from '../config/profile-store';
 import {
@@ -36,7 +38,7 @@ import {
   type RootConfig,
 } from '../config/profile-schema';
 import { permissionsToLegacySandbox } from '../config/permissions';
-import type { AppConfig, SecretInput, TenantBrand } from '../config/schema';
+import type { AppConfig, SecretInput, SecretsConfig, TenantBrand } from '../config/schema';
 import { isComplete, isSecretRef, secretKeyForApp } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
 import {
@@ -61,6 +63,7 @@ export interface ResolveProfileRuntimeOptions {
   appSecret?: string;
   tenant?: string;
   allowBootstrap?: boolean;
+  requireNewProfile?: boolean;
   selectAgent?: (detected: DetectedAgent[]) => AgentKind | undefined | Promise<AgentKind | undefined>;
   handleActiveBridgeMigrationConflict?: (
     err: ActiveBridgeMigrationConflictError,
@@ -142,15 +145,22 @@ export async function resolveProfileRuntime(
 
   let rootConfig = await loadRootConfig(configPath);
   if (rootConfig) {
-    if (!explicitProfile && !activeProfile) {
+    if (!explicitProfile && !activeProfile && rootConfig.activeProfile) {
       profile = rootConfig.activeProfile;
       appPaths = resolveAppPaths({ rootDir, profile });
     }
     let profileConfig = rootConfig.profiles[profile];
+    if (profileConfig && opts.requireNewProfile) {
+      assertRequestedAgentMatchesExistingProfile(profile, profileConfig, requestedAgent);
+      assertBootstrapAppMatchesExistingProfile(opts, profile, profileConfig);
+      throw new Error(`profile already exists: ${profile}`);
+    }
     if (!profileConfig) {
-      if (opts.allowBootstrap && explicitProfile) {
+      const canBootstrapMissingProfile =
+        opts.allowBootstrap &&
+        (Boolean(explicitProfile) || Object.keys(rootConfig.profiles).length === 0);
+      if (canBootstrapMissingProfile) {
         return bootstrapProfileIntoExistingRoot({
-          rootConfig,
           profile,
           requestedAgent,
           opts,
@@ -207,7 +217,7 @@ export async function resolveProfileRuntime(
   const bootstrapAgent = resolveBootstrapAgent(requestedAgent, profile) ?? 'claude';
   const workspace = opts.workspace;
   const fresh = await resolveBootstrapAppConfig(opts);
-  const encrypted = await encryptedConfigForProfile(fresh, appPaths);
+  const encrypted = await encryptedConfigForProfile(fresh.config, appPaths);
   const profileConfig = await createBootstrapProfileConfig({
     agentKind: bootstrapAgent,
     accounts: encrypted.accounts,
@@ -217,26 +227,30 @@ export async function resolveProfileRuntime(
     defaultWorkspace: appPaths.defaultWorkspaceDir,
     profileDir: appPaths.profileDir,
   });
-  const root = createRootConfig(profile, profileConfig, encrypted.secrets);
-  await saveRootConfig(root, configPath);
-  await writeActiveProfile(appPaths.rootDir, profile);
-  console.log(`配置已保存到 ${configPath}\n`);
-  return { cfg: runtimeProfileConfig(root, profile), profileConfig, configPath, appPaths, profile };
+  return commitBootstrapProfile({
+    profile,
+    requestedAgent,
+    opts,
+    appPaths,
+    configPath,
+    profileConfig,
+    encrypted,
+    botName: fresh.botName,
+  });
 }
 
 async function bootstrapProfileIntoExistingRoot(args: {
-  rootConfig: RootConfig;
   profile: string;
   requestedAgent: AgentKind | undefined;
   opts: ResolveProfileRuntimeOptions;
   appPaths: AppPaths;
   configPath: string;
 }): Promise<ProfileRuntime> {
-  const { rootConfig, profile, requestedAgent, opts, appPaths, configPath } = args;
+  const { profile, requestedAgent, opts, appPaths, configPath } = args;
   const bootstrapAgent = resolveBootstrapAgent(requestedAgent, profile) ?? 'claude';
   const workspace = opts.workspace;
   const fresh = await resolveBootstrapAppConfig(opts);
-  const encrypted = await encryptedConfigForProfile(fresh, appPaths);
+  const encrypted = await encryptedConfigForProfile(fresh.config, appPaths);
   const profileConfig = await createBootstrapProfileConfig({
     agentKind: bootstrapAgent,
     accounts: encrypted.accounts,
@@ -246,27 +260,111 @@ async function bootstrapProfileIntoExistingRoot(args: {
     defaultWorkspace: appPaths.defaultWorkspaceDir,
     profileDir: appPaths.profileDir,
   });
-  const nextRoot: RootConfig = {
-    ...rootConfig,
-    ...(rootConfig.secrets ?? encrypted.secrets
-      ? { secrets: rootConfig.secrets ?? encrypted.secrets }
-      : {}),
-    profiles: {
-      ...rootConfig.profiles,
-      [profile]: {
-        ...profileConfig,
-        secrets: undefined,
-      },
-    },
-  };
-  await saveRootConfig(markPermissionDefaultsMigration(nextRoot, profile), configPath);
-  console.log(`配置已保存到 ${configPath}\n`);
-  return {
-    cfg: runtimeProfileConfig(nextRoot, profile),
-    profileConfig,
-    configPath,
-    appPaths,
+  return commitBootstrapProfile({
     profile,
+    requestedAgent,
+    opts,
+    appPaths,
+    configPath,
+    profileConfig,
+    encrypted,
+    botName: fresh.botName,
+  });
+}
+
+async function commitBootstrapProfile(args: {
+  profile: string;
+  requestedAgent: AgentKind | undefined;
+  opts: ResolveProfileRuntimeOptions;
+  appPaths: AppPaths;
+  configPath: string;
+  profileConfig: ProfileConfig;
+  encrypted: AppConfig;
+  botName?: string;
+}): Promise<ProfileRuntime> {
+  const {
+    profile,
+    requestedAgent,
+    opts,
+    appPaths,
+    configPath,
+    profileConfig,
+    encrypted,
+    botName,
+  } = args;
+
+  return withConfigFileLock(configPath, async () => {
+    const latest = await loadRootConfig(configPath);
+    const existing = latest?.profiles[profile];
+    if (existing) {
+      assertRequestedAgentMatchesExistingProfile(profile, existing, requestedAgent);
+      assertBootstrapAppMatchesExistingProfile(opts, profile, existing);
+      throw new Error(`profile already exists: ${profile}`);
+    }
+
+    const becameActive = !latest || latest.activeProfile.length === 0;
+    const mergedSecrets = mergeSecretsConfig(latest?.secrets, encrypted.secrets);
+    let nextRoot: RootConfig = latest
+      ? {
+          ...latest,
+          activeProfile: latest.activeProfile || profile,
+          ...(mergedSecrets ? { secrets: mergedSecrets } : {}),
+          profiles: {
+            ...latest.profiles,
+            [profile]: {
+              ...profileConfig,
+              secrets: undefined,
+            },
+          },
+        }
+      : createRootConfig(profile, profileConfig, encrypted.secrets);
+
+    if (botName) {
+      const registration = upsertSelfRegistration(nextRoot.botRegistry ?? { entries: [] }, {
+        name: botName,
+        appId: profileConfig.accounts.app.id,
+      });
+      if (registration.kind === 'conflict') {
+        throw new Error(
+          `bot registry self-registration conflict for profile ${profile}: ` +
+            `${registration.message}. Use \`lark-channel-bridge bot-registry\` to resolve it.`,
+        );
+      }
+      nextRoot = {
+        ...nextRoot,
+        botRegistry: registration.registry,
+      };
+    }
+
+    nextRoot = markPermissionDefaultsMigration(nextRoot, profile);
+    await saveRootConfig(nextRoot, configPath);
+    if (becameActive) {
+      await writeActiveProfile(appPaths.rootDir, profile);
+    }
+    console.log(`配置已保存到 ${configPath}\n`);
+    return {
+      cfg: runtimeProfileConfig(nextRoot, profile),
+      profileConfig,
+      configPath,
+      appPaths,
+      profile,
+    };
+  });
+}
+
+function mergeSecretsConfig(
+  current: SecretsConfig | undefined,
+  prepared: SecretsConfig | undefined,
+): SecretsConfig | undefined {
+  if (!current) return prepared;
+  if (!prepared) return current;
+  return {
+    ...(current.providers || prepared.providers
+      ? { providers: { ...current.providers, ...prepared.providers } }
+      : {}),
+    ...(current.defaults || prepared.defaults
+      ? { defaults: { ...current.defaults, ...prepared.defaults } }
+      : {}),
   };
 }
 
@@ -426,7 +524,9 @@ async function migrateV1ToV2WithActiveBridgeHandling(
   }
 }
 
-async function resolveBootstrapAppConfig(opts: ResolveProfileRuntimeOptions): Promise<AppConfig> {
+async function resolveBootstrapAppConfig(
+  opts: ResolveProfileRuntimeOptions,
+): Promise<{ config: AppConfig; botName?: string }> {
   if (!opts.appId) {
     if (!isInteractiveTerminal()) {
       throw new Error(
@@ -435,7 +535,7 @@ async function resolveBootstrapAppConfig(opts: ResolveProfileRuntimeOptions): Pr
           '或传入 --app-id 和 --app-secret。',
       );
     }
-    return runRegistrationWizard();
+    return { config: await runRegistrationWizard() };
   }
   let appSecret = opts.appSecret;
   if (!appSecret) {
@@ -459,13 +559,16 @@ async function resolveBootstrapAppConfig(opts: ResolveProfileRuntimeOptions): Pr
     console.log('✓ 应用凭证校验通过');
   }
   return {
-    accounts: {
-      app: {
-        id: opts.appId,
-        secret: appSecret,
-        tenant,
+    config: {
+      accounts: {
+        app: {
+          id: opts.appId,
+          secret: appSecret,
+          tenant,
+        },
       },
     },
+    ...(result.botName ? { botName: result.botName } : {}),
   };
 }
 

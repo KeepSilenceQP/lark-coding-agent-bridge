@@ -3,6 +3,7 @@ import {
   normalizeRegistryName,
   validateBotRegistry,
   matchRegistryEntry,
+  upsertSelfRegistration,
   type BotRegistry,
 } from '../../../src/config/bot-registry';
 
@@ -375,5 +376,73 @@ describe('matchRegistryEntry', () => {
   it('does not do case-insensitive matching (NFC only)', () => {
     const result = matchRegistryEntry(registry, 'planner bot');
     expect(result.found).toBe(false);
+  });
+});
+
+describe('upsertSelfRegistration', () => {
+  it('creates a normalized entry without mutating the input registry', () => {
+    const registry: BotRegistry = { entries: [] };
+    const result = upsertSelfRegistration(registry, {
+      name: ' @Bridge Bot ',
+      appId: ' cli_bridge ',
+    });
+
+    expect(result.kind).toBe('created');
+    if (result.kind !== 'created') return;
+    expect(result.registry.entries).toEqual([
+      { name: 'Bridge Bot', aliases: [], appId: 'cli_bridge' },
+    ]);
+    expect(registry.entries).toEqual([]);
+  });
+
+  it('returns noop for the same appId and canonical name while preserving aliases', () => {
+    const registry: BotRegistry = {
+      entries: [{ name: 'Bridge Bot', aliases: ['Bridge'], appId: 'cli_bridge' }],
+    };
+
+    const result = upsertSelfRegistration(registry, {
+      name: 'Bridge Bot',
+      appId: 'cli_bridge',
+    });
+
+    expect(result.kind).toBe('noop');
+    if (result.kind !== 'noop') return;
+    expect(result.registry).toEqual(registry);
+    expect(result.registry).not.toBe(registry);
+  });
+
+  it('returns conflict when the appId is registered under another canonical name', () => {
+    const renamed = upsertSelfRegistration(
+      {
+        entries: [{ name: 'Original Bot', aliases: [], appId: 'cli_bridge' }],
+      },
+      { name: 'Renamed Bot', appId: 'cli_bridge' },
+    );
+
+    expect(renamed).toMatchObject({ kind: 'conflict' });
+  });
+
+  it('returns conflict when the name is another entry canonical name or alias', () => {
+    const registry: BotRegistry = {
+      entries: [
+        { name: 'Planner Bot', aliases: ['Planner'], appId: 'cli_planner' },
+      ],
+    };
+
+    expect(
+      upsertSelfRegistration(registry, { name: 'Planner Bot', appId: 'cli_new' }),
+    ).toMatchObject({ kind: 'conflict' });
+    expect(
+      upsertSelfRegistration(registry, { name: 'Planner', appId: 'cli_new' }),
+    ).toMatchObject({ kind: 'conflict' });
+  });
+
+  it('returns conflict for an invalid candidate', () => {
+    expect(
+      upsertSelfRegistration({ entries: [] }, { name: '  ', appId: 'cli_new' }),
+    ).toMatchObject({ kind: 'conflict' });
+    expect(
+      upsertSelfRegistration({ entries: [] }, { name: 'Bridge Bot', appId: '  ' }),
+    ).toMatchObject({ kind: 'conflict' });
   });
 });

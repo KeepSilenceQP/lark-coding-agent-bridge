@@ -61,8 +61,54 @@ describe('profile create command', () => {
     expect(saved.profiles['codex-dev']?.agentKind).toBe('codex');
     expect(saved.profiles['claude-regression']?.agentKind).toBe('claude');
     expect(saved.profiles['claude-regression']?.workspaces.default).toBe(workspaceRealpath);
+    expect(saved.botRegistry?.entries).toEqual([
+      { name: 'Claude Regression', aliases: [], appId: 'cli_claude_regression' },
+    ]);
     expect(savedText).not.toContain('manual-secret');
     expect(secret).toBe('manual-secret');
+  });
+
+  it('creates and activates a profile while preserving a zero-profile root registry', async () => {
+    const root = await makeRoot();
+    await writeJson(join(root, 'config.json'), {
+      schemaVersion: 2,
+      activeProfile: '',
+      preferences: {},
+      secrets: {
+        providers: {
+          rootEnv: { source: 'env', allowlist: ['ROOT_SECRET'] },
+        },
+        defaults: { env: 'rootEnv' },
+      },
+      botRegistry: {
+        entries: [{ name: 'Remote Bot', aliases: [], appId: 'cli_remote' }],
+      },
+      profiles: {},
+    });
+
+    await runProfileCreate('claude-restored', {
+      rootDir: root,
+      agent: 'claude',
+      appId: 'cli_restored',
+      appSecret: 'manual-secret',
+      tenant: 'feishu',
+    });
+
+    const saved = JSON.parse(await readFile(join(root, 'config.json'), 'utf8')) as RootConfig;
+    expect(saved.activeProfile).toBe('claude-restored');
+    expect(saved.profiles['claude-restored']?.accounts.app.id).toBe('cli_restored');
+    expect(saved.secrets?.defaults).toEqual({ env: 'rootEnv' });
+    expect(saved.secrets?.providers).toMatchObject({
+      rootEnv: { source: 'env', allowlist: ['ROOT_SECRET'] },
+      bridge: { source: 'exec' },
+    });
+    expect(saved.botRegistry?.entries).toEqual([
+      { name: 'Remote Bot', aliases: [], appId: 'cli_remote' },
+      { name: 'Claude Regression', aliases: [], appId: 'cli_restored' },
+    ]);
+    await expect(readFile(join(root, 'active-profile'), 'utf8')).resolves.toBe(
+      'claude-restored\n',
+    );
   });
 
   it('creates a named Codex profile that can write inside the default workspace by default', async () => {
