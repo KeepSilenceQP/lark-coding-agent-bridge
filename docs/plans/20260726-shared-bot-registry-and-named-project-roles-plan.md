@@ -1,7 +1,7 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: In Progress（Unit 1 complete；Unit 2 next）
+Status: In Progress（Unit 2 complete；Unit 3 next）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
 Plan Writer: HistoryRedactedBot2（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
@@ -28,6 +28,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - 2026-07-26 Coordinator 独立复审：5 条 finding 均已闭合，Plan Review `GO`；允许从 G0 开始，尚未授权或完成任何 Execution Unit。
 - 2026-07-26 G0 Receiving：Implementer 将 `origin/main@593f0dc` 合入本分支，merge commit `8edc5c7`；Coordinator 复核本地/远端 HEAD 一致、工作树干净、main 为祖先，复用 Implementer 回传的 `git diff --check`、`pnpm test`（1346 passed / 33 skipped）、`pnpm typecheck`、`pnpm build` 全绿证据。G0 完成，Unit 1 尚未开始。
 - 2026-07-26 Unit 1 Receiving：原 Implementer token 耗尽后，由本地 Codex Subagent 接替并延续既有 WIP，提交 `9d5aa91`；精确变更 5 个授权文件。Coordinator 独立复核配置校验、读写 fail-closed、Registry 往返与范围边界，并补跑 69 个针对性测试全绿；复用同源提交的 `pnpm ci:local`（135 files，1411 passed / 33 skipped，typecheck + build success）证据。Unit 1 完成，Unit 2 尚未开始。
+- 2026-07-26 Unit 2 Receiving：Codex Subagent 提交 `d65de8d`，精确变更 8 个计划内文件。Coordinator 独立复核共同 resolver 单锁提交、create-only 竞态 fail-closed、零 profile 保留与恢复、Registry 自注册、export 排除及 QR 无名称边界，并补跑 5 files / 109 tests（含真实 run/service/profile-create 并发）全绿；复用同源提交的 `pnpm ci:local`（136 files，1420 passed / 33 skipped，typecheck + build success）证据。Unit 2 完成，Unit 3 尚未开始。
 
 ## Current Code Evidence
 
@@ -159,7 +160,7 @@ Implementer 每单元只正式回传结果、diff 边界与验证证据，不自
 
 ### Unit 2 — Profile 生命周期：create 自注册、零 profile、export 排除 Owner: Implementer
 
-- [ ] 完成
+- [x] 完成
 
 **目标**：DD3 + DD4。
 **准确落点**：`src/runtime/profile-runtime.ts:429-470`（`resolveBootstrapAppConfig` 带出 botName）、`:207-224` 与 `:227-271`（两条创建路径锁内幂等登记 + `bootstrapProfileIntoExistingRoot` 补 activeProfile 语义）、`:143-162`（`!profileConfig` 分支放宽）、`src/cli/commands/profile.ts:189-191`（零 profile 保留 root）、`:245-253`（export 维持构造性排除）。
