@@ -7,6 +7,36 @@
 > 的定制 fork。原项目与本 fork 均按 MIT License 发布；归属和许可说明见
 > [NOTICE.md](./NOTICE.md) 与 [LICENSE](./LICENSE)。
 
+### 上游集成记录
+
+最近一次经过验证的上游集成于 2026-07-23 通过
+[Fork PR #4](https://github.com/KeepSilenceQP/lark-coding-agent-bridge/pull/4)
+完成，选择性纳入原仓库从
+[`c0caa10`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/c0caa10db9df8411089e0d44501a475a96dfc0e6)
+到
+[`021b774`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/021b77446523b55b9110df21708056f450fbb500)
+的 6 个 commit；原仓库对应的 release merge commit 为
+[`36f7d382`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/36f7d382806e11b21bf7329cf44deef604a1136b)。
+
+这里记录的是**上游来源范围，不表示两边的 tree 或 patch 等价**。上述变更通过
+cherry-pick 并处理冲突后集成，以保留本 Fork 已有的群响应策略、配置与访问控制行为、
+Codex 最终回复恢复机制和维护版 Channel 打包方式。在 Fork 当前改写后的提交历史中，
+对应的集成范围是
+[`ffae698`](https://github.com/KeepSilenceQP/lark-coding-agent-bridge/commit/ffae698596a51165f8912b5a5afebaeb3e5a2667)
+到
+[`3a2540c`](https://github.com/KeepSilenceQP/lark-coding-agent-bridge/commit/3a2540c8f8eaf0101f636ceb5c5eb5897c2e5d3f)，
+之后还有仅属于本 Fork 的兼容性修复与发布提交。
+
+该次集成通过 macOS、Ubuntu、Windows CI，以及 991 个通过、3 个跳过的测试、
+typecheck/build、release/npm clean-install 校验。
+
+**后续同步锚点：**将原仓库 commit
+[`36f7d382`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/36f7d382806e11b21bf7329cf44deef604a1136b)
+作为不包含在新范围内的下界；下次待检查范围是
+`36f7d382..upstream/main`。由于已纳入的修改在本 Fork 中经过冲突适配，这里记录的是
+上游来源历史边界，不是两仓库的 Git merge base。只有下一批上游修改完成集成并通过
+验证后，才能更新这个锚点。
+
 [English README](./README.md)
 
 ## 本 Fork 维护的增强能力
@@ -16,13 +46,65 @@
 
 | 领域 | 本 Fork 新增的能力 | 解决的问题 |
 |---|---|---|
+| **共享 Bot Registry** | 已连接的 profile 会把观测到的 Bot 身份自动登记到安装级共享 registry；CLI 可以补充别名和非本机 Bot entry，并保证精确名称、别名和 App ID 全局唯一。 | 项目准备过去依赖 profile 本地或人工复制的身份事实，同一个 Bot 名在不同 profile 或主机上可能解析不一致。 |
 | **多 Bot 项目环境准备** | `/botAdmin` 和 `/project bootstrap` 通过显式 `--plan-writer` 与 `--implementer` 角色发现并邀请指定 Bridge Bot、准备工作目录并保存群级基础角色，但不会自动启动工作流。 | 过去准备多 Bot 项目需要人工逐个拉 Bot、改权限、切目录和记录角色，没有一个经过校验的统一入口。 |
 | **原生 Bot-to-Bot 交接** | `lark-channel-bridge at-bot` 会用当前群实时 Bot 列表校验目标，并以当前 profile 的 Bot 身份发送飞书原生结构化 mention。 | 纯文本 `@名字`、手拼 mention JSON、过期的 `open_id` 或选错回传对象，都可能让交接静默丢失，但 Agent 仍误以为已经通知成功。 |
 | **按群定制行为** | 支持按群加载 operator prompt，并提供 `mention-only`、`owner-default`、`all-messages`、按群 `owner-allowlist` 四种响应模式，不需要为了免 @ 而向所有群成员开放 Bot。 | 一套全局 Prompt 和全局 @ 策略无法满足不同项目群的角色分工；Bot 可能在 owner 希望它响应时保持沉默，或响应范围过大。 |
 | **结构化 Agent 上下文** | Bridge 会注入消息、发送者/Bot 身份、引用消息、交互卡片和回传路由信息，并在每次 Codex run 中用 developer instructions 传递 Bridge 规则。 | 把协议规则混在普通用户文本里更容易被忽略或误解，尤其是在引用回复、卡片、Bot 发送者和 Codex 恢复会话场景。 |
+| **Reaction 驱动控制** | 对相关消息添加 Reaction，可以同意下一步、要求进一步解释、确认手动步骤已完成，或停止当前工作链。Bridge 会把目标消息与校准后的 Reaction 状态一并交给 Agent，持久化防重状态，并保留未预埋 emoji 供 Agent 结合上下文判断。 | 若把 Reaction 当成孤立 emoji，可能重复旧任务、丢失被回应消息，或把停止信号错误地启动成新一轮 Agent。 |
 | **可靠的过程消息与最终回复** | COT/过程输出和最终答案彻底分开，卡片与纯文本模式都单独发送最终回复；同时补齐话题路由、CardKit 流过期、陈旧回读、Codex 空终态/持久化终态和 Markdown 渲染失败的恢复路径。 | 长任务可能留下陈旧卡片或运行中 footer、重复旧内容、误触发 fallback、回复跑出话题，或者本地已经结束却没有把最终答案送到飞书。 |
 | **延后自重启与结果回执** | 同 profile 自重启会等待当前回复和活跃任务排空，再由 detached helper 重启，并向原群、原话题或原私聊发送且只发送一条成功/失败回执。 | Bot 自部署时可能在回复中途把自己终止，重启后用户也无法确定新进程是否真正连接成功。 |
 | **维护版 Channel 与可安装产物** | Release 内置维护版 `@larksuite/channel` `0.4.0-qp.1`，修复 CardKit stream rollover，并以自包含的 `@penn.qp/lark-channel-bridge` npm 包和对应 GitHub Release 发布。 | rollover 可能先把前一张卡完整重发一遍再创建下一张卡，形成重复消息；file dependency 也可能在发布产物中丢失。 |
+
+### Fork 扩展能力速查
+
+共享 Bot Registry 属于安装级能力，所有 profile 共用。已连接的 profile 会自动登记观测
+到的 Bot 身份；运维人员可以补充别名或非本机项目 Bot。名称和别名采用 NFC 归一化后的
+精确匹配，名称、别名和 App ID 全局唯一，本机 profile 仍在使用的 entry 不能删除：
+
+```bash
+lark-channel-bridge bot-registry list
+lark-channel-bridge bot-registry add --name <bot-name> --app-id <cli_xxx>
+lark-channel-bridge bot-registry add --name <bot-name> --app-id <cli_xxx> --alias <other-name>
+lark-channel-bridge bot-registry remove --name <canonical-bot-name>
+```
+
+App Secret 按 profile 加密保存。`secrets set`、`list`、`remove` 供运维人员使用；
+`secrets get` 是 profile 本地 lark-cli binding 使用的 provider 协议：
+
+```bash
+lark-channel-bridge secrets set --app-id <cli_xxx> [--profile <name>]
+lark-channel-bridge secrets list [--profile <name>]
+lark-channel-bridge secrets remove --app-id <cli_xxx> [--profile <name>]
+```
+
+Reaction 输入会经过权限校验、状态校准和持久化，并与目标消息一起交给 Agent。11 个预埋
+飞书 emoji type 映射为 4 类意图：
+
+| 意图 | 预埋 emoji type | 行为 |
+|---|---|---|
+| 同意并继续 | `OK`, `LGTM`, `Yes`, `CheckMark`, `JIAYI`（`+1`） | 仅当目标消息提出下一步时继续 |
+| 进一步解释 | `WHAT`, `THINKING` | 展开或澄清目标消息 |
+| 手动步骤已完成 | `DONE` | 从目标消息要求的手动步骤继续 |
+| 停止当前工作 | `No`, `CrossMark`, `MinusOne`（`-1`） | 按 `/stop` 语义中断匹配的工作链 |
+
+未预埋 emoji 仍会交给 Agent 结合上下文判断。重复事件、重试、重启和仍显示在消息上的
+旧 Reaction 不会重放已完成工作；移除 Reaction 也不会回滚已完成的外部操作。
+
+其他已经落地、但容易遗漏的 Fork 能力：
+
+- `/new chat [name]` 会新建群、邀请命令发送者、继承当前工作目录，并开启全新会话。
+- `/resume [N]` 在私聊中列出兼容历史；`/account` 和 `/account change` 用于查看或
+  更换当前应用凭据。
+- `/stop comment:<scopeHash>` 与
+  `/timeout comment:<scopeHash> <N|off|default>` 允许管理员控制云文档评论任务；
+  `/doc` 用于说明无需绑定的评论模型。
+- 当 bridge-aware lark-cli 支持回调签名时，Agent 创建的 CardKit 2.0 按钮可以把签名
+  载荷送回同一 session。
+- 可把 reviewed Group Prompt 安装到
+  `~/.lark-channel/profiles/<profile>/prompts/groups/<chatId>.md`。它必须是普通 UTF-8
+  文件、不能超过 64 KiB；在目标群或目标话题 scope 执行 `/new` 后，Bridge 会在那里
+  固定并激活新的不可变快照。
 
 关于能实现的效果，详情可以阅读[飞书文档](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 

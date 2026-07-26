@@ -7,6 +7,38 @@ A lightweight bot that bridges Feishu / Lark messenger with your local Claude Co
 > The original project and this fork are distributed under the MIT License. See
 > [NOTICE.md](./NOTICE.md) and [LICENSE](./LICENSE) for attribution and license terms.
 
+### Upstream integration record
+
+The last verified upstream integration was completed on 2026-07-23 in
+[Fork PR #4](https://github.com/KeepSilenceQP/lark-coding-agent-bridge/pull/4).
+It selected six upstream commits from
+[`c0caa10`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/c0caa10db9df8411089e0d44501a475a96dfc0e6)
+through
+[`021b774`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/021b77446523b55b9110df21708056f450fbb500),
+also represented by upstream release merge
+[`36f7d382`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/36f7d382806e11b21bf7329cf44deef604a1136b).
+
+This is a **source range, not a tree- or patch-equivalence claim**. The upstream
+changes were cherry-picked and conflicts were resolved to preserve this fork's
+group response policy, configuration and access behavior, Codex final-reply
+recovery, and maintained Channel packaging. In the fork's current rewritten
+history, the corresponding integration range is
+[`ffae698`](https://github.com/KeepSilenceQP/lark-coding-agent-bridge/commit/ffae698596a51165f8912b5a5afebaeb3e5a2667)
+through
+[`3a2540c`](https://github.com/KeepSilenceQP/lark-coding-agent-bridge/commit/3a2540c8f8eaf0101f636ceb5c5eb5897c2e5d3f),
+followed by fork-only compatibility and release commits.
+
+The integration was validated on macOS, Ubuntu, and Windows with 991 passing
+tests, 3 skipped tests, typecheck/build, and release/npm clean-install checks.
+
+**Future upstream sync anchor:** use upstream commit
+[`36f7d382`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/36f7d382806e11b21bf7329cf44deef604a1136b)
+as the exclusive lower bound. New candidates are
+`36f7d382..upstream/main`. This is a source-history boundary rather than a Git
+merge base because the incorporated changes were conflict-adapted in the fork.
+Do not advance this anchor until the next upstream batch has been integrated
+and verified.
+
 [中文 README](./README.zh.md)
 
 ## Enhancements maintained in this fork
@@ -17,13 +49,70 @@ Lark coding sessions:
 
 | Area | What this fork adds | Problem it solves |
 |---|---|---|
+| **Shared Bot Registry** | Connected profiles self-register their observed Bot identity in one installation-level registry. The CLI can add aliases and non-local Bot entries, while enforcing unique exact names, aliases, and App IDs. | Project bootstrap previously depended on profile-local or manually copied identity facts, so the same Bot name could resolve differently across profiles or hosts. |
 | **Multi-bot project environment preparation** | `/botAdmin` and `/project bootstrap` use explicit `--plan-writer` and `--implementer` roles to discover and invite selected Bridge bots, prepare their workspace, and persist the group's base actor assignment without starting a workflow. | Preparing a multi-bot project previously required several manual invitations, permission changes, and working-directory commands, with no single validated entry point. |
 | **Native bot-to-bot handoff** | `lark-channel-bridge at-bot` validates the target against the current group's live bot list and sends a native structured mention with the current profile's bot identity. | Plain-text `@name`, hand-built mention JSON, stale `open_id` values, and replying to the wrong bot could silently lose a handoff while the agent still claimed it had notified the target. |
 | **Per-group behavior** | Group-scoped operator prompts and four response modes (`mention-only`, `owner-default`, `all-messages`, and per-chat `owner-allowlist`) let each bot behave differently by group without opening access to everyone. | One global prompt and one global mention policy could not serve project groups with different roles; bots either stayed silent when the owner expected a reply or responded too broadly. |
 | **Structured agent context** | The Bridge injects message, sender/bot identity, quote, card, and return-route context, and sends Bridge rules to Codex as developer instructions on every run. | Protocol rules mixed into ordinary user text were easier to ignore or misinterpret, especially for quoted messages, interactive cards, bot senders, and resumed Codex sessions. |
+| **Reaction-driven control** | Reactions on relevant messages can approve a proposed next step, request more explanation, confirm that a manual step is complete, or stop the active work chain. The Bridge supplies the target message and reconciled Reaction state to the agent, persists deduplication state, and keeps unmapped emoji available for contextual interpretation. | Treating a Reaction as an isolated emoji could repeat old work, lose the message it referred to, or turn a stop signal into another agent run. |
 | **Reliable progress and final replies** | COT/progress output is separated from the dedicated final reply in both card and plain-text modes. Topic routing, expired CardKit streams, stale readback, empty or persisted Codex terminal turns, and markdown-render failures all have targeted recovery paths. | Long tasks could leave a stale card/footer, repeat earlier content, fall back unnecessarily, reply outside the topic, or finish locally without delivering the final answer. |
 | **Deferred self-restart with receipt** | A same-profile restart waits for the current reply and active runs to drain, restarts through a detached helper, and sends exactly one success or failure receipt back to the original chat or topic. | Self-deployment could terminate the bot mid-reply, and users had no reliable evidence that the replacement process connected successfully. |
 | **Maintained Channel and release artifact** | Releases bundle the maintained `@larksuite/channel` `0.4.0-qp.1`, which fixes CardKit stream rollover, and are published as a self-contained `@penn.qp/lark-channel-bridge` package plus a matching GitHub Release. | A rollover could resend the full earlier card before opening the next card, producing repeated messages; file-based Channel dependencies could also be missing from a published package. |
+
+### Fork capability reference
+
+The shared Bot Registry is installation-level and available to every profile.
+Connected profiles self-register their observed Bot identity. Operators can add
+aliases or non-local project Bots; exact NFC-normalized names, aliases, and App
+IDs are unique, and entries used by local profiles cannot be removed:
+
+```bash
+lark-channel-bridge bot-registry list
+lark-channel-bridge bot-registry add --name <bot-name> --app-id <cli_xxx>
+lark-channel-bridge bot-registry add --name <bot-name> --app-id <cli_xxx> --alias <other-name>
+lark-channel-bridge bot-registry remove --name <canonical-bot-name>
+```
+
+App Secrets are encrypted per profile. `secrets set`, `list`, and `remove`
+provide human-facing maintenance; `secrets get` is the provider protocol used
+by the profile-local lark-cli binding:
+
+```bash
+lark-channel-bridge secrets set --app-id <cli_xxx> [--profile <name>]
+lark-channel-bridge secrets list [--profile <name>]
+lark-channel-bridge secrets remove --app-id <cli_xxx> [--profile <name>]
+```
+
+Reaction input is access-controlled, reconciled, persisted, and delivered with
+the target message. Eleven predefined Feishu emoji types map to four intents:
+
+| Intent | Predefined emoji types | Behavior |
+|---|---|---|
+| Approve and continue | `OK`, `LGTM`, `Yes`, `CheckMark`, `JIAYI` (`+1`) | Continue only when the target message proposed a next step |
+| Explain more | `WHAT`, `THINKING` | Expand or clarify the target message |
+| Manual step complete | `DONE` | Continue from the requested manual step |
+| Stop current work | `No`, `CrossMark`, `MinusOne` (`-1`) | Interrupt the matching work chain with `/stop` semantics |
+
+Unmapped emoji remain available to the agent for contextual interpretation.
+Duplicate events, retries, restarts, and old still-visible Reactions do not
+replay completed work; removing a Reaction does not roll back completed
+external actions.
+
+Additional fork surfaces that are implemented but easy to miss:
+
+- `/new chat [name]` creates a group, invites the caller, inherits the current
+  working directory, and starts a fresh session.
+- `/resume [N]` privately lists compatible history; `/account` and
+  `/account change` inspect or replace the current app credentials.
+- `/stop comment:<scopeHash>` and
+  `/timeout comment:<scopeHash> <N|off|default>` let an admin control a
+  cloud-document comment run; `/doc` explains the no-binding comment model.
+- When bridge-aware lark-cli callback signing is available, agent-created
+  CardKit 2.0 buttons can return signed payloads to the same session.
+- A reviewed group prompt can be installed at
+  `~/.lark-channel/profiles/<profile>/prompts/groups/<chatId>.md`. It must be a
+  regular UTF-8 file no larger than 64 KiB. Run `/new` in the intended group or
+  topic scope to pin and activate a new immutable snapshot there.
 
 For a product walkthrough, see the [Feishu document](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e).
 
