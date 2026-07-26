@@ -1,7 +1,7 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: In Progress（Unit 4 complete；Unit 5 next）
+Status: In Progress（Unit 5 complete；Unit 6 next）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
 Plan Writer: HistoryRedactedBot2（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
@@ -31,6 +31,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - 2026-07-26 Unit 2 Receiving：Codex Subagent 提交 `d65de8d`，精确变更 8 个计划内文件。Coordinator 独立复核共同 resolver 单锁提交、create-only 竞态 fail-closed、零 profile 保留与恢复、Registry 自注册、export 排除及 QR 无名称边界，并补跑 5 files / 109 tests（含真实 run/service/profile-create 并发）全绿；复用同源提交的 `pnpm ci:local`（136 files，1420 passed / 33 skipped，typecheck + build success）证据。Unit 2 完成，Unit 3 尚未开始。
 - 2026-07-26 Unit 3 Receiving：Codex Subagent 提交 `963e67f`，精确变更 4 个 Unit 3 文件。Coordinator 独立复核独立登记服务、connect 后 best-effort 接入、最终 rejection containment 与日志分支，并补跑 service + fake-channel 2 files / 22 tests，确认 created 持久化、noop 零写、conflict/锁失败不阻断消息流；复用同源提交第二轮 `pnpm ci:local`（137 files，1428 passed / 33 skipped，typecheck + build success）证据。Unit 3 完成，Unit 4 尚未开始。
 - 2026-07-26 Unit 4 Receiving：Codex Subagent 提交 `f4bd17f`，精确变更 4 个 Unit 4 文件。Coordinator 独立复核 CLI 注册、安装级路径边界、锁内 fresh load、幂等/冲突零写、list 最小输出、canonical-only remove 与 profile 占用拒绝，并补跑新增 unit + integration 2 files / 16 tests 全绿；复用同源提交 `pnpm ci:local`（139 files，1444 passed / 33 skipped，typecheck + build success）证据。Unit 4 完成，Unit 5 尚未开始。
+- 2026-07-26 Unit 5 Receiving：Codex Subagent 提交 `57546fc`，精确变更 6 个 Unit 5 文件。Coordinator 独立复核无 shell 语义 tokenizer、具名角色 parser、统一 usage、旧位置语法优先拒绝与 commands 副作用前边界，并补跑 parser + commands integration 2 files / 75 tests 全绿；复用同源提交 `pnpm ci:local`（140 files，1465 passed / 33 skipped，typecheck + build success）证据。Unit 5 完成，Unit 6 尚未开始。
 
 ## Current Code Evidence
 
@@ -192,7 +193,7 @@ Implementer 每单元只正式回传结果、diff 边界与验证证据，不自
 
 ### Unit 5 — 具名参数 tokenizer/parser + 帮助文本 Owner: Implementer
 
-- [ ] 完成
+- [x] 完成
 
 **目标**：DD7（纯解析层 + 文案，不接 runtime）。
 **准确落点**：新增 `src/project/bootstrap-args.ts`；`src/commands/index.ts:688-741` 换用新 parser、更新 `:696`/`:717` 用法文案；`README.md:20,199`、`README.zh.md:19,198` 同版本切换。
