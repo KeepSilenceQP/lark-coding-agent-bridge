@@ -49,7 +49,7 @@ describe('ensureBotRegistrySelfRegistration', () => {
     await saveRootConfig({
       ...emptyRoot(),
       botRegistry: {
-        entries: [{ name: 'Bridge', aliases: ['HistoryRedactedBot4'], appId: 'cli_bridge' }],
+        entries: [{ name: 'Bridge', aliases: ['Coordinator Bot'], appId: 'cli_bridge' }],
       },
     }, configPath);
     const before = await readFile(configPath, 'utf8');
@@ -62,7 +62,7 @@ describe('ensureBotRegistrySelfRegistration', () => {
 
     expect(result).toEqual({
       kind: 'noop',
-      entry: { name: 'Bridge', aliases: ['HistoryRedactedBot4'], appId: 'cli_bridge' },
+      entry: { name: 'Bridge', aliases: ['Coordinator Bot'], appId: 'cli_bridge' },
     });
     expect(save).not.toHaveBeenCalled();
     expect(await readFile(configPath, 'utf8')).toBe(before);

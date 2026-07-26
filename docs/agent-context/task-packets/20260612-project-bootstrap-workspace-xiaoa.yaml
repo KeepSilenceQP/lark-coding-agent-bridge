@@ -1,7 +1,7 @@
 task_id: project-bootstrap-phase2-workspace-xiaoa
 flow_level: heavy
 phase: prd_review
-context_pack: /redacted/history/machine-1/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+context_pack: /redacted/local-root/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
 target_bot: 小A
 target_open_id: ou_dc5994dda509f61e8e0a015a627e5530
 role: non-bridge workspace-context reviewer
@@ -9,12 +9,12 @@ expected_action: Review the workspace context message intended for non-CLI bridg
 input:
   summary: 小A should not receive `/cd`; it should receive a workspace context saying local path is primary.
   workspace:
-    local: /redacted/history/machine-1/lark-channel-bridge-fork
-    devbox: /redacted/history/machine-2/lark-channel-bridge-fork
+    local: /redacted/local-root/lark-channel-bridge-fork
+    devbox: /redacted/remote-root/lark-channel-bridge-fork
 output:
   required: Required wording or runtime fields for 小A to use local workspace safely; blockers if any.
-next_receiver: HistoryRedactedBot4
-response_format: independent text/post + native mention @HistoryRedactedBot4
+next_receiver: Coordinator Bot
+response_format: independent text/post + native mention @Coordinator Bot
 stop_conditions:
   - missing context
   - runtime cannot consume workspace context

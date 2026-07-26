@@ -10,10 +10,10 @@ Parent authority:
 - current live code and tests
 
 Plan SOP:
-`/redacted/history/machine-1/o/memory_workspace/MemoryData/ai_proactive_api/agent_md/sop/plan-before-coding.md`
+`/redacted/local-root/o/memory_workspace/MemoryData/ai_proactive_api/agent_md/sop/plan-before-coding.md`
 
 Workflow authority:
-`/redacted/history/machine-1/o/memory_workspace/MemoryData/ai_proactive_api/agent_md/AGENT_LOOP_GUIDE.md`
+`/redacted/local-root/o/memory_workspace/MemoryData/ai_proactive_api/agent_md/AGENT_LOOP_GUIDE.md`
 
 Current goal: workflow execution is complete; repository submission remains a
 separate explicitly authorized action.
@@ -748,7 +748,7 @@ switch. No version/SHA/session binding is introduced to change that behavior.
       target group mode, running `0.5.9-qp.3` Bridge, candidate/live hashes,
       live Group Prompt mode `0600`, and missing live SOP/routes directory.
       Group admission is `owner-default`, but the prepared probes deliberately
-      use structured `@HistoryRedactedBot4` mentions rather than relying on a no-mention
+      use structured `@Coordinator Bot` mentions rather than relying on a no-mention
       exception.
     - Workflow is now `Environment setup required`: Qin Peng must open two
       fresh target-group topics, post the prepared structured-mention roots,
@@ -1191,8 +1191,8 @@ not covered by the confirmed authority.
 - Command:
 
   ```text
-  python3 /redacted/history/machine-1/o/memory_workspace/MemoryData/ai_proactive_api/agent_md/tools/validate_coding_plan_contracts.py \
-    --plan /redacted/history/machine-1/lark-coding-agent-bridge-worktrees/azu-group-prompt-router-optimization/docs/plans/20260721-azu-group-prompt-bug-confirmation-gate-plan.md
+  python3 /redacted/local-root/o/memory_workspace/MemoryData/ai_proactive_api/agent_md/tools/validate_coding_plan_contracts.py \
+    --plan /redacted/local-root/lark-coding-agent-bridge-worktrees/azu-group-prompt-router-optimization/docs/plans/20260721-azu-group-prompt-bug-confirmation-gate-plan.md
   ```
 
 - Prior result: the pre-repair plan was reported structurally valid.
@@ -1212,8 +1212,8 @@ not covered by the confirmed authority.
 - Command:
 
   ```text
-  python3 /redacted/history/machine-1/o/memory_workspace/MemoryData/ai_proactive_api/agent_md/tools/validate_coding_plan_contracts.py \
-    --plan /redacted/history/machine-1/lark-coding-agent-bridge-worktrees/azu-group-prompt-router-optimization/docs/plans/20260721-azu-group-prompt-bug-confirmation-gate-plan.md
+  python3 /redacted/local-root/o/memory_workspace/MemoryData/ai_proactive_api/agent_md/tools/validate_coding_plan_contracts.py \
+    --plan /redacted/local-root/lark-coding-agent-bridge-worktrees/azu-group-prompt-router-optimization/docs/plans/20260721-azu-group-prompt-bug-confirmation-gate-plan.md
   ```
 
 - Result: `PASS: Coding Plan unit dispatch facts are structurally valid`.

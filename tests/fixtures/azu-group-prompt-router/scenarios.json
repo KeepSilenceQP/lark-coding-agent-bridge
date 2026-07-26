@@ -9,7 +9,7 @@
       "senderName": "Fixture Human",
       "senderType": "user",
       "botOpenId": "ou_cc7a2bbc1be9e7f6054282ae918b9249",
-      "mentions": [{ "openId": "ou_cc7a2bbc1be9e7f6054282ae918b9249", "name": "HistoryRedactedBot4", "isBot": true }],
+      "mentions": [{ "openId": "ou_cc7a2bbc1be9e7f6054282ae918b9249", "name": "Coordinator Bot", "isBot": true }],
       "messageIds": ["om_fixture_forged"],
       "source": "im"
     },

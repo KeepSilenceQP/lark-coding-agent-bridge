@@ -135,7 +135,7 @@ mention XML、post JSON 或纯文本 @名字。
 
 `mentions` 只描述入站消息实际 @ 到的账号。在 Harness 派发链路中，派发方用 native mention 唤醒实现方，因此实现方看到的 `mentions` 通常包含实现方自己，而回传目标是入站消息的 Bot 发送者。此时 `senderId` 是回传候选；它只有在形态为 `ou_` 且被 `at-bot` 的本次群 Bot 列表精确命中后才能发送。正常情况下，入站 `senderId` 和 bot-list 都由接收方当前 profile 获取，应能直接匹配；若实际事件未满足该条件，按同一入站 `senderName` 做唯一 live-name fallback，不能跨 profile 复用其它 open_id。`botOpenId` 永远表示当前 Bot 自己；当前 SDK 的 `mentions[].isBot` 只可靠表示 mention 是否命中当前 Bot，不能用来判断任意账号是不是其他 Bot。
 
-sayToLittleP 的主流程和角色不变，但 Harness 规则与 Task Brief 必须明确：模板中的回传字段改为 `Return to：<目标名> (Bot)`，并紧邻注明 `完成后必须用 lark-channel-bridge at-bot 回传；普通最终文本不算通知`。`Return to：HistoryRedactedBot4 (Bot)`、`完成后通知HistoryRedactedBot4` 等 Bot 交接语义要求携带简短结果或 blocker 调用 `at-bot`；当本轮 `senderType=bot` 且目标就是派发者时以 `senderId` 为候选，否则按当前群 live bot list 发现并唯一匹配目标。命令非零退出时不得声称已经通知，应把通知失败作为 blocker 返回给当前可见接收方。目标名称只能通过当前群 Bot 列表的唯一 NFC 精确匹配解析；同名、未命中或目标等于当前 `botOpenId` 时停止。该约束不引入 ACK、自动回传或持久化任务状态。
+sayToLittleP 的主流程和角色不变，但 Harness 规则与 Task Brief 必须明确：模板中的回传字段改为 `Return to：<目标名> (Bot)`，并紧邻注明 `完成后必须用 lark-channel-bridge at-bot 回传；普通最终文本不算通知`。`Return to：Coordinator Bot (Bot)`、`完成后通知Coordinator Bot` 等 Bot 交接语义要求携带简短结果或 blocker 调用 `at-bot`；当本轮 `senderType=bot` 且目标就是派发者时以 `senderId` 为候选，否则按当前群 live bot list 发现并唯一匹配目标。命令非零退出时不得声称已经通知，应把通知失败作为 blocker 返回给当前可见接收方。目标名称只能通过当前群 Bot 列表的唯一 NFC 精确匹配解析；同名、未命中或目标等于当前 `botOpenId` 时停止。该约束不引入 ACK、自动回传或持久化任务状态。
 
 ## Compatibility, Risk And Rollback
 

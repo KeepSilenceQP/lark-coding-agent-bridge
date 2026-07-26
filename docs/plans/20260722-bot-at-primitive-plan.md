@@ -4,8 +4,8 @@ Date: 2026-07-22
 Status: revised after R17 CONDITIONAL — processKill injected into deps, real process.kill no longer called from mock tests; child tmpDir passed via argv to avoid Windows path escaping; awaiting re-review (R8 PASS baseline; R12–R17 revisions need independent verification)
 Authority: `docs/specs/20260722-bot-at-primitive.md` (`confirmed — R7 independent review PASS`)
 Bridge branch: `feat/bot-at-primitive` from `a6185f9`
-Companion repository: `/redacted/history/machine-1/sayToLittleP` (`main@2efbb50`, clean at planning time)
-Plan Writer: HistoryRedactedBot4
+Companion repository: `/redacted/local-root/sayToLittleP` (`main@2efbb50`, clean at planning time)
+Plan Writer: Coordinator Bot
 Plan Reviewer: independent SubAgent
 Execution mode: direct repository work; this task does **not** run the sayToLittleP Harness
 
@@ -54,7 +54,7 @@ The final handoff records both commit SHAs. Either repository may be reviewed in
 
 ### sayToLittleP repository
 
-- `HARNESS.md:84-99`, `templates/task-brief.md:1-21`, and the repository README’s confirmed authority `docs/2026-07-20-harness-core-workflow-spec.md:185-202` currently use the ambiguous label `Return to：HistoryRedactedBot4` and do not tell a weak model that the target is a Bot or that it must invoke `at-bot`.
+- `HARNESS.md:84-99`, `templates/task-brief.md:1-21`, and the repository README’s confirmed authority `docs/2026-07-20-harness-core-workflow-spec.md:185-202` currently use the ambiguous label `Return to：Coordinator Bot` and do not tell a weak model that the target is a Bot or that it must invoke `at-bot`.
 - `HARNESS.md:115-125` requires native mention but delegates operational details to `foundation/feishu-bot-interop/`.
 - `foundation/feishu-bot-interop/lark-channel-bridge飞书群协作接入与行为规则.md:31-45` still describes direct structured-mention construction rather than the new primitive.
 - `foundation/feishu-bot-interop/Bot接入验收清单.md:52-92` already defines sender mapping, mention readback, nonce continuity, and target receipt evidence; it needs to name `at-bot` as the send path while retaining user-identity message readback.
@@ -275,7 +275,7 @@ Assertions prove both adapters receive the same new command mapping and that no 
 
 ### Unit 4 — Update sayToLittleP’s contract surfaces
 
-Before editing, verify `/redacted/history/machine-1/sayToLittleP` is clean and create its own `feat/bot-at-primitive` branch from current `main`.
+Before editing, verify `/redacted/local-root/sayToLittleP` is clean and create its own `feat/bot-at-primitive` branch from current `main`.
 
 Companion files:
 
@@ -301,7 +301,7 @@ Gate:
 - direct send commands remain only where they are explicitly independent readback/setup operations, never as the model’s Bot notification path;
 - the acceptance checklist records command result, sender mapping, structured mention, nonce, and target receipt;
 - `git diff --check` passes in the companion repository;
-- neither full-width nor ASCII `Return to` forms in current normative/executable documentation retain a concrete `HistoryRedactedBot4` skeleton without the `(Bot) + at-bot` obligation; any historical hit is labeled non-authoritative in the review inventory;
+- neither full-width nor ASCII `Return to` forms in current normative/executable documentation retain a concrete `Coordinator Bot` skeleton without the `(Bot) + at-bot` obligation; any historical hit is labeled non-authoritative in the review inventory;
 - every full-repository scan hit is present in the review inventory, and the complete active set (including root `README.md`, `AGENTS.md`, templates, roles, confirmed Spec, and interop docs) contains no `<at>`, hand-built `tag:"at"`, or direct `messages-send` Bot-notification instruction;
 - the active set contains no rule equivalent to “目标身份优先取自当前消息的 mentions”; static checks and row-level review evidence confirm sender/explicit-other-Bot/name-discovery semantics match DD3/DD4;
 - a separate companion commit SHA is recorded before the scan, and the inventory plus mechanical checks name that same SHA.
@@ -340,7 +340,7 @@ Because the process-tree contract is OS-specific, Unit 5 also waits for the push
 
 ### Unit 5 — Artifact rollout and controlled weak-model / dual-Bot Gate
 
-Owner: 秦鹏 + HistoryRedactedBot4. Implementation support may provide builds, entry-path discovery, config readback, and logs, but may not declare live acceptance from unit tests alone.
+Owner: 秦鹏 + Coordinator Bot. Implementation support may provide builds, entry-path discovery, config readback, and logs, but may not declare live acceptance from unit tests alone.
 
 Preflight:
 
@@ -446,7 +446,7 @@ Runtime readback commands and service operations are resolved from the live prof
 ## Review History
 
 - **R1 `CONDITIONAL`**: (1) the Plan omitted the confirmed Spec’s same-inbound-name fallback when a sender or explicit-mention candidate ID misses the current live Bot list; DD3/DD4, Prompt tests, and Unit 5 now require unique NFC full-name fallback from that same object and block missing/zero/ambiguous matches. (2) the pure-text negative control could legitimately intake under non-mention response modes; Unit 5 now records `groupResponseMode` and runs that control only in `mention-only`, requiring a `mention-required` skip and no run/reply.
-- **R2 `CONDITIONAL`**: (1) the confirmed sayToLittleP workflow Spec retained the old `Return to：HistoryRedactedBot4` skeleton; Unit 4 now updates or delegates that authority and inventories all tracked Markdown. (2) the async subprocess wording did not close timeout/settlement lifecycle; the Plan initially changed to `spawnProcessSync`. (3) success envelopes and parsed API error redaction were underspecified; DD1/DD2 and RED tests now require exact `ok:true + identity:bot + optional numeric code 0 + stage data` and redact every child-derived error source before truncation.
+- **R2 `CONDITIONAL`**: (1) the confirmed sayToLittleP workflow Spec retained the old `Return to：Coordinator Bot` skeleton; Unit 4 now updates or delegates that authority and inventories all tracked Markdown. (2) the async subprocess wording did not close timeout/settlement lifecycle; the Plan initially changed to `spawnProcessSync`. (3) success envelopes and parsed API error redaction were underspecified; DD1/DD2 and RED tests now require exact `ok:true + identity:bot + optional numeric code 0 + stage data` and redact every child-derived error source before truncation.
 - **R3 `BLOCKED`**: (1) live evidence showed `lark-cli` is a Node wrapper around a native child, so sync timeout can kill only the wrapper while the request survives; the R2 runner choice is withdrawn. DD1/Units 1–2 now require an argv-only process-group/tree runner plus a real wrapper→child timeout regression test. (2) the stale-contract scan was only partial and non-enforcing; Unit 4 now scans all tracked Markdown, requires a row-for-row classification in Code Review evidence, and mechanically rejects manual-send instructions in active authority files.
 - **R4 `CONDITIONAL`**: (1) the process-tree runner lacked an explicit `exit`/`close`/tree-kill failure state table; DD1 now makes original `close` the only normal settle point, bounds Windows taskkill and close confirmation, preserves the first terminal cause, and adds race/cleanup tests. (2) the active sayToLittleP set omitted root `README.md`/`AGENTS.md` and was not bound to a revision; Unit 4 now defines the full active set and runs both inventory and hard checks against the recorded companion commit SHA. (3) real lark-cli failures may use nested `error.message`, and arbitrary bare secrets are unsafe to echo; DD2 now returns only fixed categories, recognizes unbound markers without echoing source text, and tests top-level/nested/stderr/spawn credential vectors.
 - **R5 `CONDITIONAL`**: (1) Windows tree termination was mocked only despite the repository’s three-OS CI; Unit 1 now runs the real wrapper→heartbeat-child timeout regression on macOS, Linux, and Windows, and Unit 5 waits for all three CI jobs. (2) spawn `error` lacked a state transition; DD1 now locks `unavailable`, avoids kill without a PID, bounds missing-close behavior, and routes PID-bearing failures through tree termination. (3) fixed errors were not asserted category by category; DD2 now defines stable prefix/action pairs and table-driven tests, with only optional numeric API code variability and no child prose.
@@ -458,4 +458,4 @@ Runtime readback commands and service operations are resolved from the live prof
 
 ## Review Gate
 
-This Plan was written by HistoryRedactedBot4 and independently reviewed through R8 (R8 returned `PASS` with no remaining P0/P1/P2). The Plan was subsequently revised in R12 (Windows observational boundary), R13 (Plan consistency across all sections), R14 (detached-child survival), R15 (heartbeat-file evidence), and R16 (fixture stability + diagnostic assertions). These post-R8 revisions address new evidence from real Windows CI runs and must be independently re-verified before the Plan can be considered current. This review does not itself commit files, modify runtime code, deploy artifacts, or start the sayToLittleP Harness.
+This Plan was written by Coordinator Bot and independently reviewed through R8 (R8 returned `PASS` with no remaining P0/P1/P2). The Plan was subsequently revised in R12 (Windows observational boundary), R13 (Plan consistency across all sections), R14 (detached-child survival), R15 (heartbeat-file evidence), and R16 (fixture stability + diagnostic assertions). These post-R8 revisions address new evidence from real Windows CI runs and must be independently re-verified before the Plan can be considered current. This review does not itself commit files, modify runtime code, deploy artifacts, or start the sayToLittleP Harness.

@@ -154,7 +154,7 @@ After code gates pass:
 3. 修复 CLI 入口到可验证构建，再重启 Codex profile；不改 Claude profile 的响应模式。
 4. 仅把 Codex profile 切换为 `owner-default`，保持其他 access 配置不变。
 5. 验证 daemon、WS、profile config readback 和日志无启动错误。
-6. 在测试群完成真实消息矩阵：无 @、@ 人、@ 其他 bot、@ HistoryRedactedBot4、同时 @ HistoryRedactedBot4和其他 bot、`@所有成员`。记录每条消息 ID、哪些 bot 实际回复和HistoryRedactedBot4 intake/run 日志。
+6. 在测试群完成真实消息矩阵：无 @、@ 人、@ 其他 bot、@ Coordinator Bot、同时 @ Coordinator Bot和其他 bot、`@所有成员`。记录每条消息 ID、哪些 bot 实际回复和Coordinator Bot intake/run 日志。
 
 Runtime PASS requires both config readback and Feishu behavior evidence；只通过单测、构建或进程存活不算完成。
 

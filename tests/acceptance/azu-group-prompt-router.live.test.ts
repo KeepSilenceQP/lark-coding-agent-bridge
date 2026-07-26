@@ -156,7 +156,7 @@ describe.skipIf(!RUN)('阿祖群 Prompt isolated live-model acceptance', () => {
       AZU_REPO_ROOT: REPO_ROOT,
       AZU_REAL_CODEX_BINARY: realCodex,
       AZU_REAL_GIT_BINARY: realGit,
-      AZU_LIVE_MEMORYDATA_ROOT: '/redacted/history/machine-1/o/memory_workspace/MemoryData',
+      AZU_LIVE_MEMORYDATA_ROOT: '/redacted/local-root/o/memory_workspace/MemoryData',
       ...(Object.hasOwn(process.env, 'AZU_ACCEPTANCE_SCENARIOS')
         ? { AZU_ACCEPTANCE_SCENARIOS: process.env.AZU_ACCEPTANCE_SCENARIOS }
         : {}),

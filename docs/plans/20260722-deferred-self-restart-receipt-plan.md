@@ -4,9 +4,9 @@ Date: 2026-07-22
 Status: Complete — Unit 6 runtime PASS and independent re-review GO
 Authority: `docs/specs/20260722-deferred-self-restart-receipt.md` (confirmed by Qin Peng, commit `b906c8b`)
 Branch: `fix/lark-bridge-followup`
-Implementer: HistoryRedactedBot1
-Plan Writer: HistoryRedactedBot2
-Plan Reviewer: HistoryRedactedBot4
+Implementer: Implementer Bot
+Plan Writer: Planner Bot
+Plan Reviewer: Coordinator Bot
 
 ## Outcome
 
@@ -31,15 +31,15 @@ Plan Reviewer: HistoryRedactedBot4
 - **R4 修订**：DD1 单一 terminal + attempt lease + 读 terminal 优先 + crash 表；DD3/DD4/DD5 引用；Unit 1/2/4 同步测试。
 - **R5（CHANGES REQUIRED，单点文字/测试修正，R4 核心已关闭）**：attempt 接管条件前后不一致——要求/摘要是 AND（owner crash + lease TTL + owner-dead），DD1 recovery 实际写成 OR（"ownerPid 死 或 TTL 超时"），会让 owner 仍活但发送超 TTL 时被第二 actor 抢占，破坏唯一发送权。统一为严格 AND：只有 `lease TTL 已超时 && ownerPid 已确认死亡` 才允许删旧 attempt 并原子接管；任一不满足等待/不接管；ownerPid 检测不确定/EPERM 按仍存活 fail-closed。补测试：TTL 超时但 owner alive 不接管；owner dead 但 TTL 未到不接管；二者同时满足才唯一接管。
 - **R5 修订**：DD1 recovery OR→严格 AND + fail-closed；同步 DD1 attempt 文件描述、crash 表、DD3/DD4/DD5 接管措辞、Unit 1 接管测试。Plan Writer 未自判 GO。
-- **R6（HistoryRedactedBot4，PASS）**：R1-R5 findings 全部关闭。confirmed Spec、live code 落点、per-run route lease、唯一 pending、claim/attempt/terminal 原子状态、strict-AND recovery、Bridge System Prompt、三平台自动化与隔离 failure/live success 验收链一致；无剩余 Plan blocker。允许HistoryRedactedBot1进入 Unit 1-5，实现完成后仍须经过HistoryRedactedBot2独立 Code Review，方可进入 Unit 6。
-- **Implementation handoff（HistoryRedactedBot1，`7a992ff`，返修中）**：Unit 1-5 首版已提交并报告全量测试/typecheck/build/diff-check 通过；Coordinator 检查发现 receipt sender 虽生成稳定 UUID，但通过不支持 UUID 的 `channel.send` 发送，UUID 未进入飞书 create/reply 请求，不能满足 DD5 exactly-once；同时 README.md/README.zh.md 未按 Unit 5 更新。已退回HistoryRedactedBot1补齐真实 UUID API 传递、出站请求断言/同 UUID 重试测试及文档，修复完成前不勾选 Unit 1-5、不进入独立 Code Review。
-- **Implementation rework complete（HistoryRedactedBot1，`bab1ea1` + `f5545a4` + `2857005` + `22cbf21`）**：真实 REST reply UUID、topic `reply_in_thread`、缺失 messageId 协议错误、Bridge PID 写入、helper 旧进程语义、temp 唯一性、startup lifecycle cleanup、确定性凭据/token 失败收敛及可注入 production seams 已补齐；README 双语文档已更新。Coordinator targeted verification：8 files / 114 tests PASS，`pnpm typecheck` PASS，`pnpm build` PASS，`git diff --check` PASS。全量：967 PASS / 1 FAIL / 3 SKIP；唯一失败 `tests/process/codex-turn-state-probe.test.ts` 在当前长路径 worktree 复现，但同一 `22cbf21` 隔离临时 worktree PASS，记录为独立评审需知的路径/进程退出竞态，不作为本功能 GO 证据。
-- **Independent Code Review（HistoryRedactedBot2，head `6b111dd`，conditional GO）**：核心 DD1-DD7、端到端接线与 targeted 114/114 通过，无 P1；Unit 6 前须关闭两个 P2：（1）`handleReceiptRecovery` 完成后未按 receiptId 删除 crash-window 残留 pending，可能让后续 restart EEXIST 最长 30 分钟，且现有 crash test 只手工删 pending、未跑生产 recovery；（2）`makeClaimUuid` 不是 RFC 4122 UUID，飞书 reply 端点虽支持 uuid 幂等，但当前格式未证明可被服务端接受。Code Review Gate 暂不勾选；已退回HistoryRedactedBot1补生产 recovery 集成测试、verified pending cleanup 与 deterministic RFC 4122 UUID。
-- **P2 rework（HistoryRedactedBot1，`827ffc5` + `5068c0e`）**：生产 `handleReceiptRecovery` 已在 terminal-existing、existing-claim 和 post-terminal 路径按 receiptId 清 pending；claim UUID 改为确定性 RFC 4122 UUIDv5，sender 补 429 有界重试。测试直接调用真实 recovery handler（仅注入 sender），覆盖 crash-window pending+claim+stale attempt → 同 kind/UUID 发送 → terminal(messageId) → 全残留清理，以及 terminal 已存在时不重复发送；另以真实 `runServiceRestart` 覆盖 EEXIST 时 lease 不丢、首个 pending 保留。Coordinator 在 head `5068c0e` 复验：8 files / 123 tests PASS，`pnpm typecheck` PASS，`pnpm build` PASS，`git diff --check b906c8b..HEAD` PASS。现提交同一精确 head 给HistoryRedactedBot2独立复审，复审 GO 前 Code Review Gate 仍不勾选、不进入 Unit 6。
-- **Independent Code Re-review（HistoryRedactedBot2，head `3645e27`，unconditional GO）**：在独立 Devbox worktree 确认两个 P2 均关闭；真实 `handleReceiptRecovery` 测试覆盖 crash-window 与 terminal-existing 清理，RFC 4122 UUIDv5 确定且重试稳定，真实 `runServiceRestart` EEXIST 保留 lease/首个 pending。独立 targeted 8 files / 123 tests PASS，`pnpm typecheck` PASS，`git diff --check b906c8b..HEAD` PASS；无新 P1/P2。Coordinator 同 head 全量为 976 PASS / 1 FAIL / 3 SKIP，唯一失败仍是 `codex-turn-state-probe` 临时文件竞态，单独重跑 1/1 PASS，记录为非功能路径的已知 process-test 波动。
-- **Unit 6 production success（HistoryRedactedBot4，artifact `8b746ab`，PASS）**：兼容 bootstrap 先将旧进程 `90022` 切到新 artifact PID `76727`；随后由真实 per-run route lease 发起 receipt `restart-0f5c965e-e823-4a6c-b41a-69396abe0c62`。飞书回读顺序为触发消息 `om_x100b6939866bb4a0ddbc8b614399e63` → 最终回复 `om_x100b693986356ca0b4af0219a817898` → success receipt `om_x100b693985f064a0b14bc34d3a64152`；新 PID `85140`，旧 PID `76727` 已死亡。单一 terminal 为 `kind=success,outcome=completed` 且 messageId 与飞书回读一致，pending/claim/attempt 全清。生产 Bot 未构造 failure。
-- **Unit 6 isolated failure/rollback evidence（HistoryRedactedBot4，PASS with safe fixture substitute）**：按 Plan 的非生产隔离边界，不破坏生产 launchd/service，也不复用生产 return route 构造失败消息；以 production-seam mock adapter 覆盖 service-action-failure、startup-timeout、deterministic sender failure→terminal(delivery-failed)、old marker compatibility 与状态清理。5 files / 92 tests PASS，`pnpm typecheck` PASS，`git diff --check` PASS。真实 Bridge 注入 `LARK_CHANNEL_ROUTE_ID` 暴露旧 marker 兼容测试的 env 隔离缺口；`5df6827` 仅在该测试保存/清空/恢复 routeId，当前 bridge-bound 环境复验通过。该 test-only follow-up 需HistoryRedactedBot2窄复审后才将 Unit 6 checkbox 最终勾选。
-- **Unit 6 narrow re-review（HistoryRedactedBot2，head `25695b5`，GO）**：确认 `3645e27..25695b5` 无运行代码变化；`5df6827` 的 routeId save/clear/restore 位于 try/finally 边界且不泄漏，测试真实 old-marker fallback；Unit 6 生产 success 与隔离 failure 证据符合 Spec。独立 focused 101/101 PASS，`pnpm typecheck` PASS，`git diff --check b906c8b..HEAD` PASS；无 finding。
+- **R6（Coordinator Bot，PASS）**：R1-R5 findings 全部关闭。confirmed Spec、live code 落点、per-run route lease、唯一 pending、claim/attempt/terminal 原子状态、strict-AND recovery、Bridge System Prompt、三平台自动化与隔离 failure/live success 验收链一致；无剩余 Plan blocker。允许Implementer Bot进入 Unit 1-5，实现完成后仍须经过Planner Bot独立 Code Review，方可进入 Unit 6。
+- **Implementation handoff（Implementer Bot，`7a992ff`，返修中）**：Unit 1-5 首版已提交并报告全量测试/typecheck/build/diff-check 通过；Coordinator 检查发现 receipt sender 虽生成稳定 UUID，但通过不支持 UUID 的 `channel.send` 发送，UUID 未进入飞书 create/reply 请求，不能满足 DD5 exactly-once；同时 README.md/README.zh.md 未按 Unit 5 更新。已退回Implementer Bot补齐真实 UUID API 传递、出站请求断言/同 UUID 重试测试及文档，修复完成前不勾选 Unit 1-5、不进入独立 Code Review。
+- **Implementation rework complete（Implementer Bot，`bab1ea1` + `f5545a4` + `2857005` + `22cbf21`）**：真实 REST reply UUID、topic `reply_in_thread`、缺失 messageId 协议错误、Bridge PID 写入、helper 旧进程语义、temp 唯一性、startup lifecycle cleanup、确定性凭据/token 失败收敛及可注入 production seams 已补齐；README 双语文档已更新。Coordinator targeted verification：8 files / 114 tests PASS，`pnpm typecheck` PASS，`pnpm build` PASS，`git diff --check` PASS。全量：967 PASS / 1 FAIL / 3 SKIP；唯一失败 `tests/process/codex-turn-state-probe.test.ts` 在当前长路径 worktree 复现，但同一 `22cbf21` 隔离临时 worktree PASS，记录为独立评审需知的路径/进程退出竞态，不作为本功能 GO 证据。
+- **Independent Code Review（Planner Bot，head `6b111dd`，conditional GO）**：核心 DD1-DD7、端到端接线与 targeted 114/114 通过，无 P1；Unit 6 前须关闭两个 P2：（1）`handleReceiptRecovery` 完成后未按 receiptId 删除 crash-window 残留 pending，可能让后续 restart EEXIST 最长 30 分钟，且现有 crash test 只手工删 pending、未跑生产 recovery；（2）`makeClaimUuid` 不是 RFC 4122 UUID，飞书 reply 端点虽支持 uuid 幂等，但当前格式未证明可被服务端接受。Code Review Gate 暂不勾选；已退回Implementer Bot补生产 recovery 集成测试、verified pending cleanup 与 deterministic RFC 4122 UUID。
+- **P2 rework（Implementer Bot，`827ffc5` + `5068c0e`）**：生产 `handleReceiptRecovery` 已在 terminal-existing、existing-claim 和 post-terminal 路径按 receiptId 清 pending；claim UUID 改为确定性 RFC 4122 UUIDv5，sender 补 429 有界重试。测试直接调用真实 recovery handler（仅注入 sender），覆盖 crash-window pending+claim+stale attempt → 同 kind/UUID 发送 → terminal(messageId) → 全残留清理，以及 terminal 已存在时不重复发送；另以真实 `runServiceRestart` 覆盖 EEXIST 时 lease 不丢、首个 pending 保留。Coordinator 在 head `5068c0e` 复验：8 files / 123 tests PASS，`pnpm typecheck` PASS，`pnpm build` PASS，`git diff --check b906c8b..HEAD` PASS。现提交同一精确 head 给Planner Bot独立复审，复审 GO 前 Code Review Gate 仍不勾选、不进入 Unit 6。
+- **Independent Code Re-review（Planner Bot，head `3645e27`，unconditional GO）**：在独立 Devbox worktree 确认两个 P2 均关闭；真实 `handleReceiptRecovery` 测试覆盖 crash-window 与 terminal-existing 清理，RFC 4122 UUIDv5 确定且重试稳定，真实 `runServiceRestart` EEXIST 保留 lease/首个 pending。独立 targeted 8 files / 123 tests PASS，`pnpm typecheck` PASS，`git diff --check b906c8b..HEAD` PASS；无新 P1/P2。Coordinator 同 head 全量为 976 PASS / 1 FAIL / 3 SKIP，唯一失败仍是 `codex-turn-state-probe` 临时文件竞态，单独重跑 1/1 PASS，记录为非功能路径的已知 process-test 波动。
+- **Unit 6 production success（Coordinator Bot，artifact `8b746ab`，PASS）**：兼容 bootstrap 先将旧进程 `90022` 切到新 artifact PID `76727`；随后由真实 per-run route lease 发起 receipt `restart-0f5c965e-e823-4a6c-b41a-69396abe0c62`。飞书回读顺序为触发消息 `om_x100b6939866bb4a0ddbc8b614399e63` → 最终回复 `om_x100b693986356ca0b4af0219a817898` → success receipt `om_x100b693985f064a0b14bc34d3a64152`；新 PID `85140`，旧 PID `76727` 已死亡。单一 terminal 为 `kind=success,outcome=completed` 且 messageId 与飞书回读一致，pending/claim/attempt 全清。生产 Bot 未构造 failure。
+- **Unit 6 isolated failure/rollback evidence（Coordinator Bot，PASS with safe fixture substitute）**：按 Plan 的非生产隔离边界，不破坏生产 launchd/service，也不复用生产 return route 构造失败消息；以 production-seam mock adapter 覆盖 service-action-failure、startup-timeout、deterministic sender failure→terminal(delivery-failed)、old marker compatibility 与状态清理。5 files / 92 tests PASS，`pnpm typecheck` PASS，`git diff --check` PASS。真实 Bridge 注入 `LARK_CHANNEL_ROUTE_ID` 暴露旧 marker 兼容测试的 env 隔离缺口；`5df6827` 仅在该测试保存/清空/恢复 routeId，当前 bridge-bound 环境复验通过。该 test-only follow-up 需Planner Bot窄复审后才将 Unit 6 checkbox 最终勾选。
+- **Unit 6 narrow re-review（Planner Bot，head `25695b5`，GO）**：确认 `3645e27..25695b5` 无运行代码变化；`5df6827` 的 routeId save/clear/restore 位于 try/finally 边界且不泄漏，测试真实 old-marker fallback；Unit 6 生产 success 与隔离 failure 证据符合 Spec。独立 focused 101/101 PASS，`pnpm typecheck` PASS，`git diff --check b906c8b..HEAD` PASS；无 finding。
 
 ## Current Evidence
 
@@ -168,9 +168,9 @@ Plan Reviewer: HistoryRedactedBot4
 
 ## Execution Units
 
-Owner：Unit 1-5 HistoryRedactedBot1 实现；Unit 1-5 + 自检后交回HistoryRedactedBot4，由HistoryRedactedBot2 独立 Code Review GO 后才进 Unit 6。Unit 6 live success self-restart owner = 秦鹏+HistoryRedactedBot4（HistoryRedactedBot1 提供构建/配置/日志），failure live test 在隔离 fixture。Plan Review GO 前不修改运行代码、不部署。
+Owner：Unit 1-5 Implementer Bot 实现；Unit 1-5 + 自检后交回Coordinator Bot，由Planner Bot 独立 Code Review GO 后才进 Unit 6。Unit 6 live success self-restart owner = 秦鹏+Coordinator Bot（Implementer Bot 提供构建/配置/日志），failure live test 在隔离 fixture。Plan Review GO 前不修改运行代码、不部署。
 
-### Unit 1 — RED：失败测试先行  Owner: HistoryRedactedBot1  ☑
+### Unit 1 — RED：失败测试先行  Owner: Implementer Bot  ☑
 
 Files：`tests/unit/runtime/deferred-service-restart.test.ts`、`tests/unit/cli/service-profile.test.ts`、`tests/integration/bot/markdown-stream-startup-failure.test.ts`、`tests/unit/bot/channel-intake.test.ts`，新增 receipt/route-lease/helper/recovery/terminal 专用测试。
 
@@ -190,7 +190,7 @@ Add failing coverage：
 
 Gate: targeted tests fail for missing behavior before production edits.
 
-### Unit 2 — Marker 状态机 + route lease + return route 数据流  Owner: HistoryRedactedBot1  ☑
+### Unit 2 — Marker 状态机 + route lease + return route 数据流  Owner: Implementer Bot  ☑
 
 Files：`src/runtime/deferred-service-restart.ts`（receipt 目录 + 原语 A/R/C + 单一 terminal + attempt lease + stale quarantine + 旧格式兼容）、新增 `src/runtime/route-lease.ts`（lease store）、`src/agent/lark-channel-env.ts`（routeId）、`src/agent/claude/adapter.ts`+`src/agent/codex/adapter.ts`（per-run routeId overlay，经 AgentRunOptions）、`src/cli/commands/service.ts`（restart CLI 校验 lease + 原语 A 创建 pending + 创建成功后删 lease + EEXIST reject）、`src/bot/channel.ts`（runAgentBatch 建 lease 用 firstMsg.chatId/threadId + lastMsg.messageId + AgentRunOptions.routeId + drain 读 pending 不删）。
 
@@ -198,7 +198,7 @@ Changes：按 DD1 实现原语 A/R/C + 单一 terminal + attempt lease + 文件�
 
 Gate: 原语 + 单一 terminal + attempt owner + route lease + 并发 EEXIST 不串路由 + lease 消费顺序 + crash-point recovery targeted tests pass；旧 marker 行为不变。
 
-### Unit 3 — helper 协调者 + failure receipt + recovery  Owner: HistoryRedactedBot1  ☑
+### Unit 3 — helper 协调者 + failure receipt + recovery  Owner: Implementer Bot  ☑
 
 Files：`src/runtime/deferred-service-restart.ts`、`src/cli/commands/service.ts`（helper else 分支：读 pending + adapter.restart + waitForServiceConnect + final 复查 + 原语 A claim/attempt + failure receipt + 有界重试 + terminal(delivery-failed)）、`src/daemon/service-adapter.ts`（如需）。
 
@@ -206,7 +206,7 @@ Changes：按 DD3 重写 helper（用 DD1 原语 + 单一 terminal + attempt lea
 
 Gate: helper targeted tests pass（failure 路径 + 新 PID 观察不误判 + final 复查 + recovery 不翻转 + crash-point）。
 
-### Unit 4 — 新 Bridge success receipt + exactly-once + recovery  Owner: HistoryRedactedBot1  ☑
+### Unit 4 — 新 Bridge success receipt + exactly-once + recovery  Owner: Implementer Bot  ☑
 
 Files：`src/bot/channel.ts`（startChannel `channel.connect` 成功后读 pending + 原语 A claim/attempt + 发 success + 原语 A terminal + 原语 C 清残留 + 扫描 `claim.*` recovery 接管 attempt）、`src/runtime/deferred-service-restart.ts`（原语 + terminal + attempt + recovery）。
 
@@ -214,7 +214,7 @@ Changes：按 DD4/DD5 新 bridge `channel.connect` 成功后 claim+attempt+发 s
 
 Gate: new-bridge success + exactly-once + recovery targeted tests pass（含 success vs failure 并发单一 terminal + 两 recovery 唯一 owner + send→terminal 崩溃恢复 + 不翻转 + crash-point 表全部）。
 
-### Unit 5 — 确定性 receipt sender + Bridge System Prompt  Owner: HistoryRedactedBot1  ☑
+### Unit 5 — 确定性 receipt sender + Bridge System Prompt  Owner: Implementer Bot  ☑
 
 Files：新增 `src/runtime/restart-receipt.ts`（sendRestartReceipt，uuid 幂等，回传 messageId）、`src/agent/bridge-system-prompt.ts`（自重启段）、`README.md`/`README.zh.md`。
 
@@ -222,11 +222,11 @@ Changes：按 DD6 实现 typed sender（从 config 解析凭据，固定文案�
 
 Gate: receipt-sender + system-prompt contract tests pass；docs contract tests pass。
 
-### Code Review Gate  Owner: HistoryRedactedBot2  ☑
+### Code Review Gate  Owner: Planner Bot  ☑
 
-HistoryRedactedBot1 完成 Unit 1-5 + 自检（`pnpm typecheck && pnpm test && pnpm build && git diff --check` 全绿）后交回HistoryRedactedBot4。HistoryRedactedBot2 对照 Spec（`b906c8b`）与本 Plan 独立 Code Review，GO 后才进 Unit 6。
+Implementer Bot 完成 Unit 1-5 + 自检（`pnpm typecheck && pnpm test && pnpm build && git diff --check` 全绿）后交回Coordinator Bot。Planner Bot 对照 Spec（`b906c8b`）与本 Plan 独立 Code Review，GO 后才进 Unit 6。
 
-### Unit 6 — 三平台测试 + 实机自部署（success 生产 Bot / failure 隔离 fixture）+ 回滚  Owner: 秦鹏+HistoryRedactedBot4（HistoryRedactedBot1 提供构建/配置/日志）  ☑
+### Unit 6 — 三平台测试 + 实机自部署（success 生产 Bot / failure 隔离 fixture）+ 回滚  Owner: 秦鹏+Coordinator Bot（Implementer Bot 提供构建/配置/日志）  ☑
 
 After Code Review GO：
 1. 三平台自动化：mock adapter 证明 launchd/systemd/schtasks 在 helper 流程等价（drain→restart→新 PID 观察→claim/attempt→terminal）。
@@ -272,6 +272,6 @@ git diff --check
 
 ## Review Gate
 
-### Plan Review Gate  Owner: HistoryRedactedBot4  ☑
+### Plan Review Gate  Owner: Coordinator Bot  ☑
 
-R6 PASS。R1-R5 findings 已全部关闭；HistoryRedactedBot1可以开始 Unit 1-5。Plan Writer 未自判 GO。Unit 1-5 完成后仍由HistoryRedactedBot2独立 Code Review，GO 后才进 Unit 6。
+R6 PASS。R1-R5 findings 已全部关闭；Implementer Bot可以开始 Unit 1-5。Plan Writer 未自判 GO。Unit 1-5 完成后仍由Planner Bot独立 Code Review，GO 后才进 Unit 6。

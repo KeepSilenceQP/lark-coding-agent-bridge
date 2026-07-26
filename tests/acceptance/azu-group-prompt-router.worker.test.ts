@@ -472,7 +472,7 @@ describe.skipIf(!RUN).sequential('isolated group prompt scenario worker', () => 
       await writeFile(disposableRoutePrompt, await readFile(operatorRoutePromptPath), { mode: 0o600 });
 
       const operatorPrompt = await readFile(operatorPromptPath, 'utf8');
-      const identity = { openId: 'ou_cc7a2bbc1be9e7f6054282ae918b9249', name: 'HistoryRedactedBot4' };
+      const identity = { openId: 'ou_cc7a2bbc1be9e7f6054282ae918b9249', name: 'Coordinator Bot' };
       const developerInstructions = composeBridgeSystemPrompt(identity, operatorPrompt);
       process.env.AZU_SCENARIO_FILE = scenarioFile;
       process.env.AZU_SHIM_LOG = shimLog;
@@ -845,7 +845,7 @@ async function assertOracle(
     expect((await git(fixtureRepo, ['worktree', 'list', '--porcelain'])).match(/^worktree /gmu)?.length).toBe(1);
   }
   for (const command of commands) {
-    expect(command).not.toContain('/redacted/history/machine-1/o/memory_workspace/MemoryData');
+    expect(command).not.toContain('/redacted/local-root/o/memory_workspace/MemoryData');
   }
 }
 

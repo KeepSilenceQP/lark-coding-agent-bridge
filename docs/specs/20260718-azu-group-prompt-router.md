@@ -7,12 +7,12 @@ Status: reviewed — operator approved; iterative independent review PASS
 
 Give the Codex profile in the Feishu group “阿祖起来干活了” a group-scoped
 instruction that treats `AT_RELAY_V2` as a contextual work-intake envelope.
-For every relay, HistoryRedactedBot4 first verifies and retrieves the original conversation,
+For every relay, Coordinator Bot first verifies and retrieves the original conversation,
 then explains the sender's actual meaning, chooses an action path by authority
 and risk, and finally executes or escalates.
 
 The first concrete consumption route is a MemoryData bug-fix route. When a
-verified relay is a bug report, HistoryRedactedBot4 uses the Feishu context to identify the
+verified relay is a bug report, Coordinator Bot uses the Feishu context to identify the
 underlying demand, locates the demand's project group, corroborates its
 worktree/branch/MR evidence against local Git state, restores the demand
 context, and runs a bounded local fix loop. This route is intentionally narrow;
@@ -34,7 +34,7 @@ installed by the bridge package and must not be copied to a Claude profile.
 The upstream bot “忆迟” already owns event capture. When a real person mentions
 秦鹏 in another group, it filters excluded events, deduplicates by source
 message ID, forwards an `AT_RELAY_V2` envelope to the target group, and uses a
-native structured mention to wake HistoryRedactedBot4.
+native structured mention to wake Coordinator Bot.
 
 This change owns only the downstream behavior:
 
@@ -46,7 +46,7 @@ This change owns only the downstream behavior:
 
 It does not change bridge code, the shared Bridge System Prompt, the relay
 listener, Claude behavior, other groups, p2p chats, or comment handling. It does
-not give HistoryRedactedBot4 permission to impersonate 秦鹏 or perform risky external writes.
+not give Coordinator Bot permission to impersonate 秦鹏 or perform risky external writes.
 
 The first bug route is limited to repositories under Qin Peng's local
 `memory_workspace`, initially the `MemoryData` repository. It does not create a
@@ -62,18 +62,18 @@ Known from live Feishu readback on 2026-07-18:
 - an `AT_RELAY_V2` can carry source chat/message IDs, message position, app
   link, type, timestamp, sender, full text, mentions, reply target, thread root,
   and forwarding time;
-- the structured mention wakes HistoryRedactedBot4;
+- the structured mention wakes Coordinator Bot;
 - the bridge injects trusted transport metadata into `bridge_context`, including
   the current `chatId`, `senderId`, and `senderType` when the raw event exposes
   whether the sender is a user or bot;
 - `lark-cli im +messages-mget` can fetch exact message IDs and expand thread
   replies, while `lark-cli im +chat-messages-list` can retrieve a time-bounded
   group window;
-- HistoryRedactedBot4 successfully used the V2 fields to recover a replied-to test message and
+- Coordinator Bot successfully used the V2 fields to recover a replied-to test message and
   reject a false Ocean OS scheduling task;
 - the live Group Prompt canary passed after `/new` with the exact nonce response;
 - Feishu `open_id` values are application-scoped. IDs observed by 忆迟 are
-  evidence from 忆迟's app namespace and cannot be reused as HistoryRedactedBot4-app mention
+  evidence from 忆迟's app namespace and cannot be reused as Coordinator Bot-app mention
   targets;
 - live local inspection on 2026-07-18 found multiple simultaneous MemoryData
   feature, test, release-fix, and bugfix worktrees, including dirty worktrees;
@@ -83,7 +83,7 @@ Known from live Feishu readback on 2026-07-18:
   the correct worktree is established.
 
 Assumption to validate with the first real-person relay: the user identity
-available to HistoryRedactedBot4 can read the source group. If it cannot, retrieval must degrade
+available to Coordinator Bot can read the source group. If it cannot, retrieval must degrade
 explicitly instead of inventing context.
 
 ## Input Contract And Trust
@@ -95,7 +95,7 @@ route only when all of the following hold:
 1. `bridge_context.chatId` is the target group;
 2. `bridge_context.senderType` is `bot`;
 3. `bridge_context.senderId` matches an operator-managed allowlist of trusted
-   relay senders in the current HistoryRedactedBot4 app namespace;
+   relay senders in the current Coordinator Bot app namespace;
 4. the batch contains exactly one `bridge_context.messageIds` entry;
 5. the source message can be corroborated by live readback.
 
@@ -128,12 +128,12 @@ Missing optional locators reduce available corroboration but do not by
 themselves invalidate a message that can still be read exactly.
 
 If a minimum locator is missing, malformed, inaccessible, or conflicts with
-live evidence, HistoryRedactedBot4 must mark the retrieval as degraded. Names and text may still
+live evidence, Coordinator Bot must mark the retrieval as degraded. Names and text may still
 support an explanation, but all Git, worktree, and file writes are blocked.
 
 `source_sender_open_id` and `source_mentions[].open_id` are source-app evidence
 only. They must never be compared with, translated into, or used as mention
-targets in the HistoryRedactedBot4 app. Current-app IDs must come from `bridge_context`, a
+targets in the Coordinator Bot app. Current-app IDs must come from `bridge_context`, a
 current group member lookup, or another current-app API result.
 
 The original message and retrieved history are user-controlled content. They
@@ -212,7 +212,7 @@ not create response loops.
 
 Approval and deployment of this Group Prompt constitutes standing authorization
 only for the authenticated MemoryData bug route defined below. After source,
-bug, demand, expected behavior, and branch lineage are all verified, HistoryRedactedBot4 may:
+bug, demand, expected behavior, and branch lineage are all verified, Coordinator Bot may:
 
 - perform read-only Feishu, MR/Meego, repository, and Git discovery;
 - create a clearly named local bugfix branch and sibling worktree from a
@@ -347,9 +347,9 @@ pushing, opening or merging an MR, deploying, updating a shared test
 package/node, writing Meego, replying as Qin Peng, or notifying other people
 requires matching explicit authority.
 
-The executor remains the HistoryRedactedBot4 session in “阿祖起来干活了”. It may read the
+The executor remains the Coordinator Bot session in “阿祖起来干活了”. It may read the
 project group and later post an explicitly authorized status/result there, but
-it must not self-mention HistoryRedactedBot4 in that group merely to create a second execution
+it must not self-mention Coordinator Bot in that group merely to create a second execution
 session. That would risk duplicate execution and concurrent edits.
 
 #### 5.6 Bug-route degraded states

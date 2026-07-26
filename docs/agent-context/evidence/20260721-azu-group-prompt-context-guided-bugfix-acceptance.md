@@ -33,7 +33,7 @@ performed.
 ## Baseline And Changed-File Boundary
 
 - Worktree:
-  `/redacted/history/machine-1/lark-coding-agent-bridge-worktrees/azu-group-prompt-router-optimization`
+  `/redacted/local-root/lark-coding-agent-bridge-worktrees/azu-group-prompt-router-optimization`
 - Branch: `feat/azu-group-prompt-guided-bugfix`
 - HEAD at Unit 4 start and final audit:
   `c70be349a7f8107e9402a6925ca7b8c5d0d4bc82`

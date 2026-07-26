@@ -33,7 +33,7 @@ the repository Markdown alone is not deployment.
 - Do not edit or deploy any Claude prompt, profile, service, or configuration.
 - Do not put the group-specific route into shared Bridge instructions.
 - Do not infer 忆迟's identity from its display name or a source-app ID. Use
-  the current HistoryRedactedBot4-app sender identity proven by a real target-group relay and a
+  the current Coordinator Bot-app sender identity proven by a real target-group relay and a
   current group bot lookup.
 - Do not log prompt bodies, raw private group transcripts, secrets, or full
   argv. Evidence records may contain message links/IDs, hashes, byte counts,
@@ -226,7 +226,7 @@ handwritten concatenation is not equivalent evidence.
 
 Construct the acceptance adapter with `ignoreUserConfig: true`,
 `ignoreRules: true`, and `sandbox: 'workspace-write'`, and call
-`setBotIdentity(...)` with the same HistoryRedactedBot4 identity used by the target profile. It
+`setBotIdentity(...)` with the same Coordinator Bot identity used by the target profile. It
 must not run in the Vitest process's ambient environment. The Vitest controller
 first creates a dedicated acceptance-worker subprocess with an explicit
 environment allowlist; only inside that subprocess may the runner construct the

@@ -44,9 +44,12 @@
     "test:process": "vitest run tests/process --passWithNoTests",
     "ci:local": "git diff --check && pnpm test && pnpm typecheck && pnpm build",
     "ci:platform": "pnpm test && pnpm typecheck && pnpm build",
-    "prepack": "node tools/check-npm-bundle.mjs",
+    "privacy:tree": "node tools/check-privacy-denylist.mjs --tree --root .",
+    "privacy:dist": "node tools/check-privacy-denylist.mjs --dist --root .",
+    "prepack": "node tools/check-privacy-denylist.mjs --tree --root . && node tools/check-privacy-denylist.mjs --dist --root . && node tools/check-npm-bundle.mjs",
+    "verify:package": "npm run build && node tools/pack-and-verify.mjs",
     "prepare": "npm run build",
-    "prepublishOnly": "pnpm typecheck && pnpm build"
+    "prepublishOnly": "npm run typecheck && npm run verify:package"
   },
   "dependencies": {
     "@clack/prompts": "^1.4.0",

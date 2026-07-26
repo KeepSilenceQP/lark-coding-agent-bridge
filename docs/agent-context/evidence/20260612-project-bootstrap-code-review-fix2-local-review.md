@@ -1,14 +1,14 @@
 # Project Bootstrap Phase 2 — Code Review Fix2 Local Review
 
 Date: 2026-06-12
-Reviewer: HistoryRedactedBot4
+Reviewer: Coordinator Bot
 Branch: feat/project-bootstrap-phase2
 
 ## Verdict
 
 CHANGES_REQUESTED.
 
-HistoryRedactedBot1这轮返工修正了 B1/B3/B5 的主要方向，但集成层仍不能交给HistoryRedactedBot2复审。
+Implementer Bot这轮返工修正了 B1/B3/B5 的主要方向，但集成层仍不能交给Planner Bot复审。
 
 ## Verified Locally
 
@@ -61,11 +61,11 @@ Required tests:
 
 ## Next Action
 
-Send `project-bootstrap-phase2-code-review-fix2-xiaoc` to HistoryRedactedBot1. Do not request HistoryRedactedBot2 review until F2-F5 are fixed.
+Send `project-bootstrap-phase2-code-review-fix2-xiaoc` to Implementer Bot. Do not request Planner Bot review until F2-F5 are fixed.
 
 ## Fix2 Resolution
 
-HistoryRedactedBot1回传 F2-F5 evidence 后，本地继续补了两处硬证据：
+Implementer Bot回传 F2-F5 evidence 后，本地继续补了两处硬证据：
 
 - 增加 commands 集成测试，覆盖三消息派发、human-admin gate、verified receipt 后 pin、下一次 live open_id 变化触发 `identity_changed`。
 - 修复 receipt parser：既接受 `/cd <path> → ok`，也接受协议文案里的 `/cd → ok`。

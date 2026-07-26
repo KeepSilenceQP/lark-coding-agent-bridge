@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Enable pnpm
         run: corepack enable
@@ -67,6 +69,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -76,32 +80,13 @@ jobs:
       - name: Prepare npm release layout
         run: npm install --install-links=true
 
-      - name: Pack
-        id: pack
+      - name: Pack, privacy-scan, and clean-install one artifact
         shell: bash
         run: |
-          pack_output="$(npm pack --silent)"
-          printf '%s\n' "$pack_output"
-          pack_file="$(printf '%s\n' "$pack_output" | tail -n 1)"
-          echo "tarball=$PWD/$pack_file" >> "$GITHUB_OUTPUT"
-
-      - name: Install and start packed CLI
-        shell: bash
-        run: |
-          verify_dir="$(mktemp -d)"
-          npm install \
-            --prefix "$verify_dir" \
-            --install-links=true \
-            --ignore-scripts \
-            "${{ steps.pack.outputs.tarball }}"
-          installed="$verify_dir/node_modules/@penn.qp/lark-channel-bridge"
-          expected="$(node -p 'require("./package.json").version')"
-          actual="$(node "$installed/dist/cli.js" --version)"
-          test "$actual" = "$expected"
-          node -e '
-            const root = process.argv[1];
-            const channel = require(`${root}/node_modules/@larksuite/channel/package.json`);
-            const sdk = require(`${root}/node_modules/@larksuiteoapi/node-sdk/package.json`);
-            if (channel.version !== "0.4.0-qp.1") throw new Error(`unexpected channel ${channel.version}`);
-            if (!sdk.version) throw new Error("missing channel SDK");
-          ' "$installed"
+          patterns="$RUNNER_TEMP/privacy-denylist.json"
+          artifact="$RUNNER_TEMP/verified-package.tgz"
+          node tools/extract-privacy-denylist.mjs --output "$patterns"
+          npm run build
+          node tools/pack-and-verify.mjs \
+            --patterns-file "$patterns" \
+            --output "$artifact"

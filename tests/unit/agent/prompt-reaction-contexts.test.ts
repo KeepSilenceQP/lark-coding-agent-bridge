@@ -40,7 +40,7 @@ function makeReactionContext(overrides: Record<string, unknown> = {}) {
       available: true,
       messageId: 'om_target',
       senderId: 'cli_bot',
-      senderName: 'HistoryRedactedBot1',
+      senderName: 'Implementer Bot',
       createdAt: '2026-07-23T13:00:00.000Z',
       rawContentType: 'text',
       content: '是否按这个方案继续执行？',
@@ -95,7 +95,7 @@ describe('buildAgentPrompt with reaction_contexts', () => {
     const prompt = buildAgentPrompt({ ...baseInput, reactionContexts: [rc] });
     expect(prompt).toContain('是否按这个方案继续执行？');
     expect(prompt).toContain('om_target');
-    expect(prompt).toContain('HistoryRedactedBot1');
+    expect(prompt).toContain('Implementer Bot');
   });
 
   it('marks source as reaction when source is reaction', () => {

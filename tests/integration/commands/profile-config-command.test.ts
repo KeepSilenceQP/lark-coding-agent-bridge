@@ -300,7 +300,7 @@ describe('profile-aware account and config commands', () => {
             content,
             resources: [],
             mentions: opts.mentionedBot
-              ? [{ openId: 'ou-bot', name: 'HistoryRedactedBot1', isBot: true }]
+              ? [{ openId: 'ou-bot', name: 'Implementer Bot', isBot: true }]
               : [],
             mentionedBot: opts.mentionedBot ?? false,
           } as unknown as NormalizedMessage,

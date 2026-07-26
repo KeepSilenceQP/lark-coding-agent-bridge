@@ -4,9 +4,9 @@ Date: 2026-07-21
 Status: revised after R2 Plan Re-review — awaiting re-review
 Authority: `docs/specs/20260721-per-group-owner-no-mention-response.md` (confirmed, commit `c1b148b`)
 Branch: `feat/per-group-response-mode`
-Implementer: HistoryRedactedBot1
-Plan Writer: HistoryRedactedBot2
-Plan Reviewer: HistoryRedactedBot4
+Implementer: Implementer Bot
+Plan Writer: Planner Bot
+Plan Reviewer: Coordinator Bot
 
 ## Outcome
 
@@ -16,15 +16,15 @@ Plan Reviewer: HistoryRedactedBot4
 
 ## Review History
 
-- **R1（HistoryRedactedBot4，CONDITIONAL）**：方向忠实 Spec，5 项 finding 需修订：
+- **R1（Coordinator Bot，CONDITIONAL）**：方向忠实 Spec，5 项 finding 需修订：
   - [P1] 未 @ 初始化不能由路由「自然保证」：`all-messages` 收全部消息、全局 `owner-default` 收 owner 无 @ 消息，未 @ 的 `/invite owner-default group` 会到达命令层，多 Bot 下可能被同时执行。→ 两条新命令命令层强守卫 `ctx.msg.mentionedBot===true`。
-  - [P1] Harness gate / 责任人顺序错误：Unit 1-5 实现后须独立 Code Review + 复审 GO 才能进 Unit 6 实机验收；Unit 6 owner 改为秦鹏 + HistoryRedactedBot4，HistoryRedactedBot1 只提供构建/配置/日志支持。
+  - [P1] Harness gate / 责任人顺序错误：Unit 1-5 实现后须独立 Code Review + 复审 GO 才能进 Unit 6 实机验收；Unit 6 owner 改为秦鹏 + Coordinator Bot，Implementer Bot 只提供构建/配置/日志支持。
   - [P2] 新字段未覆盖完整配置类型链：`src/config/schema.ts:80-92` `AppAccess` 须同步扩 `ownerNoMentionChats`，否则 legacy `saveAccessConfig` 投影 typecheck 失败。
   - [P2] 指纹 Gate 自相矛盾 + rollback 过度承诺：新增 JSON key 必然改变 digest；接受一次性 digest 失效，不要求与旧 binary hash 相等；rollback 只保证安全降级 `mention-only`，旧 binary 写配置会丢名单。
   - [P2] 「不提供批量命令」与现有 parser 顺序冲突：`/invite all owner-default group` 会落入旧 `/invite all group` 改 `allowedChats`。→ 新命令精确 grammar，在 legacy all-group 分支前拒绝 `owner-default + all/多余 token`。
   - Open point 裁定：(1) 命令层加 `mentionedBot` 守卫，两条新命令都要求显式 @ 目标 Bot；(2) denied-chat bypass 覆盖 invite 与 remove 两条新命令，仍要求精确匹配、显式 @、`canRunBotAdminCommand`；(3) legacy 无 root 投影必须补 `ownerNoMentionChats`，同时扩 `AppAccess` 和回读测试。
 - **R1 修订**：按上述裁定重写 DD1/DD2/DD4/DD5/DD7、Execution Units gate 顺序、Rollback、Open Points；Status 置为 awaiting re-review。Plan Writer 不自判 GO。
-- **R2（HistoryRedactedBot4，re-review）**：R1 的 5 项 finding 与 3 项裁定均已闭合；仅剩 1 个 P2：
+- **R2（Coordinator Bot，re-review）**：R1 的 5 项 finding 与 3 项裁定均已闭合；仅剩 1 个 P2：
   - [P2] p2p 拦截与 mentionedBot 守卫顺序冲突：DD4 原写「!mentionedBot 拒绝 → p2p 拦截」，p2p 消息 `mentionedBot=false` 会先返回「请 @ 当前 Bot」，p2p 的 group-only 错误不可达，违反 Spec「私聊返回明确错误」。→ 新命令按「p2p 拦截 → 群聊 mentionedBot 守卫 → 权限/持久化」排序；p2p 回复「请在目标群中 @ 当前 Bot 执行」，不改名单。Unit 1/4 补 p2p + `mentionedBot=false` 回归断言。
 - **R2 修订（本次）**：最小修订 DD4 流程顺序、Unit 1/4 测试表述与 Review History；其余保持不变。Status 置为 awaiting re-review。Plan Writer 不自判 GO。
 
@@ -139,7 +139,7 @@ Plan Reviewer: HistoryRedactedBot4
 
 ## Execution Units
 
-Unit 1-5 为实现单元，由HistoryRedactedBot1 按序推进，每 Unit 满足自身 Gate 后进下一个。**Unit 1-5 全部完成 + HistoryRedactedBot1 自检后，交回HistoryRedactedBot4；由HistoryRedactedBot2做独立 Code Review，GO 后才进入 Unit 6**。Unit 6 实机验收 owner 为秦鹏 + HistoryRedactedBot4，HistoryRedactedBot1 只提供构建、配置、日志支持。Plan Writer / Reviewer 不替实现者自判 GO。
+Unit 1-5 为实现单元，由Implementer Bot 按序推进，每 Unit 满足自身 Gate 后进下一个。**Unit 1-5 全部完成 + Implementer Bot 自检后，交回Coordinator Bot；由Planner Bot做独立 Code Review，GO 后才进入 Unit 6**。Unit 6 实机验收 owner 为秦鹏 + Coordinator Bot，Implementer Bot 只提供构建、配置、日志支持。Plan Writer / Reviewer 不替实现者自判 GO。
 
 ### Unit 1 — RED：失败测试先行
 
@@ -231,13 +231,13 @@ Gate: `config-card` / `profile-config-command` / `readme-contract` 测试通过�
 
 ### Code Review Gate（Unit 1-5 完成后）
 
-HistoryRedactedBot1 完成 Unit 1-5 并自检（`pnpm typecheck && pnpm test && pnpm build && git diff --check` 全绿）后，交回HistoryRedactedBot4。由**HistoryRedactedBot2**对照 confirmed Spec（`c1b148b`）与本 Plan 做独立 Code Review，结论 GO（或修订后复审 GO）后，才进入 Unit 6。HistoryRedactedBot1 不得自行进入实机验收。
+Implementer Bot 完成 Unit 1-5 并自检（`pnpm typecheck && pnpm test && pnpm build && git diff --check` 全绿）后，交回Coordinator Bot。由**Planner Bot**对照 confirmed Spec（`c1b148b`）与本 Plan 做独立 Code Review，结论 GO（或修订后复审 GO）后，才进入 Unit 6。Implementer Bot 不得自行进入实机验收。
 
-### Unit 6 — 实机验收（owner：秦鹏 + HistoryRedactedBot4；HistoryRedactedBot1 提供构建/配置/日志支持）
+### Unit 6 — 实机验收（owner：秦鹏 + Coordinator Bot；Implementer Bot 提供构建/配置/日志支持）
 
 After Code Review GO：
-1. HistoryRedactedBot1 提供可验证构建产物与入口核对（全局 CLI 软链 / daemon 入口可解析，不复用失效路径）。
-2. 秦鹏 / HistoryRedactedBot4 仅把验收用 Bot profile 切为 `owner-allowlist`，其他 access 不变；`@bot /invite owner-default group` 把测试群加入名单。
+1. Implementer Bot 提供可验证构建产物与入口核对（全局 CLI 软链 / daemon 入口可解析，不复用失效路径）。
+2. 秦鹏 / Coordinator Bot 仅把验收用 Bot profile 切为 `owner-allowlist`，其他 access 不变；`@bot /invite owner-default group` 把测试群加入名单。
 3. 验证 daemon、profile config readback、日志无启动错误；`/config` 卡回显第 4 选项与名单正确。
 4. 真实消息矩阵（记录每条 msgId、哪些 Bot 实际回复、intake/run 日志 reason）：
    - owner 在名单群无 @ → 仅本 Bot 回复。
@@ -281,7 +281,7 @@ git diff --check
 - policy digest：升级后一次性失效（所有 session 重建一次 policy），预期行为。
 - 若 `im:message.group_msg` 授权或事件投递不稳定，保留代码但不启用 `owner-allowlist`。
 
-## Open Points 裁定（HistoryRedactedBot4 R1 Review）
+## Open Points 裁定（Coordinator Bot R1 Review）
 
 1. **命令层 @ 守卫**：两条新命令都要求显式 @ 目标 Bot（`ctx.msg.mentionedBot===true`），未 @ 不改任一名单。已写入 DD4 / Unit 1 / Unit 4 / Unit 6。
 2. **denied-chat bypass 覆盖 invite + remove 两条新命令**：仍要求精确匹配、显式 @、`canRunBotAdminCommand`。已写入 DD5 / Unit 4。
@@ -293,4 +293,4 @@ git diff --check
 
 ## Review Gate
 
-本 Plan 经HistoryRedactedBot4 R1 Review 为 CONDITIONAL，已按 5 项 finding 与 3 项 open point 裁定修订（见 Review History）。修订后需HistoryRedactedBot4 复审：结论 PASS（或所有阻塞项修订并复审通过）后，HistoryRedactedBot1 才开始 Unit 1 实现。Plan Writer 不给自己的 Plan 判 GO。Unit 1-5 完成后另由HistoryRedactedBot2做独立 Code Review，GO 后才进 Unit 6。
+本 Plan 经Coordinator Bot R1 Review 为 CONDITIONAL，已按 5 项 finding 与 3 项 open point 裁定修订（见 Review History）。修订后需Coordinator Bot 复审：结论 PASS（或所有阻塞项修订并复审通过）后，Implementer Bot 才开始 Unit 1 实现。Plan Writer 不给自己的 Plan 判 GO。Unit 1-5 完成后另由Planner Bot做独立 Code Review，GO 后才进 Unit 6。

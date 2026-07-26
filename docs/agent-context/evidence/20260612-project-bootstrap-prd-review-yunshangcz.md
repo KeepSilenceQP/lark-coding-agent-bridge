@@ -1,4 +1,4 @@
-# HistoryRedactedBot2 PRD Review
+# Planner Bot PRD Review
 
 task_id: project-bootstrap-phase2-prd-review-yunshangcz
 phase: prd_review
@@ -40,14 +40,14 @@ The checklist distinguishes sent / acknowledged / verified / blocked, but verifi
 defined source:
 
 - `sent`: local send API succeeded and message object has structured mention.
-- `acknowledged`: receiving bot replies with structured @ HistoryRedactedBot4 and matching task id.
+- `acknowledged`: receiving bot replies with structured @ Coordinator Bot and matching task id.
 - `verified`: receiving bot reports command/context application success in a structured receipt.
 - `blocked`: discovery, dispatch, permission, path, or execution failed with explicit reason.
 
 ## D4 Receiver Authorization Prerequisite
 
-Dispatch depends on target bridge bot having already added HistoryRedactedBot4 as botAdmin. If a target rejects
-the command because HistoryRedactedBot4 is not authorized, bootstrap must mark that bot
+Dispatch depends on target bridge bot having already added Coordinator Bot as botAdmin. If a target rejects
+the command because Coordinator Bot is not authorized, bootstrap must mark that bot
 `blocked(denied)` and must not fail silently.
 
 ## Scope Recommendation
@@ -60,7 +60,7 @@ True invite should be Phase 3.
 
 1. Non-admin trigger is rejected.
 2. Target bot missing from group -> blocked, no fake delivery.
-3. Receiver has not authorized HistoryRedactedBot4 -> blocked(denied).
+3. Receiver has not authorized Coordinator Bot -> blocked(denied).
 4. Plain text @ does not count as mention.
 5. Invalid slug with spaces, `..`, or special chars is rejected.
 6. Machine path mapping is correct.
@@ -75,4 +75,4 @@ True invite should be Phase 3.
 
 For devbox spec/code review, either publish the fork to GitHub and grant the existing deploy
 key, or reuse an existing accessible repository/branch. The devbox path
-`/redacted/history/machine-2/lark-channel-bridge-fork` does not currently exist.
+`/redacted/remote-root/lark-channel-bridge-fork` does not currently exist.

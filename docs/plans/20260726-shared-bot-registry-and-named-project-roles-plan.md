@@ -4,8 +4,8 @@ Date: 2026-07-26
 Status: In Progress（Unit 6 complete；Unit 7 next）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
-Plan Writer: HistoryRedactedBot2（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
-Plan Reviewer: HistoryRedactedBot4（Coordinator，独立 Review）
+Plan Writer: Planner Bot（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
+Plan Reviewer: Coordinator Bot（Coordinator，独立 Review）
 Implementer: 按当前群绑定的 Implementer actor
 Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立审查增量
 
@@ -22,9 +22,9 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 
 ## Review History
 
-- 2026-07-26 HistoryRedactedBot2：基于 `2d47a21` 全文读取 Spec + 全量源码勘察（RootConfig、profile 生命周期、CLI、bootstrap runtime、tokenizer、测试与打包布局），产出本 Plan 草稿。Plan Writer 不自审。
+- 2026-07-26 Planner Bot：基于 `2d47a21` 全文读取 Spec + 全量源码勘察（RootConfig、profile 生命周期、CLI、bootstrap runtime、tokenizer、测试与打包布局），产出本 Plan 草稿。Plan Writer 不自审。
 - 2026-07-26 Coordinator Plan Review：结论为 CHANGES REQUESTED，共 5 条 finding，涉及 tracked tree 隐私口径、create-time 锁边界、真实 tarball 扫描生命周期、最终 Code Review 顺序和 Plan 进度责任。
-- 2026-07-26 本地 Codex subagent：原 Writer HistoryRedactedBot2 unavailable 后临时接替 Plan Writer，逐条 Receiving 并修订本 Plan；未担任 Plan Reviewer，未实施代码、测试、配置、部署或远端历史操作。
+- 2026-07-26 本地 Codex subagent：原 Writer Planner Bot unavailable 后临时接替 Plan Writer，逐条 Receiving 并修订本 Plan；未担任 Plan Reviewer，未实施代码、测试、配置、部署或远端历史操作。
 - 2026-07-26 Coordinator 独立复审：5 条 finding 均已闭合，Plan Review `GO`；允许从 G0 开始，尚未授权或完成任何 Execution Unit。
 - 2026-07-26 G0 Receiving：Implementer 将 `origin/main@593f0dc` 合入本分支，merge commit `8edc5c7`；Coordinator 复核本地/远端 HEAD 一致、工作树干净、main 为祖先，复用 Implementer 回传的 `git diff --check`、`pnpm test`（1346 passed / 33 skipped）、`pnpm typecheck`、`pnpm build` 全绿证据。G0 完成，Unit 1 尚未开始。
 - 2026-07-26 Unit 1 Receiving：原 Implementer token 耗尽后，由本地 Codex Subagent 接替并延续既有 WIP，提交 `9d5aa91`；精确变更 5 个授权文件。Coordinator 独立复核配置校验、读写 fail-closed、Registry 往返与范围边界，并补跑 69 个针对性测试全绿；复用同源提交的 `pnpm ci:local`（135 files，1411 passed / 33 skipped，typecheck + build success）证据。Unit 1 完成，Unit 2 尚未开始。

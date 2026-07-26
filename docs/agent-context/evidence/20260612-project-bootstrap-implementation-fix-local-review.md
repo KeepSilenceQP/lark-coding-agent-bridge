@@ -1,4 +1,4 @@
-# HistoryRedactedBot4 Local Review After B1-B5 Fix
+# Coordinator Bot Local Review After B1-B5 Fix
 
 task_id: project-bootstrap-phase2-implementation-fix-xiaoc
 phase: local_review_after_fix
@@ -29,7 +29,7 @@ npm run build
 - B3 duplicate live names: `planBootstrap` now tracks duplicate NFC names and blocks them as
   `ambiguous_name`.
 - B4 coordinator identity: uses `channel.botIdentity` when available.
-- B5 devbox path: HistoryRedactedBot2 and 云上HistoryRedactedBot1 default projectRoot is now `lark-coding-agent-bridge`.
+- B5 devbox path: Planner Bot and Cloud Implementer Bot default projectRoot is now `lark-coding-agent-bridge`.
 
 ## Remaining Review Risk
 

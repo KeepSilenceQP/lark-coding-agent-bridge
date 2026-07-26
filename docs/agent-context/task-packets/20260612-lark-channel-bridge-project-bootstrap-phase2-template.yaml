@@ -1,7 +1,7 @@
 task_id: lark-channel-bridge-project-bootstrap-phase2-TODO
 flow_level: heavy
 phase: TODO
-context_pack: /redacted/history/machine-1/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+context_pack: /redacted/local-root/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
 target_bot: TODO
 role: TODO
 expected_action: TODO
@@ -10,8 +10,8 @@ input:
   files: []
 output:
   required: TODO
-next_receiver: HistoryRedactedBot4
-response_format: independent text/post + native mention @HistoryRedactedBot4
+next_receiver: Coordinator Bot
+response_format: independent text/post + native mention @Coordinator Bot
 stop_conditions:
   - missing context
   - missing repository

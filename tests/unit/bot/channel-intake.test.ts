@@ -10,7 +10,7 @@ describe('channel intake command bypass', () => {
 
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /invite group', {
+        message('@ExampleBot /invite group', {
           senderId: 'ou-bot-admin',
           mentionedBot: true,
         }),
@@ -24,7 +24,7 @@ describe('channel intake command bypass', () => {
 
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /cd /tmp', {
+        message('@ExampleBot /cd /tmp', {
           senderId: 'ou-bot-admin',
           mentionedBot: true,
         }),
@@ -42,7 +42,7 @@ describe('channel intake command bypass', () => {
     ).toBe(false);
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /invite group', {
+        message('@ExampleBot /invite group', {
           senderId: 'ou-stranger',
           mentionedBot: true,
         }),
@@ -51,7 +51,7 @@ describe('channel intake command bypass', () => {
     ).toBe(false);
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /invite group please', {
+        message('@ExampleBot /invite group please', {
           senderId: 'ou-bot-admin',
           mentionedBot: true,
         }),
@@ -60,7 +60,7 @@ describe('channel intake command bypass', () => {
     ).toBe(false);
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /invite group\n/cd /tmp', {
+        message('@ExampleBot /invite group\n/cd /tmp', {
           senderId: 'ou-bot-admin',
           mentionedBot: true,
         }),
@@ -76,7 +76,7 @@ describe('channel intake command bypass', () => {
 
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /invite owner-default group', {
+        message('@ExampleBot /invite owner-default group', {
           senderId: 'ou-bot-admin',
           mentionedBot: true,
         }),
@@ -90,7 +90,7 @@ describe('channel intake command bypass', () => {
 
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /remove owner-default group', {
+        message('@ExampleBot /remove owner-default group', {
           senderId: 'ou-bot-admin',
           mentionedBot: true,
         }),
@@ -118,7 +118,7 @@ describe('channel intake command bypass', () => {
 
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /invite owner-default group extra', {
+        message('@ExampleBot /invite owner-default group extra', {
           senderId: 'ou-bot-admin',
           mentionedBot: true,
         }),
@@ -128,7 +128,7 @@ describe('channel intake command bypass', () => {
 
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /invite all owner-default group', {
+        message('@ExampleBot /invite all owner-default group', {
           senderId: 'ou-bot-admin',
           mentionedBot: true,
         }),
@@ -142,7 +142,7 @@ describe('channel intake command bypass', () => {
 
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /invite owner-default group', {
+        message('@ExampleBot /invite owner-default group', {
           senderId: 'ou-stranger',
           mentionedBot: true,
         }),
@@ -156,7 +156,7 @@ describe('channel intake command bypass', () => {
 
     expect(
       shouldBypassDeniedChatForInviteGroup(
-        message('@HistoryRedactedBot1 /invite group', {
+        message('@ExampleBot /invite group', {
           senderId: 'ou-bot-admin',
           mentionedBot: true,
         }),

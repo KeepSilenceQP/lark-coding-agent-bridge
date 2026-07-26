@@ -50,7 +50,7 @@ the shared bridge protocol, other groups, p2p chats, or other profiles.
 
 ## Background And User Need
 
-The originating request is to give "HistoryRedactedBot4 in this group" a durable role,
+The originating request is to give "Coordinator Bot in this group" a durable role,
 operating style, and behavioral contract similar to a group-specific `soul.md`.
 That role must survive bridge restarts and conversation compaction, but must not
 change the same bot profile in another group or in p2p.
