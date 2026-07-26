@@ -3,166 +3,126 @@ import {
   planBootstrap,
   type LiveBotMember,
 } from '../../../src/project/dispatch';
-import {
-  defaultRegistry,
-  type BotRegistryEntry,
-} from '../../../src/project/bot-registry';
+import type { BotRegistryEntry } from '../../../src/project/bot-registry';
 
 describe('bootstrap planning', () => {
+  const implementer: BotRegistryEntry = {
+    name: 'Implementer Bot',
+    aliases: ['Implementation Alias'],
+    appId: 'cli_test_implementer',
+  };
+  const planner: BotRegistryEntry = {
+    name: 'Planner Bot',
+    aliases: [],
+    appId: 'cli_test_planner',
+  };
   const baseInput = {
-    slug: 'lark-channel-bridge-fork',
-    chatId: 'oc_test',
-    coordinatorName: 'HistoryRedactedBot4',
-    coordinatorOpenId: 'ou_cc7a2bbc1be9e7f6054282ae918b9249',
-    dispatcherProfile: 'claude',
-    pinned: new Map(),
-    participants: ['HistoryRedactedBot1', 'HistoryRedactedBot2'],
+    slug: 'test-project',
+    workspacePath: './workspace with spaces/$HOME',
+    coordinatorOpenId: 'ou_coordinator',
   };
 
-  it('marks all registry bots as blocked when no live members', () => {
+  it('marks targets as blocked when no live members exist', () => {
     const plan = planBootstrap({
       ...baseInput,
       liveMembers: [],
-      registry: defaultRegistry(),
+      registry: [implementer, planner],
     });
-    expect(plan.results.every((r) => r.status === 'blocked')).toBe(true);
+
+    expect(plan.results).toEqual([
+      {
+        botName: 'Implementer Bot',
+        status: 'blocked',
+        blockedReason: 'bot_not_in_group',
+      },
+      {
+        botName: 'Planner Bot',
+        status: 'blocked',
+        blockedReason: 'bot_not_in_group',
+      },
+    ]);
     expect(plan.instructions).toHaveLength(0);
   });
 
-  it('matches live members and generates instructions for bridge bots', () => {
+  it('matches canonical names and passes the original workspace text through', () => {
     const liveMembers: LiveBotMember[] = [
-      { openId: 'ou_c', name: 'HistoryRedactedBot1' },
-      { openId: 'ou_z', name: 'HistoryRedactedBot2' },
-    ];
-    const registry: BotRegistryEntry[] = [
-      {
-        canonicalName: 'HistoryRedactedBot1',
-        aliases: [],
-        role: 'bridge',
-        machines: [{ kind: 'local', root: '/redacted/history/machine-1' }],
-        projectRoot: 'test-project',
-      },
+      { openId: 'ou_implementer', name: 'Implementer Bot' },
     ];
     const plan = planBootstrap({
       ...baseInput,
       liveMembers,
-      registry,
+      registry: [implementer],
     });
-    expect(plan.results).toHaveLength(1);
-    expect(plan.results[0]!.status).toBe('sent');
-    expect(plan.instructions).toHaveLength(1);
-    expect(plan.instructions[0]!.kind).toBe('cd-and-invite');
-    expect(plan.instructions[0]!.workspacePath).toBe('/redacted/history/machine-1/test-project');
+
+    expect(plan.results).toEqual([
+      { botName: 'Implementer Bot', status: 'sent' },
+    ]);
+    expect(plan.instructions).toEqual([
+      {
+        targetName: 'Implementer Bot',
+        targetOpenId: 'ou_implementer',
+        kind: 'cd-and-invite',
+        workspacePath: './workspace with spaces/$HOME',
+      },
+    ]);
   });
 
-  it('blocks non-bridge bots because bootstrap only sends bridge slash commands', () => {
-    const liveMembers: LiveBotMember[] = [
-      { openId: 'ou_a', name: 'ContextBot' },
-    ];
-    const registry: BotRegistryEntry[] = [
-      {
-        canonicalName: 'ContextBot',
-        aliases: [],
-        role: 'non-bridge',
-        machines: [{ kind: 'local', root: '/redacted/history/machine-1' }],
-        projectRoot: 'test-project',
-      },
-    ];
+  it('matches aliases using NFC exact equality', () => {
     const plan = planBootstrap({
       ...baseInput,
-      liveMembers,
-      registry,
+      liveMembers: [{ openId: 'ou_implementer', name: 'Implementation Alias' }],
+      registry: [implementer],
     });
-    expect(plan.results[0]!.status).toBe('blocked');
-    expect(plan.results[0]!.blockedReason).toBe('denied');
+
+    expect(plan.results[0]?.status).toBe('sent');
+    expect(plan.instructions[0]?.targetOpenId).toBe('ou_implementer');
+  });
+
+  it('skips the Coordinator instead of dispatching to itself', () => {
+    const plan = planBootstrap({
+      ...baseInput,
+      liveMembers: [
+        { openId: 'ou_coordinator', name: 'Implementer Bot' },
+        { openId: 'ou_planner', name: 'Planner Bot' },
+      ],
+      registry: [implementer, planner],
+    });
+
+    expect(plan.results.map((result) => result.botName)).toEqual(['Planner Bot']);
+    expect(plan.instructions.map((instruction) => instruction.targetName)).toEqual(['Planner Bot']);
+  });
+
+  it('blocks duplicate canonical live matches without guessing an open_id', () => {
+    const plan = planBootstrap({
+      ...baseInput,
+      liveMembers: [
+        { openId: 'ou_first', name: 'Implementer Bot' },
+        { openId: 'ou_second', name: 'Implementer Bot' },
+      ],
+      registry: [implementer],
+    });
+
+    expect(plan.results).toEqual([
+      {
+        botName: 'Implementer Bot',
+        status: 'blocked',
+        blockedReason: 'ambiguous_name',
+      },
+    ]);
     expect(plan.instructions).toHaveLength(0);
   });
 
-  it('blocks bots not found in live members', () => {
-    const liveMembers: LiveBotMember[] = [
-      { openId: 'ou_c', name: 'HistoryRedactedBot1' },
-    ];
-    const registry: BotRegistryEntry[] = [
-      defaultRegistry().find((e) => e.canonicalName === 'HistoryRedactedBot1')!,
-      defaultRegistry().find((e) => e.canonicalName === 'HistoryRedactedBot2')!,
-    ];
+  it('blocks when canonical and alias each match a different live Bot', () => {
     const plan = planBootstrap({
       ...baseInput,
-      liveMembers,
-      registry,
-    });
-    const yunshangCz = plan.results.find((r) => r.botName === 'HistoryRedactedBot2');
-    expect(yunshangCz!.status).toBe('blocked');
-    expect(yunshangCz!.blockedReason).toBe('bot_not_in_group');
-  });
-
-  it('skips the coordinator bot instead of dispatching to itself', () => {
-    const liveMembers: LiveBotMember[] = [
-      { openId: baseInput.coordinatorOpenId, name: 'HistoryRedactedBot4' },
-      { openId: 'ou_c', name: 'HistoryRedactedBot1' },
-    ];
-    const registry: BotRegistryEntry[] = [
-      defaultRegistry().find((e) => e.canonicalName === 'HistoryRedactedBot4')!,
-      defaultRegistry().find((e) => e.canonicalName === 'HistoryRedactedBot1')!,
-    ];
-
-    const plan = planBootstrap({
-      ...baseInput,
-      liveMembers,
-      registry,
+      liveMembers: [
+        { openId: 'ou_first', name: 'Implementer Bot' },
+        { openId: 'ou_second', name: 'Implementation Alias' },
+      ],
+      registry: [implementer],
     });
 
-    expect(plan.results.map((r) => r.botName)).toEqual(['HistoryRedactedBot1']);
-    expect(plan.instructions.map((i) => i.targetName)).toEqual(['HistoryRedactedBot1']);
-  });
-
-  it('detects identity changes via pinned bindings', () => {
-    const pinned = new Map();
-    pinned.set('HistoryRedactedBot1', { openId: 'ou_old', dispatcherProfile: 'claude', verifiedAt: 1000 });
-    const liveMembers: LiveBotMember[] = [
-      { openId: 'ou_new', name: 'HistoryRedactedBot1' },
-    ];
-    const registry: BotRegistryEntry[] = [
-      {
-        canonicalName: 'HistoryRedactedBot1',
-        aliases: [],
-        role: 'bridge',
-        machines: [{ kind: 'local', root: '/redacted/history/machine-1' }],
-        projectRoot: 'test-project',
-      },
-    ];
-    const plan = planBootstrap({
-      ...baseInput,
-      liveMembers,
-      registry,
-      pinned,
-    });
-    expect(plan.results[0]!.status).toBe('blocked');
-    expect(plan.results[0]!.blockedReason).toBe('identity_changed');
-  });
-
-  it('blocks ambiguous names when live members have duplicate NFC-normalised names', () => {
-    const liveMembers: LiveBotMember[] = [
-      { openId: 'ou_a', name: 'HistoryRedactedBot1' },
-      { openId: 'ou_b', name: 'HistoryRedactedBot1' },  // duplicate!
-    ];
-    const registry: BotRegistryEntry[] = [
-      {
-        canonicalName: 'HistoryRedactedBot1',
-        aliases: [],
-        role: 'bridge',
-        machines: [{ kind: 'local', root: '/redacted/history/machine-1' }],
-        projectRoot: 'test',
-      },
-    ];
-    const plan = planBootstrap({
-      ...baseInput,
-      liveMembers,
-      registry,
-    });
-    expect(plan.results[0]!.status).toBe('blocked');
-    expect(plan.results[0]!.blockedReason).toBe('ambiguous_name');
+    expect(plan.results[0]?.blockedReason).toBe('ambiguous_name');
     expect(plan.instructions).toHaveLength(0);
   });
-
 });

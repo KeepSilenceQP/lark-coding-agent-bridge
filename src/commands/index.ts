@@ -43,6 +43,11 @@ import type {
   ProfileConfig,
   ProfileMode,
 } from '../config/profile-schema';
+import {
+  matchRegistryEntry,
+  type BotRegistry,
+  type BotRegistryEntry,
+} from '../config/bot-registry';
 import { effectiveLarkCliIdentity } from '../config/profile-schema';
 import { resolveAppPaths } from '../config/app-paths';
 import { accessToClaudePermissionMode } from '../config/permissions';
@@ -63,10 +68,7 @@ import {
   type RuntimeControls,
 } from '../policy/access';
 import {
-  defaultRegistry,
-  mergeRegistry,
   validateSlug,
-  type BotRegistryEntry,
 } from '../project/bot-registry';
 import {
   createSdkLiveDiscovery,
@@ -749,22 +751,24 @@ function workspaceSlugFromPath(path: string): string {
 }
 
 function resolveBootstrapRoleEntry(
-  registry: BotRegistryEntry[],
+  registry: BotRegistry,
   requestedName: string,
   role: 'Implementer' | 'Plan Writer',
 ): { ok: true; entry: BotRegistryEntry } | { ok: false; reason: string } {
-  const normalized = requestedName.normalize('NFC');
-  const matches = registry.filter((entry) =>
-    entry.canonicalName.normalize('NFC') === normalized ||
-    entry.aliases.some((alias) => alias.normalize('NFC') === normalized),
-  );
-  if (matches.length === 0) {
-    return { ok: false, reason: `未在 Bot Registry 中找到 ${role}：\`${requestedName}\`` };
+  const match = matchRegistryEntry(registry, requestedName);
+  if (!match.found && match.reason === 'not_found') {
+    return {
+      ok: false,
+      reason: [
+        `未在 Bot Registry 中找到 ${role}：\`${requestedName}\`。`,
+        `请先使用 \`lark-channel-bridge bot-registry add --name "${requestedName}" --app-id <cli_xxx>\` 登记该 Bot。`,
+      ].join('\n'),
+    };
   }
-  if (matches.length > 1) {
+  if (!match.found) {
     return { ok: false, reason: `${role} 名称存在歧义：\`${requestedName}\`` };
   }
-  return { ok: true, entry: matches[0]! };
+  return { ok: true, entry: match.entry };
 }
 
 function projectBotActor(
@@ -777,26 +781,15 @@ function projectBotActor(
 
 function resolveCoordinatorBootstrapWorkspaceInput(
   workspacePath: string,
-  registry: BotRegistryEntry[],
-  coordinatorName: string,
 ): string {
   if (isAbsoluteOrTilde(workspacePath)) return expandTilde(workspacePath);
-
-  const normalized = coordinatorName.normalize('NFC');
-  const coordinator = registry.find((entry) =>
-    entry.canonicalName.normalize('NFC') === normalized ||
-    entry.aliases.some((alias) => alias.normalize('NFC') === normalized),
-  );
-  const localRoot = coordinator?.machines.find((machine) => machine.kind === 'local')?.root;
-  return localRoot ? join(localRoot, workspacePath) : workspacePath;
+  return workspacePath;
 }
 
 async function resolveBootstrapCoordinatorWorkspace(
   workspacePath: string,
-  registry: BotRegistryEntry[],
-  coordinatorName: string,
 ): Promise<{ ok: true; cwdRealpath: string } | { ok: false; reason: string }> {
-  const requested = resolveCoordinatorBootstrapWorkspaceInput(workspacePath, registry, coordinatorName);
+  const requested = resolveCoordinatorBootstrapWorkspaceInput(workspacePath);
   const workspace = await resolveWorkingDirectory(requested);
   if (!workspace.ok) {
     log.warn('project', 'bootstrap-coordinator-workspace-unresolved', {
@@ -828,31 +821,20 @@ async function inviteMissingBootstrapBots(
   chatId: string,
   registry: BotRegistryEntry[],
   liveMembers: LiveBotMember[],
-  coordinatorName: string,
   larkCliEnv: NodeJS.ProcessEnv,
 ): Promise<{ inviteFailed: Map<string, BootstrapResult>; invitedAny: boolean }> {
   const inviteFailed = new Map<string, BootstrapResult>();
   let invitedAny = false;
 
   for (const entry of registry) {
-    if (entry.canonicalName === coordinatorName) continue;
     if (findBootstrapLiveMember(entry, liveMembers)) continue;
-
-    if (!entry.appId) {
-      inviteFailed.set(entry.canonicalName, {
-        botName: entry.canonicalName,
-        status: 'blocked',
-        blockedReason: 'app_id_unknown',
-      });
-      continue;
-    }
 
     const invited = await inviteBotAppToChat(chatId, entry.appId, larkCliEnv);
     if (invited) {
       invitedAny = true;
     } else {
-      inviteFailed.set(entry.canonicalName, {
-        botName: entry.canonicalName,
+      inviteFailed.set(entry.name, {
+        botName: entry.name,
         status: 'blocked',
         blockedReason: 'invite_failed',
       });
@@ -866,7 +848,7 @@ function findBootstrapLiveMember(
   entry: BotRegistryEntry,
   liveMembers: LiveBotMember[],
 ): LiveBotMember | undefined {
-  const names = [entry.canonicalName, ...entry.aliases].map((name) => name.normalize('NFC'));
+  const names = [entry.name, ...entry.aliases].map((name) => name.normalize('NFC'));
   return liveMembers.find((member) => names.includes(member.name.normalize('NFC')));
 }
 
@@ -1029,45 +1011,58 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
   const coordinatorName = coordinatorIdentity.name;
   const coordinatorOpenId = coordinatorIdentity.openId;
 
-  const mergedRegistry = mergeRegistry(
-    defaultRegistry(),
-    (ctx.controls.profileConfig as { botRegistry?: BotRegistryEntry[] }).botRegistry ?? [],
-  );
-  const implementerResult = resolveBootstrapRoleEntry(mergedRegistry, implementer, 'Implementer');
-  if (!implementerResult.ok) {
-    await replyProjectBootstrapPreflightFailure(ctx, implementerResult.reason);
-    return;
-  }
-  const planWriterResult = resolveBootstrapRoleEntry(mergedRegistry, planWriter, 'Plan Writer');
-  if (!planWriterResult.ok) {
-    await replyProjectBootstrapPreflightFailure(ctx, planWriterResult.reason);
-    return;
-  }
-  if (implementerResult.entry.canonicalName === planWriterResult.entry.canonicalName) {
-    await replyProjectBootstrapPreflightFailure(
-      ctx,
-      'Implementer 和 Plan Writer 解析到了同一个 Bot。',
-    );
-    return;
-  }
-  const coordinatorEntry = mergedRegistry.find((entry) =>
-    entry.canonicalName.normalize('NFC') === coordinatorName.normalize('NFC') ||
-    entry.aliases.some((alias) => alias.normalize('NFC') === coordinatorName.normalize('NFC')),
-  );
-  if (
-    coordinatorEntry &&
-    [implementerResult.entry, planWriterResult.entry]
-      .some((entry) => entry.canonicalName === coordinatorEntry.canonicalName)
-  ) {
-    await replyProjectBootstrapPreflightFailure(
-      ctx,
-      'Coordinator、Implementer 和 Plan Writer 必须由三个不同 Bot 承担。',
-    );
-    return;
-  }
-  const registry = [implementerResult.entry, planWriterResult.entry];
-
   await withProjectBootstrapLock(ctx.msg.chatId, async () => {
+    let sharedRegistry: BotRegistry;
+    try {
+      const rootConfig = await loadRootConfig(ctx.controls.configPath);
+      if (!rootConfig) {
+        await replyProjectBootstrapPreflightFailure(
+          ctx,
+          '无法读取共享 Bot Registry：Root Config 尚未初始化。',
+        );
+        return;
+      }
+      sharedRegistry = rootConfig.botRegistry ?? { entries: [] };
+    } catch (err) {
+      await replyProjectBootstrapPreflightFailure(
+        ctx,
+        `无法读取共享 Bot Registry：${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+
+    const implementerResult = resolveBootstrapRoleEntry(sharedRegistry, implementer, 'Implementer');
+    if (!implementerResult.ok) {
+      await replyProjectBootstrapPreflightFailure(ctx, implementerResult.reason);
+      return;
+    }
+    const planWriterResult = resolveBootstrapRoleEntry(sharedRegistry, planWriter, 'Plan Writer');
+    if (!planWriterResult.ok) {
+      await replyProjectBootstrapPreflightFailure(ctx, planWriterResult.reason);
+      return;
+    }
+    if (implementerResult.entry.appId === planWriterResult.entry.appId) {
+      await replyProjectBootstrapPreflightFailure(
+        ctx,
+        'Implementer 和 Plan Writer 解析到了同一个 Bot。',
+      );
+      return;
+    }
+    const coordinatorMatch = matchRegistryEntry(sharedRegistry, coordinatorName);
+    const coordinatorEntry = coordinatorMatch.found ? coordinatorMatch.entry : undefined;
+    if (
+      coordinatorEntry &&
+      [implementerResult.entry, planWriterResult.entry]
+        .some((entry) => entry.appId === coordinatorEntry.appId)
+    ) {
+      await replyProjectBootstrapPreflightFailure(
+        ctx,
+        'Coordinator、Implementer 和 Plan Writer 必须由三个不同 Bot 承担。',
+      );
+      return;
+    }
+    const registry = [implementerResult.entry, planWriterResult.entry];
+
     const projectsFile = commandProfilePaths(ctx).projectsFile;
     const previousState = await readProjectRoleAssignmentState(
       dirname(projectsFile),
@@ -1102,11 +1097,10 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       liveMembers = [];
     }
 
-    // If discovery itself failed, all bots are blocked(discovery_failed)
     if (discoveryFailed) {
       log.warn('project', 'bootstrap-discovery-failed', {
         slug,
-        bots: registry.map((e) => e.canonicalName),
+        bots: registry.map((e) => e.name),
       });
       await fail('/project bootstrap 无法读取群内 bot 列表，未派发任何命令。');
       return;
@@ -1114,8 +1108,6 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
 
     const coordinatorWorkspace = await resolveBootstrapCoordinatorWorkspace(
       workspacePath,
-      mergedRegistry,
-      coordinatorName,
     );
     if (!coordinatorWorkspace.ok) {
       await fail(`Coordinator workspace 无法准备：${coordinatorWorkspace.reason}`);
@@ -1154,7 +1146,6 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
       ctx.msg.chatId,
       registry,
       liveMembers,
-      coordinatorName,
       larkCliEnv,
     );
     if (inviteState.invitedAny) {
@@ -1166,7 +1157,6 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
           discovery,
           ctx.msg.chatId,
           registry,
-          coordinatorName,
         );
       } catch {
         // Keep the original discovery result; remaining missing bots will be
@@ -1188,14 +1178,9 @@ async function handleProjectBootstrap(args: string, ctx: CommandContext): Promis
     const plan = planBootstrap({
       slug,
       workspacePath,
-      chatId: ctx.msg.chatId,
-      coordinatorName,
       coordinatorOpenId,
-      dispatcherProfile: ctx.controls.profile,
       liveMembers,
       registry,
-      pinned: new Map(),
-      participants: registry.map((e) => e.canonicalName),
     });
 
     // B3: dispatch with proper send tracking — sent only on success
@@ -1312,12 +1297,11 @@ async function rediscoverBootstrapBotsAfterInvite(
   discovery: ReturnType<typeof createSdkLiveDiscovery>,
   chatId: string,
   registry: BotRegistryEntry[],
-  coordinatorName: string,
 ): Promise<LiveBotMember[]> {
   let latest: LiveBotMember[] = [];
   for (let attempt = 0; attempt < BOOTSTRAP_INVITE_DISCOVERY_ATTEMPTS; attempt += 1) {
     latest = await discovery.discoverBots(chatId);
-    if (bootstrapRegistryPresent(registry, latest, coordinatorName)) {
+    if (bootstrapRegistryPresent(registry, latest)) {
       return latest;
     }
     if (attempt < BOOTSTRAP_INVITE_DISCOVERY_ATTEMPTS - 1) {
@@ -1330,11 +1314,8 @@ async function rediscoverBootstrapBotsAfterInvite(
 function bootstrapRegistryPresent(
   registry: BotRegistryEntry[],
   liveMembers: LiveBotMember[],
-  coordinatorName: string,
 ): boolean {
-  return registry.every((entry) =>
-    entry.canonicalName === coordinatorName || Boolean(findBootstrapLiveMember(entry, liveMembers)),
-  );
+  return registry.every((entry) => Boolean(findBootstrapLiveMember(entry, liveMembers)));
 }
 
 function sleep(ms: number): Promise<void> {

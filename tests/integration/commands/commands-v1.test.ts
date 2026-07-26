@@ -1,5 +1,6 @@
-import { chmod, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { basename, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NormalizedMessage } from '@larksuite/channel';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
@@ -327,16 +328,16 @@ describe('Bridge command contracts', () => {
 
     // Add bot admin
     await expect(
-      h.run('/botAdmin add HistoryRedactedBot4', { chatMode: 'group' }),
+      h.run('/botAdmin add CoordinatorBot', { chatMode: 'group' }),
     ).resolves.toBe(true);
-    expect(lastMarkdown(h.channel)).toContain('已把 HistoryRedactedBot4 加入 Bot 管理员');
+    expect(lastMarkdown(h.channel)).toContain('已把 CoordinatorBot 加入 Bot 管理员');
 
     let root = await loadRootConfig(h.controls.configPath);
     expect(root?.profiles.claude?.access.botAdmins).toContain('ou-self');
 
     // Add same bot again (idempotent)
     await expect(
-      h.run('/botAdmin add HistoryRedactedBot4', { chatMode: 'group' }),
+      h.run('/botAdmin add CoordinatorBot', { chatMode: 'group' }),
     ).resolves.toBe(true);
     expect(lastMarkdown(h.channel)).toContain('已经在 Bot 管理员里');
 
@@ -346,7 +347,7 @@ describe('Bridge command contracts', () => {
 
     // Remove
     await expect(
-      h.run('/botAdmin remove HistoryRedactedBot4', { chatMode: 'group' }),
+      h.run('/botAdmin remove CoordinatorBot', { chatMode: 'group' }),
     ).resolves.toBe(true);
     expect(lastMarkdown(h.channel)).toContain('移出 Bot 管理员');
 
@@ -387,13 +388,13 @@ describe('Bridge command contracts', () => {
     await installFakeLarkCliDiscoveryFailure(h);
 
     await expect(
-      h.run('/botAdmin add HistoryRedactedBot4', { chatMode: 'group' }),
+      h.run('/botAdmin add CoordinatorBot', { chatMode: 'group' }),
     ).resolves.toBe(true);
 
     const root = await loadRootConfig(h.controls.configPath);
     expect(root?.profiles.claude?.access.botAdmins).not.toContain('ou-self');
     expect(lastMarkdown(h.channel)).toContain('无法读取当前群内 Bot 列表');
-    expect(lastMarkdown(h.channel)).toContain('HistoryRedactedBot4');
+    expect(lastMarkdown(h.channel)).toContain('CoordinatorBot');
   });
 
   it('rejects @-prefixed names as /botAdmin targets', async () => {
@@ -403,7 +404,7 @@ describe('Bridge command contracts', () => {
     await saveRootConfig(createRootConfig('claude', h.controls.profileConfig), h.controls.configPath);
 
     await expect(
-      h.run('/botAdmin remove @HistoryRedactedBot4', {
+      h.run('/botAdmin remove @CoordinatorBot', {
         chatMode: 'group',
       }),
     ).resolves.toBe(true);
@@ -421,7 +422,7 @@ describe('Bridge command contracts', () => {
     await saveRootConfig(createRootConfig('claude', h.controls.profileConfig), h.controls.configPath);
 
     await expect(
-      h.run('/botAdmin remove HistoryRedactedBot4', {
+      h.run('/botAdmin remove CoordinatorBot', {
         chatMode: 'group',
       }),
     ).resolves.toBe(true);
@@ -431,7 +432,7 @@ describe('Bridge command contracts', () => {
     expect(await readFile(logFile, 'utf8')).toContain(
       'chat.members bots --params {"chat_id":"chat-1"} --as bot',
     );
-    expect(lastMarkdown(h.channel)).toContain('已把 HistoryRedactedBot4 移出 Bot 管理员');
+    expect(lastMarkdown(h.channel)).toContain('已把 CoordinatorBot 移出 Bot 管理员');
   });
 
   it('uses only names after /botAdmin add as bot admin targets', async () => {
@@ -439,29 +440,29 @@ describe('Bridge command contracts', () => {
     await installFakeLarkCliDiscoveryFallback(h);
 
     await expect(
-      h.run('/botAdmin add HistoryRedactedBot4', { chatMode: 'group' }),
+      h.run('/botAdmin add CoordinatorBot', { chatMode: 'group' }),
     ).resolves.toBe(true);
 
     const root = await loadRootConfig(h.controls.configPath);
     expect(root?.profiles.claude?.access.botAdmins).toEqual(['ou-self']);
-    expect(lastMarkdown(h.channel)).toContain('已把 HistoryRedactedBot4 加入 Bot 管理员');
-    expect(lastMarkdown(h.channel)).not.toContain('HistoryRedactedBot1');
+    expect(lastMarkdown(h.channel)).toContain('已把 CoordinatorBot 加入 Bot 管理员');
+    expect(lastMarkdown(h.channel)).not.toContain('ImplementerBot');
   });
 
   it('uses only names after /botAdmin remove as bot admin targets', async () => {
     const h = await createHarness();
     await installFakeLarkCliDiscoveryFallback(h);
-    h.controls.profileConfig.access.botAdmins = ['ou-live-c', 'ou-self'];
+    h.controls.profileConfig.access.botAdmins = ['ou_implementer', 'ou-self'];
     await saveRootConfig(createRootConfig('claude', h.controls.profileConfig), h.controls.configPath);
 
     await expect(
-      h.run('/botAdmin remove HistoryRedactedBot4', { chatMode: 'group' }),
+      h.run('/botAdmin remove CoordinatorBot', { chatMode: 'group' }),
     ).resolves.toBe(true);
 
     const root = await loadRootConfig(h.controls.configPath);
-    expect(root?.profiles.claude?.access.botAdmins).toEqual(['ou-live-c']);
-    expect(lastMarkdown(h.channel)).toContain('已把 HistoryRedactedBot4 移出 Bot 管理员');
-    expect(lastMarkdown(h.channel)).not.toContain('HistoryRedactedBot1');
+    expect(root?.profiles.claude?.access.botAdmins).toEqual(['ou_implementer']);
+    expect(lastMarkdown(h.channel)).toContain('已把 CoordinatorBot 移出 Bot 管理员');
+    expect(lastMarkdown(h.channel)).not.toContain('ImplementerBot');
   });
 
   it('strips only leading wake mentions when raw command text contains parameter mentions', async () => {
@@ -473,16 +474,16 @@ describe('Bridge command contracts', () => {
     await expect(
       h.run('/botAdmin remove', {
         mentions: [
-          { ...botMention('ou-xiaoc', 'HistoryRedactedBot1'), key: '@_user_1' },
+          { ...botMention('ou-xiaoc', 'ImplementerBot'), key: '@_user_1' },
         ],
-        rawContent: JSON.stringify({ text: '@HistoryRedactedBot1 /botAdmin remove HistoryRedactedBot4' }),
+        rawContent: JSON.stringify({ text: '@ImplementerBot /botAdmin remove CoordinatorBot' }),
         chatMode: 'group',
       }),
     ).resolves.toBe(true);
 
     const root = await loadRootConfig(h.controls.configPath);
     expect(root?.profiles.claude?.access.botAdmins).toEqual([]);
-    expect(lastMarkdown(h.channel)).toContain('已把 HistoryRedactedBot4 移出 Bot 管理员');
+    expect(lastMarkdown(h.channel)).toContain('已把 CoordinatorBot 移出 Bot 管理员');
   });
 
   // ── botAdmin permission split tests ──
@@ -621,11 +622,12 @@ describe('Bridge command contracts', () => {
 
   it('dispatches /project bootstrap bridge commands as invite-before-cd slash commands', async () => {
     const h = await createHarness();
-    await mkdir(join(h.tmp.root, 'repo-one'), { recursive: true });
-    configureSingleBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'repo-one');
+    const workspacePath = join(h.tmp.root, 'repo-one');
+    await mkdir(workspacePath, { recursive: true });
+    configureSingleBridgeBotBootstrap(h, 'ImplementerBot', 'ou_implementer');
 
     await expect(
-      h.run('/project bootstrap repo-one --implementer @HistoryRedactedBot1 --plan-writer @HistoryRedactedBot2', {
+      h.run(`/project bootstrap ${workspacePath} --implementer @ImplementerBot --plan-writer @PlannerBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -640,26 +642,27 @@ describe('Bridge command contracts', () => {
     expect(textMessages.join('\n')).not.toContain('Project Bootstrap Task');
     expect(textMessages.join('\n')).not.toContain('task_id: project-bootstrap');
     expect(textMessages.join('\n')).not.toContain('Expected receipt format');
-    expect(textMessages).toContain('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-one');
-    expect(textMessages).toContain('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /invite group');
-    expect(textMessages).toContain('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-one');
-    expect(textMessages).toContain('<at user_id="ou-live-c">HistoryRedactedBot1</at> /invite group');
-    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-one'));
-    expect(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-one'));
+    expect(textMessages).toContain(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`);
+    expect(textMessages).toContain('<at user_id="ou_planner">PlannerBot</at> /invite group');
+    expect(textMessages).toContain(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`);
+    expect(textMessages).toContain('<at user_id="ou_implementer">ImplementerBot</at> /invite group');
+    expect(textMessages.indexOf('<at user_id="ou_planner">PlannerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`));
+    expect(textMessages.indexOf('<at user_id="ou_implementer">ImplementerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`));
   });
 
   it('persists coordinator, implementer, and plan-writer role bindings from project bootstrap', async () => {
     const h = await createHarness();
-    await mkdir(join(h.tmp.root, 'repo-roles'), { recursive: true });
+    const workspacePath = join(h.tmp.root, 'repo-roles');
+    await mkdir(workspacePath, { recursive: true });
     configureRoleBotsBootstrap(h, [
-      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
-      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+      { name: 'ImplementerBot', openId: 'ou-implementer' },
+      { name: 'AlternateBot', openId: 'ou-plan-writer' },
     ]);
 
     await expect(
-      h.run('/project bootstrap repo-roles --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1', {
+      h.run(`/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer AlternateBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -672,25 +675,25 @@ describe('Bridge command contracts', () => {
     }).projectsFile);
     await store.load();
     expect(store.get('oc-project')).toEqual({
-      workspace: 'repo-roles',
+      workspace: workspacePath,
       decisionOwner: { openId: 'ou-admin', name: 'User' },
-      coordinator: { botId: 'ou-self', name: 'HistoryRedactedBot4' },
-      planWriter: { botId: 'ou-plan-writer', name: '云上HistoryRedactedBot1' },
-      implementer: { botId: 'ou-implementer', name: 'HistoryRedactedBot1' },
+      coordinator: { botId: 'ou-self', name: 'CoordinatorBot' },
+      planWriter: { botId: 'ou-plan-writer', name: 'AlternateBot' },
+      implementer: { botId: 'ou-implementer', name: 'ImplementerBot' },
     });
 
     const textMessages = h.channel.sent
       .map((m) => (m.content as { text?: string }).text)
       .filter((text): text is string => typeof text === 'string');
-    expect(textMessages).toContain('<at user_id="ou-plan-writer">云上HistoryRedactedBot1</at> /cd repo-roles');
-    expect(textMessages.join('\n')).not.toContain('HistoryRedactedBot2');
+    expect(textMessages).toContain(`<at user_id="ou-plan-writer">AlternateBot</at> /cd ${workspacePath}`);
+    expect(textMessages.join('\n')).not.toContain('PlannerBot');
   });
 
   it('explicitly rejects the legacy three-positional project bootstrap form', async () => {
     const h = await createHarness();
 
     await expect(
-      h.run('/project bootstrap repo-legacy HistoryRedactedBot1 HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-legacy ImplementerBot PlannerBot', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -704,23 +707,25 @@ describe('Bridge command contracts', () => {
 
   it('serializes different bootstrap requests for the same chat', async () => {
     const h = await createHarness();
+    const firstWorkspace = join(h.tmp.root, 'repo-first');
+    const secondWorkspace = join(h.tmp.root, 'repo-second');
     await Promise.all([
-      mkdir(join(h.tmp.root, 'repo-first'), { recursive: true }),
-      mkdir(join(h.tmp.root, 'repo-second'), { recursive: true }),
+      mkdir(firstWorkspace, { recursive: true }),
+      mkdir(secondWorkspace, { recursive: true }),
     ]);
     configureRoleBotsBootstrap(h, [
-      { name: 'HistoryRedactedBot1', openId: 'ou-implementer-a' },
-      { name: '云上HistoryRedactedBot1', openId: 'ou-implementer-b' },
-      { name: 'HistoryRedactedBot2', openId: 'ou-plan-writer' },
+      { name: 'ImplementerBot', openId: 'ou-implementer-a' },
+      { name: 'AlternateBot', openId: 'ou-implementer-b' },
+      { name: 'PlannerBot', openId: 'ou-plan-writer' },
     ]);
 
     await Promise.all([
-      h.run('/project bootstrap repo-first --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
+      h.run(`/project bootstrap ${firstWorkspace} --implementer ImplementerBot --plan-writer PlannerBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
       }),
-      h.run('/project bootstrap repo-second --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
+      h.run(`/project bootstrap ${secondWorkspace} --implementer AlternateBot --plan-writer PlannerBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -732,23 +737,25 @@ describe('Bridge command contracts', () => {
       profile: h.controls.profile,
     }).projectsFile);
     await store.load();
-    expect(store.get('oc-project')?.workspace).toBe('repo-second');
+    expect(store.get('oc-project')?.workspace).toBe(secondWorkspace);
 
     const commands = h.channel.sent
       .map((message) => (message.content as { text?: string }).text)
       .filter((text): text is string => typeof text === 'string');
-    const firstLast = commands.map((text) => text.includes('repo-first')).lastIndexOf(true);
-    const secondFirst = commands.findIndex((text) => text.includes('repo-second'));
+    const firstLast = commands.map((text) => text.includes(firstWorkspace)).lastIndexOf(true);
+    const secondFirst = commands.findIndex((text) => text.includes(secondWorkspace));
     expect(firstLast).toBeGreaterThanOrEqual(0);
     expect(secondFirst).toBeGreaterThan(firstLast);
   });
 
   it('keeps the old binding usable when a rebind fails before any preparation side effect', async () => {
     const h = await createHarness();
-    await mkdir(join(h.tmp.root, 'repo-stable'), { recursive: true });
+    const stableWorkspace = join(h.tmp.root, 'repo-stable');
+    const missingWorkspace = join(h.tmp.root, 'repo-missing');
+    await mkdir(stableWorkspace, { recursive: true });
     configureRoleBotsBootstrap(h, [
-      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
-      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+      { name: 'ImplementerBot', openId: 'ou-implementer' },
+      { name: 'AlternateBot', openId: 'ou-plan-writer' },
     ]);
     const runOptions = {
       chatId: 'oc-project',
@@ -757,11 +764,11 @@ describe('Bridge command contracts', () => {
     };
 
     await h.run(
-      '/project bootstrap repo-stable --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1',
+      `/project bootstrap ${stableWorkspace} --implementer ImplementerBot --plan-writer AlternateBot`,
       runOptions,
     );
     await h.run(
-      '/project bootstrap repo-missing --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot1',
+      `/project bootstrap ${missingWorkspace} --implementer AlternateBot --plan-writer ImplementerBot`,
       runOptions,
     );
 
@@ -770,7 +777,7 @@ describe('Bridge command contracts', () => {
       profile: h.controls.profile,
     }).projectsFile);
     await store.load();
-    expect(store.get('oc-project')?.workspace).toBe('repo-stable');
+    expect(store.get('oc-project')?.workspace).toBe(stableWorkspace);
     expect(store.getState('oc-project').usable).toBe(true);
     expect(lastMarkdown(h.channel)).toContain('旧绑定记录未改变且仍可安全使用');
     expect(lastMarkdown(h.channel)).toContain('Coordinator workspace 无法准备');
@@ -778,14 +785,15 @@ describe('Bridge command contracts', () => {
 
   it('disables the old binding and reports partial side effects when target dispatch fails', async () => {
     const h = await createHarness();
+    const stableWorkspace = join(h.tmp.root, 'repo-stable');
     const rebindWorkspace = join(h.tmp.root, 'repo-rebind');
     await Promise.all([
-      mkdir(join(h.tmp.root, 'repo-stable'), { recursive: true }),
+      mkdir(stableWorkspace, { recursive: true }),
       mkdir(rebindWorkspace, { recursive: true }),
     ]);
     configureRoleBotsBootstrap(h, [
-      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
-      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+      { name: 'ImplementerBot', openId: 'ou-implementer' },
+      { name: 'AlternateBot', openId: 'ou-plan-writer' },
     ]);
     const runOptions = {
       chatId: 'oc-project',
@@ -793,7 +801,7 @@ describe('Bridge command contracts', () => {
       chatMode: 'group' as const,
     };
     await h.run(
-      '/project bootstrap repo-stable --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1',
+      `/project bootstrap ${stableWorkspace} --implementer ImplementerBot --plan-writer AlternateBot`,
       runOptions,
     );
 
@@ -806,7 +814,7 @@ describe('Bridge command contracts', () => {
       return originalSend(chatId, content, options);
     };
     await h.run(
-      `/project bootstrap ${rebindWorkspace} --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot1`,
+      `/project bootstrap ${rebindWorkspace} --implementer AlternateBot --plan-writer ImplementerBot`,
       runOptions,
     );
 
@@ -817,7 +825,7 @@ describe('Bridge command contracts', () => {
     await store.load();
     expect(store.get('oc-project')).toBeUndefined();
     expect(store.getState('oc-project')).toMatchObject({
-      assignment: { workspace: 'repo-stable' },
+      assignment: { workspace: stableWorkspace },
       usable: false,
       disabledReason: 'bootstrap_incomplete',
     });
@@ -829,14 +837,15 @@ describe('Bridge command contracts', () => {
 
   it('keeps the old record disabled when new-binding persistence fails after preparation', async () => {
     const h = await createHarness();
+    const stableWorkspace = join(h.tmp.root, 'repo-stable');
     const rebindWorkspace = join(h.tmp.root, 'repo-persist-fail');
     await Promise.all([
-      mkdir(join(h.tmp.root, 'repo-stable'), { recursive: true }),
+      mkdir(stableWorkspace, { recursive: true }),
       mkdir(rebindWorkspace, { recursive: true }),
     ]);
     configureRoleBotsBootstrap(h, [
-      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
-      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+      { name: 'ImplementerBot', openId: 'ou-implementer' },
+      { name: 'AlternateBot', openId: 'ou-plan-writer' },
     ]);
     const runOptions = {
       chatId: 'oc-project',
@@ -844,7 +853,7 @@ describe('Bridge command contracts', () => {
       chatMode: 'group' as const,
     };
     await h.run(
-      '/project bootstrap repo-stable --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1',
+      `/project bootstrap ${stableWorkspace} --implementer ImplementerBot --plan-writer AlternateBot`,
       runOptions,
     );
 
@@ -862,7 +871,7 @@ describe('Bridge command contracts', () => {
     };
     try {
       await h.run(
-        `/project bootstrap ${rebindWorkspace} --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot1`,
+        `/project bootstrap ${rebindWorkspace} --implementer AlternateBot --plan-writer ImplementerBot`,
         runOptions,
       );
     } finally {
@@ -877,7 +886,7 @@ describe('Bridge command contracts', () => {
     await store.load();
     expect(store.get('oc-project')).toBeUndefined();
     expect(store.getState('oc-project')).toMatchObject({
-      assignment: { workspace: 'repo-stable' },
+      assignment: { workspace: stableWorkspace },
       usable: false,
       disabledReason: 'bootstrap_incomplete',
     });
@@ -890,7 +899,7 @@ describe('Bridge command contracts', () => {
     const h = await createHarness();
 
     await expect(
-      h.run('/project bootstrap repo-conflict --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot1', {
+      h.run('/project bootstrap repo-conflict --implementer ImplementerBot --plan-writer ImplementerBot', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -900,39 +909,187 @@ describe('Bridge command contracts', () => {
     expect(lastMarkdown(h.channel)).toContain('必须是不同 Bot');
   });
 
+  it('fails before side effects when a named role is missing from the shared Registry', async () => {
+    const h = await createHarness();
+    configureBootstrapCoordinatorIdentity(h);
+    let discoveryCalls = 0;
+    (h.channel.rawClient.im.v1 as unknown as {
+      chatMembers: { bots(): Promise<unknown> };
+    }).chatMembers = {
+      async bots(): Promise<unknown> {
+        discoveryCalls += 1;
+        return { data: { items: [] } };
+      },
+    };
+
+    await h.run(
+      '/project bootstrap missing-workspace --implementer MissingBot --plan-writer PlannerBot',
+      { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' },
+    );
+
+    expect(discoveryCalls).toBe(0);
+    expect(lastMarkdown(h.channel)).toContain('MissingBot');
+    expect(lastMarkdown(h.channel)).toContain('bot-registry add');
+    expect(lastMarkdown(h.channel)).toContain('未执行任何准备副作用');
+    expect(h.workspaces.cwdFor('oc-project')).toBeUndefined();
+    const root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.allowedChats).not.toContain('oc-project');
+  });
+
+  it('fails closed before side effects when the shared Registry is invalid', async () => {
+    const h = await createHarness();
+    configureBootstrapCoordinatorIdentity(h);
+    const raw = JSON.parse(await readFile(h.controls.configPath, 'utf8')) as {
+      botRegistry: unknown;
+    };
+    raw.botRegistry = {
+      entries: [{ name: 'BrokenBot', aliases: [], appId: '' }],
+    };
+    await writeFile(h.controls.configPath, `${JSON.stringify(raw)}\n`, 'utf8');
+    let discoveryCalls = 0;
+    (h.channel.rawClient.im.v1 as unknown as {
+      chatMembers: { bots(): Promise<unknown> };
+    }).chatMembers = {
+      async bots(): Promise<unknown> {
+        discoveryCalls += 1;
+        return { data: { items: [] } };
+      },
+    };
+
+    await h.run(
+      '/project bootstrap missing-workspace --implementer ImplementerBot --plan-writer PlannerBot',
+      { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' },
+    );
+
+    expect(discoveryCalls).toBe(0);
+    expect(lastMarkdown(h.channel)).toContain('无法读取共享 Bot Registry');
+    expect(lastMarkdown(h.channel)).toContain('appId');
+    expect(lastMarkdown(h.channel)).toContain('未执行任何准备副作用');
+  });
+
+  it('fails closed before side effects when Root Config is missing', async () => {
+    const h = await createHarness();
+    configureBootstrapCoordinatorIdentity(h);
+    await rm(h.controls.configPath);
+    let discoveryCalls = 0;
+    (h.channel.rawClient.im.v1 as unknown as {
+      chatMembers: { bots(): Promise<unknown> };
+    }).chatMembers = {
+      async bots(): Promise<unknown> {
+        discoveryCalls += 1;
+        return { data: { items: [] } };
+      },
+    };
+
+    await h.run(
+      '/project bootstrap missing-workspace --implementer ImplementerBot --plan-writer PlannerBot',
+      { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' },
+    );
+
+    expect(discoveryCalls).toBe(0);
+    expect(lastMarkdown(h.channel)).toContain('Root Config 尚未初始化');
+    expect(lastMarkdown(h.channel)).toContain('未执行任何准备副作用');
+  });
+
+  it('rejects a Registry role that resolves to the Coordinator entry before side effects', async () => {
+    const h = await createHarness();
+    configureBootstrapCoordinatorIdentity(h);
+
+    await h.run(
+      '/project bootstrap missing-workspace --implementer CoordinatorBot --plan-writer PlannerBot',
+      { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' },
+    );
+
+    expect(lastMarkdown(h.channel)).toContain('三个不同 Bot');
+    expect(lastMarkdown(h.channel)).toContain('未执行任何准备副作用');
+    expect(h.workspaces.cwdFor('oc-project')).toBeUndefined();
+  });
+
+  it('rejects role names that resolve to the same live open_id', async () => {
+    const h = await createHarness();
+    const workspacePath = join(h.tmp.root, 'same-live-id');
+    await mkdir(workspacePath, { recursive: true });
+    configureRoleBotsBootstrap(h, [
+      { name: 'ImplementerBot', openId: 'ou_shared_role' },
+      { name: 'PlannerBot', openId: 'ou_shared_role' },
+    ]);
+
+    await h.run(
+      `/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`,
+      { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' },
+    );
+
+    expect(lastMarkdown(h.channel)).toContain('解析为三个不同 Bot');
+    expect(lastMarkdown(h.channel)).toContain('已发生部分准备副作用');
+    const store = new ProjectStore(resolveAppPaths({
+      rootDir: h.tmp.root,
+      profile: h.controls.profile,
+    }).projectsFile);
+    await store.load();
+    expect(store.get('oc-project')).toBeUndefined();
+    expect(store.getState('oc-project').disabledReason).toBe('bootstrap_incomplete');
+  });
+
+  it('blocks duplicate live matches instead of guessing an open_id', async () => {
+    const h = await createHarness();
+    const workspacePath = join(h.tmp.root, 'duplicate-live-name');
+    await mkdir(workspacePath, { recursive: true });
+    configureRoleBotsBootstrap(h, [
+      { name: 'ImplementerBot', openId: 'ou_implementer_first' },
+      { name: 'ImplementerBot', openId: 'ou_implementer_second' },
+      { name: 'PlannerBot', openId: 'ou_planner' },
+    ]);
+
+    await h.run(
+      `/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`,
+      { chatId: 'oc-project', scope: 'oc-project', chatMode: 'group' },
+    );
+
+    expect(lastMarkdown(h.channel)).toContain('ImplementerBot: ambiguous_name');
+    const store = new ProjectStore(resolveAppPaths({
+      rootDir: h.tmp.root,
+      profile: h.controls.profile,
+    }).projectsFile);
+    await store.load();
+    expect(store.get('oc-project')).toBeUndefined();
+    expect(store.getState('oc-project').disabledReason).toBe('bootstrap_incomplete');
+  });
+
   it('sets the coordinator cwd during project bootstrap without rewriting dispatched workspace text', async () => {
     const h = await createHarness();
-    configureSingleBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'repo-one');
-    const coordinatorWorkspace = join(h.tmp.root, 'repo-one');
-    await mkdir(coordinatorWorkspace, { recursive: true });
+    const workspacePath = 'tests/integration/commands';
+    configureSingleBridgeBotBootstrap(h, 'ImplementerBot', 'ou_implementer');
     h.sessions.set('oc-project', 'stale-session', h.tmp.workspace);
 
     await expect(
-      h.run('/project bootstrap repo-one --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
+      h.run(`/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
       }),
     ).resolves.toBe(true);
 
-    await expect(realpath(coordinatorWorkspace)).resolves.toBe(h.workspaces.cwdFor('oc-project'));
-    expect(h.sessions.resumeFor('oc-project', await realpath(coordinatorWorkspace))).toBeUndefined();
+    await expect(realpath(workspacePath)).resolves.toBe(h.workspaces.cwdFor('oc-project'));
+    expect(h.sessions.resumeFor('oc-project', await realpath(workspacePath))).toBeUndefined();
 
     const textMessages = h.channel.sent
       .map((m) => (m.content as { text?: string }).text)
       .filter((text): text is string => typeof text === 'string');
 
-    expect(textMessages).toContain('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-one');
-    expect(textMessages).toContain('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-one');
+    expect(textMessages).toContain(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`);
+    expect(textMessages).toContain(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`);
   });
 
   it('keeps the original bootstrap workspace instead of expanding tilde paths', async () => {
     const h = await createHarness();
-    configureSingleBridgeBotBootstrap(h, '云上HistoryRedactedBot1', 'ou-cloud-c', 'sayToLittleP');
+    const homeWorkspace = await mkdtemp(join(homedir(), '.bridge-bootstrap-test-'));
+    const workspaceText = `~/${basename(homeWorkspace)}`;
+    cleanups.push(() => rm(homeWorkspace, { recursive: true, force: true }));
+    configureSingleBridgeBotBootstrap(h, 'AlternateBot', 'ou_alternate');
 
     await expect(
       h.run(
-        '/project bootstrap ~/repo/sayToLittleP --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot2',
+        `/project bootstrap ${workspaceText} --implementer AlternateBot --plan-writer PlannerBot`,
         {
           chatId: 'oc-project',
           scope: 'oc-project',
@@ -945,18 +1102,19 @@ describe('Bridge command contracts', () => {
       .map((m) => (m.content as { text?: string }).text)
       .filter((text): text is string => typeof text === 'string');
 
-    expect(textMessages).toContain('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd ~/repo/sayToLittleP');
-    expect(textMessages).toContain('<at user_id="ou-cloud-c">云上HistoryRedactedBot1</at> /cd ~/repo/sayToLittleP');
-    expect(textMessages.join('\n')).not.toContain('/redacted/history/machine-1/sayToLittleP');
+    expect(textMessages).toContain(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspaceText}`);
+    expect(textMessages).toContain(`<at user_id="ou_alternate">AlternateBot</at> /cd ${workspaceText}`);
+    expect(textMessages.join('\n')).not.toContain(homedir());
   });
 
   it('adds the project group to coordinator allowedChats before bootstrap dispatch', async () => {
     const h = await createHarness();
-    await mkdir(join(h.tmp.root, 'repo-allow'), { recursive: true });
-    configureSingleBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'repo-allow');
+    const workspacePath = join(h.tmp.root, 'repo-allow');
+    await mkdir(workspacePath, { recursive: true });
+    configureSingleBridgeBotBootstrap(h, 'ImplementerBot', 'ou_implementer');
 
     await expect(
-      h.run('/project bootstrap repo-allow --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
+      h.run(`/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -972,7 +1130,7 @@ describe('Bridge command contracts', () => {
     const h = await createHarness();
 
     await expect(
-      h.run('/project bootstrap repo-p2p --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2'),
+      h.run('/project bootstrap repo-p2p --implementer ImplementerBot --plan-writer PlannerBot'),
     ).resolves.toBe(true);
 
     expect(lastMarkdown(h.channel)).toContain('只能在普通项目群里使用');
@@ -980,19 +1138,20 @@ describe('Bridge command contracts', () => {
 
   it('rejects Topic bootstrap without binding writes or preparation side effects', async () => {
     const h = await createHarness();
-    await mkdir(join(h.tmp.root, 'repo-stable'), { recursive: true });
+    const stableWorkspace = join(h.tmp.root, 'repo-stable');
+    await mkdir(stableWorkspace, { recursive: true });
     configureRoleBotsBootstrap(h, [
-      { name: 'HistoryRedactedBot1', openId: 'ou-implementer' },
-      { name: '云上HistoryRedactedBot1', openId: 'ou-plan-writer' },
+      { name: 'ImplementerBot', openId: 'ou-implementer' },
+      { name: 'AlternateBot', openId: 'ou-plan-writer' },
     ]);
-    await h.run('/project bootstrap repo-stable --implementer HistoryRedactedBot1 --plan-writer 云上HistoryRedactedBot1', {
+    await h.run(`/project bootstrap ${stableWorkspace} --implementer ImplementerBot --plan-writer AlternateBot`, {
       chatId: 'oc-project',
       scope: 'oc-project',
       chatMode: 'group',
     });
     const sentBeforeTopic = h.channel.sent.length;
 
-    await h.run('/project bootstrap repo-topic --implementer 云上HistoryRedactedBot1 --plan-writer HistoryRedactedBot1', {
+    await h.run('/project bootstrap repo-topic --implementer AlternateBot --plan-writer ImplementerBot', {
       chatId: 'oc-project',
       scope: 'oc-project:thread-a',
       chatMode: 'topic',
@@ -1003,7 +1162,7 @@ describe('Bridge command contracts', () => {
       profile: h.controls.profile,
     }).projectsFile);
     await store.load();
-    expect(store.get('oc-project')?.workspace).toBe('repo-stable');
+    expect(store.get('oc-project')?.workspace).toBe(stableWorkspace);
     expect(store.getState('oc-project').usable).toBe(true);
     expect(h.workspaces.cwdFor('oc-project:thread-a')).toBeUndefined();
     expect(h.channel.sent.slice(sentBeforeTopic)).toHaveLength(1);
@@ -1013,13 +1172,14 @@ describe('Bridge command contracts', () => {
 
   it('invites missing project bootstrap bots by app_id before dispatching', async () => {
     const h = await createHarness();
-    await mkdir(join(h.tmp.root, 'repo-invite'), { recursive: true });
+    const workspacePath = join(h.tmp.root, 'repo-invite');
+    await mkdir(workspacePath, { recursive: true });
     const inviteLog = join(h.tmp.root, 'fake-lark-cli.log');
     await installFakeLarkCli(h, inviteLog);
-    configureMissingThenPresentBridgeBotBootstrap(h, 'HistoryRedactedBot1', 'ou-live-c', 'cli_target_c', 'repo-invite');
+    configureMissingThenPresentBridgeBotBootstrap(h, 'ImplementerBot', 'ou_implementer');
 
     await expect(
-      h.run('/project bootstrap repo-invite --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
+      h.run(`/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1031,28 +1191,31 @@ describe('Bridge command contracts', () => {
       .filter((text): text is string => typeof text === 'string');
 
     expect(textMessages).toHaveLength(4);
-    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-invite'));
-    expect(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-invite'));
-    expect(textMessages).toContain('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-invite');
-    expect(textMessages).toContain('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-invite');
+    expect(textMessages.indexOf('<at user_id="ou_planner">PlannerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`));
+    expect(textMessages.indexOf('<at user_id="ou_implementer">ImplementerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`));
+    expect(textMessages).toContain(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`);
+    expect(textMessages).toContain(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`);
 
     const inviteCalls = await readFile(inviteLog, 'utf8');
     expect(inviteCalls).toContain('chat.members create');
     expect(inviteCalls).toContain('--chat-id oc-project');
     expect(inviteCalls).toContain('--member-id-type app_id');
+    expect(inviteCalls).toContain('cli_test_implementer');
+    expect(inviteCalls).toContain('cli_test_planner');
   });
 
   it('does not rediscover bootstrap bots before invite succeeds', async () => {
     const h = await createHarness();
-    await mkdir(join(h.tmp.root, 'repo-order'), { recursive: true });
+    const workspacePath = join(h.tmp.root, 'repo-order');
+    await mkdir(workspacePath, { recursive: true });
     const inviteLog = join(h.tmp.root, 'fake-lark-cli-order.log');
     await installFakeLarkCli(h, inviteLog);
-    configureBootstrapBotsAppearOnlyAfterInvite(h, 'HistoryRedactedBot1', 'ou-live-c', 'cli_target_c', 'repo-order', inviteLog);
+    configureBootstrapBotsAppearOnlyAfterInvite(h, 'ImplementerBot', 'ou_implementer', inviteLog);
 
     await expect(
-      h.run('/project bootstrap repo-order --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
+      h.run(`/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1064,23 +1227,24 @@ describe('Bridge command contracts', () => {
       .filter((text): text is string => typeof text === 'string');
 
     expect(await readFile(inviteLog, 'utf8')).toContain('chat.members create');
-    expect(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-order'));
-    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-order'));
-    expect(textMessages).toContain('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-order');
-    expect(textMessages).toContain('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-order');
+    expect(textMessages.indexOf('<at user_id="ou_implementer">ImplementerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`));
+    expect(textMessages.indexOf('<at user_id="ou_planner">PlannerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`));
+    expect(textMessages).toContain(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`);
+    expect(textMessages).toContain(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`);
   });
 
   it('retries bootstrap discovery after invite before dispatching cd commands', async () => {
     const h = await createHarness();
-    await mkdir(join(h.tmp.root, 'repo-retry'), { recursive: true });
+    const workspacePath = join(h.tmp.root, 'repo-retry');
+    await mkdir(workspacePath, { recursive: true });
     const inviteLog = join(h.tmp.root, 'fake-lark-cli-retry.log');
     await installFakeLarkCli(h, inviteLog);
-    configureBootstrapBotsAppearAfterInviteRetry(h, 'HistoryRedactedBot1', 'ou-live-c', 'cli_target_c', 'repo-retry', inviteLog);
+    configureBootstrapBotsAppearAfterInviteRetry(h, 'ImplementerBot', 'ou_implementer', inviteLog);
 
     await expect(
-      h.run('/project bootstrap repo-retry --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
+      h.run(`/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1092,23 +1256,24 @@ describe('Bridge command contracts', () => {
       .filter((text): text is string => typeof text === 'string');
 
     expect(await readFile(inviteLog, 'utf8')).toContain('chat.members create');
-    expect(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-retry'));
-    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-retry'));
-    expect(textMessages).toContain('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-retry');
-    expect(textMessages).toContain('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-retry');
+    expect(textMessages.indexOf('<at user_id="ou_implementer">ImplementerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`));
+    expect(textMessages.indexOf('<at user_id="ou_planner">PlannerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`));
+    expect(textMessages).toContain(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`);
+    expect(textMessages).toContain(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`);
   });
 
   it('falls back to lark-cli bot discovery when raw SDK discovery fails', async () => {
     const h = await createHarness();
-    await mkdir(join(h.tmp.root, 'repo-fallback'), { recursive: true });
+    const workspacePath = join(h.tmp.root, 'repo-fallback');
+    await mkdir(workspacePath, { recursive: true });
     const inviteLog = join(h.tmp.root, 'fake-lark-cli-fallback.log');
     await installFakeLarkCliDiscoveryFallback(h, inviteLog);
-    configureThrowingRawSdkBootstrap(h, 'HistoryRedactedBot1', 'cli_target_c', 'repo-fallback');
+    configureThrowingRawSdkBootstrap(h);
 
     await expect(
-      h.run('/project bootstrap repo-fallback --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
+      h.run(`/project bootstrap ${workspacePath} --implementer ImplementerBot --plan-writer PlannerBot`, {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1119,12 +1284,12 @@ describe('Bridge command contracts', () => {
       .map((m) => (m.content as { text?: string }).text)
       .filter((text): text is string => typeof text === 'string');
 
-    expect(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-fallback'));
-    expect(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /invite group'))
-      .toBeLessThan(textMessages.indexOf('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-fallback'));
-    expect(textMessages).toContain('<at user_id="ou-live-c">HistoryRedactedBot1</at> /cd repo-fallback');
-    expect(textMessages).toContain('<at user_id="ou-cloud-cz">HistoryRedactedBot2</at> /cd repo-fallback');
+    expect(textMessages.indexOf('<at user_id="ou_implementer">ImplementerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`));
+    expect(textMessages.indexOf('<at user_id="ou_planner">PlannerBot</at> /invite group'))
+      .toBeLessThan(textMessages.indexOf(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`));
+    expect(textMessages).toContain(`<at user_id="ou_implementer">ImplementerBot</at> /cd ${workspacePath}`);
+    expect(textMessages).toContain(`<at user_id="ou_planner">PlannerBot</at> /cd ${workspacePath}`);
 
     const calls = await readFile(inviteLog, 'utf8');
     expect(calls).toContain('chat.members bots');
@@ -1134,10 +1299,10 @@ describe('Bridge command contracts', () => {
   it('reports bootstrap discovery failure without dispatching or allowlisting the group', async () => {
     const h = await createHarness();
     await installFailingLarkCli(h);
-    configureThrowingRawSdkBootstrap(h, 'HistoryRedactedBot1', 'cli_target_c', 'repo-fail');
+    configureThrowingRawSdkBootstrap(h);
 
     await expect(
-      h.run('/project bootstrap repo-fail --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2', {
+      h.run('/project bootstrap repo-fail --implementer ImplementerBot --plan-writer PlannerBot', {
         chatId: 'oc-project',
         scope: 'oc-project',
         chatMode: 'group',
@@ -1160,7 +1325,7 @@ describe('Bridge command contracts', () => {
 
     await expect(
       h.run(
-        '/project bootstrap repo-two --implementer HistoryRedactedBot1 --plan-writer HistoryRedactedBot2',
+        '/project bootstrap repo-two --implementer ImplementerBot --plan-writer PlannerBot',
         { senderId: 'ou-bot-admin' },
       ),
     ).resolves.toBe(true);
@@ -1180,7 +1345,32 @@ async function createHarness(): Promise<Harness> {
   const workspaceRealpath = await realpath(tmp.workspace);
   const profileConfig = appConfig(workspaceRealpath);
   const configPath = join(tmp.root, 'config.json');
-  await saveRootConfig(createRootConfig('claude', profileConfig), configPath);
+  const rootConfig = createRootConfig('claude', profileConfig);
+  rootConfig.botRegistry = {
+    entries: [
+      {
+        name: 'CoordinatorBot',
+        aliases: [],
+        appId: 'cli_test_coordinator',
+      },
+      {
+        name: 'ImplementerBot',
+        aliases: ['ImplementationAlias'],
+        appId: 'cli_test_implementer',
+      },
+      {
+        name: 'PlannerBot',
+        aliases: [],
+        appId: 'cli_test_planner',
+      },
+      {
+        name: 'AlternateBot',
+        aliases: [],
+        appId: 'cli_test_alternate',
+      },
+    ],
+  };
+  await saveRootConfig(rootConfig, configPath);
   const controls = {
     profile: 'claude',
     profileConfig,
@@ -1281,12 +1471,8 @@ function configureSingleBridgeBotBootstrap(
   h: Harness,
   name: string,
   openId: string,
-  projectRoot: string,
 ): void {
-  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
-    openId: 'ou-self',
-    name: 'HistoryRedactedBot4',
-  };
+  configureBootstrapCoordinatorIdentity(h);
   (h.channel.rawClient.im.v1 as unknown as {
     chatMembers: {
       bots(params: unknown): Promise<unknown>;
@@ -1298,8 +1484,8 @@ function configureSingleBridgeBotBootstrap(
           items: [
             {
               member_id_type: 'bot',
-              member_id: 'ou-cloud-cz',
-              name: 'HistoryRedactedBot2',
+              member_id: 'ou_planner',
+              name: 'PlannerBot',
             },
             {
               member_id_type: 'bot',
@@ -1311,40 +1497,13 @@ function configureSingleBridgeBotBootstrap(
       };
     },
   };
-  (h.controls.profileConfig as unknown as {
-    botRegistry: Array<{
-      canonicalName: string;
-      aliases: string[];
-      role: 'bridge';
-      machines: Array<{ kind: 'local'; root: string }>;
-      projectRoot: string;
-    }>;
-  }).botRegistry = [
-    {
-      canonicalName: 'HistoryRedactedBot4',
-      aliases: [],
-      role: 'bridge',
-      machines: [{ kind: 'local', root: h.tmp.root }],
-      projectRoot,
-    },
-    {
-      canonicalName: name,
-      aliases: [],
-      role: 'bridge',
-      machines: [{ kind: 'local', root: '/redacted/history/machine-1' }],
-      projectRoot,
-    },
-  ];
 }
 
 function configureRoleBotsBootstrap(
   h: Harness,
   bots: Array<{ name: string; openId: string }>,
 ): void {
-  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
-    openId: 'ou-self',
-    name: 'HistoryRedactedBot4',
-  };
+  configureBootstrapCoordinatorIdentity(h);
   (h.channel.rawClient.im.v1 as unknown as {
     chatMembers: {
       bots(params: unknown): Promise<unknown>;
@@ -1362,21 +1521,13 @@ function configureRoleBotsBootstrap(
       };
     },
   };
-  (h.controls.profileConfig as unknown as {
-    botRegistry: Array<{
-      canonicalName: string;
-      aliases: string[];
-      role: 'bridge';
-      machines: Array<{ kind: 'local'; root: string }>;
-      projectRoot: string;
-    }>;
-  }).botRegistry = [{
-    canonicalName: 'HistoryRedactedBot4',
-    aliases: [],
-    role: 'bridge',
-    machines: [{ kind: 'local', root: h.tmp.root }],
-    projectRoot: 'repo-roles',
-  }];
+}
+
+function configureBootstrapCoordinatorIdentity(h: Harness): void {
+  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
+    openId: 'ou-self',
+    name: 'CoordinatorBot',
+  };
 }
 
 async function installFakeLarkCli(h: Harness, logFile?: string): Promise<void> {
@@ -1435,9 +1586,9 @@ async function installFakeLarkCliDiscoveryFallback(h: Harness, logFile?: string)
       'case "$*" in',
       '  *"chat.members bots"*)',
       '    if [ -n "$LARK_FAKE_CLI_LOG" ] && grep -q "chat.members create" "$LARK_FAKE_CLI_LOG"; then',
-      '      printf \'{"ok":true,"data":{"items":[{"bot_id":"ou-self","bot_name":"HistoryRedactedBot4"},{"bot_id":"ou-cloud-cz","bot_name":"HistoryRedactedBot2"},{"bot_id":"ou-live-c","bot_name":"HistoryRedactedBot1"}]}}\\n\'',
+      '      printf \'{"ok":true,"data":{"items":[{"bot_id":"ou-self","bot_name":"CoordinatorBot"},{"bot_id":"ou_planner","bot_name":"PlannerBot"},{"bot_id":"ou_implementer","bot_name":"ImplementerBot"}]}}\\n\'',
       '    else',
-      '      printf \'{"ok":true,"data":{"items":[{"bot_id":"ou-self","bot_name":"HistoryRedactedBot4"}]}}\\n\'',
+      '      printf \'{"ok":true,"data":{"items":[{"bot_id":"ou-self","bot_name":"CoordinatorBot"}]}}\\n\'',
       '    fi',
       '    ;;',
       '  *)',
@@ -1512,13 +1663,8 @@ function configureMissingThenPresentBridgeBotBootstrap(
   h: Harness,
   name: string,
   openId: string,
-  appId: string,
-  projectRoot: string,
 ): void {
-  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
-    openId: 'ou-self',
-    name: 'HistoryRedactedBot4',
-  };
+  configureBootstrapCoordinatorIdentity(h);
   let calls = 0;
   (h.channel.rawClient.im.v1 as unknown as {
     chatMembers: {
@@ -1534,8 +1680,8 @@ function configureMissingThenPresentBridgeBotBootstrap(
             : [
               {
                 member_id_type: 'bot',
-                member_id: 'ou-cloud-cz',
-                name: 'HistoryRedactedBot2',
+                member_id: 'ou_planner',
+                name: 'PlannerBot',
               },
               {
                 member_id_type: 'bot',
@@ -1547,45 +1693,12 @@ function configureMissingThenPresentBridgeBotBootstrap(
       };
     },
   };
-  (h.controls.profileConfig as unknown as {
-    botRegistry: Array<{
-      canonicalName: string;
-      aliases: string[];
-      appId: string;
-      role: 'bridge';
-      machines: Array<{ kind: 'local'; root: string }>;
-      projectRoot: string;
-    }>;
-  }).botRegistry = [
-    {
-      canonicalName: 'HistoryRedactedBot4',
-      aliases: [],
-      appId: 'cli_self',
-      role: 'bridge',
-      machines: [{ kind: 'local', root: h.tmp.root }],
-      projectRoot,
-    },
-    {
-      canonicalName: name,
-      aliases: [],
-      appId,
-      role: 'bridge',
-      machines: [{ kind: 'local', root: '/redacted/history/machine-1' }],
-      projectRoot,
-    },
-  ];
 }
 
 function configureThrowingRawSdkBootstrap(
   h: Harness,
-  name: string,
-  appId: string,
-  projectRoot: string,
 ): void {
-  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
-    openId: 'ou-self',
-    name: 'HistoryRedactedBot4',
-  };
+  configureBootstrapCoordinatorIdentity(h);
   (h.channel.rawClient.im.v1 as unknown as {
     chatMembers: {
       bots(params: unknown): Promise<unknown>;
@@ -1595,47 +1708,15 @@ function configureThrowingRawSdkBootstrap(
       throw new Error('raw SDK discovery unavailable');
     },
   };
-  (h.controls.profileConfig as unknown as {
-    botRegistry: Array<{
-      canonicalName: string;
-      aliases: string[];
-      appId: string;
-      role: 'bridge';
-      machines: Array<{ kind: 'local'; root: string }>;
-      projectRoot: string;
-    }>;
-  }).botRegistry = [
-    {
-      canonicalName: 'HistoryRedactedBot4',
-      aliases: [],
-      appId: 'cli_self',
-      role: 'bridge',
-      machines: [{ kind: 'local', root: h.tmp.root }],
-      projectRoot,
-    },
-    {
-      canonicalName: name,
-      aliases: [],
-      appId,
-      role: 'bridge',
-      machines: [{ kind: 'local', root: '/redacted/history/machine-1' }],
-      projectRoot,
-    },
-  ];
 }
 
 function configureBootstrapBotsAppearOnlyAfterInvite(
   h: Harness,
   name: string,
   openId: string,
-  appId: string,
-  projectRoot: string,
   inviteLog: string,
 ): void {
-  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
-    openId: 'ou-self',
-    name: 'HistoryRedactedBot4',
-  };
+  configureBootstrapCoordinatorIdentity(h);
   (h.channel.rawClient.im.v1 as unknown as {
     chatMembers: {
       bots(params: unknown): Promise<unknown>;
@@ -1651,8 +1732,8 @@ function configureBootstrapBotsAppearOnlyAfterInvite(
             ? [
               {
                 member_id_type: 'bot',
-                member_id: 'ou-cloud-cz',
-                name: 'HistoryRedactedBot2',
+                member_id: 'ou_planner',
+                name: 'PlannerBot',
               },
               {
                 member_id_type: 'bot',
@@ -1665,47 +1746,15 @@ function configureBootstrapBotsAppearOnlyAfterInvite(
       };
     },
   };
-  (h.controls.profileConfig as unknown as {
-    botRegistry: Array<{
-      canonicalName: string;
-      aliases: string[];
-      appId: string;
-      role: 'bridge';
-      machines: Array<{ kind: 'local'; root: string }>;
-      projectRoot: string;
-    }>;
-  }).botRegistry = [
-    {
-      canonicalName: 'HistoryRedactedBot4',
-      aliases: [],
-      appId: 'cli_self',
-      role: 'bridge',
-      machines: [{ kind: 'local', root: h.tmp.root }],
-      projectRoot,
-    },
-    {
-      canonicalName: name,
-      aliases: [],
-      appId,
-      role: 'bridge',
-      machines: [{ kind: 'local', root: '/redacted/history/machine-1' }],
-      projectRoot,
-    },
-  ];
 }
 
 function configureBootstrapBotsAppearAfterInviteRetry(
   h: Harness,
   name: string,
   openId: string,
-  appId: string,
-  projectRoot: string,
   inviteLog: string,
 ): void {
-  (h.channel as unknown as { botIdentity: { openId: string; name: string } }).botIdentity = {
-    openId: 'ou-self',
-    name: 'HistoryRedactedBot4',
-  };
+  configureBootstrapCoordinatorIdentity(h);
   let postInviteDiscoveries = 0;
   (h.channel.rawClient.im.v1 as unknown as {
     chatMembers: {
@@ -1723,8 +1772,8 @@ function configureBootstrapBotsAppearAfterInviteRetry(
             ? [
               {
                 member_id_type: 'bot',
-                member_id: 'ou-cloud-cz',
-                name: 'HistoryRedactedBot2',
+                member_id: 'ou_planner',
+                name: 'PlannerBot',
               },
               {
                 member_id_type: 'bot',
@@ -1737,33 +1786,6 @@ function configureBootstrapBotsAppearAfterInviteRetry(
       };
     },
   };
-  (h.controls.profileConfig as unknown as {
-    botRegistry: Array<{
-      canonicalName: string;
-      aliases: string[];
-      appId: string;
-      role: 'bridge';
-      machines: Array<{ kind: 'local'; root: string }>;
-      projectRoot: string;
-    }>;
-  }).botRegistry = [
-    {
-      canonicalName: 'HistoryRedactedBot4',
-      aliases: [],
-      appId: 'cli_self',
-      role: 'bridge',
-      machines: [{ kind: 'local', root: h.tmp.root }],
-      projectRoot,
-    },
-    {
-      canonicalName: name,
-      aliases: [],
-      appId,
-      role: 'bridge',
-      machines: [{ kind: 'local', root: '/redacted/history/machine-1' }],
-      projectRoot,
-    },
-  ];
 }
 
 function lastContent(channel: FakeChannel): Record<string, unknown> {
