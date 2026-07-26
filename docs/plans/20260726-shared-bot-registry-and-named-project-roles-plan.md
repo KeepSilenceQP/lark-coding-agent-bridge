@@ -1,7 +1,7 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: In Progress（Unit 9 complete；G8 review next）
+Status: Code Review NO-GO（2 high fixes in progress）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
 Plan Writer: Planner Bot（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
@@ -35,6 +35,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - 2026-07-26 Unit 6 Receiving：Codex Subagent 提交 `f1e71ba`，精确变更 6 个 Unit 6 文件。Coordinator 独立复核 RootConfig Registry 在 per-chat lock 内且副作用前 fail-closed、entry/live 两层 actor 隔离、workspace 原文与相对 cwd 语义、旧绑定状态机，以及 default/machines/pin/identity_changed 删除边界，并补跑 project + commands 3 files / 83 tests 全绿；复用同源提交 `pnpm ci:local`（140 files，1470 passed / 33 skipped，typecheck + build success）证据。Unit 6 完成，Unit 7 尚未开始。
 - 2026-07-26 Unit 7 Receiving：Codex Subagent 提交 `98a1581`，清理 45 个 tracked 文件并落地 tree/dist/tarball 三层隐私门禁、真实 pack-and-verify、CI/publish 同一 artifact 与远端可达性报告。Coordinator 独立复核真实模式不入当前树、无文档/路径豁免、prepack/后验生命周期分离，并重跑 build + 真实同一 tgz 扫描/净安装及 tools 2 files / 7 tests 全绿；复用同源提交 `pnpm ci:local`（142 files，1477 passed / 33 skipped，typecheck + build success）证据。当前 tracked tree、dist、tarball 均为完整 denylist 零命中；远端历史 remediation 仍待 G11 单独授权。Unit 7 完成，Unit 9 尚未开始。
 - 2026-07-26 Unit 9 Receiving：Codex Subagent 提交 `3f83aa3`，新增协调升级/回滚 runbook、历史源码与当前源码的隔离 child-process runner、三路径集成测试和受控证据。Coordinator 独立复核 temp-only 路径、Bridge 环境隔离、仅管理自建 child、历史 serializer 真实执行与证据边界，并补跑 new install / upgrade / rollback→re-upgrade 集成 1/1 全绿；复用同源提交 `pnpm ci:local`（143 files，1478 passed / 33 skipped，typecheck + build success）及完整 denylist tree/dist/tgz 零命中、同一 tgz 净安装证据。Unit 9 完成，G8 尚未开始。
+- 2026-07-26 G8 独立 Code Review：结论 `NO-GO`，无 blocker、2 条 high。Finding 1：existing-profile upgrade/plaintext-secret、service materialize 与 account update 仍存在锁外 RootConfig read-modify-write，可与 Registry 写入形成 lost update；要求统一同锁内最终重读/合并/保存并补竞态测试。Finding 2：首次 live discovery 已可识别的多匹配或同 open_id 冲突在禁用旧绑定与环境准备后才阻断；要求在任何副作用前预检，邀请后重复唯一性检查，并补旧绑定仍 usable、零副作用测试。G8 保持未通过，待 Implementer 修复后由独立 Reviewer 复审。
 
 ## Current Code Evidence
 
