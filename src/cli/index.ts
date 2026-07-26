@@ -25,6 +25,7 @@ import {
 } from './commands/service';
 import { runStart } from './commands/start';
 import { runAtBotCli } from './commands/at-bot';
+import { createBotRegistryCommand } from './commands/bot-registry';
 
 const program = new Command();
 
@@ -134,6 +135,8 @@ profile
       yes: opts.yes,
     });
   });
+
+program.addCommand(createBotRegistryCommand());
 
 program
   .command('ps')
