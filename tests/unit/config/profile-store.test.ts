@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -6,7 +6,13 @@ import {
   createDefaultProfileConfig,
   type RootConfig,
 } from '../../../src/config/profile-schema';
-import { createRootConfig, loadRootConfig, saveRootConfig } from '../../../src/config/profile-store';
+import {
+  createRootConfig,
+  loadRootConfig,
+  removeProfile,
+  saveRootConfig,
+} from '../../../src/config/profile-store';
+import { resolveAppPaths } from '../../../src/config/app-paths';
 
 const roots: string[] = [];
 
@@ -204,5 +210,168 @@ describe('profile store canonical serialization', () => {
     const loaded = await loadRootConfig(configPath);
     expect(loaded?.profiles.claude?.access.ownerNoMentionChats).toEqual(['oc_a', 'oc_b']);
     expect(loaded?.profiles.claude?.access.groupResponseMode).toBe('owner-allowlist');
+  });
+});
+
+describe('botRegistry round-trip', () => {
+  const registry = {
+    entries: [
+      { name: 'Planner Bot', aliases: ['Planner'], appId: 'cli_plan' },
+      { name: 'Implementer Bot', aliases: ['Coder'], appId: 'cli_code' },
+    ],
+  };
+
+  function rootConfig(botRegistry: unknown = registry): RootConfig {
+    const profile = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app },
+    });
+    return {
+      schemaVersion: 2,
+      activeProfile: 'claude',
+      preferences: {},
+      botRegistry: botRegistry as RootConfig['botRegistry'],
+      profiles: { claude: profile },
+    };
+  }
+
+  async function writeRawRegistry(configPath: string, botRegistry: unknown): Promise<string> {
+    const raw = rootConfig() as unknown as Record<string, unknown>;
+    raw.botRegistry = botRegistry;
+    const bytes = `${JSON.stringify(raw, null, 2)}\n`;
+    await writeFile(configPath, bytes, { mode: 0o600 });
+    return bytes;
+  }
+
+  it('missing botRegistry normalizes to {entries: []} on load', async () => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const legacy = rootConfig() as RootConfig & { botRegistry?: unknown };
+    delete legacy.botRegistry;
+    await writeFile(configPath, `${JSON.stringify(legacy, null, 2)}\n`, { mode: 0o600 });
+
+    const loaded = await loadRootConfig(configPath);
+    expect(loaded?.botRegistry).toEqual({ entries: [] });
+  });
+
+  it('missing botRegistry is serialized as empty', async () => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const legacy = rootConfig() as RootConfig & { botRegistry?: unknown };
+    delete legacy.botRegistry;
+    await saveRootConfig(legacy, configPath);
+
+    const saved = JSON.parse(await readFile(configPath, 'utf8')) as RootConfig;
+    expect(saved.botRegistry).toEqual({ entries: [] });
+  });
+
+  it('valid botRegistry is normalized and preserved through save and load', async () => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const unnormalized = {
+      entries: [
+        { name: ' Planner Bot ', aliases: [' @Planner '], appId: ' cli_plan ' },
+        { name: 'Implementer Bot', aliases: ['Coder'], appId: 'cli_code' },
+      ],
+    };
+
+    await saveRootConfig(rootConfig(unnormalized), configPath);
+
+    const loaded = await loadRootConfig(configPath);
+    expect(loaded?.botRegistry).toEqual(registry);
+  });
+
+  it('createRootConfig initializes botRegistry as empty', () => {
+    const profile = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app },
+    });
+
+    expect(createRootConfig('claude', profile).botRegistry).toEqual({ entries: [] });
+  });
+
+  it('preserves botRegistry across active-profile updates and profile removal', async () => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const codex = createDefaultProfileConfig({
+      agentKind: 'codex',
+      accounts: { app },
+      codex: { binaryPath: '/usr/local/bin/codex' },
+    });
+    const claude = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app: { ...app, id: 'cli_second' } },
+    });
+    const config: RootConfig = {
+      ...rootConfig(),
+      activeProfile: 'codex',
+      profiles: { codex, claude },
+    };
+    await saveRootConfig(config, configPath);
+
+    const loaded = await loadRootConfig(configPath);
+    expect(loaded).toBeDefined();
+    await saveRootConfig({ ...loaded!, activeProfile: 'claude' }, configPath);
+
+    const codexDir = resolveAppPaths({ rootDir: root, profile: 'codex' }).profileDir;
+    await mkdir(codexDir, { recursive: true });
+    const result = await removeProfile((await loadRootConfig(configPath))!, 'codex', root, {
+      purge: true,
+    });
+    await saveRootConfig(result.root, configPath);
+
+    const afterRemove = await loadRootConfig(configPath);
+    expect(afterRemove?.botRegistry).toEqual(registry);
+    expect(afterRemove?.profiles.codex).toBeUndefined();
+    expect(afterRemove?.profiles.claude).toBeDefined();
+  });
+
+  const invalidRegistries: Array<[string, unknown]> = [
+    ['invalid structure', 'not-an-object'],
+    ['invalid entry', { entries: [{ name: 'Bot', aliases: 'not-an-array', appId: 'cli_a' }] }],
+    [
+      'canonical name conflict',
+      {
+        entries: [
+          { name: 'Same Name', aliases: [], appId: 'cli_a' },
+          { name: 'Same Name', aliases: [], appId: 'cli_b' },
+        ],
+      },
+    ],
+    [
+      'alias conflict',
+      {
+        entries: [
+          { name: 'Bot A', aliases: ['Shared'], appId: 'cli_a' },
+          { name: 'Bot B', aliases: ['Shared'], appId: 'cli_b' },
+        ],
+      },
+    ],
+    [
+      'appId conflict',
+      {
+        entries: [
+          { name: 'Bot A', aliases: [], appId: 'cli_same' },
+          { name: 'Bot B', aliases: [], appId: 'cli_same' },
+        ],
+      },
+    ],
+  ];
+
+  it.each(invalidRegistries)('load fails closed for %s without changing file bytes', async (_label, invalid) => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const original = await writeRawRegistry(configPath, invalid);
+    await expect(loadRootConfig(configPath)).rejects.toThrow();
+    expect(await readFile(configPath, 'utf8')).toBe(original);
+  });
+
+  it.each(invalidRegistries)('save rejects %s before writing', async (_label, invalid) => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    await saveRootConfig(rootConfig(), configPath);
+    const original = await readFile(configPath, 'utf8');
+    await expect(saveRootConfig(rootConfig(invalid), configPath)).rejects.toThrow();
+    expect(await readFile(configPath, 'utf8')).toBe(original);
   });
 });

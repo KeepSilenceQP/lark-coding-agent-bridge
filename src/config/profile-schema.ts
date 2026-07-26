@@ -1,3 +1,4 @@
+import type { BotRegistry } from './bot-registry';
 import type {
   AppCredentials,
   AppPreferences,
@@ -138,6 +139,7 @@ export interface RootConfig {
   migrations?: {
     permissionDefaultsV1?: string[];
   };
+  botRegistry?: BotRegistry;
   profiles: Record<string, ProfileConfig>;
 }
 

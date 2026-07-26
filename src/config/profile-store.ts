@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import * as lockfile from 'proper-lockfile';
 import { writeFileAtomic } from '../platform/atomic-write';
 import { resolveAppPaths } from './app-paths';
+import { validateBotRegistry, type BotRegistry } from './bot-registry';
 import {
   normalizeProfileConfig,
   type AgentKind,
@@ -27,12 +28,18 @@ function normalizeRootConfig(root: RootConfig): RootConfig {
     profiles[name] = normalizeProfileConfig(profile);
   }
   const migrations = normalizeRootMigrations(root.migrations);
+
+  const botRegistry = root.botRegistry === undefined
+    ? { entries: [] }
+    : validateBotRegistry(root.botRegistry);
+
   return {
     schemaVersion: 2,
     activeProfile: root.activeProfile,
     preferences: {},
     ...(root.secrets ? { secrets: root.secrets } : {}),
     ...(migrations ? { migrations } : {}),
+    botRegistry,
     profiles,
   };
 }
@@ -63,6 +70,7 @@ type StoredProfileConfig = Pick<
 
 type StoredRootConfig = Omit<RootConfig, 'preferences' | 'profiles'> & {
   preferences: Record<string, never>;
+  botRegistry: BotRegistry;
   profiles: Record<string, StoredProfileConfig>;
 };
 
@@ -78,6 +86,7 @@ function serializeRootConfig(root: RootConfig): StoredRootConfig {
     preferences: {},
     ...(root.secrets ? { secrets: root.secrets } : {}),
     ...(migrations ? { migrations } : {}),
+    botRegistry: validateBotRegistry(root.botRegistry ?? { entries: [] }),
     profiles,
   };
 }
@@ -159,6 +168,7 @@ export function createRootConfig(profile: string, cfg: ProfileConfig, secrets = 
     preferences: {},
     ...(secrets ? { secrets } : {}),
     migrations: { permissionDefaultsV1: [profile] },
+    botRegistry: { entries: [] },
     profiles: {
       [profile]: {
         ...cfg,
