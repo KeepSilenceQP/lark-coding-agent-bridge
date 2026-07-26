@@ -7,7 +7,7 @@ describe('mixed-version installation migration acceptance', () => {
 
     expect(evidence.evidenceBoundary).toMatchObject({
       oldArtifact: 'historical-source-build',
-      historicalSourceRef: 'f666689',
+      historicalSourceRef: 'fd872acea804be938a87e0a16089cb7084dfb97d',
       publishedOldBinaryTested: false,
     });
     expect(evidence.isolation).toEqual({

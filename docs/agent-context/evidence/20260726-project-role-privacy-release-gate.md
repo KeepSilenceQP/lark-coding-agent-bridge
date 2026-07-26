@@ -55,7 +55,7 @@ clean installation of that same tarball. CI package smoke and npm publish use
 this runner; publishing targets the verified artifact rather than repacking the
 source.
 
-## Remote-history reachability
+## Initial reachability and scoped remediation
 
 Read-only evidence was collected with a full fetch, `git ls-remote origin`, and
 ancestry checks against every fetched branch and tag. Both known historical
@@ -80,8 +80,26 @@ commits (`665ad74` and `a0464f7`) remain reachable from the same remote refs:
 - `refs/tags/v0.5.9-qp.1`
 - `refs/tags/v0.5.9-qp.4`
 
-Current tracked content is clean under the complete denylist. Remote-history
-remediation is not complete: rewriting or deleting any shared branch, pull ref,
-tag, or release remains a separate destructive G11 action requiring explicit
-Decision Owner authorization. Unit 7 performs no history rewrite, force push,
-tag deletion, release mutation, or G11 action.
+Unit 7 performed no history mutation. After Unit 10 closed, the Decision Owner
+separately authorized G11 and then narrowed its target to source commit history.
+The operation:
+
+- created a private mirror backup containing 5 heads, 2 tags, and 11 pull refs;
+- moved the release gate from historical extraction to a mode-0600 local file
+  or the `LARK_BRIDGE_PRIVACY_DENYLIST_JSON` GitHub Actions secret;
+- rewrote only the 5 remote `refs/heads/*` with
+  `git-filter-repo --sensitive-data-removal --no-fetch`;
+- updated those 5 heads in one atomic push with an exact lease for every old
+  tip; and
+- fetched the heads again from GitHub and scanned their complete fast-export:
+  all 10 protected patterns had 0 findings and `git fsck` was clean.
+
+The first replacement attempt was rejected locally before any push because
+space-bearing fictional Bot names changed command tokenization. The accepted
+rewrite uses no-whitespace fictional Bot names; the rewritten `main` passed
+133 test files (1331 passed, 33 skipped), typecheck, and build.
+
+Old pull refs, tags, releases, caches, and GitHub Support remediation were
+explicitly left outside the narrowed authorization. This evidence therefore
+proves current-content cleanup plus source-branch-history cleanup, not complete
+removal from every GitHub-side ref or retained object.

@@ -1,7 +1,7 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: Complete / Closed（Unit 10 live acceptance 与扩展失败/恢复/跨群隔离矩阵 PASS；G11 仍为本需求范围外的单独授权 gate）
+Status: Complete / Closed（Unit 10 live acceptance 与扩展失败/恢复/跨群隔离矩阵 PASS；关闭后单独授权的 G11 源码分支历史 remediation 已完成）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
 Plan Writer: Planner Bot（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
@@ -18,7 +18,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 1. Bot Registry 从 Bridge 源码迁移到安装级共享 Root Config：空默认值、fail-closed 校验、profile 自注册、`bot-registry` CLI 增删查、零 profile 与 export 语义。
 2. `/project bootstrap` 切换为具名角色参数：`/project bootstrap <workspace> --plan-writer <bot-name> --implementer <bot-name>`，位置顺序不再承载角色语义，旧位置语法明确拒绝。
 
-并完成发布卫生：当前内容隐私清理 + `npm pack` tarball denylist 扫描 + 远端坏 commit 可达范围记录。远端历史改写**不属于**本需求，只列为 Decision Owner 单独授权 gate（见文末 G11）。
+并完成发布卫生：当前内容隐私清理 + `npm pack` tarball denylist 扫描 + 远端坏 commit 可达范围记录。远端历史改写原不属于本需求；需求关闭后，Decision Owner 对 G11 另行授权，并把执行范围明确收窄为远端源码分支（见文末 G11）。
 
 ## Review History
 
@@ -39,6 +39,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - 2026-07-26 G8 Fix + Re-review：Implementer 提交 `a601904`，闭合四类锁外 RootConfig RMW 与 bootstrap 初始 live 冲突副作用时点，新增四类受控 interleaving 和初始/邀请后身份冲突回归；`pnpm ci:local` 为 144 files / 1483 passed / 33 skipped，完整隐私与同一 tgz gate 通过。独立 Reviewer 复审结论 `GO`：原 2 条 high 均 Closed，无新 blocker/high；复审定向 3 files / 83 tests 全绿。G8 完成，Unit 10 尚未开始。
 - 2026-07-27 Unit 10 Receiving：Decision Owner 在场授权并完成真实安装迁移与当前群 live acceptance。Coordinator 复核同一 Root Config 下两个 live profile、共享 Registry 且无 profile-local 副本；将一个已登记 Bot 临时移出后，仅凭 Registry 名称完成邀请、重新发现 live `open_id`、原生 `/invite group` → `/cd` 派发与角色绑定持久化，另一已在群 Bot 未重复邀请；下一轮 `bridge_context.projectRoleAssignment` 注入与磁盘绑定一致。定向 4 files / 140 tests 全绿；`pnpm ci:local` 为 144 files / 1483 passed / 33 skipped，typecheck + build 成功；真实同一 tgz 完成 tree/dist/tarball 扫描与净安装；最终远端 commit 的 Linux、macOS、Windows、package smoke 四项 check 均成功。Unit 10 完成，本需求范围完成；G11 未授权且未执行。
 - 2026-07-27 Unit 10 扩展 live closeout：Decision Owner 在测试群完成正常 bootstrap、准备前 workspace 失败、准备后受控 `invite_failed`、旧绑定禁用与停止注入、完整 bootstrap 恢复、A/B 群可区分 workspace 隔离及最终恢复。准备前失败保持旧绑定可用且无部分副作用；准备后失败未覆盖旧绑定、准确记录部分副作用并停止 `projectRoleAssignment` 注入；恢复后完整注入重新出现。测试群临时绑定 repository `src` 子目录期间，原项目群仍注入 repository root，证明 chat 级绑定未串读；测试群随后恢复 repository root。临时 Registry entry 已删除，Root Config 与测试前备份 SHA-256 一致，Git 工作树干净。收口 tracked delta 仅为本 Plan 验收回写；`pnpm ci:local` 再次通过（144 files / 1483 passed / 33 skipped，typecheck + build success），tree/dist/实际 tarball 10 项受保护模式均零命中，同一 tarball 净安装通过。G8 实现审查结论保持 `GO`，Unit 10 在证据回写后重新关闭；全部计划内功能测试完成，环境恢复，无剩余 live 操作。
+- 2026-07-27 G11 scoped remediation：Decision Owner 在需求关闭后单独授权远端历史改写，并随后把范围收窄为源码提交历史。执行前保存包含 heads/tags/pull refs 的完整私有 mirror（5 heads / 2 tags / 11 pull refs，`git fsck` clean），将隐私门禁从坏 commit 提取改为 mode-0600 本地文件或 GitHub Actions Secret，缺失输入继续 fail closed；迁移提交的 package-smoke、Linux、macOS、Windows CI 全绿。随后仅对 5 个 `refs/heads/*` 运行 `git-filter-repo --sensitive-data-removal --no-fetch`，用无空格虚构 Bot 名保持命令语义，并以逐 ref lease 的 atomic force-push 更新远端。事后从 GitHub 重新 fetch 5 heads，完整 fast-export 对 10 项 denylist 为 0 命中，`git fsck` clean；重写后的 `main` 为 133 files / 1331 passed / 33 skipped，typecheck + build 成功。旧 PR refs、tags、release 与 GitHub cache/support remediation 按 Decision Owner 明示不处理，因此本结论只覆盖源码分支历史，不表述为 GitHub 端全引用清除。
 
 ## Current Code Evidence
 
@@ -256,11 +257,11 @@ Implementer 每单元只正式回传结果、diff 边界与验证证据，不自
 **完成条件**：上述证据齐备；`pnpm ci:local` 通过；最终远端 commit CI 绿；对最终待发布 commit 重做 Unit 7 tree/dist + 实际 tarball 扫描。Unit 10 原则上只采集外部/未跟踪 live 证据；若为修复验收问题或沉淀证据产生任何 tracked 修改，必须回到 G8 对 G0 后最终全量 diff 重新 Review，通过后才能重新完成 Unit 10。
 **扩展 closeout 证据**：正常路径、准备前 fail-closed、准备后部分失败与绑定禁用、恢复注入、A/B 群可区分隔离、最终 workspace/Registry/Root Config/Git 恢复均已通过。workspace 切换暴露的 session 连续性问题记录于「Known Issues / Blockers」，不改变本 Unit 的角色绑定与隔离验收结论。
 
-### Gate G11 — 远端历史 remediation（Decision Owner 单独授权，不属于本需求执行范围）
+### Gate G11 — 远端源码分支历史 remediation（关闭后单独授权）
 
-- [ ] Decision Owner 已确认 targets 与兼容影响（本需求内不执行）
+- [x] Decision Owner 已确认并收窄 targets：仅 5 个远端 `refs/heads/*`
 
-删除/重写已共享的 main、tag、release 中 `665ad74`/`a0464f7` 可达的个人数据属破坏性 release remediation。未获 Decision Owner 对具体 targets 与兼容影响的单独确认前，任何人不得改写远端历史，也不得把 Unit 7 的「当前内容已清理」表述成「历史已清理」。
+源码分支已在完整私有 mirror 备份、替换语义预检、重写后全量测试与逐 ref lease 保护下完成原子改写。远端重新抓取的 5 个 heads 对完整 10 项 denylist 为零命中。旧 PR refs、tags、release、缓存与 GitHub Support 操作未纳入授权目标，也未修改；因此 Gate 只关闭「源码分支历史」范围，Unit 7 的「当前内容已清理」与本 Gate 的「源码分支历史已清理」仍分别陈述。
 
 ## Acceptance Coverage Matrix（Spec 验收行 → Unit/Gate）
 

@@ -8,7 +8,8 @@ acceptance, publication, or remote-history remediation.
 ## Evidence boundary
 
 The controlled old artifact was built at runtime from the actual pre-Registry
-serializer source at commit `f666689`. The new artifact was built from the
+serializer source at rewritten commit `fd872acea804be938a87e0a16089cb7084dfb97d`.
+The new artifact was built from the
 current serializer source at baseline
 `525dd27532b25dc1d3b74021b18fc748b6c3d58b`.
 
@@ -19,7 +20,7 @@ not infer writer generation from version text alone.
 
 | Generation | Source ref | Declared version | Controlled artifact SHA-256 |
 | --- | --- | --- | --- |
-| Old | `f666689` | `0.5.9-qp.5` | `8e81d9a9c212dfb6401c0ee97fcb1025dc6afb1aebe93a3f6389c6205719040e` |
+| Old | `fd872acea804be938a87e0a16089cb7084dfb97d` | `0.5.9-qp.5` | `8e81d9a9c212dfb6401c0ee97fcb1025dc6afb1aebe93a3f6389c6205719040e` |
 | New | `525dd27532b25dc1d3b74021b18fc748b6c3d58b` | `0.5.9-qp.5` | `850988ee2f995fd4189a92a9e5d4b32d01b9031c1c7369a2abf9eaba1ea88019` |
 
 ## Isolation

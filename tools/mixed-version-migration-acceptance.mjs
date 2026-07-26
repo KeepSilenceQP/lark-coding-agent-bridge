@@ -21,7 +21,7 @@ import { execFile } from 'node:child_process';
 import { build } from 'tsup';
 
 const execFileAsync = promisify(execFile);
-const HISTORICAL_SOURCE_REF = 'f666689';
+const HISTORICAL_SOURCE_REF = 'fd872acea804be938a87e0a16089cb7084dfb97d';
 const HISTORICAL_FILES = [
   'src/config/app-paths.ts',
   'src/config/permissions.ts',
