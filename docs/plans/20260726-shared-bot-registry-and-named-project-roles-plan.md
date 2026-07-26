@@ -1,7 +1,7 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: In Progress（Unit 5 complete；Unit 6 next）
+Status: In Progress（Unit 6 complete；Unit 7 next）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
 Plan Writer: HistoryRedactedBot2（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
@@ -32,6 +32,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - 2026-07-26 Unit 3 Receiving：Codex Subagent 提交 `963e67f`，精确变更 4 个 Unit 3 文件。Coordinator 独立复核独立登记服务、connect 后 best-effort 接入、最终 rejection containment 与日志分支，并补跑 service + fake-channel 2 files / 22 tests，确认 created 持久化、noop 零写、conflict/锁失败不阻断消息流；复用同源提交第二轮 `pnpm ci:local`（137 files，1428 passed / 33 skipped，typecheck + build success）证据。Unit 3 完成，Unit 4 尚未开始。
 - 2026-07-26 Unit 4 Receiving：Codex Subagent 提交 `f4bd17f`，精确变更 4 个 Unit 4 文件。Coordinator 独立复核 CLI 注册、安装级路径边界、锁内 fresh load、幂等/冲突零写、list 最小输出、canonical-only remove 与 profile 占用拒绝，并补跑新增 unit + integration 2 files / 16 tests 全绿；复用同源提交 `pnpm ci:local`（139 files，1444 passed / 33 skipped，typecheck + build success）证据。Unit 4 完成，Unit 5 尚未开始。
 - 2026-07-26 Unit 5 Receiving：Codex Subagent 提交 `57546fc`，精确变更 6 个 Unit 5 文件。Coordinator 独立复核无 shell 语义 tokenizer、具名角色 parser、统一 usage、旧位置语法优先拒绝与 commands 副作用前边界，并补跑 parser + commands integration 2 files / 75 tests 全绿；复用同源提交 `pnpm ci:local`（140 files，1465 passed / 33 skipped，typecheck + build success）证据。Unit 5 完成，Unit 6 尚未开始。
+- 2026-07-26 Unit 6 Receiving：Codex Subagent 提交 `f1e71ba`，精确变更 6 个 Unit 6 文件。Coordinator 独立复核 RootConfig Registry 在 per-chat lock 内且副作用前 fail-closed、entry/live 两层 actor 隔离、workspace 原文与相对 cwd 语义、旧绑定状态机，以及 default/machines/pin/identity_changed 删除边界，并补跑 project + commands 3 files / 83 tests 全绿；复用同源提交 `pnpm ci:local`（140 files，1470 passed / 33 skipped，typecheck + build success）证据。Unit 6 完成，Unit 7 尚未开始。
 
 ## Current Code Evidence
 
@@ -203,7 +204,7 @@ Implementer 每单元只正式回传结果、diff 边界与验证证据，不自
 
 ### Unit 6 — bootstrap runtime 迁移共享 Registry + entry 最小化 Owner: Implementer
 
-- [ ] 完成
+- [x] 完成
 
 **目标**：DD8。
 **准确落点**：`src/project/bot-registry.ts`（精简）、`src/project/dispatch.ts`（收敛）、`src/commands/index.ts:753-794,1034-1070,1072-1300`（Registry 来源、workspace 输入解析、角色解析接 Unit 5 parser）。
