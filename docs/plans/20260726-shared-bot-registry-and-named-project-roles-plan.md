@@ -1,7 +1,7 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: Draft（已 Receiving Coordinator Plan Review findings，修订后待复审）
+Status: Plan Review GO（Implementation Ready）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
 Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
 Plan Writer: HistoryRedactedBot2（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
@@ -25,6 +25,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - 2026-07-26 HistoryRedactedBot2：基于 `2d47a21` 全文读取 Spec + 全量源码勘察（RootConfig、profile 生命周期、CLI、bootstrap runtime、tokenizer、测试与打包布局），产出本 Plan 草稿。Plan Writer 不自审。
 - 2026-07-26 Coordinator Plan Review：结论为 CHANGES REQUESTED，共 5 条 finding，涉及 tracked tree 隐私口径、create-time 锁边界、真实 tarball 扫描生命周期、最终 Code Review 顺序和 Plan 进度责任。
 - 2026-07-26 本地 Codex subagent：原 Writer HistoryRedactedBot2 unavailable 后临时接替 Plan Writer，逐条 Receiving 并修订本 Plan；未担任 Plan Reviewer，未实施代码、测试、配置、部署或远端历史操作。
+- 2026-07-26 Coordinator 独立复审：5 条 finding 均已闭合，Plan Review `GO`；允许从 G0 开始，尚未授权或完成任何 Execution Unit。
 
 ## Current Code Evidence
 
@@ -316,4 +317,4 @@ git ls-remote origin                            # 坏 commit 可达范围记录�
 
 ## Plan Review Gate
 
-本 Plan 已逐条 Receiving Coordinator 首轮 5 条 finding，尚待 Coordinator（HistoryRedactedBot4）独立复审。接替 Writer 未实现、未自审，也未作为 Reviewer；复审通过前不开始任何 Execution Unit（G0 是否可先行仍由 Reviewer 决定）。
+Coordinator 独立复审已确认首轮 5 条 finding 全部闭合，Plan Review `GO`。接替 Writer 未实现、未自审，也未作为 Reviewer；Implementation 只允许从 G0 开始，并按每单元正式回传、Coordinator 回写状态、再派下一单元的顺序推进。
