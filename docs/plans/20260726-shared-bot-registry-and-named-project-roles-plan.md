@@ -1,10 +1,10 @@
 # Shared Bot Registry And Named Project Roles — Coding Plan
 
 Date: 2026-07-26
-Status: Draft（尚未 Plan Review）
+Status: Draft（已 Receiving Coordinator Plan Review findings，修订后待复审）
 Spec authority: `docs/specs/20260726-shared-bot-registry-and-named-project-roles.md`（branch `feat/project-role-assignment` @ `2d47a21`，Status: confirmed by Qin Peng）
-Target branch: `feat/project-role-assignment`（Plan 基线 `2d47a21`；实现前必须先过 G0 base-sync gate）
-Plan Writer: HistoryRedactedBot2（只写本 Plan；不实现、不自审、不部署）
+Target branch: `feat/project-role-assignment`（本轮修订基线 `8df2991`；实现前必须先过 G0 base-sync gate）
+Plan Writer: HistoryRedactedBot2（初稿，当前 unavailable）；本地 Codex subagent（接替本轮 Plan 修订；不实现、不自审、不部署）
 Plan Reviewer: HistoryRedactedBot4（Coordinator，独立 Review）
 Implementer: 按当前群绑定的 Implementer actor
 Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立审查增量
@@ -23,6 +23,8 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 ## Review History
 
 - 2026-07-26 HistoryRedactedBot2：基于 `2d47a21` 全文读取 Spec + 全量源码勘察（RootConfig、profile 生命周期、CLI、bootstrap runtime、tokenizer、测试与打包布局），产出本 Plan 草稿。Plan Writer 不自审。
+- 2026-07-26 Coordinator Plan Review：结论为 CHANGES REQUESTED，共 5 条 finding，涉及 tracked tree 隐私口径、create-time 锁边界、真实 tarball 扫描生命周期、最终 Code Review 顺序和 Plan 进度责任。
+- 2026-07-26 本地 Codex subagent：原 Writer HistoryRedactedBot2 unavailable 后临时接替 Plan Writer，逐条 Receiving 并修订本 Plan；未担任 Plan Reviewer，未实施代码、测试、配置、部署或远端历史操作。
 
 ## Current Code Evidence
 
@@ -42,6 +44,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 - `src/runtime/profile-runtime.ts:452-460` `resolveBootstrapAppConfig()` 调 `validateAppCredentials()`（`src/utils/feishu-auth.ts:63` 返回 `{ok, botName, botOpenId}`），**botName 当前只用于打一行日志后被丢弃**——create-time 自注册的数据源已存在。
 - 同文件 `:207-224` 全新创建路径 `createRootConfig()` → `saveRootConfig()`；`:227-271` `bootstrapProfileIntoExistingRoot()` 用 spread 保留既有 root 字段加新 profile，但**不设置 `activeProfile`、不写 active-profile 指针**——零 profile 状态下 create 会留下 `activeProfile: ''` 的缺口。
 - 同文件 `:143-162`：`rootConfig` 存在但 profile 缺失时，只有 `allowBootstrap && explicitProfile` 才走补建；`run --allow-bootstrap` 不带 `--profile` 时会 `throw profile not found`——零 profile 状态下 `run --allow-bootstrap` 的直接缺口。
+- `src/cli/commands/profile.ts:109-135` 只有 `runProfileCreate()` 在外层持有 `withConfigFileLock()` 后调用 `resolveProfileRuntime()`；`src/cli/commands/start.ts:85-91` 的 `runStart()` 与 `src/cli/commands/service.ts:116-136` 的 `ensureBridgeConfigured()` 均直接调用 `resolveProfileRuntime({allowBootstrap: true})`，当前 create/bootstrap 写路径本身不持锁。因 `proper-lockfile` 锁不是可重入锁，不能简单在 `resolveProfileRuntime()` 内再套锁而保留 `runProfileCreate()` 外层锁。
 
 **CLI 层**
 
@@ -62,7 +65,7 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 
 **打包与文档**
 
-- `package.json` `files` 仅 `dist/bin/README.md/README.zh.md/NOTICE.md/LICENSE/vendor`——docs、tests 不进 npm 包；但 `defaultRegistry()` 会编译进 `dist`，tarball 扫描是真实必要 gate。`prepack` 现有 `tools/check-npm-bundle.mjs` 只校验 `@larksuite/channel` 闭包，无隐私扫描。
+- `package.json` `files` 仅 `dist/bin/README.md/README.zh.md/NOTICE.md/LICENSE/vendor`——docs、tests 不进 npm 包；但 `defaultRegistry()` 会编译进 `dist`，tarball 扫描是真实必要 gate。`prepack` 现有 `tools/check-npm-bundle.mjs` 只校验 `@larksuite/channel` 闭包，无隐私扫描；`.github/workflows/ci.yml` 的 `package-smoke` 已执行真实 `npm pack`，但尚未在 clean-install 前扫描其实际 `.tgz`。
 - 旧语法文档：`README.md:199`、`README.zh.md:198` 命令表；`README.md:20`、`README.zh.md:19` feature 表。`src/agent/bridge-system-prompt.ts:29` 只提 `projectRoleAssignment` 注入语义，不含命令语法与个人值，无需改。
 - 个人值当前分布（grep 实证）：源码 `src/project/bot-registry.ts`；测试 `tests/unit/project/bot-registry.test.ts`、`tests/unit/project/dispatch.test.ts`、`tests/integration/commands/commands-v1.test.ts:614-800`、`tests/acceptance/azu-group-prompt-router.live.test.ts`、`tests/acceptance/azu-group-prompt-router.worker.test.ts`；文档 `docs/plans/20260721-azu-group-prompt-bug-confirmation-gate-plan.md`、`docs/plans/20260722-bot-at-primitive-plan.md` 及 `docs/agent-context/**` 历史证据档案（14 个文件）。
 - 坏 commit：`665ad74`（feat: add project bootstrap orchestration）、`a0464f7`（fix: validate project bootstrap bot targets），已在 `origin/main`。
@@ -85,7 +88,8 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 ### DD3 — Profile 生命周期与自注册（create 路径）
 
 - `resolveBootstrapAppConfig()` 返回值扩展带出 `botName`（已有数据源，不新增权限/请求）。
-- 全新创建（`profile-runtime.ts:207-224`）与 `bootstrapProfileIntoExistingRoot()`（`:227-271`）两条路径：若取得 `botName`，在**同一个受锁 Root Config 更新**内按 `{name: botName, aliases: [], appId}` 调 DD4 的幂等登记。`runProfileCreate` 已在 `withConfigFileLock` 内调 `resolveProfileRuntime`（`profile.ts:109-135`），锁连续性保持；实现须确认两条路径都不在锁外另写 config。
+- create/bootstrap 采用**单一锁拥有者**策略，复用现有 `withConfigFileLock`，不引入第二种锁，也不允许同一调用链嵌套获取同一个 config 锁：`resolveProfileRuntime()` 所有入口共同到达的 create/bootstrap 提交边界负责且只负责一次锁获取；`runProfileCreate()` 不再在调用该边界时持有外层同锁。交互式凭据取得、agent 探测等不依赖 Root Config 一致性的准备可在锁外完成，但最终提交必须在锁内重新 `loadRootConfig()`，重新校验目标 profile/Registry 冲突，并在同一份最新 root 上合并 profile、`botRegistry`、`activeProfile` 后一次 `saveRootConfig()`；锁外早先读取的 root 不能直接保存。
+- 上述共同提交边界必须覆盖 `runStart()`、`service start` 的 `ensureBridgeConfigured()`、`profile create` 以及 existing-zero-profile bootstrap；全新 Root Config 与 `bootstrapProfileIntoExistingRoot()` 两条路径若取得 `botName`，均在这次**同一个受锁 Root Config 更新**内按 `{name: botName, aliases: [], appId}` 调 DD4 的幂等登记。实现可按现有控制流抽取内部 locked/unlocked seam，但 Plan 不预设未经源码验证的函数名或公开 API。
 - 零 profile：`runProfileRemove` 删最后一个 profile 时改为**保留** Root Config：写 `activeProfile: ''`、`profiles: {}`、保留 `botRegistry` 与 `secrets`，仅 `rm(activeProfileFile)` 删除失效指针，不再 `rm(configFile)`。
 - 零 profile 后续：`bootstrapProfileIntoExistingRoot()` 补「`activeProfile` 为空时置为新 profile 并 `writeActiveProfile`」；`resolveProfileRuntime()` 的 `!profileConfig` 分支放宽为 `allowBootstrap && (explicitProfile ?? 可推导 profile)`，使零 profile 下 `run --allow-bootstrap`（无 `--profile`）也能补建——两条修复都附回归测试。
 - `runProfileExport()` 维持构造性排除 Registry（不 spread root），新增测试断言默认与 `--include-secrets` 两种导出都不含 `botRegistry`。
@@ -116,7 +120,11 @@ Code Reviewer: 按 Harness 由 Plan Writer actor 派生，实现完成后独立�
 
 ### DD9 — 隐私清理与 denylist 口径
 
-清理范围（当前内容）：源码、全部测试文件、`docs/plans/` 与 `docs/agent-context/**` 中含 App ID / 机器路径的值。denylist = 4 个真实 App ID + 本机/devbox 两个机器根路径 + 4 个个人 Bot 名。处置口径：**App ID 与机器路径全树清零**（历史证据文档中同样替换为 `cli_redacted` / `/redacted/...` 占位，保留叙述）；个人 Bot 名在 `docs/agent-context/**` 历史证据叙述中出现属历史事实，替换会破坏证据语义，列为残留分类报告（见下），功能上下文（源码/测试/README/命令示例/新文档）中清零。新增 `tools/check-privacy-denylist.mjs`：tree 模式扫当前工作树（排除 `.git`/`node_modules`），tarball 模式对真实 `npm pack` 产物解包扫描；tarball 模式接入 `prepack`（在 check-npm-bundle 之后），扫描失败即阻断打包；bot 名在 tarball 中同为硬失败（包内无历史证据豁免）。最终验收产出「当前内容清理」报告：tree 扫描 App ID/路径零命中 + bot 名残留仅存在于逐文件列出的历史证据豁免清单。
+清理范围是**全部 tracked current tree**：源码、全部测试/fixture、README、命令示例、新文档以及所有旧 tracked docs（含 `docs/plans/**`、`docs/agent-context/**`）。denylist = 4 个真实 App ID + 本机/devbox 两个机器根路径 + 4 个真实个人 Bot 名；四类真实值一律改为角色化或虚构占位，tree 扫描必须全树零命中，**不按历史证据目录、文件类型或叙述语义提供任何豁免**。旧文档的事件语义用 `Planner Bot`、`Implementer Bot`、`cli_example_*`、`/redacted/...` 等占位保留；真实值的追溯由 Git 历史及 G11 的远端可达范围记录承担，不在 current tree 复制一份“历史证据”。
+
+新增 `tools/check-privacy-denylist.mjs`，tree/dist/tarball 三种输入均对完整 denylist 硬失败且无路径 allowlist。由于真实 denylist 自身也不得以明文进入 tracked tree，工具从受保护的仓外/未跟踪输入接收真实模式；仓内测试只使用明确虚构 fixture，发布 gate 缺少真实 denylist 输入即失败，不能退化成跳过。`prepack` 只做打包生成前的 tree + 当前 dist 门禁（并保留 `check-npm-bundle.mjs`），不得声称验证尚未产生的 `.tgz`。
+
+另建真实 pack-and-verify 流程：在临时目录执行实际 `npm pack`，取得本次生成的 `.tgz` 后调用 tarball 模式解包扫描，再把**同一份已扫描 tarball**交给现有 `package-smoke` clean-install；该流程同时接入发布前 gate。最终验收报告必须给出 tracked tree、dist、实际 tarball 三者全 denylist 零命中，并将「当前内容清理」与 G11「历史 remediation」分开陈述。
 
 ### DD10 — 混合版本为安装级原子迁移，非滚动升级
 
@@ -124,7 +132,7 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 
 ## Execution Units
 
-所有单元初始未完成。每单元完成后由 Implementer 更新 checkbox 与本 Plan 状态。
+所有单元初始未完成。Implementer 每单元只正式回传结果、diff 边界与验证证据，不自行编辑本 Plan checkbox/status；Coordinator 按完成条件 Receiving，更新对应 checkbox/status并提交该同步后，才派发下一单元。未满足完成条件时由 Coordinator 保持未勾选并回传缺口。
 
 ### Gate G0 — Base-sync（实现前必须过） Owner: Implementer
 
@@ -153,8 +161,8 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 **目标**：DD3 + DD4。
 **准确落点**：`src/runtime/profile-runtime.ts:429-470`（`resolveBootstrapAppConfig` 带出 botName）、`:207-224` 与 `:227-271`（两条创建路径锁内幂等登记 + `bootstrapProfileIntoExistingRoot` 补 activeProfile 语义）、`:143-162`（`!profileConfig` 分支放宽）、`src/cli/commands/profile.ts:189-191`（零 profile 保留 root）、`:245-253`（export 维持构造性排除）。
 **依赖**：Unit 1。
-**完成条件**：凭据校验返回 botName 时，新 profile 在同一受锁更新内完成 `{name, aliases: [], appId}` 登记（含 QR wizard 未取得名字时不登记、不留半成品）；同 appId 重复 create/冲突按 DD4 三态；删除最后 profile 后 root 存在（`activeProfile: ''`、`profiles: {}`、Registry 保留）、active-profile 指针删除、`bot-registry list/add/remove` 可用；零 profile 下 `profile create` 与 `run --allow-bootstrap` 均能新增 profile、保留旧 Registry 并恢复 active 指针；export 两种模式均不含 `botRegistry`。
-**最小测试**：扩展 `tests/integration/cli/profile-create.test.ts`、`profile-retention.test.ts`（零 profile 往返）；新增 `tests/unit/config/bot-registry.test.ts` upsert 三态；export 排除断言（integration cli）。
+**完成条件**：凭据校验返回 botName 时，新 profile 在 DD3 单一锁拥有者的同一更新内完成 `{name, aliases: [], appId}` 登记（含 QR wizard 未取得名字时不登记、不留半成品）；`runStart`、`service start`、`profile create` 与 existing-zero-profile bootstrap 都走同一锁内最终重读/冲突复核/合并/保存合同，且无嵌套死锁；同 appId 重复 create/冲突按 DD4 三态；删除最后 profile 后 root 存在（`activeProfile: ''`、`profiles: {}`、Registry 保留）、active-profile 指针删除、`bot-registry list/add/remove` 可用；零 profile 下 `profile create` 与 `run --allow-bootstrap` 均能新增 profile、保留旧 Registry 并恢复 active 指针；export 两种模式均不含 `botRegistry`。
+**最小测试**：扩展 `tests/integration/cli/profile-create.test.ts`、`profile-retention.test.ts`（零 profile 往返）；新增 `tests/unit/config/bot-registry.test.ts` upsert 三态；export 排除断言（integration cli）；增加跨入口并发测试，至少并发覆盖 `runStart` / `service start` / `profile create` 对同一 Root Config 的 create/bootstrap 竞争及 existing-zero-profile 与另一入口竞争，断言超时内完成、无死锁、每个成功 profile 与 Registry entry 均保留、activeProfile 合法且最终配置可重新加载。
 
 ### Unit 3 — 首次 WS identity 幂等补登记 Owner: Implementer
 
@@ -162,7 +170,7 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 
 **目标**：DD5。
 **准确落点**：登记服务函数（`src/config/bot-registry-service.ts` 或 `src/project/self-registration.ts`）；hook 于 `src/bot/channel.ts:1769` identity 观察点后。
-**依赖**：Unit 1（DD4 函数；Unit 2 复用同一函数但本单元不依赖 Unit 2 完成）。
+**依赖**：Unit 2（复用已落地的 DD4 函数与锁边界）。
 **完成条件**：首次 connect 取得 `botIdentity.name` 且 registry 无此 appId → 补登记成功；完全一致 → no-op；冲突 → 可诊断错误日志且不覆盖；登记失败（含锁超时、磁盘错误）不影响消息收发，connect 流程不因此失败。
 **最小测试**：服务函数单测（新增/ no-op/冲突/失败不抛）；fake-channel 集成测试断言 connect 后 Root Config 出现 entry、消息流正常。
 
@@ -201,16 +209,10 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 - [ ] 完成
 
 **目标**：DD9。
-**准确落点**：新增 `tools/check-privacy-denylist.mjs`；`package.json` `prepack` 串联；清理 Current Code Evidence 列出的全部命中（源码/测试已在 Unit 6 处理的部分除外）。
+**准确落点**：新增 `tools/check-privacy-denylist.mjs` 与真实 pack-and-verify runner；`package.json` 的 `prepack` 接 tree/dist 前置门禁、发布前 gate 接实际 pack-and-verify；`.github/workflows/ci.yml` 的 `package-smoke` 改为扫描实际产出的同一 `.tgz` 后再 clean-install；清理 Current Code Evidence 列出的全部命中（源码/测试已在 Unit 6 处理的部分除外）。
 **依赖**：Unit 6（源码/单测/集成测试清零之后）；tarball 扫描依赖 `pnpm build`。
-**完成条件**：tree 扫描 4 个 App ID + 2 个机器根路径全仓零命中（含 `docs/agent-context/**`，占位替换）；个人 Bot 名在功能上下文零命中、历史证据残留逐文件列入清理报告；`npm pack` tarball 解包扫描全 denylist 零命中且接入 `prepack` 硬失败；`git ls-remote` + 已 fetch 全部 branches/tags 记录 `665ad74`/`a0464f7` 当前可达范围，报告分别陈述「当前内容清理」与「历史 remediation」状态，不把前者表述成后者。
-**最小测试**：`tests/unit/tools/check-privacy-denylist.test.ts`（命中/豁免/占位/tarball 模式）；清理报告（markdown，随 PR 证据提交，`docs/agent-context/evidence/` 或 PR 附件）。
-
-### Gate G8 — Code Review Owner: Code Reviewer（Plan Writer actor 派生）
-
-- [ ] 通过
-
-实现增量（G0 merge commit 之后）的独立受限预算 Code Review：只审本 Plan 对应增量 diff + 最小上下文；复用各单元验证证据不重复执行；重点 Registry fail-closed 边界、锁连续性、自注册幂等、tokenizer 安全、bootstrap 副作用顺序、denylist 可信度。无 blocker/high 才 GO；finding 回 Implementer 做 Receiving 闭环。
+**完成条件**：tracked tree 扫描 4 个 App ID + 2 个机器根路径 + 4 个真实个人 Bot 名全仓零命中，覆盖源码、测试/fixture、README 与所有新旧 tracked docs，无历史文档豁免；dist 同样零命中；临时目录中实际 `npm pack` 产生的 tarball 解包扫描全 denylist 零命中，且同一已扫描 tarball 通过现有 package-smoke clean-install；`prepack` 不冒充 tarball 后验；发布前 gate 必须执行真实 pack-and-verify；`git ls-remote` + 已 fetch 全部 branches/tags 记录 `665ad74`/`a0464f7` 当前可达范围，报告分别陈述「当前内容清理」与「历史 remediation」状态，不把前者表述成后者。
+**最小测试**：`tests/unit/tools/check-privacy-denylist.test.ts`（tree/dist/tarball 命中、无路径豁免、虚构占位、缺少真实 denylist 输入 fail closed）；真实 pack-and-verify 的流程测试；清理报告（markdown，随 PR 证据提交，内容本身同样不得复写真实 denylist）。
 
 ### Unit 9 — 混合版本升级/回滚 runbook + 受控验收 Owner: Implementer
 
@@ -218,9 +220,17 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 
 **目标**：DD10。
 **准确落点**：`docs/` 下新增升级与回滚 runbook（归入实现文档目录约定）；受控进程验收脚本或手工记录。
-**依赖**：Gate G8。
+**依赖**：Units 1–7 全部完成。
 **完成条件**：runbook 覆盖 Spec Coordinated Upgrade Gate 全序列与 rollback 序列；受控验收证明：旧版 artifact 在运行中被全部停止前不写 `botRegistry`；升级后旧 PID/旧 artifact 不能再覆盖 Root Config（可用旧版二进制对备份配置实测其 save 丢字段行为并记录）；验收证据区分「新装」「升级」「回滚再升级」三路径。
 **最小测试**：迁移测试或受控进程验收记录（证据附 PR）。
+
+### Gate G8 — Final Code Review Owner: Code Reviewer（Plan Writer actor 派生）
+
+- [ ] 通过
+
+**依赖**：Unit 9。Unit 9 可能新增 tracked runbook、脚本或证据，必须先完成再进入本 Gate。
+
+对 G0 之后的**全部**本需求增量做最终独立受限预算 Code Review，覆盖实现、测试、README、新旧文档清理、runbook、工具脚本、CI/package-smoke 与发布前 gate；只审本 Plan 对应 diff + 必要最小上下文，复用验证证据不无意义重复执行。重点 Registry fail-closed 边界、单一锁拥有者与跨入口并发、自注册幂等、tokenizer 安全、bootstrap 副作用顺序、tracked tree 零豁免和真实 tarball gate。无 blocker/high 且 finding 完成 Receiving 才 GO；Implementer 只回传修复与证据，Coordinator 更新 G8 checkbox/status 并提交同步。
 
 ### Unit 10 — live acceptance + 全量验证 Owner: Implementer（live 由 Decision Owner 在场授权执行）
 
@@ -228,8 +238,8 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 
 **目标**：Spec Runtime Acceptance 全行。
 **步骤**：新装或按 Unit 9 runbook 升级的安装上：两 profile 首次取得身份后同 Root Config 出现两条 entry 且无 profile-local 副本；注册一个不在测试群的 Bridge Bot，仅凭名称完成邀请/discovery/原生派发/绑定；已注册 Bot 在群内时不重复邀请、直接用 live `open_id`；真实群验收记录命令文本、邀请前后 Bot 列表、解析出的 live `open_id`、两条派发结果、最终 `projectRoleAssignment`，证据区分「邀请成功」「派发成功」「绑定持久化成功」。
-**依赖**：Unit 9。
-**完成条件**：上述证据齐备；`pnpm ci:local` 通过；最终远端 commit CI 绿；对最终待发布 commit 重做 Unit 7 tarball + tree 扫描。
+**依赖**：Gate G8。
+**完成条件**：上述证据齐备；`pnpm ci:local` 通过；最终远端 commit CI 绿；对最终待发布 commit 重做 Unit 7 tree/dist + 实际 tarball 扫描。Unit 10 原则上只采集外部/未跟踪 live 证据；若为修复验收问题或沉淀证据产生任何 tracked 修改，必须回到 G8 对 G0 后最终全量 diff 重新 Review，通过后才能重新完成 Unit 10。
 
 ### Gate G11 — 远端历史 remediation（Decision Owner 单独授权，不属于本需求执行范围）
 
@@ -243,11 +253,11 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 
 | Spec 验收 | 覆盖 |
 | --- | --- |
-| 全仓 + `git log origin/main..HEAD -p` 无个人 Bot 名/App ID/本机路径；`defaultRegistry()` 不再返回个人条目 | Unit 6（删除）+ Unit 7（扫描 gate 与报告） |
+| 全部 tracked tree（源码/测试/fixture/README/新旧 docs）+ `git log origin/main..HEAD -p` 无真实个人 Bot 名/App ID/本机路径；无历史文档豁免；`defaultRegistry()` 不再返回个人条目 | Unit 6（删除）+ Unit 7（全树零命中 gate 与报告；Git 历史承担追溯） |
 | RootConfig 新建/读/归一化/保存/profile 往返 `botRegistry` 不丢，缺失稳定归一化为空 | Unit 1 |
 | 结构错误/entry 无效/冲突 fail closed，文件不被重写为空 | Unit 1 + Unit 4（CLI 修改路径） |
 | 删最后 profile 后 RootConfig/Registry 存在且可继续 CLI；新建 profile 保留旧 Registry；export 不携带 | Unit 2 + Unit 4 |
-| add/list/remove、自注册、冲突、并发锁、原子写入单测 | Unit 1/2/3/4 |
+| add/list/remove、自注册、冲突、跨 run/service/profile-create/zero-profile 入口并发锁、原子写入单测 | Unit 1/2/3/4 |
 | 配置与 CLI 输出无 App Secret 泄露 | Unit 1/4（输出合同）+ Unit 7（denylist 含 secret 形态检查时可扩展，本版 denylist 不含 secret 值） |
 | 混合版本迁移测试或受控进程验收 | Unit 9 |
 
@@ -269,8 +279,8 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 | 仅名称邀请不在群 Bot 完成邀请/discovery/派发/绑定 | Unit 10（live） |
 | 已在群不重复邀请，直接用 live `open_id` | Unit 10（live） |
 | 真实群验收完整证据链 | Unit 10 |
-| `pnpm ci:local` + 最终 commit CI | G0 起每单元 + Unit 10 终审 |
-| tarball/树 denylist 扫描 + 远端可达范围 + 两类状态分别报告 | Unit 7 + Unit 10 终审 |
+| `pnpm ci:local` + 最终 commit CI + G0 后全部 tracked 增量独立 Review | G0 起每单元 + Unit 9 + G8 + Unit 10；Unit 10 有 tracked 修改则重跑 G8 |
+| tracked tree/dist 零豁免扫描 + 实际 `npm pack` tarball 扫描 + 远端可达范围 + 两类状态分别报告 | Unit 7 + G8 + Unit 10 终审 |
 
 **Spec 行为合同（非验收段）兜底**：Target Configuration Contract → Unit 1；Registry Lifecycle（初始化/自注册/remove 保护/零 profile/export）→ Unit 1-4；Command Contract（canonical syntax/解析规则/Runtime Flow 9 步与 9 条规则）→ Unit 5/6；Migration & Release Hygiene → Unit 7/9 + G11；Security And Privacy → Unit 1/4/6/7。
 
@@ -280,8 +290,9 @@ schemaVersion 保持 2 只表示新版读旧配置兼容；旧版保存会丢 `b
 pnpm ci:local                                   # git diff --check && pnpm test && pnpm typecheck && pnpm build
 pnpm test:unit                                  # 单元层
 pnpm test:integration                           # 集成层
-node tools/check-privacy-denylist.mjs --tree    # Unit 7 新增：工作树扫描
-npm pack --dry-run && node tools/check-privacy-denylist.mjs --tarball <tgz>
+node tools/check-privacy-denylist.mjs --tree    # Unit 7 新增：受保护输入提供真实 denylist；工作树全量扫描
+node tools/check-privacy-denylist.mjs --dist    # 已生成 dist 扫描
+pnpm verify:package                             # Unit 7 新增：临时目录执行真实 npm pack，扫描实际 tgz；不得用 --dry-run
 git log origin/main..HEAD -p | grep -E '<denylist 模式>'   # 增量历史扫描（应为空）
 git ls-remote origin                            # 坏 commit 可达范围记录输入
 ```
@@ -294,8 +305,8 @@ git ls-remote origin                            # 坏 commit 可达范围记录�
 
 1. **内部字段名与持久化合同一致**（`name/aliases/appId`，DD1），消除 canonicalName/name 双命名；`src/project/*` 存量引用随 Unit 6 收敛。
 2. **pin-on-first-verify 系列作为死代码删除**（DD8）：调用方只传空 Map，`identity_changed` 不可达；Spec 明确 Registry 不持久化 `open_id`，每次 bootstrap 以 live 列表为准。
-3. **历史证据文档处置口径**（DD9）：App ID/机器路径全树清零（含 agent-context，占位替换）；个人 Bot 名仅在历史证据叙述中豁免并逐文件列入报告。请 Plan Reviewer 重点复核此口径与 Spec「全仓扫描」验收的一致性；若 Review 判定 bot 名也必须全树清零，Unit 7 扩大替换范围即可，不影响其它单元。
-4. **denylist 工具新建独立脚本**而非塞进 `check-npm-bundle.mjs`：两者职责不同（bundle 闭包 vs 隐私），`prepack` 串联。
+3. **current tracked tree 不保留历史文档豁免**（DD9）：真实个人 Bot 名、App ID 与机器路径在源码、测试、README 和全部新旧 tracked docs 中统一改为角色化/虚构占位并全树零命中；Git 历史承担追溯，G11 单独记录坏 commit 可达范围。
+4. **denylist 与打包生命周期分层**（DD9）：隐私扫描独立于 `check-npm-bundle.mjs`；真实 denylist 来自不进入 tracked tree 的受保护输入且缺失时 fail closed。`prepack` 只做 tree/dist 前置门禁；实际 tarball 必须由临时目录中的真实 pack-and-verify 后验扫描，并接入 package-smoke 与发布前 gate。
 5. **tokenizer 手写约 60 行纯函数**，不引入新依赖（引号语义简单且必须保证不展开）。
 6. **base-sync 采用 merge 而非 rebase**（保留分支已 push 历史；Implementer 若选 rebase 须在回传中说明并确认无人基于旧分支工作）。
 
@@ -305,4 +316,4 @@ git ls-remote origin                            # 坏 commit 可达范围记录�
 
 ## Plan Review Gate
 
-本 Plan 尚待 Coordinator（HistoryRedactedBot4）独立 Review。Plan Writer 未实现、未自审；Review 通过前不开始任何 Execution Unit（G0 除外与否由 Reviewer 决定）。
+本 Plan 已逐条 Receiving Coordinator 首轮 5 条 finding，尚待 Coordinator（HistoryRedactedBot4）独立复审。接替 Writer 未实现、未自审，也未作为 Reviewer；复审通过前不开始任何 Execution Unit（G0 是否可先行仍由 Reviewer 决定）。
