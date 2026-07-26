@@ -32,6 +32,7 @@ import {
 } from '../card/run-state';
 import { renderText } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
+import { ensureBotRegistrySelfRegistration } from '../config/bot-registry-service';
 import type { AppConfig } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -129,6 +130,7 @@ import { buildReactionTargetMessage } from './reaction/context-builder';
 import { decideStopAdded, executeStopAdded } from './reaction/stop-target';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
+import { readProjectRoleAssignment } from '../project/store';
 import {
   consumeCotEvents,
   CotClient,
@@ -1775,6 +1777,38 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       ...(identity.name ? { name: identity.name } : {}),
     });
   }
+  if (identity?.name && cfg.accounts.app.id) {
+    void ensureBotRegistrySelfRegistration({
+      configPath: controls.configPath,
+      name: identity.name,
+      appId: cfg.accounts.app.id,
+    }).then((outcome) => {
+      if (outcome.kind === 'created') {
+        log.info('bot-registry', 'self-registration-created', {
+          name: outcome.entry.name,
+          appId: outcome.entry.appId,
+        });
+      } else if (outcome.kind === 'conflict') {
+        log.warn('bot-registry', 'self-registration-conflict', {
+          appId: cfg.accounts.app.id,
+          message: outcome.message,
+        });
+      } else if (outcome.kind === 'failed') {
+        log.fail('bot-registry', outcome.error, {
+          step: 'self-registration',
+          appId: cfg.accounts.app.id,
+        });
+      }
+      // noop is intentionally silent.
+    }).catch((error) => {
+      // The service is non-throwing by contract; retain a final containment
+      // boundary so future implementation changes cannot affect the channel.
+      log.fail('bot-registry', error, {
+        step: 'self-registration-unhandled',
+        appId: cfg.accounts.app.id,
+      });
+    });
+  }
   log.info('ws', 'connected', {
     bot: identity?.name ?? 'unknown',
     openId: identity?.openId ?? '-',
@@ -2240,6 +2274,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const reactionContexts: unknown[] | undefined = isReactionBatch
     ? getReactionContexts(reactionTurnId ? [reactionTurnId] : [])
     : undefined;
+  // Project bootstrap binds one ordinary-group workspace. Topic sessions use
+  // `chatId:threadId` cwd scope, so a chat-level assignment must never be
+  // injected into them.
+  const projectRoleAssignment = deps.profileDir && mode !== 'topic'
+    ? await readProjectRoleAssignment(deps.profileDir, chatId).catch((err) => {
+        log.warn('project', 'read-role-assignment-failed', {
+          chatId,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        return undefined;
+      })
+    : undefined;
 
   const prompt = buildPrompt(
     batch,
@@ -2249,6 +2295,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     channel.botIdentity,
     extraInstructions,
     (reactionContexts && reactionContexts.length > 0) ? reactionContexts : undefined,
+    projectRoleAssignment,
   );
   log.info('prompt', 'built', {
     promptChars: prompt.length,
@@ -3755,6 +3802,7 @@ function buildPrompt(
   botIdentity?: { openId: string; name?: string },
   extraInstructions?: string[],
   reactionContexts?: unknown[],
+  projectRoleAssignment?: import('../project/store').ProjectRoleAssignment,
 ): string {
   const first = batch[0];
   if (!first) return '';
@@ -3793,6 +3841,7 @@ function buildPrompt(
       ...(senderType ? { senderType } : {}),
       ...(botIdentity?.openId ? { botOpenId: botIdentity.openId } : {}),
       ...(mentions.length > 0 ? { mentions } : {}),
+      ...(projectRoleAssignment ? { projectRoleAssignment } : {}),
       ...(first.threadId ? { threadId: first.threadId } : {}),
       messageIds: batch.map((m) => m.messageId),
       source: isReactionBatch ? 'reaction' : 'im',

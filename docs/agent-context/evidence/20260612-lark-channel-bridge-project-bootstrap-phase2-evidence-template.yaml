@@ -1,4 +1,4 @@
-workspace: /redacted/history/machine-1/lark-channel-bridge-fork
+workspace: /redacted/local-root/lark-channel-bridge-fork
 branch:
 commit:
 working_tree:
@@ -10,5 +10,5 @@ tests:
 diff_or_key_snippets:
 risks:
 followups:
-next_receiver: HistoryRedactedBot4
+next_receiver: Coordinator Bot
 

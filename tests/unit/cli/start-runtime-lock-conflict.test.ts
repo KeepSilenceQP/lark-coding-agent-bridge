@@ -59,6 +59,7 @@ describe('run runtime lock conflict handling', () => {
         mediaDir: '/tmp/lark-channel-home/profiles/codex/media',
         sessionsFile: '/tmp/lark-channel-home/profiles/codex/sessions.json',
         workspacesFile: '/tmp/lark-channel-home/profiles/codex/workspaces.json',
+        projectsFile: '/tmp/lark-channel-home/profiles/codex/projects.json',
         userRegistryFile: '/tmp/lark-channel-home/registry/processes.json',
         larkCliConfigDir: '/tmp/lark-channel-home/profiles/codex/lark-cli',
         larkCliSourceConfigFile: '/tmp/lark-channel-home/profiles/codex/lark-cli-source/config.json',

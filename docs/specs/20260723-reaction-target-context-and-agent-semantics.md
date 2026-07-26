@@ -100,7 +100,7 @@ Reaction 交给 Agent。
     "available": true,
     "messageId": "om_xxx",
     "senderId": "cli_xxx",
-    "senderName": "HistoryRedactedBot4",
+    "senderName": "Coordinator Bot",
     "createdAt": "2026-07-23T13:00:00.000Z",
     "rawContentType": "text",
     "content": "是否按这个方案继续执行？"

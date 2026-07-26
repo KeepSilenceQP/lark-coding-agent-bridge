@@ -109,9 +109,20 @@ describe('profile retention and export', () => {
     );
   });
 
-  it('archives the last active profile and clears root config so the name can be recreated', async () => {
+  it('archives the last profile while preserving the installation root for recreation', async () => {
     const root = await makeRoot();
     await writeProfiles(root, 'codex', ['codex']);
+    const beforeRemove = await readRoot(root);
+    beforeRemove.secrets = {
+      providers: {
+        rootEnv: { source: 'env', allowlist: ['ROOT_SECRET'] },
+      },
+      defaults: { env: 'rootEnv' },
+    };
+    beforeRemove.botRegistry = {
+      entries: [{ name: 'Original Bot', aliases: [], appId: 'cli_codex' }],
+    };
+    await writeJson(join(root, 'config.json'), beforeRemove);
     const codex = await writeVersionExecutable(root, 'codex-bin', 'codex 1.2.3');
     const oldCodexBin = process.env.LARK_CHANNEL_CODEX_BIN;
     process.env.LARK_CHANNEL_CODEX_BIN = codex;
@@ -119,7 +130,11 @@ describe('profile retention and export', () => {
     try {
       await runProfileRemove('codex', { rootDir: root });
 
-      await expect(stat(join(root, 'config.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      const zeroProfileRoot = await readRoot(root);
+      expect(zeroProfileRoot.activeProfile).toBe('');
+      expect(zeroProfileRoot.profiles).toEqual({});
+      expect(zeroProfileRoot.botRegistry).toEqual(beforeRemove.botRegistry);
+      expect(zeroProfileRoot.secrets).toEqual(beforeRemove.secrets);
       await expect(stat(join(root, 'active-profile'))).rejects.toMatchObject({ code: 'ENOENT' });
       await expect(stat(join(root, 'profiles', 'codex'))).rejects.toMatchObject({ code: 'ENOENT' });
       await runProfileCreate('codex', {
@@ -139,6 +154,14 @@ describe('profile retention and export', () => {
     const config = await readRoot(root);
     expect(config.activeProfile).toBe('codex');
     expect(config.profiles.codex?.agentKind).toBe('codex');
+    expect(config.botRegistry?.entries).toEqual([
+      { name: 'Original Bot', aliases: [], appId: 'cli_codex' },
+      { name: 'Recreated Bot', aliases: [], appId: 'cli_recreated' },
+    ]);
+    expect(config.secrets?.providers).toMatchObject({
+      rootEnv: { source: 'env', allowlist: ['ROOT_SECRET'] },
+      bridge: { source: 'exec' },
+    });
   });
 
   it('adds a suffix when archive names collide', async () => {
@@ -164,17 +187,27 @@ describe('profile retention and export', () => {
     await expect(stat(join(root, '.trash'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('exports profiles without secrets by default and requires --yes for secrets', async () => {
+  it('exports profiles without the installation bot registry in either secrets mode', async () => {
     const root = await makeRoot();
     await writeProfiles(root, 'claude', ['claude']);
+    const rootConfig = await readRoot(root);
+    rootConfig.botRegistry = {
+      entries: [{ name: 'Shared Bot', aliases: ['Shared'], appId: 'cli_shared' }],
+    };
+    await writeJson(join(root, 'config.json'), rootConfig);
     const lines: string[] = [];
     vi.spyOn(console, 'log').mockImplementation((line: string) => lines.push(line));
 
     await runProfileExport('claude', { rootDir: root });
-    const exported = JSON.parse(lines.join('\n')) as RootConfig;
+    const safeExport = JSON.parse(lines.pop() ?? '') as RootConfig;
+    await runProfileExport('claude', { rootDir: root, includeSecrets: true, yes: true });
+    const secretExport = JSON.parse(lines.pop() ?? '') as RootConfig;
 
-    expect(JSON.stringify(exported)).not.toContain('plain-secret');
-    expect(exported.profiles.claude?.accounts.app.secret).toBe('[REDACTED]');
+    expect(JSON.stringify(safeExport)).not.toContain('plain-secret');
+    expect(safeExport.profiles.claude?.accounts.app.secret).toBe('[REDACTED]');
+    expect(safeExport).not.toHaveProperty('botRegistry');
+    expect(secretExport.profiles.claude?.accounts.app.secret).toBe('plain-secret');
+    expect(secretExport).not.toHaveProperty('botRegistry');
     await expect(
       runProfileExport('claude', { rootDir: root, includeSecrets: true }),
     ).rejects.toThrow(/--yes/);

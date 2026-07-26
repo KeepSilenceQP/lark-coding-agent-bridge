@@ -1,4 +1,4 @@
-# HistoryRedactedBot4 Local Implementation Review
+# Coordinator Bot Local Implementation Review
 
 task_id: project-bootstrap-phase2-implementation-xiaoc
 phase: implementation_review
@@ -67,21 +67,21 @@ is: same-name zero or more-than-one matches must hard-fail as `blocked(ambiguous
 coordinatorOpenId: ctx.msg.senderId
 ```
 
-If Qin Peng triggers `@HistoryRedactedBot4 /project bootstrap ...`, `ctx.msg.senderId` is the human sender, not
-HistoryRedactedBot4's bot identity. Non-bridge packets would contain the wrong coordinator id.
+If Qin Peng triggers `@Coordinator Bot /project bootstrap ...`, `ctx.msg.senderId` is the human sender, not
+Coordinator Bot's bot identity. Non-bridge packets would contain the wrong coordinator id.
 
 ### B5. Devbox workspace alias mismatch remains unresolved
 
 Default registry uses:
 
 ```text
-/redacted/history/machine-2/lark-channel-bridge-fork
+/redacted/remote-root/lark-channel-bridge-fork
 ```
 
-云上HistoryRedactedBot1 reported the actual devbox repo is:
+Cloud Implementer Bot reported the actual devbox repo is:
 
 ```text
-/redacted/history/machine-2/lark-coding-agent-bridge
+/redacted/remote-root/lark-coding-agent-bridge
 ```
 
 The implementation needs an alias/config surface or a corrected default before devbox targets

@@ -116,6 +116,9 @@ describe('profile runtime resolver', () => {
     const saved = JSON.parse(savedText) as {
       activeProfile: string;
       profiles: Record<string, { accounts: { app: { id: string; secret: unknown } } }>;
+      botRegistry?: {
+        entries: Array<{ name: string; aliases: string[]; appId: string }>;
+      };
       secrets?: { providers?: Record<string, { command?: string }> };
     };
     const appPaths = resolveAppPaths({ rootDir: root, profile: 'claude' });
@@ -136,6 +139,9 @@ describe('profile runtime resolver', () => {
       provider: 'bridge',
       id: 'app-cli_existing',
     });
+    expect(saved.botRegistry?.entries).toEqual([
+      { name: 'Bridge Bot', aliases: [], appId: 'cli_existing' },
+    ]);
     expect(saved.secrets?.providers?.bridge?.command).toBe(expectedSecretsGetter(root));
     expect(savedText).not.toContain('manual-secret');
     expect(secret).toBe('manual-secret');
@@ -1056,6 +1062,7 @@ describe('profile runtime resolver', () => {
     const saved = JSON.parse(await readFile(join(root, 'config.json'), 'utf8')) as {
       activeProfile: string;
       profiles: Record<string, { agentKind: string; accounts: { app: { id: string } } }>;
+      botRegistry?: { entries: unknown[] };
     };
     const appPaths = resolveAppPaths({ rootDir: root, profile: 'claude-regression' });
     const secret = await getSecret(secretKeyForApp('cli_claude_regression'), appPaths);
@@ -1069,7 +1076,65 @@ describe('profile runtime resolver', () => {
     expect(saved.profiles['codex-dev']?.agentKind).toBe('codex');
     expect(saved.profiles['claude-regression']?.agentKind).toBe('claude');
     expect(saved.profiles['claude-regression']?.accounts.app.id).toBe('cli_claude_regression');
+    expect(saved.botRegistry).toEqual({ entries: [] });
     expect(secret).toBe('new-profile-secret');
+  });
+
+  it('bootstraps an inferred profile from an existing zero-profile root', async () => {
+    const root = await tmpRoot();
+    await writeProfileRoot(root, '', {}, {
+      botRegistry: {
+        entries: [{ name: 'Remote Bot', aliases: [], appId: 'cli_remote' }],
+      },
+    });
+
+    const runtime = await resolveProfileRuntime({
+      config: join(root, 'config.json'),
+      agent: 'claude',
+      allowBootstrap: true,
+      appId: 'cli_local',
+      appSecret: 'manual-secret',
+      tenant: 'feishu',
+    });
+
+    const saved = JSON.parse(await readFile(join(root, 'config.json'), 'utf8')) as {
+      activeProfile: string;
+      profiles: Record<string, unknown>;
+      botRegistry: { entries: Array<{ name: string; appId: string }> };
+    };
+    expect(runtime.profile).toBe('claude');
+    expect(saved.activeProfile).toBe('claude');
+    expect(Object.keys(saved.profiles)).toEqual(['claude']);
+    expect(saved.botRegistry.entries).toEqual([
+      { name: 'Remote Bot', aliases: [], appId: 'cli_remote' },
+      { name: 'Bridge Bot', aliases: [], appId: 'cli_local' },
+    ]);
+    await expect(readFile(join(root, 'active-profile'), 'utf8')).resolves.toBe('claude\n');
+  });
+
+  it('fails the locked commit on self-registration conflict without changing root bytes', async () => {
+    const root = await tmpRoot();
+    await writeProfileRoot(root, '', {}, {
+      botRegistry: {
+        entries: [{ name: 'Bridge Bot', aliases: [], appId: 'cli_existing' }],
+      },
+    });
+    const configPath = join(root, 'config.json');
+    const original = await readFile(configPath, 'utf8');
+
+    await expect(
+      resolveProfileRuntime({
+        config: configPath,
+        profile: 'new-profile',
+        agent: 'claude',
+        allowBootstrap: true,
+        appId: 'cli_different',
+        appSecret: 'manual-secret',
+        tenant: 'feishu',
+      }),
+    ).rejects.toThrow(/bot registry self-registration conflict/);
+
+    expect(await readFile(configPath, 'utf8')).toBe(original);
   });
 
   it('normalizes stored v2 profiles before exposing runtime config', async () => {

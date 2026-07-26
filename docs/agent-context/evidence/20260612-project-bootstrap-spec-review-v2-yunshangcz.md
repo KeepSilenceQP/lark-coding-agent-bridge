@@ -1,4 +1,4 @@
-# HistoryRedactedBot2 Spec Review V2
+# Planner Bot Spec Review V2
 
 task_id: project-bootstrap-phase2-spec-review-v2-yunshangcz
 phase: spec_review
@@ -32,9 +32,9 @@ Required rules:
 
 ## Delivery Correction Case
 
-HistoryRedactedBot2 reported that its previous message likely mentioned HistoryRedactedBot4 with HistoryRedactedBot4's Context Pack
-`open_id`, which is not valid from HistoryRedactedBot2's app perspective. It re-sent using HistoryRedactedBot2's own
-live view of HistoryRedactedBot4.
+Planner Bot reported that its previous message likely mentioned Coordinator Bot with Coordinator Bot's Context Pack
+`open_id`, which is not valid from Planner Bot's app perspective. It re-sent using Planner Bot's own
+live view of Coordinator Bot.
 
 This confirms the design rule: delivery mentions must use the sending app/profile's live
 identity resolution. Registry `open_id` values are metadata/cache only, not cross-app delivery
@@ -44,11 +44,11 @@ truth.
 
 Verified must be based on a structured receipt from the target bot:
 
-- target bot structurally mentions HistoryRedactedBot4;
+- target bot structurally mentions Coordinator Bot;
 - receipt includes matching `task_id`;
 - receipt includes fixed `status` / execution-result fields.
 
-HistoryRedactedBot4 must not infer verified by reading free-form chat history.
+Coordinator Bot must not infer verified by reading free-form chat history.
 
 ## Additional Tests
 

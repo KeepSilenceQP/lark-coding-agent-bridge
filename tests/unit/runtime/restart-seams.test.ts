@@ -212,6 +212,7 @@ describe('helperRestartAndWait — injected deps', () => {
       activeProfileFile: join(dir, 'active-profile'),
       sessionsFile: join(dir, 'sessions.json'),
       workspacesFile: join(dir, 'workspaces.json'),
+      projectsFile: join(dir, 'projects.json'),
       secretsFile: join(dir, 'secrets.enc'),
       keystoreSaltFile: join(dir, '.keystore.salt'),
       secretsGetterScript: join(dir, 'secrets-getter'),

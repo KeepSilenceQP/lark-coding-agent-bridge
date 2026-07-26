@@ -1,24 +1,24 @@
-# HistoryRedactedBot1 Phase 2 Spec Draft
+# Implementer Bot Phase 2 Spec Draft
 
 task_id: project-bootstrap-phase2-spec-xiaoc
 phase: spec_draft
 
 ## Summary
 
-HistoryRedactedBot1 submitted a Phase 2 implementation spec for `/project start` group collaboration startup.
+Implementer Bot submitted a Phase 2 implementation spec for `/project start` group collaboration startup.
 
 ## Proposed Syntax
 
 ```text
-@HistoryRedactedBot4 /project start /cd lark-channel-bridge-fork
-@HistoryRedactedBot4 /project start /cd /redacted/history/machine-1/lark-channel-bridge-fork
+@Coordinator Bot /project start /cd lark-channel-bridge-fork
+@Coordinator Bot /project start /cd /redacted/local-root/lark-channel-bridge-fork
 ```
 
 ## Proposed Flow
 
-1. HistoryRedactedBot4 self setup:
+1. Coordinator Bot self setup:
    - `/invite group`
-   - `/cd <HistoryRedactedBot4 local workspace>`
+   - `/cd <Coordinator Bot local workspace>`
 2. Query group bots:
    - `lark-cli im chat.members bots --params '{"chat_id":"<chatId>"}' --as user --format json`
 3. Match known bot registry.
@@ -37,7 +37,7 @@ HistoryRedactedBot1 submitted a Phase 2 implementation spec for `/project start`
 
 ## Important Review Point
 
-HistoryRedactedBot1's draft says:
+Implementer Bot's draft says:
 
 ```text
 src/commands/index.ts 无修改（/project start 语义不变，编排由 agent 完成）

@@ -15,6 +15,7 @@ export interface AppPaths {
   activeProfileFile: string;
   sessionsFile: string;
   workspacesFile: string;
+  projectsFile: string;
   secretsFile: string;
   keystoreSaltFile: string;
   secretsGetterScript: string;
@@ -49,6 +50,7 @@ export function resolveAppPaths(opts: ResolveAppPathsOptions = {}): AppPaths {
     activeProfileFile: join(rootDir, 'active-profile'),
     sessionsFile: join(profileDir, 'sessions.json'),
     workspacesFile: join(profileDir, 'workspaces.json'),
+    projectsFile: join(profileDir, 'projects.json'),
     secretsFile: join(profileDir, 'secrets.enc'),
     keystoreSaltFile: join(profileDir, '.keystore.salt'),
     secretsGetterScript: join(rootDir, 'secrets-getter'),

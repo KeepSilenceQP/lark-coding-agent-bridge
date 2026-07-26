@@ -5,7 +5,7 @@ Status: confirmed
 
 ## Background
 
-当前群消息路由只有两种行为：群里必须明确 @ 当前 bot，或把所有群消息都交给 agent。后者会让 bot 介入本来发给其他人或其他 bot 的消息，不能满足“HistoryRedactedBot4只承接秦鹏没有指定接收者的群消息”这一需求。
+当前群消息路由只有两种行为：群里必须明确 @ 当前 bot，或把所有群消息都交给 agent。后者会让 bot 介入本来发给其他人或其他 bot 的消息，不能满足“Coordinator Bot只承接秦鹏没有指定接收者的群消息”这一需求。
 
 本需求增加一个独立的 owner-default 路由语义：应用 owner 在群里发送消息时，如果没有结构化 @ 任何账号，则默认由当前 bot 回答；一旦存在任何 @，默认响应不生效。
 
@@ -46,7 +46,7 @@ Status: confirmed
 - `owner-default`：本需求新增行为；owner 无任何 @ 时默认响应，存在任何 @ 时不抢答。
 - `all-messages`：保留现有“不要求 @”能力，继续用于已有显式配置。
 
-旧配置必须无损映射到原有语义；不得因为升级自动启用 `owner-default`。HistoryRedactedBot4 的 Codex profile 在功能部署后单独切换到 `owner-default`。
+旧配置必须无损映射到原有语义；不得因为升级自动启用 `owner-default`。Coordinator Bot 的 Codex profile 在功能部署后单独切换到 `owner-default`。
 
 启用 `owner-default` 仍依赖飞书向应用投递非 @ 群消息的权限。复用现有 `im:message.group_msg` 检查和授权引导，不新增授权流程。
 

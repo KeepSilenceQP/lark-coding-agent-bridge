@@ -5,9 +5,9 @@ Status: Amendment Code Review GO; deployment and Unit 11 stop live authorized; l
 Spec authority: `docs/specs/20260723-reaction-target-context-and-agent-semantics.md` (commit `526cbcb`，confirmed；`stop_current_work` trigger-message amendment independent review PASS)
 Target branch: `fix/bugfix` (synced to `526cbcb`)
 Harness protocol: `feishu-group-project-flow-v2`
-Plan Writer: HistoryRedactedBot2 (only writes this Plan; no self-review, no implementation)
-Plan Reviewer: independent SubAgent（Amendment exact-range review）；HistoryRedactedBot4只评估和采纳 findings
-Implementer: HistoryRedactedBot1（Unit 1-10）→ HistoryRedactedBot4（B9 R6-R8 接管及后续闭环）
+Plan Writer: Planner Bot (only writes this Plan; no self-review, no implementation)
+Plan Reviewer: independent SubAgent（Amendment exact-range review）；Coordinator Bot只评估和采纳 findings
+Implementer: Implementer Bot（Unit 1-10）→ Coordinator Bot（B9 R6-R8 接管及后续闭环）
 
 > 本 Plan 不重写需求。所有行为契约、字段、验收以 Spec 为准；本文件只把 Spec 落到真实模块、依赖、顺序、Execution Units、完成条件与 gate。Spec 与当前代码冲突处单列在「Known Issues / Blockers」与「Resolved Decisions」，不静默裁定。
 
@@ -22,14 +22,14 @@ Implementer: HistoryRedactedBot1（Unit 1-10）→ HistoryRedactedBot4（B9 R6-R
 
 ## Review History
 
-- 2026-07-24 HistoryRedactedBot2：基于 `e7e178f` 全文读取 Spec + 全量源码勘察，产出本 Plan 草稿。Plan Writer 不自审。
-- 2026-07-24 HistoryRedactedBot4 复核 + HistoryRedactedBot2 修订（第 2 版）：DD17/B1 原结论「`/stop` 不取消 pending」误判——经 `src/bot/channel.ts:1304-1331` 复核，`intakeMessage` 对 `tryHandleCommand` 返回 `handled=true` 的命令统一 `pending.cancel(scope)`，`/stop` 已含取消 pending。stop 控制面改为复用现有 `/stop`「interrupt + pending.cancel」复合语义，不比 `/stop` 严格，无 `/stop` 对齐改动；B1 撤回。
-- 2026-07-24 HistoryRedactedBot4 Plan Review 结论 BLOCKED（6 项 finding 有效）+ HistoryRedactedBot2 修订（第 3 版，基于 Spec `d18322c`）：①`Get` 不新增为第 12 个预埋 alias，v1 仍 11 个，示例用 `JIAYI`，`Get` 走 unmapped 透传；②单数 `triggerReaction` 改为按 action time+到达顺序排列的 `triggerReactions[]`，保留 `effectiveReactionSet`，补"启动前快速新增两个不同 Reaction"与"同 buffer 一增一减且最终非空"测试；③stop added 顺序改为门禁+防重后先判 scope 完全无 work→回无任务，仅 scope 有 current work 时才做 target→current workChain 关联（历史/无关→fail closed）；④定义 canonical fingerprint 稳定字段/去重/确定性排序，跨页/返回顺序打乱不产生 revision；⑤补 context-builder→fetchQuotedContext→reaction_contexts 卡片/合并转发真实内容 wiring 测试；⑥workChainId 给出明确 TTL/容量/淘汰规则与边界测试。
-- 2026-07-24 HistoryRedactedBot4 Plan v3 复审：前 5 项 CLOSED；第 6 项 TTL/LRU 方向成立但 DD15 引入 1 个 BLOCKER（16/256 作总 Map 硬上限与 current 不淘汰、PendingQueue 无背压三者冲突；current outbound mapping 不能被 TTL 淘汰，否则长任务丢 stop 关联）。HistoryRedactedBot2 修订（第 4 版）：16/256 重定义为 historical cache 上限（非总 Map 硬上限），current chains 及其 outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，terminal 后才进入 30min historical retention 并按 LRU 裁剪；总边界表述为 current workload references + bounded historical cache；不引入 pending admission/drop/backpressure；Unit6 补 a/b/c 三测试。
-- 2026-07-24 HistoryRedactedBot4 Plan v4 复审：第 6 项 BLOCKER CLOSED；六项 finding 全部闭合，未发现新的阻塞或 Spec 缩减，Plan Review `GO`。
-- 2026-07-24 HistoryRedactedBot4接管 B9 R6-R8：R6 经独立 SubAgent Review 发现 5 项 lifecycle/invariant 问题并在 R7 闭合；R7 复审发现 rev1 已离队但尚未 reserve 时，rev2 replacement 未写 tombstone 的 BLOCKER；R8 `67b43d8` 补齐 exact old turn invalidation。独立 SubAgent 最终复审 `5c2682d..67b43d8` 结论 `GO`，确认 R7 的 5 项修复维持闭合，允许重新打包部署并继续 Unit 11；live 验收仍需单独完成。
+- 2026-07-24 Planner Bot：基于 `e7e178f` 全文读取 Spec + 全量源码勘察，产出本 Plan 草稿。Plan Writer 不自审。
+- 2026-07-24 Coordinator Bot 复核 + Planner Bot 修订（第 2 版）：DD17/B1 原结论「`/stop` 不取消 pending」误判——经 `src/bot/channel.ts:1304-1331` 复核，`intakeMessage` 对 `tryHandleCommand` 返回 `handled=true` 的命令统一 `pending.cancel(scope)`，`/stop` 已含取消 pending。stop 控制面改为复用现有 `/stop`「interrupt + pending.cancel」复合语义，不比 `/stop` 严格，无 `/stop` 对齐改动；B1 撤回。
+- 2026-07-24 Coordinator Bot Plan Review 结论 BLOCKED（6 项 finding 有效）+ Planner Bot 修订（第 3 版，基于 Spec `d18322c`）：①`Get` 不新增为第 12 个预埋 alias，v1 仍 11 个，示例用 `JIAYI`，`Get` 走 unmapped 透传；②单数 `triggerReaction` 改为按 action time+到达顺序排列的 `triggerReactions[]`，保留 `effectiveReactionSet`，补"启动前快速新增两个不同 Reaction"与"同 buffer 一增一减且最终非空"测试；③stop added 顺序改为门禁+防重后先判 scope 完全无 work→回无任务，仅 scope 有 current work 时才做 target→current workChain 关联（历史/无关→fail closed）；④定义 canonical fingerprint 稳定字段/去重/确定性排序，跨页/返回顺序打乱不产生 revision；⑤补 context-builder→fetchQuotedContext→reaction_contexts 卡片/合并转发真实内容 wiring 测试；⑥workChainId 给出明确 TTL/容量/淘汰规则与边界测试。
+- 2026-07-24 Coordinator Bot Plan v3 复审：前 5 项 CLOSED；第 6 项 TTL/LRU 方向成立但 DD15 引入 1 个 BLOCKER（16/256 作总 Map 硬上限与 current 不淘汰、PendingQueue 无背压三者冲突；current outbound mapping 不能被 TTL 淘汰，否则长任务丢 stop 关联）。Planner Bot 修订（第 4 版）：16/256 重定义为 historical cache 上限（非总 Map 硬上限），current chains 及其 outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，terminal 后才进入 30min historical retention 并按 LRU 裁剪；总边界表述为 current workload references + bounded historical cache；不引入 pending admission/drop/backpressure；Unit6 补 a/b/c 三测试。
+- 2026-07-24 Coordinator Bot Plan v4 复审：第 6 项 BLOCKER CLOSED；六项 finding 全部闭合，未发现新的阻塞或 Spec 缩减，Plan Review `GO`。
+- 2026-07-24 Coordinator Bot接管 B9 R6-R8：R6 经独立 SubAgent Review 发现 5 项 lifecycle/invariant 问题并在 R7 闭合；R7 复审发现 rev1 已离队但尚未 reserve 时，rev2 replacement 未写 tombstone 的 BLOCKER；R8 `67b43d8` 补齐 exact old turn invalidation。独立 SubAgent 最终复审 `5c2682d..67b43d8` 结论 `GO`，确认 R7 的 5 项修复维持闭合，允许重新打包部署并继续 Unit 11；live 验收仍需单独完成。
 - 2026-07-24 Unit 11 stop live 暴露产品约束：流式卡片在编辑过程中无法添加 Reaction，故“对正在更新的 Bot 卡片添加 stop Reaction”不能作为唯一实时停止入口；当前实现又在 stop 分支之前做 own-message 过滤，导致对触发任务的用户消息添加 `No` 被静默丢弃。
-- 2026-07-24 HistoryRedactedBot4修订 Spec 并完成三轮独立 SubAgent Review：R1 `76e6f02`、R2 `ab1fee0` BLOCKED；R3 `602bc7a` PASS/GO，最终确认提交 `526cbcb`。确认 user-trigger stop 的 eligibility-before-no-work、removed ledger bypass、PendingUnit 全部真实 trigger ID、current mapping TTL/LRU 保护、Reaction 无 @ 权限边界和负向验收；Plan、代码、部署与 live 均需重新过 gate。
+- 2026-07-24 Coordinator Bot修订 Spec 并完成三轮独立 SubAgent Review：R1 `76e6f02`、R2 `ab1fee0` BLOCKED；R3 `602bc7a` PASS/GO，最终确认提交 `526cbcb`。确认 user-trigger stop 的 eligibility-before-no-work、removed ledger bypass、PendingUnit 全部真实 trigger ID、current mapping TTL/LRU 保护、Reaction 无 @ 权限边界和负向验收；Plan、代码、部署与 live 均需重新过 gate。
 - 2026-07-24 Amendment Plan Review R1（`526cbcb..cf77468`）BLOCKED，5 项 finding 全部采纳：①普通 non-stop 必须 own-message-before-permission，stop 才走 user-target 权限/eligibility；②清除旧完成状态对 amendment 的误覆盖；③把过期 Current Evidence 明确标为 historical baseline；④trigger historical cap 独立于 outbound 256 预算；⑤补 unknown user target 在 no-work / another-current 两种状态下均静默的生产 seam。
 - 2026-07-24 Amendment Plan Review R2（`cf77468..9672b74`）GO：独立 SubAgent 确认上轮 5 项全部 CLOSED，Bot target 兼容、真实 inbound ID、synthetic 排除、current mapping 保护、removed ledger、Reaction 无 @ 权限及 live oracle 与 Spec `526cbcb` 一致；GO 仅放行 Unit 12 实现。
 - 2026-07-24 Amendment Code Review R1（`24b324b..eaa538b`）BLOCKED：独立 SubAgent 发现 queue→prompt-prep reservation 空窗、converted-topic scope 不一致、ordinary input 默认登记 Bot/synthetic trigger、removed 可重复借用旧 added 四项问题；全部采纳。
@@ -74,7 +74,7 @@ Amendment current live/source evidence（2026-07-24，`526cbcb`）：
 
 ### DD1 — Reaction 流水线归属与模块边界
 
-新增 `src/bot/reaction/` 子目录承载入站 Reaction 全流程，替换 `channel.ts:934-992` 的「合成文本入队」路径。`src/bot/reaction.ts`（出站 Typing）保持不动。建议模块（命名可由HistoryRedactedBot1 微调，职责不可省）：
+新增 `src/bot/reaction/` 子目录承载入站 Reaction 全流程，替换 `channel.ts:934-992` 的「合成文本入队」路径。`src/bot/reaction.ts`（出站 Typing）保持不动。建议模块（命名可由Implementer Bot 微调，职责不可省）：
 
 - `semantics.ts` — 预埋语义表（DD4）。
 - `ledger.ts` — 普通 Reaction 持久 ledger（DD6）。
@@ -251,16 +251,16 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 
 ## Execution Units
 
-> 顺序即建议实施顺序；每 Unit 先 RED 再实现。Owner 默认 HistoryRedactedBot1。`- [ ]` 为完成条件，全部勾选 + 通过对应测试方可视为完成。Unit 间依赖见各 Unit「Depends」。
+> 顺序即建议实施顺序；每 Unit 先 RED 再实现。Owner 默认 Implementer Bot。`- [ ]` 为完成条件，全部勾选 + 通过对应测试方可视为完成。Unit 间依赖见各 Unit「Depends」。
 
-### Unit 1 — 预埋语义表 + 未映射透传（RED 先行）  Owner: HistoryRedactedBot1
+### Unit 1 — 预埋语义表 + 未映射透传（RED 先行）  Owner: Implementer Bot
 
 - [x] `src/bot/reaction/semantics.ts`：版本化映射表，11 个 `emojiType` 精确映射（case-sensitive），`emojiMeaningSource` 区分 `predefined`/`unmapped`，未映射完整透传（保留 `emojiType` + 可用 glyph/label）。
 - [x] RED：`tests/unit/bot/reaction-semantics.test.ts` 断言 **严格 11 个**精确映射（case-sensitive）、`Get` **不在** v1 表且 `emojiMeaningSource='unmapped'` 完整透传（不得被提升为预埋 alias/不得新增为第 12 个）、未映射不丢弃、表 `schemaVersion` 存在。
 - Depends: 无。
 - Spec 覆盖：§Confirmed Predefined Semantics；Acceptance「真实 emojiType=Get 不在 v1 表(unmapped)」「未预埋但可理解」「未预埋且不透明」「OK/LGTM/Yes/CheckMark/JIAYI」「WHAT/THINKING」「DONE」「No/CrossMark/MinusOne」映射行。
 
-### Unit 2 — Self-operator guard + 权限/群响应门禁复用（RED 先行）  Owner: HistoryRedactedBot1
+### Unit 2 — Self-operator guard + 权限/群响应门禁复用（RED 先行）  Owner: Implementer Bot
 
 - [x] `pipeline.ts`：self-operator guard（`evt.operator.openId` vs `botIdentity.openId`/`cfg.accounts.app.id`/`evt.raw.operator_type==='app'`），先于一切副作用，静默丢弃。
 - [x] 复用 `canUseDm`/`canUseGroup`（operator openId）+ `decideGroupResponse({mentionedBot:false,mentionCount:0,mentionAll:false,...})`；失败静默拒绝；**不**复用 `shouldBypassDeniedChatForInviteGroup`。
@@ -268,7 +268,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: Unit 1（语义映射在 stop 路径前置，但 guard 本身不依赖；可并行起步）。
 - Spec 覆盖：§Permission Contract；Acceptance「operator 未通过 canUseDm/canUseGroup」「mention-only」「owner-default/allowlist/all-messages」「两名 operator 同语义」「Bot/app Typing self-operator」「未授权停止 Reaction」。
 
-### Unit 3 — Reaction ledger + buffer + 全分页 reconciliation + revision + 净零/重试/重启（RED 先行）  Owner: HistoryRedactedBot1
+### Unit 3 — Reaction ledger + buffer + 全分页 reconciliation + revision + 净零/重试/重启（RED 先行）  Owner: Implementer Bot
 
 - [x] `ledger.ts`：持久 ledger（`scope+operatorOpenId+targetMessageId` → record IDs/fingerprint/actionTime/consumed fingerprint），镜像 `prompt-binding-ledger.ts`（`writeFileAtomic`、RMW 队列、revision、`schemaVersion`、`profileDir`）。
 - [x] `buffer.ts`：同 key 事件短时 buffer（quiet window + 最大等待，按 action time 再按到达顺序）。
@@ -277,7 +277,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: Unit 1、Unit 2。
 - Spec 覆盖：§Agent Input Contract 2（buffer/list/ledger/revision/no-op/例外）；Acceptance「重复投递 no-op」「乱序到达」「快速 added→removed list 已回空」「重启后新事件」「list 落后」「缩权/读取失败」。
 
-### Unit 4 — 目标消息上下文 + `<reaction_contexts>` 注入 + `source='reaction'`（RED 先行）  Owner: HistoryRedactedBot1
+### Unit 4 — 目标消息上下文 + `<reaction_contexts>` 注入 + `source='reaction'`（RED 先行）  Owner: Implementer Bot
 
 - [x] `context-builder.ts`：用 `fetchQuotedContext` 复用规范化（文本/富文本/卡片/合并转发），两级失败处理（路由成功正文失败 → `available:false`+messageId；路由/sender 失败 → 丢弃）。
 - [x] `src/agent/prompt.ts`：`BridgePromptSource += 'reaction'`；`BuildAgentPromptInput += reactionContexts?`；新增 `promptSection('reaction_contexts', …)`（`safeJsonStringify`）；`bridge_context.source='reaction'`；`user_input` 保留简短兼容摘要但标注 reaction_contexts 为权威；目标消息不被 batch messageIds 去重。
@@ -285,7 +285,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: Unit 3。
 - Spec 覆盖：§Agent Input Contract 2（结构化上下文/安全序列化/不去重/available）；Acceptance「目标是交互卡片或合并转发」「路由成功正文失败 available=false」「无法取得路由/sender 丢弃」「目标正文含伪造标签」「approve_continue Reaction prompt 同时含 Reaction+完整目标消息」。
 
-### Unit 5 — 共享 `BRIDGE_SYSTEM_PROMPT` `## Reaction` 段 + 两路注入（RED 先行）  Owner: HistoryRedactedBot1
+### Unit 5 — 共享 `BRIDGE_SYSTEM_PROMPT` `## Reaction` 段 + 两路注入（RED 先行）  Owner: Implementer Bot
 
 - [x] `src/agent/bridge-system-prompt.ts`：加入 Spec「Bridge System Prompt Contract」`## Reaction` 段（9 条规则 + 预埋语义子节），行为语义不弱化。
 - [x] 通过 `composeBridgeSystemPrompt` 经 Claude（`claude/adapter.ts:72-84`）与 Codex（`codex/adapter.ts:205-218`）两路注入；两路共享同一常量。
@@ -293,7 +293,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: 无（可与 Unit 1-4 并行）。
 - Spec 覆盖：§Bridge System Prompt Contract；Acceptance「共享 Bridge System Prompt 构建」。
 
-### Unit 6 — `workChainId` 存储/继承/登记/生命周期 + fail-closed 关联（RED 先行）  Owner: HistoryRedactedBot1
+### Unit 6 — `workChainId` 存储/继承/登记/生命周期 + fail-closed 关联（RED 先行）  Owner: Implementer Bot
 
 - [x] `work-chain.ts`：分配/继承（回复或 Reaction 指向已关联 Bot 消息时继承）/outbound message ID 登记/terminal 生命周期；current vs historical；停止目标 message ID → current chain 映射；重启失效 fail closed；受限日志。
 - [x] pending unit / reservation / active run 携带 `workChainId`；outbound message ID 创建即登记。
@@ -301,7 +301,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: 无（可与前面并行；但 DD12/DD16 集成需它）。
 - Spec 覆盖：§Stop Reaction Control Contract（workChainId 关联）；Acceptance「目标确认消息被 Reaction 继续」「sibling queued unit」「重启后未知关联 fail closed」「当前 run 已产生 Bot 输出，停止 Reaction 指向该输出」。
 
-### Unit 7 — Reaction turn batch barrier + replyTo 目标 + 可见回复（RED 先行）  Owner: HistoryRedactedBot1
+### Unit 7 — Reaction turn batch barrier + replyTo 目标 + 可见回复（RED 先行）  Owner: Implementer Bot
 
 - [x] `PendingQueue` 扩展 barrier 条目（Reaction turn 独立 flush，不与普通消息合并，按到达顺序）；`pipeline` 产出 `ReactionTurn` 经此路径启动 run。
 - [x] Reaction turn outbound `sendOpts.replyTo = targetMessageId`（topic 模式 `replyInThread` 不变）；每个被消费最新状态一条可见回复引用自己目标；多目标分别回复；no-op 不回复。
@@ -309,7 +309,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: Unit 3、Unit 4、Unit 6。
 - Spec 覆盖：§5 Batching/路由/回复；Acceptance「单 Reaction 普通群/私聊/话题」「与普通文本同 debounce window」「多 Reaction 不同目标」「其他 Bot/用户消息 Reaction 不启动」「按目标拆分 reply target」。
 
-### Unit 8 — revision 失效/中断/替代 + superseded 流式回复 + terminal 后撤回（RED 先行）  Owner: HistoryRedactedBot1
+### Unit 8 — revision 失效/中断/替代 + superseded 流式回复 + terminal 后撤回（RED 先行）  Owner: Implementer Bot
 
 - [x] Reaction run 记录 `operatorOpenId+targetMessageId+reactionRevision`（`ActiveRuns` 之外加 per-run 元数据或扩展 `RunHandle`）；同 key 新授权变化 → revision++、`activeRuns.interrupt(scope)`、替代 turn（空集则不启动 Agent + Bridge 撤回回复）；不同 operator/target 不打断。
 - [x] `run-state.ts`：`Terminal += 'superseded'` + `markSuperseded`；渲染器输出「已被后续 Reaction 取代/已中断」、不显示成功终态；流式循环识别 superseded 停止写成功终态。
@@ -319,7 +319,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: Unit 3、Unit 6、Unit 7。
 - Spec 覆盖：§5 revision/superseded/terminal；Acceptance 对应行（queued/reserved/active 移除、terminal 后移除、旧 revision 未产生/已产生 reply、完成后移除最后一个、run 中新增/移除触发 Reaction、不同 operator/target 变化）。
 
-### Unit 9 — `stop_current_work` 独立控制面（added/removed 独立 ledger + interrupt + cancel pending + 可见回复）（RED 先行）  Owner: HistoryRedactedBot1
+### Unit 9 — `stop_current_work` 独立控制面（added/removed 独立 ledger + interrupt + cancel pending + 可见回复）（RED 先行）  Owner: Implementer Bot
 
 - [x] `control-ledger.ts`：stop added/removed 独立持久 ledger（同 DD6 模式），防重 fingerprint（稳定 ID 优先，否则规范化字段 + action time）。
 - [x] 原始 Bot-target added：self-operator+路由+own-message+Reaction 权限+语义+控制 ledger 防重后，scope 无 work → 无任务；有 work 再校验 current `workChainId`；关联通过 → `activeRuns.interrupt(scope)` + `pending.cancel(scope)` + interrupted 终态 + 可见回复。**Amendment 的 user-trigger target 不沿用此 no-work-first 顺序，必须由 Unit 12 eligibility-before-no-work 覆盖。**
@@ -328,7 +328,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: Unit 2、Unit 5、Unit 6、Unit 8。
 - Spec 覆盖：pre-amendment Bot-target Stop Contract baseline（未授权停止、Bot current/historical/unrelated、已产生 Bot 输出、目标确认消息继续、sibling queued、Bot 重启 fail closed、Bot no-work、移除不恢复与防重）；user-trigger amendment 全部由 Unit 12 覆盖。
 
-### Unit 10 — 接线：`channel.ts` reaction handler 委派 + 故障隔离  Owner: HistoryRedactedBot1
+### Unit 10 — 接线：`channel.ts` reaction handler 委派 + 故障隔离  Owner: Implementer Bot
 
 - [x] pre-amendment baseline：`channel.ts:934-992` 改为 `pipeline.handleReactionEvent(evt, deps)` 委派，移除合成 `NormalizedMessage` push；普通 non-stop 保留 self-message 路由前提与 `withTrace`。Unit 12 覆盖 stop 的受限 user-trigger 例外。
 - [x] 故障隔离：路由/list/ledger/规范化失败不崩 bridge 队列；受限日志（目标消息 ID、阶段、trace，不记凭据/无界原文）。
@@ -336,7 +336,7 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: Unit 1-9。
 - Spec 覆盖：pre-amendment ordinary/Bot-target §Compatibility, Failure And Rollback；Amendment target-class 路由由 Unit 12 覆盖。
 
-### Unit 12 — stop target 扩展到真实 inbound trigger（Amendment，RED 先行）  Owner: HistoryRedactedBot4
+### Unit 12 — stop target 扩展到真实 inbound trigger（Amendment，RED 先行）  Owner: Coordinator Bot
 
 - [x] `pipeline.ts` 重排为：self-operator → 安全路由/target sender 分类 → stop/non-stop 分类。non-stop 先 own-Bot-message gate，再调用 Reaction 无 @ 权限并进入普通流水线；stop 调用 Reaction 无 @ 权限后再做 added eligibility 或 removed ledger 匹配。禁止把 user-target stop 当普通 Reaction 送入 buffer/Agent。
 - [x] `WorkChainStore` 增加带 target class 的 trigger correlation（或等价的显式 API），并让 `resolveStopTarget` 区分：current trigger、retained historical trigger、unknown/expired/restart-lost user target、Bot outbound。不得把 unknown user target 降级为 Bot fail-closed。
@@ -361,9 +361,9 @@ Reaction run 已 terminal 后才移除 Reaction：永不重新唤起 Agent、不
 - Depends: Spec authority `526cbcb`、Amendment Plan Review Gate GO；复用 Unit 6/9 与 B9 R8 的 per-unit lease/lifecycle。
 - Spec 覆盖：§Permission Contract、§Stop Reaction Control Contract、§Compatibility、Acceptance 中所有 inbound-trigger/unknown-user/removed/TTL-LRU/permission/live 行。
 
-### Code Review Gate  Owner: HistoryRedactedBot4
+### Code Review Gate  Owner: Coordinator Bot
 
-- [x] HistoryRedactedBot4 对 Unit 1-10 实现 + 测试做 Code Review（Plan Writer HistoryRedactedBot2 不自审）。
+- [x] Coordinator Bot 对 Unit 1-10 实现 + 测试做 Code Review（Plan Writer Planner Bot 不自审）。
 - [x] DD17/B1 已澄清：当前 `/stop` 经 `intakeMessage`（`channel.ts:1304-1331`）已 `interrupt + pending.cancel`；stop 控制面复用该复合语义，不比 `/stop` 严格，无 `/stop` 对齐改动。
 - [x] 确认未静默缩减 Spec 验收；覆盖矩阵全绿。
 
@@ -374,7 +374,7 @@ in the unchecked RED items for Units 3/4/5/8/9/10: full mocked
 injection, streaming-path superseded, stop UI terminal convergence, and
 card/merged-forward reaction-context propagation.
 
-Progress update (2026-07-24): B9 R6-R8 was implemented by HistoryRedactedBot4 after takeover
+Progress update (2026-07-24): B9 R6-R8 was implemented by Coordinator Bot after takeover
 and reviewed by an independent SubAgent. R6 review found five lifecycle and
 invariant gaps; R7 closed them, and R8 closed the remaining pre-reservation
 replacement race. Final review of `5c2682d..67b43d8` is `GO`. Full automated
@@ -388,7 +388,7 @@ Amendment gate（Spec `526cbcb`）：
 - [x] 独立 SubAgent Code Review exact commit ranges，确认 permission/eligibility/ledger/trigger mapping/lifecycle/live oracle 无缩减。
 - [x] R1/R2 的 BLOCKER/HIGH 全部闭合，R3 `GO`；允许重新打包部署并继续 stop live。
 
-### Unit 11 — 自动化全量 + live-model 对照验收（两路）  Owner: HistoryRedactedBot4（接管闭环）
+### Unit 11 — 自动化全量 + live-model 对照验收（两路）  Owner: Coordinator Bot（接管闭环）
 
 - [x] pre-amendment 自动化：`526cbcb` 之前的 Spec Acceptance/Next Phase 场景在 Claude 与 Codex 两路通过结构/注入测试。
 - [x] amendment 自动化：Unit 12 的 user-trigger target、eligibility、permission、mapping lifecycle、removed ledger、startup-retry stop race 与负向场景全部通过（1322 pass / 33 skip / 0 fail）。
@@ -555,7 +555,7 @@ pnpm -s test
 # 按 Unit 11 oracle 执行并归档 prompt/systemPrompt 版本/工具调用/副作用/回复/飞书消息 ID
 ```
 
-> 实际脚本名以 `package.json` 既有 `typecheck`/`build`/`test` 为准；HistoryRedactedBot1 执行前先对齐脚本名，不得新增未约定的脚本。
+> 实际脚本名以 `package.json` 既有 `typecheck`/`build`/`test` 为准；Implementer Bot 执行前先对齐脚本名，不得新增未约定的脚本。
 
 ## Rollback
 
@@ -585,18 +585,18 @@ pnpm -s test
 - **B6（实现注意）**：`ActiveRuns` 仅按 scope 键，无 per-run (operator,target,revision,workChainId) 元数据；DD12/DD15 需在其外加 per-run 元数据注册或扩展 `RunHandle`，注意与现有 `interrupt`/`unregister` 生命周期一致。
 - **B7（实现注意，第 3 版；v4 + amendment 修订）**：DD15 的 `workChainId` 常量（`MAX_CHAINS_PER_SCOPE=16`、`MAX_OUTBOUND_MAP_PER_SCOPE=256`、`MAX_TRIGGER_MAP_PER_SCOPE=256`、`HISTORICAL_CHAIN_TTL_MS=1_800_000`）为 Plan 定义默认值，实现时可同量级调整。各 MAX 是独立 historical cache 上限，非总 Map 硬上限；trigger 不得挤占 outbound 256 兼容预算。current chains 及其 trigger/outbound mappings 在 queued/reserved/active 期间不参与 TTL/LRU，仅 terminal 后进入各自 historical retention 并按 LRU/TTL 裁剪；不引入 pending admission/drop/backpressure。
 - **B8（Unit 11 live blocker，已修复）**：普通 Reaction reconciliation 产生空 `effectiveReactionSet` 时，buffer flush 经 `decideReactionFlush` 走 `bridge-reply`(empty-set) 分支——Bridge 回复"已收到撤回"+interrupt(若有 active)+cancelPending+clearContext+deleteTurnMeta，**不 enqueue Agent**（channel.ts `executeReactionFlushDecision`）。terminal 后 removed 只由 Bridge 回复；in-flight/queued removal 经 `evictInFlightReactionEntry`(tri-state) 使旧 revision 失效；空集合不启动替代 turn；净零/重复投递遵守 DD7/DD14 防重。已由 B8 fix + 本轮 invariants 修复覆盖。
-- **B9（invariants 修复，HistoryRedactedBot2 Implementer，R4 — 待HistoryRedactedBot4 Review）**：R3 Review（8919bd2..738c6f5）BLOCKED 5 项（R3-F1..F5），R4 把 workChain/lifecycle token 从 messageId side-map 迁移到**真实 PendingUnit**：
+- **B9（invariants 修复，Planner Bot Implementer，R4 — 待Coordinator Bot Review）**：R3 Review（8919bd2..738c6f5）BLOCKED 5 项（R3-F1..F5），R4 把 workChain/lifecycle token 从 messageId side-map 迁移到**真实 PendingUnit**：
   - R3-F1（lease on PendingUnit，替代 side-map）：`PendingQueue` 重写——`PendingUnit` 携带 `WorkLease{workChainId,unitId}`；`leaseHooks{acquire,release}` 在 unit 创建时 acquire、cancel 时 release、onFlush 时 transfer 给 run。`push` 仅同 workChainId 合并（不同 chain 拆 unit），`pushBarrier` 带 lease。`intakeMessage` 普通 REPLY（有 replyTo）传 workChainId（enqueue acquire），top-level（无 replyTo）无 lease（按旧方式合并，run start 分配 B1）。`runAgentBatch` 从 `deps.lease` 取 workChainId/unitId（不再 acquire，不再 consumeOrdinaryTurnMeta）。解决 batch 2..N 条 meta 泄漏。
   - R3-F2（evict/empty-set 释放旧 unit）：`cancelMessage`/`cancel` 现经 leaseHooks release 被移除 unit 的 lease——evict 的 cancelMessage、empty-set 的 cancelPendingForTarget 自动释放 rev1 unit（不再裸 deleteReactionTurnMeta）。`executeReactionFlushDecision` empty-set / `evictInFlightReactionEntry` queued 路径覆盖。
   - R3-F3（命令路径 cancel 释放）：`pending.cancel(scope)` 释放所有 unit lease（queue 内置）；`intakeMessage` handled=true 的 `pending.cancel` 同样释放。stop Reaction 分支保留 releaseEnqueuedTurn 清 reaction meta/tracker。
   - R3-F4（startFlow throw 释放）：onFlush 的 `invokeFlush` catch 释放 lease；`runAgentBatch` `!flow.ok` 释放 `deps.lease` + 清 reaction meta/tracker。
   - R3-F5（测试+Plan）：B4 acquireUnit/releaseUnit per-unit sibling 测试 + hasActiveOrReserved + isLatest 已存。typecheck=0、reaction+runtime+executor 364/364。完整 lease-on-PendingUnit 端到端 production-seam 测试仍建议跟进。Plan B9 保持 OPEN。
-- **B9 R5（HistoryRedactedBot2 Implementer，待HistoryRedactedBot4 Review）**：R4 Review（738c6f5..041b300）BLOCKED 3 项，R5 修复：
+- **B9 R5（Planner Bot Implementer，待Coordinator Bot Review）**：R4 Review（738c6f5..041b300）BLOCKED 3 项，R5 修复：
   - B1（top-level 普通 unit 也带 lease，DD15）：`leaseHooks` 加 `allocate(scope, replyTo)`；`push(scope, msg, replyTo?)` 按 replyTo 合并（同 replyTo/top-level 合一 unit），新 unit 经 allocate 分配 chain+lease（per-unit 非 per-message）。`intakeMessage` 传 `emsg.replyToMessageId`（top-level 与 reply 都带 lease）。`runAgentBatch` 去 top-level B1 fallback（lease 覆盖）。
   - B2（async onFlush catch 释放 lease）：onFlush handler 的 catch 释放 `lease`（workChainStore.releaseUnit）+ `releaseEnqueuedTurn`（清 reaction meta/tracker），覆盖 chatMode resolve/startFlow/stream 异步 throw。
   - B3（命令 cancel / empty-set 清 reaction side-state）：`intakeMessage` handled cancel 对每个 dropped msg 调 `releaseEnqueuedTurn`；`executeReactionFlushDecision` empty-set 加 `unregisterTrackerForTarget` effect 清 tracker。统一 lease（queue）+ reaction side-state（releaseEnqueuedTurn）释放。
   - 死 side-map 清理：移除 `_ordinaryTurnMeta`/`setOrdinaryTurnMeta`/`consumeOrdinaryTurnMeta`；`releaseEnqueuedTurn` 简化为 reaction-only（ordinary lifecycle 完全在 PendingUnit lease）。typecheck=0、reaction+runtime+executor 364/364。
-- **B9 R6（HistoryRedactedBot4接管实现，待最终 Review/Unit 11）**：R5 Review 发现共享调用方与测试 gate 未闭合，R6 收敛为单一消息契约：
+- **B9 R6（Coordinator Bot接管实现，待最终 Review/Unit 11）**：R5 Review 发现共享调用方与测试 gate 未闭合，R6 收敛为单一消息契约：
   - `PendingQueue.push(scope, msg)` 直接读取 `msg.replyToMessageId`，不再要求调用方并行传递 target；top-level 同 debounce unit 共用新 chain，显式回复按实际 resolved `workChainId` 合并，同 chain 的不同 Bot outbound target 不再被误拆成串行 unit。
   - Card callback synthetic message 写入 `replyToMessageId=evt.messageId`，点击继续承载卡片的原 workChain，不再分配无关 top-level chain。
   - `releaseEnqueuedTurn` 与 `releaseFlushedTurnAfterError` 统一清理 context/meta/tracker/lease；命令取消、empty-set queued、chatMode/startFlow 前后异常均不会留下无界 context 或 stale tracker。
@@ -612,11 +612,11 @@ pnpm -s test
 
 ## Plan Review Gate  Owner: independent SubAgent Reviewer
 
-- [x] HistoryRedactedBot4 确认本 Plan 覆盖 Spec 全部必做单元（权限/self-operator 门禁、buffer/权威快照/ledger/revision、动态 Reaction 上下文、共享 System Prompt、可见回复、stop 控制面）。
-- [x] HistoryRedactedBot4 复审第 3 版 6 项 finding 是否逐项解决：①Get unmapped（v1 仍 11，示例 JIAYI）；②triggerReactions[] 有序+两场景测试；③stop added 顺序（无 work→无任务；有 current work→关联）；④canonical fingerprint 稳定字段/去重/确定性排序+跨页不产生 revision；⑤卡片/合并转发 wiring 测试；⑥workChainId TTL/容量/淘汰+边界测试。
+- [x] Coordinator Bot 确认本 Plan 覆盖 Spec 全部必做单元（权限/self-operator 门禁、buffer/权威快照/ledger/revision、动态 Reaction 上下文、共享 System Prompt、可见回复、stop 控制面）。
+- [x] Coordinator Bot 复审第 3 版 6 项 finding 是否逐项解决：①Get unmapped（v1 仍 11，示例 JIAYI）；②triggerReactions[] 有序+两场景测试；③stop added 顺序（无 work→无任务；有 current work→关联）；④canonical fingerprint 稳定字段/去重/确定性排序+跨页不产生 revision；⑤卡片/合并转发 wiring 测试；⑥workChainId TTL/容量/淘汰+边界测试。
 - [x] DD17/B1 已澄清：`/stop` 经 `intakeMessage`（`channel.ts:1304-1331`）已 `interrupt + pending.cancel`；stop 控制面复用该语义，不比 `/stop` 严格，无 `/stop` 对齐改动。
 - [x] 确认未静默缩减 Spec 验收，覆盖矩阵完整。
-- [x] GO 后交 HistoryRedactedBot1 实施；Plan Review 前不修改运行代码。
+- [x] GO 后交 Implementer Bot 实施；Plan Review 前不修改运行代码。
 
 Amendment Plan Review Gate（Spec `526cbcb`）：
 

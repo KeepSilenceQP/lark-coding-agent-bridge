@@ -1,8 +1,8 @@
 task_id: project-bootstrap-phase2-plan-yunshangxiaoc
 flow_level: heavy
 phase: plan_draft
-context_pack: /redacted/history/machine-1/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
-target_bot: 云上HistoryRedactedBot1
+context_pack: /redacted/local-root/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+target_bot: Cloud Implementer Bot
 target_open_id: ou_f017ffff038aa3c6a4e5beb711be495d
 role: implementation planner and devbox feasibility reviewer
 expected_action: Check devbox assumptions and propose a step-by-step implementation plan that can be executed after spec review.
@@ -14,8 +14,8 @@ input:
     - src/agent/bridge-system-prompt.ts
 output:
   required: Plan with ordered steps, devbox caveats, test strategy, and risks.
-next_receiver: HistoryRedactedBot4
-response_format: independent text/post + native mention @HistoryRedactedBot4
+next_receiver: Coordinator Bot
+response_format: independent text/post + native mention @Coordinator Bot
 stop_conditions:
   - missing repository
   - devbox unavailable

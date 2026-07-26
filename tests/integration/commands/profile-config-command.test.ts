@@ -12,7 +12,13 @@ import {
   type GroupResponseMode,
   type RootConfig,
 } from '../../../src/config/profile-schema';
-import { runtimeProfileConfig } from '../../../src/config/profile-store';
+import { upsertSelfRegistration } from '../../../src/config/bot-registry';
+import {
+  loadRootConfig,
+  runtimeProfileConfig,
+  saveRootConfig,
+  withConfigFileLock,
+} from '../../../src/config/profile-store';
 import {
   getGroupResponseMode,
   getMessageReplyMode,
@@ -300,7 +306,7 @@ describe('profile-aware account and config commands', () => {
             content,
             resources: [],
             mentions: opts.mentionedBot
-              ? [{ openId: 'ou-bot', name: 'HistoryRedactedBot1', isBot: true }]
+              ? [{ openId: 'ou-bot', name: 'Implementer Bot', isBot: true }]
               : [],
             mentionedBot: opts.mentionedBot ?? false,
           } as unknown as NormalizedMessage,
@@ -515,6 +521,51 @@ describe('profile-aware account and config commands', () => {
     await expect(
       listSecretIds(codexPaths),
     ).resolves.not.toContain(secretKeyForApp('cli_new'));
+  });
+
+  it('preserves a competing bot registration while /account commits the active profile', async () => {
+    vi.useFakeTimers();
+    const h = await createHarness();
+    const configPath = resolveAppPaths({ rootDir: h.rootDir }).configFile;
+    const appPaths = resolveAppPaths({ rootDir: h.rootDir, profile: 'claude' });
+
+    await withConfigFileLock(configPath, async () => {
+      await h.command('/account submit', {
+        app_id: 'cli_account_race',
+        app_secret: 'test-account-secret',
+        tenant: 'lark',
+      });
+      await vi.waitFor(async () => {
+        await expect(getSecret(secretKeyForApp('cli_account_race'), appPaths))
+          .resolves.toBe('test-account-secret');
+      });
+
+      const latest = await loadRootConfig(configPath);
+      if (!latest) throw new Error('test root config missing');
+      const registration = upsertSelfRegistration(latest.botRegistry ?? { entries: [] }, {
+        name: 'Account Registry Bot',
+        appId: 'cli_account_registry',
+      });
+      if (registration.kind === 'conflict') throw new Error(registration.message);
+      await saveRootConfig({ ...latest, botRegistry: registration.registry }, configPath);
+    });
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    const saved = await waitForRoot(h.rootDir, (candidate) =>
+      candidate.profiles.claude?.accounts.app.id === 'cli_account_race',
+    );
+    expect(saved.botRegistry?.entries).toContainEqual({
+      name: 'Account Registry Bot',
+      aliases: [],
+      appId: 'cli_account_registry',
+    });
+    expect(saved.profiles['codex-dev']).toBeDefined();
+    expect(saved.profiles.claude?.accounts.app.secret).toMatchObject({
+      source: 'exec',
+      provider: 'bridge',
+      id: secretKeyForApp('cli_account_race'),
+    });
+    await expect(loadRootConfig(configPath)).resolves.toMatchObject({ schemaVersion: 2 });
   });
 });
 

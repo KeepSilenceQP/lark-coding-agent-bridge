@@ -106,32 +106,31 @@ export async function runProfileCreate(
 ): Promise<void> {
   const rootDir = opts.rootDir ?? paths.rootDir;
   const configFile = resolveAppPaths({ rootDir }).configFile;
-  await withConfigFileLock(configFile, async () => {
-    const root = await loadRootConfig(configFile);
-    const existing = root?.profiles[name];
-    if (existing) {
-      const requested = agentKindFromString(opts.agent);
-      if (requested && existing.agentKind !== requested) {
-        throw new Error(
-          `profile ${name} already exists with agentKind ${existing.agentKind}, ` +
-            `but profile create requested --agent ${requested}. ` +
-            `Profile names are labels; use the existing ${existing.agentKind} profile, ` +
-            `choose another name, or remove profile ${name} before creating a ${requested} profile.`,
-        );
-      }
-      throw new Error(`profile already exists: ${name}`);
+  const root = await loadRootConfig(configFile);
+  const existing = root?.profiles[name];
+  if (existing) {
+    const requested = agentKindFromString(opts.agent);
+    if (requested && existing.agentKind !== requested) {
+      throw new Error(
+        `profile ${name} already exists with agentKind ${existing.agentKind}, ` +
+          `but profile create requested --agent ${requested}. ` +
+          `Profile names are labels; use the existing ${existing.agentKind} profile, ` +
+          `choose another name, or remove profile ${name} before creating a ${requested} profile.`,
+      );
     }
+    throw new Error(`profile already exists: ${name}`);
+  }
 
-    await resolveProfileRuntime({
-      config: configFile,
-      profile: name,
-      agent: opts.agent,
-      workspace: opts.workspace,
-      appId: opts.appId,
-      appSecret: opts.appSecret,
-      tenant: opts.tenant,
-      allowBootstrap: true,
-    });
+  await resolveProfileRuntime({
+    config: configFile,
+    profile: name,
+    agent: opts.agent,
+    workspace: opts.workspace,
+    appId: opts.appId,
+    appSecret: opts.appSecret,
+    tenant: opts.tenant,
+    allowBootstrap: true,
+    requireNewProfile: true,
   });
   console.log(`已创建 profile: ${name}`);
 }
@@ -187,7 +186,7 @@ export async function runProfileRemove(
       });
       try {
         if (Object.keys(result.root.profiles).length === 0) {
-          await rm(configFile, { force: true });
+          await saveRootConfig(result.root, configFile);
           await rm(resolveAppPaths({ rootDir }).activeProfileFile, { force: true });
         } else {
           await saveRootConfig(result.root, configFile);
@@ -258,7 +257,7 @@ export async function runProfileExport(
     delete profile.secrets;
     profile.accounts.app.secret = '[REDACTED]';
   }
-  const body = formatRootConfig(exported);
+  const body = formatProfileExport(exported);
 
   if (!opts.output) {
     console.log(body.trimEnd());
@@ -273,4 +272,10 @@ export async function runProfileExport(
 
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function formatProfileExport(root: RootConfig): string {
+  const serialized = JSON.parse(formatRootConfig(root)) as Record<string, unknown>;
+  delete serialized.botRegistry;
+  return `${JSON.stringify(serialized, null, 2)}\n`;
 }

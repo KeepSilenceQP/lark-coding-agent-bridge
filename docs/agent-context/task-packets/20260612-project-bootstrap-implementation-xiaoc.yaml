@@ -1,8 +1,8 @@
 task_id: project-bootstrap-phase2-implementation-xiaoc
 flow_level: heavy
 phase: implementing
-context_pack: /redacted/history/machine-1/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
-target_bot: HistoryRedactedBot1
+context_pack: /redacted/local-root/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+target_bot: Implementer Bot
 target_open_id: ou_324e9fce8ef80022821ca29ae594e45c
 role: implementer
 expected_action: Implement Phase 2 `/project bootstrap <workspace-slug>` after spec review GO-with-musts.
@@ -24,13 +24,13 @@ input:
     - Add canonical_name + aliases[] and NFC exact matching.
     - Add pin-on-first-verify and blocked(identity_changed).
     - Add blocked(ambiguous_name).
-    - Verified must require structured @ HistoryRedactedBot4 + matching task_id + fixed status fields.
+    - Verified must require structured @ Coordinator Bot + matching task_id + fixed status fields.
     - Non-bridge packet must be machine-readable and local-first.
     - Do not implement real chat member invite in Phase 2.
 output:
   required: Evidence package with changed files, tests run, known failures, risks, and whether code is committed.
-next_receiver: HistoryRedactedBot4
-response_format: independent text/post + native mention @HistoryRedactedBot4
+next_receiver: Coordinator Bot
+response_format: independent text/post + native mention @Coordinator Bot
 stop_conditions:
   - missing repository
   - missing permission or auth

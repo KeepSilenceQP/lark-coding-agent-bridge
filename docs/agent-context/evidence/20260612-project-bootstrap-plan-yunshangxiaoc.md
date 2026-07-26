@@ -1,4 +1,4 @@
-# 云上HistoryRedactedBot1 Implementation Plan And Devbox Feasibility
+# Cloud Implementer Bot Implementation Plan And Devbox Feasibility
 
 task_id: project-bootstrap-phase2-plan-yunshangxiaoc
 phase: plan_draft -> plan_delivered
@@ -7,7 +7,7 @@ result: FEASIBLE with prerequisite caveat
 
 ## Plan Summary
 
-云上HistoryRedactedBot1 proposes:
+Cloud Implementer Bot proposes:
 
 - Bot registry and live bot discovery.
 - Workspace path mapping.
@@ -17,33 +17,33 @@ result: FEASIBLE with prerequisite caveat
 
 ## Important Correction: open_id Scope
 
-云上HistoryRedactedBot1 reported that all Context Pack open_ids differ from its live API result. Local
-re-verification from HistoryRedactedBot4's current bridge-bound profile returned the same open_ids as the
+Cloud Implementer Bot reported that all Context Pack open_ids differ from its live API result. Local
+re-verification from Coordinator Bot's current bridge-bound profile returned the same open_ids as the
 Context Pack:
 
 ```text
 小A: ou_dc5994dda509f61e8e0a015a627e5530
-小HistoryRedactedBot4: ou_0e58ef3ecdf6401d66c34122bdd1711a
-HistoryRedactedBot4: ou_cc7a2bbc1be9e7f6054282ae918b9249
-HistoryRedactedBot1: ou_324e9fce8ef80022821ca29ae594e45c
-HistoryRedactedBot2: ou_a73add268438eb388b31e559a4fa846f
-云上HistoryRedactedBot1: ou_f017ffff038aa3c6a4e5beb711be495d
+Excluded Bot: ou_0e58ef3ecdf6401d66c34122bdd1711a
+Coordinator Bot: ou_cc7a2bbc1be9e7f6054282ae918b9249
+Implementer Bot: ou_324e9fce8ef80022821ca29ae594e45c
+Planner Bot: ou_a73add268438eb388b31e559a4fa846f
+Cloud Implementer Bot: ou_f017ffff038aa3c6a4e5beb711be495d
 ```
 
-Previous dispatched messages from HistoryRedactedBot4 also fetched back with sender `app` and structured
+Previous dispatched messages from Coordinator Bot also fetched back with sender `app` and structured
 mentions for each target.
 
 Conclusion: this is not a stale Context Pack by itself. Feishu open_ids are app/profile scoped.
-The bootstrap registry must be scoped to the dispatching profile/app. HistoryRedactedBot4 dispatch must use
-HistoryRedactedBot4's own live `chat.members bots` result, not another bot's app-scoped result.
+The bootstrap registry must be scoped to the dispatching profile/app. Coordinator Bot dispatch must use
+Coordinator Bot's own live `chat.members bots` result, not another bot's app-scoped result.
 
 ## Plan Items To Keep
 
 - Live discovery first; static registry only as fallback/config for role and workspace metadata.
 - User identity caveat for `chat.members bots` remains relevant.
 - Workspace aliasing is required because Mac and devbox repo names differ:
-  - macOS: `/redacted/history/machine-1/lark-channel-bridge-fork`
-  - devbox: `/redacted/history/machine-2/lark-coding-agent-bridge`
+  - macOS: `/redacted/local-root/lark-channel-bridge-fork`
+  - devbox: `/redacted/remote-root/lark-coding-agent-bridge`
 - Dispatch and checklist should remain mockable.
 
 ## Spec Corrections Needed

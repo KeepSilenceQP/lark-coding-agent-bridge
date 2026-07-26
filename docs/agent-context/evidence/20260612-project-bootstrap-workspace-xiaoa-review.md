@@ -21,8 +21,8 @@ recipient_identity:
 role: non-bridge workspace-context recipient/reviewer
 workspace:
   primary_workspace_kind: local
-  local_workspace: /redacted/history/machine-1/lark-channel-bridge-fork
-  devbox_workspace: /redacted/history/machine-2/lark-channel-bridge-fork
+  local_workspace: /redacted/local-root/lark-channel-bridge-fork
+  devbox_workspace: /redacted/remote-root/lark-channel-bridge-fork
   devbox_usage: reference_only / not_executable_for_xiaoa
 safety:
   must_not_run:
@@ -35,17 +35,17 @@ safety:
 
 ```text
 小A：请不要执行 /cd。你的项目工作区以本机路径为准：
-/redacted/history/machine-1/lark-channel-bridge-fork。
+/redacted/local-root/lark-channel-bridge-fork。
 读取/审查/生成文件均以该 local_workspace 为 primary；devbox path
 仅用于理解其他 bridge bot 的环境，不作为小A运行路径。
 ```
 
 ## Blockers / Spec Followups
 
-- Current PRD says 小A and 小HistoryRedactedBot4 use local workspace as primary, but does not yet define a
+- Current PRD says 小A and Excluded Bot use local workspace as primary, but does not yet define a
   machine-readable non-bridge bot packet schema.
 - Startup checklist must distinguish non-bridge verification from bridge cwd verification.
   For 小A, verified means local workspace exists and is readable, not cwd changed.
 - Add acceptance: 小A reply must include
-  `local_workspace=/redacted/history/machine-1/lark-channel-bridge-fork` and explicitly say it
+  `local_workspace=/redacted/local-root/lark-channel-bridge-fork` and explicitly say it
   will not execute `/cd`.

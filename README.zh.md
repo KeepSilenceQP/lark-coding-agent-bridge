@@ -16,7 +16,7 @@
 
 | 领域 | 本 Fork 新增的能力 | 解决的问题 |
 |---|---|---|
-| **多 Bot 项目启动** | `/botAdmin` 和 `/project bootstrap` 可以发现并邀请所需的 Bridge Bot、绑定项目工作目录，并在项目群中派发启动命令。 | 过去启动多 Bot 项目需要人工逐个拉 Bot、改权限、切目录和发命令，没有一个经过校验的统一入口。 |
+| **多 Bot 项目环境准备** | `/botAdmin` 和 `/project bootstrap` 通过显式 `--plan-writer` 与 `--implementer` 角色发现并邀请指定 Bridge Bot、准备工作目录并保存群级基础角色，但不会自动启动工作流。 | 过去准备多 Bot 项目需要人工逐个拉 Bot、改权限、切目录和记录角色，没有一个经过校验的统一入口。 |
 | **原生 Bot-to-Bot 交接** | `lark-channel-bridge at-bot` 会用当前群实时 Bot 列表校验目标，并以当前 profile 的 Bot 身份发送飞书原生结构化 mention。 | 纯文本 `@名字`、手拼 mention JSON、过期的 `open_id` 或选错回传对象，都可能让交接静默丢失，但 Agent 仍误以为已经通知成功。 |
 | **按群定制行为** | 支持按群加载 operator prompt，并提供 `mention-only`、`owner-default`、`all-messages`、按群 `owner-allowlist` 四种响应模式，不需要为了免 @ 而向所有群成员开放 Bot。 | 一套全局 Prompt 和全局 @ 策略无法满足不同项目群的角色分工；Bot 可能在 owner 希望它响应时保持沉默，或响应范围过大。 |
 | **结构化 Agent 上下文** | Bridge 会注入消息、发送者/Bot 身份、引用消息、交互卡片和回传路由信息，并在每次 Codex run 中用 developer instructions 传递 Bridge 规则。 | 把协议规则混在普通用户文本里更容易被忽略或误解，尤其是在引用回复、卡片、Bot 发送者和 Codex 恢复会话场景。 |
@@ -195,7 +195,7 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/remove user @某人`, `/remove admin @某人`, `/remove group` | 移除访问控制条目 |
 | `/remove owner-default group` | 从 owner 无 @ 响应名单中移除当前群 |
 | `/botAdmin add <Bot>`, `/botAdmin remove <Bot>`, `/botAdmin list` | 管理可以执行群运维命令的 Bot |
-| `/project bootstrap <workspace> <implementer>` | 发现/邀请项目 Bot、绑定工作目录并启动项目群协作 |
+| `/project bootstrap <workspace> --plan-writer <bot-name> --implementer <bot-name>` | 在普通群中准备 chat 级 workspace，并保存 Decision Owner、命令接收 Coordinator、显式指定的 Implementer 和 Plan Writer；两个角色 flag 顺序任意，Topic 群会被拒绝，也不会自动启动工作流 |
 | `/stop` | 停止当前 run，也可点卡片停止按钮 |
 | `/timeout [N\|off\|default]` | 设置或清除当前会话的 idle watchdog |
 | `/ps` | 列出本机 bridge 进程 |
@@ -272,6 +272,7 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 | `~/.lark-channel/profiles/<profile>/sessions.json` | 会话状态 |
 | `~/.lark-channel/profiles/<profile>/sessions.json.catalog.json` | agent-aware 会话索引 |
 | `~/.lark-channel/profiles/<profile>/workspaces.json` | 当前和命名工作空间绑定 |
+| `~/.lark-channel/profiles/<profile>/projects.json` | 按普通群保存的项目 workspace 与角色记录，并记录不完整准备后的注入禁用状态 |
 | `~/.lark-channel/profiles/<profile>/secrets.enc` | profile 本地加密 secret |
 | `~/.lark-channel/profiles/<profile>/lark-cli/` | 当前 profile 的 lark-cli 目录 |
 | `~/.lark-channel/profiles/<profile>/media/` | 附件缓存 |

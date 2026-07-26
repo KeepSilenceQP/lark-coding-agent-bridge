@@ -7,8 +7,8 @@ updated: 2026-06-12 16:49:05 +0800
 - name: lark-channel-bridge-fork
 - chat_id: oc_c1a30ba2d2692138047f5ea2b5bf8c92
 - flow_level: heavy
-- source_of_truth: /redacted/history/machine-1/lark-channel-bridge-fork
-- local_workspace: /redacted/history/machine-1/lark-channel-bridge-fork
+- source_of_truth: /redacted/local-root/lark-channel-bridge-fork
+- local_workspace: /redacted/local-root/lark-channel-bridge-fork
 - devbox_workspace: 
 
 ## PRD
@@ -22,19 +22,19 @@ current implementation. The current bridge code has:
 - `/project bootstrap <workspace> <targetBot>` for project-group
   implementation bootstrap.
 
-The agreed project-group bootstrap flow requires more: HistoryRedactedBot4 should coordinate a new project
+The agreed project-group bootstrap flow requires more: Coordinator Bot should coordinate a new project
 group, prepare context, discover bot identities, dispatch native-mention task packets, and
 bring participating bridge bots into the project workspace.
 
 ### Goals
 
-- Add a project bootstrap command so HistoryRedactedBot4 can dispatch bootstrap setup to HistoryRedactedBot2 and the
+- Add a project bootstrap command so Coordinator Bot can dispatch bootstrap setup to Planner Bot and the
   human-selected implementer from the human-provided workspace.
 - Keep `botAdmin` as a least-privilege operational role, not owner/admin equivalence.
 - For bridge bots in the group, send native-mention instructions to run:
   - `/cd <machine-specific-workspace>`
   - `/invite group`
-- Default R&D bootstrap targets are HistoryRedactedBot1, HistoryRedactedBot2, and 云上HistoryRedactedBot1; HistoryRedactedBot4 is the
+- Default R&D bootstrap targets are Implementer Bot, Planner Bot, and Cloud Implementer Bot; Coordinator Bot is the
   coordinator and is not dispatched to itself.
 - Keep non-bridge workspace-context support as an explicit custom-registry extension, not as
   part of the default R&D bootstrap list.
@@ -50,7 +50,7 @@ bring participating bridge bots into the project workspace.
 - Do not let bot admins modify human users/admins or botAdmins.
 - Do not pretend a bot was mentioned if the message lacks a structured mention.
 - Do not assume a bot can be contacted in a project group if it is not a group member.
-- Do not include 小A or 小HistoryRedactedBot4 in the default R&D bootstrap list.
+- Do not include 小A or Excluded Bot in the default R&D bootstrap list.
 - Do not rely on CardKit display mentions as bot-deliverable handoff.
 
 ### Constraints
@@ -58,12 +58,12 @@ bring participating bridge bots into the project workspace.
 - Feishu bots only receive group messages when structurally mentioned.
 - Bot-to-bot task dispatch must use bot identity (`lark-cli ... --as bot`).
 - Bot discovery must use current group bot membership, not text names or user search.
-- Receiving bridge bots must have HistoryRedactedBot4 in their own `botAdmins` list before they can accept
-  HistoryRedactedBot4-dispatched `/cd <workspace>` and `/invite group` commands. The permission direction is
-  "HistoryRedactedBot4 is botAdmin of the receiving bot", not "receiving bots are botAdmins of HistoryRedactedBot4".
+- Receiving bridge bots must have Coordinator Bot in their own `botAdmins` list before they can accept
+  Coordinator Bot-dispatched `/cd <workspace>` and `/invite group` commands. The permission direction is
+  "Coordinator Bot is botAdmin of the receiving bot", not "receiving bots are botAdmins of Coordinator Bot".
 - This botAdmin grant is a one-time receiving-profile setup, not a per-project or per-group
   step. Re-apply it only when adding a new receiving bot, changing/resetting its profile, or
-  when HistoryRedactedBot4's sending identity/open_id changes.
+  when Coordinator Bot's sending identity/open_id changes.
 - `/invite group` means "add current chat to the receiving bot's allowedChats"; it does not
   invite a bot into the chat.
 - Current group bot membership can be queried with:
@@ -73,40 +73,40 @@ bring participating bridge bots into the project workspace.
   and then re-discovered before any native mention dispatch. The invite input is app_id; native
   mentions still use the live `bot_id/open_id` returned by the second discovery.
 - Bootstrap workspace is human-provided and may be relative. Qin Peng guarantees the same
-  relative workspace exists in the relevant local/devbox runtimes; HistoryRedactedBot4 forwards it as the
+  relative workspace exists in the relevant local/devbox runtimes; Coordinator Bot forwards it as the
   workspace command argument without inferring implementation location.
 - Local workspace:
-  `/redacted/history/machine-1/lark-channel-bridge-fork`
+  `/redacted/local-root/lark-channel-bridge-fork`
 - Devbox workspace convention:
-  `/redacted/history/machine-2/lark-channel-bridge-fork`
+  `/redacted/remote-root/lark-channel-bridge-fork`
 
 ### Acceptance
 
 - PRD/spec/plan are reviewed before implementation.
-- `/project bootstrap <workspace> <HistoryRedactedBot1|云上HistoryRedactedBot1>` behavior is specified and tested.
+- `/project bootstrap <workspace> <Implementer Bot|Cloud Implementer Bot>` behavior is specified and tested.
 - Legacy `/project start <absolute-or-tilde-path>` behavior is removed.
 - Current group bot discovery is covered by tests or a seam that can be mocked.
 - Native mention dispatch uses bot identity and structured mentions.
 - Bridge bot startup dispatch sends machine-appropriate `/cd` and `/invite group` commands.
-- Default bootstrap does not invite or dispatch to 小A or 小HistoryRedactedBot4.
+- Default bootstrap does not invite or dispatch to 小A or Excluded Bot.
 - Startup receipt reports each target bot state and blocked reason.
 - Focused tests pass; known unrelated failures are called out separately.
 
 ## Roles
 
-- coordinator: HistoryRedactedBot4
-- prd_reviewers: HistoryRedactedBot2
-- spec_author: HistoryRedactedBot1
-- spec_reviewer: HistoryRedactedBot2
-- plan_author: 云上HistoryRedactedBot1
-- plan_reviewer: HistoryRedactedBot4
-- implementer: HistoryRedactedBot1
-- code_reviewer: HistoryRedactedBot2
+- coordinator: Coordinator Bot
+- prd_reviewers: Planner Bot
+- spec_author: Implementer Bot
+- spec_reviewer: Planner Bot
+- plan_author: Cloud Implementer Bot
+- plan_reviewer: Coordinator Bot
+- implementer: Implementer Bot
+- code_reviewer: Planner Bot
 
 ## Handoff
 
-- next_receiver: HistoryRedactedBot2, HistoryRedactedBot1, 云上HistoryRedactedBot1
-- required_native_mentions: HistoryRedactedBot4
+- next_receiver: Planner Bot, Implementer Bot, Cloud Implementer Bot
+- required_native_mentions: Coordinator Bot
 - response_format: independent text/post + native mention
 - evidence_package: docs/agent-context/evidence/20260612-lark-channel-bridge-project-bootstrap-phase2-evidence-template.yaml
 
@@ -120,30 +120,30 @@ bring participating bridge bots into the project workspace.
 
 | Bot | open_id | Role In This Flow |
 | --- | --- | --- |
-| HistoryRedactedBot4 | ou_cc7a2bbc1be9e7f6054282ae918b9249 | coordinator |
-| HistoryRedactedBot1 | ou_324e9fce8ef80022821ca29ae594e45c | spec author and implementer |
-| HistoryRedactedBot2 | ou_a73add268438eb388b31e559a4fa846f | PRD/spec/code reviewer |
-| 云上HistoryRedactedBot1 | ou_f017ffff038aa3c6a4e5beb711be495d | plan author/devbox feasibility |
+| Coordinator Bot | ou_cc7a2bbc1be9e7f6054282ae918b9249 | coordinator |
+| Implementer Bot | ou_324e9fce8ef80022821ca29ae594e45c | spec author and implementer |
+| Planner Bot | ou_a73add268438eb388b31e559a4fa846f | PRD/spec/code reviewer |
+| Cloud Implementer Bot | ou_f017ffff038aa3c6a4e5beb711be495d | plan author/devbox feasibility |
 
-Excluded from R&D bootstrap defaults: 小A, 小HistoryRedactedBot4.
+Excluded from R&D bootstrap defaults: 小A, Excluded Bot.
 
 ## Phase 2 Bootstrap Target Behavior
 
 When a human admin sends:
 
 ```text
-@HistoryRedactedBot4 /project bootstrap lark-channel-bridge-fork HistoryRedactedBot1
+@Coordinator Bot /project bootstrap lark-channel-bridge-fork Implementer Bot
 ```
 
-HistoryRedactedBot4 should:
+Coordinator Bot should:
 
 1. Parse the human-provided workspace and target implementer.
-2. Add the current group to HistoryRedactedBot4's own `allowedChats`.
+2. Add the current group to Coordinator Bot's own `allowedChats`.
 3. Discover group bot members with the current dispatching profile.
-4. For HistoryRedactedBot2 and the registered target implementer missing from the group, invite by app_id with
+4. For Planner Bot and the registered target implementer missing from the group, invite by app_id with
    `chat.members create`, then re-run bot discovery.
-5. Match HistoryRedactedBot2 and the target implementer from registry metadata.
-6. Dispatch bridge-bot setup messages to HistoryRedactedBot2 and the selected implementer:
+5. Match Planner Bot and the target implementer from registry metadata.
+6. Dispatch bridge-bot setup messages to Planner Bot and the selected implementer:
    - `/cd <human-provided-workspace>`
    - `/invite group`
    - task metadata containing `target_bot`
@@ -166,7 +166,7 @@ Required spec changes:
    registry must not be treated as globally valid open_id truth.
 4. Define status semantics:
    - `sent`: send API succeeded and fetched message has structured mention.
-   - `acknowledged`: target bot replies with structured @ HistoryRedactedBot4 and matching task id.
+   - `acknowledged`: target bot replies with structured @ Coordinator Bot and matching task id.
    - `verified`: target bot reports command/context application success.
    - `blocked`: discovery, dispatch, permission, path, or execution failed with explicit reason.
 5. Define receiver authorization failure as `blocked(denied)`.
@@ -175,11 +175,11 @@ Required spec changes:
 ## Registry And Open ID Scope
 
 Feishu `open_id` values are app/profile scoped. The same visible bot can have different
-`open_id` values when discovered from HistoryRedactedBot4, 云上HistoryRedactedBot1, or HistoryRedactedBot2 profiles.
+`open_id` values when discovered from Coordinator Bot, Cloud Implementer Bot, or Planner Bot profiles.
 
-Concrete observed case: HistoryRedactedBot2's first review reply used HistoryRedactedBot4's Context Pack `open_id`
-(`ou_cc7a...`), which is valid from HistoryRedactedBot4's app perspective but not from HistoryRedactedBot2's app
-perspective. HistoryRedactedBot2 had to re-send using its own live view of HistoryRedactedBot4's `open_id`. Therefore,
+Concrete observed case: Planner Bot's first review reply used Coordinator Bot's Context Pack `open_id`
+(`ou_cc7a...`), which is valid from Coordinator Bot's app perspective but not from Planner Bot's app
+perspective. Planner Bot had to re-send using its own live view of Coordinator Bot's `open_id`. Therefore,
 delivery mentions must always be constructed from the sending app/profile's live identity
 resolution. Registry `open_id` values, if present, are metadata/cache only and must not be
 treated as cross-app delivery truth.
@@ -209,6 +209,6 @@ use the following identity rules:
 - If a future name match resolves to a different `open_id` than the pinned binding, do not
   auto-rebind. Mark `blocked(identity_changed)` and require human-admin confirmation.
 - Zero matches or multiple matches are hard failures: `blocked(ambiguous_name)`.
-- Verified status must come from a structured target-bot receipt with native @ HistoryRedactedBot4, matching
-  `task_id`, and fixed status/execution fields. HistoryRedactedBot4 must not infer verified from free-form chat
+- Verified status must come from a structured target-bot receipt with native @ Coordinator Bot, matching
+  `task_id`, and fixed status/execution fields. Coordinator Bot must not infer verified from free-form chat
   history.

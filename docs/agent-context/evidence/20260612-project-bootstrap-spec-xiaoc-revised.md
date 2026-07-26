@@ -1,4 +1,4 @@
-# HistoryRedactedBot1 Phase 2 Revised Spec
+# Implementer Bot Phase 2 Revised Spec
 
 task_id:
   - project-bootstrap-phase2-spec-revision-xiaoc
@@ -10,7 +10,7 @@ source_message_ids:
 
 ## Result
 
-HistoryRedactedBot1 submitted a revised Phase 2 spec addressing D1-D4 and the open_id scope correction.
+Implementer Bot submitted a revised Phase 2 spec addressing D1-D4 and the open_id scope correction.
 
 ## D1 Command Surface
 
@@ -29,29 +29,29 @@ HistoryRedactedBot1 submitted a revised Phase 2 spec addressing D1-D4 and the op
 ## D3 Status Semantics
 
 - `sent`: send API returned `ok=true` and a non-empty message id.
-- `acknowledged`: target replies with structured @ HistoryRedactedBot4 and matching task id.
+- `acknowledged`: target replies with structured @ Coordinator Bot and matching task id.
 - `verified`: target replies with structured execution report.
 - `blocked`: explicit reason such as `bot_not_in_group`, `open_id_unknown`,
   `dispatch_failed`, `denied`, or `no_response`.
 
 ## D4 Receiver Authorization
 
-If a target bridge bot has not added HistoryRedactedBot4 as botAdmin, bootstrap must show
+If a target bridge bot has not added Coordinator Bot as botAdmin, bootstrap must show
 `blocked(denied)` in the receipt. Phase 2 assumes human pre-authorization rather than adding a
 direct cross-profile authorization API.
 
 ## Non-Bridge Workspace Packet
 
-HistoryRedactedBot1 incorporated 小A's schema requirements:
+Implementer Bot incorporated 小A's schema requirements:
 
 - `primary_workspace_kind: local`
-- `local_workspace: /redacted/history/machine-1/lark-channel-bridge-fork`
+- `local_workspace: /redacted/local-root/lark-channel-bridge-fork`
 - `devbox_usage: reference_only`
 - `must_not_run: ["/cd", "/invite group"]`
 
 ## Open ID Scope Revision
 
-HistoryRedactedBot1 accepted that Feishu open_ids are app/profile scoped.
+Implementer Bot accepted that Feishu open_ids are app/profile scoped.
 
 Revised registry design:
 

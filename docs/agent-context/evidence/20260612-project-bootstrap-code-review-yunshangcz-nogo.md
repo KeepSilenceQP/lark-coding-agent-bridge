@@ -1,4 +1,4 @@
-# HistoryRedactedBot2 Code Review
+# Planner Bot Code Review
 
 task_id: project-bootstrap-phase2-code-review-unblocked
 phase: code_review
@@ -7,7 +7,7 @@ result: NO-GO
 
 ## Scope Reviewed
 
-HistoryRedactedBot2 pulled `feat/project-bootstrap-phase2` and reviewed `2b01f88..6e7d1ba`, including
+Planner Bot pulled `feat/project-bootstrap-phase2` and reviewed `2b01f88..6e7d1ba`, including
 `77ffc94` implementation changes.
 
 ## Positive Finding
@@ -87,7 +87,7 @@ verified state progression.
 
 Required decision:
 
-- Implement minimal receipt ingestion: parse target bot structured @ HistoryRedactedBot4 receipt, match task id,
+- Implement minimal receipt ingestion: parse target bot structured @ Coordinator Bot receipt, match task id,
   advance state, and persist pin; or
 - explicitly re-scope Phase 2 to sent/blocked only.
 
@@ -107,7 +107,7 @@ Required:
 
 - Registry override is read via cast but schema does not declare it; confirm config normalization.
 - Alias duplicate handling may misclassify some ambiguity.
-- Registry contains HistoryRedactedBot4 itself, so self-dispatch risk exists; exclude coordinator/self.
+- Registry contains Coordinator Bot itself, so self-dispatch risk exists; exclude coordinator/self.
 - `bridge-system-prompt` additions are good.
 
 ## Required New Tests

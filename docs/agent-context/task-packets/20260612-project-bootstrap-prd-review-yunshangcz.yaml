@@ -1,8 +1,8 @@
 task_id: project-bootstrap-phase2-prd-review-yunshangcz
 flow_level: heavy
 phase: prd_review
-context_pack: /redacted/history/machine-1/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
-target_bot: HistoryRedactedBot2
+context_pack: /redacted/local-root/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+target_bot: Planner Bot
 target_open_id: ou_a73add268438eb388b31e559a4fa846f
 role: PRD and architecture reviewer
 expected_action: Review the PRD for scope, security, and missing acceptance criteria before implementation.
@@ -15,8 +15,8 @@ input:
     - src/agent/bridge-system-prompt.ts
 output:
   required: GO/NO-GO with blocking issues, recommended implementation boundaries, and required tests.
-next_receiver: HistoryRedactedBot4
-response_format: independent text/post + native mention @HistoryRedactedBot4
+next_receiver: Coordinator Bot
+response_format: independent text/post + native mention @Coordinator Bot
 stop_conditions:
   - missing repository
   - missing context

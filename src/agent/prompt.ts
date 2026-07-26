@@ -6,6 +6,19 @@ export interface BridgePromptMention {
   isBot?: boolean;
 }
 
+export interface BridgePromptProjectBot {
+  botId: string;
+  name: string;
+}
+
+export interface BridgePromptProjectRoleAssignment {
+  workspace: string;
+  decisionOwner: { openId: string; name?: string };
+  coordinator: BridgePromptProjectBot;
+  planWriter: BridgePromptProjectBot;
+  implementer: BridgePromptProjectBot;
+}
+
 export interface BridgePromptContext {
   chatId: string;
   chatType: string;
@@ -17,6 +30,8 @@ export interface BridgePromptContext {
   botOpenId?: string;
   /** Accounts @-mentioned in the triggering message(s), deduped across the batch. */
   mentions?: BridgePromptMention[];
+  /** Persisted project role binding produced by /project bootstrap for this group. */
+  projectRoleAssignment?: BridgePromptProjectRoleAssignment;
   threadId?: string;
   messageIds?: string[];
   source: BridgePromptSource;

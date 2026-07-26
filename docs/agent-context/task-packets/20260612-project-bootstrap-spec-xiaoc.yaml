@@ -1,8 +1,8 @@
 task_id: project-bootstrap-phase2-spec-xiaoc
 flow_level: heavy
 phase: spec_draft
-context_pack: /redacted/history/machine-1/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
-target_bot: HistoryRedactedBot1
+context_pack: /redacted/local-root/lark-channel-bridge-fork/docs/agent-context/20260612-lark-channel-bridge-project-bootstrap-phase2.md
+target_bot: Implementer Bot
 target_open_id: ou_324e9fce8ef80022821ca29ae594e45c
 role: spec author and likely implementer
 expected_action: Draft a concrete implementation spec for Phase 2 without coding yet.
@@ -16,8 +16,8 @@ input:
     - tests/integration/commands/commands-v1.test.ts
 output:
   required: Spec draft with proposed files to change, test list, risks, and open questions. Do not implement until review.
-next_receiver: HistoryRedactedBot4
-response_format: independent text/post + native mention @HistoryRedactedBot4
+next_receiver: Coordinator Bot
+response_format: independent text/post + native mention @Coordinator Bot
 stop_conditions:
   - missing repository
   - missing context
