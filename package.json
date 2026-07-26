@@ -46,6 +46,7 @@
     "ci:platform": "pnpm test && pnpm typecheck && pnpm build",
     "privacy:tree": "node tools/check-privacy-denylist.mjs --tree --root .",
     "privacy:dist": "node tools/check-privacy-denylist.mjs --dist --root .",
+    "verify:migration": "node tools/mixed-version-migration-acceptance.mjs",
     "prepack": "node tools/check-privacy-denylist.mjs --tree --root . && node tools/check-privacy-denylist.mjs --dist --root . && node tools/check-npm-bundle.mjs",
     "verify:package": "npm run build && node tools/pack-and-verify.mjs",
     "prepare": "npm run build",
