@@ -1,8 +1,13 @@
 import type { NormalizedMessage } from '@larksuite/channel';
-import { realpath } from 'node:fs/promises';
+import { realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
+import {
+  createRootConfig,
+  loadRootConfig,
+  saveRootConfig,
+} from '../../../src/config/profile-store.js';
 import type { Controls } from '../../../src/commands/index.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
@@ -81,6 +86,55 @@ describe('bot identity injection into the agent adapter', () => {
     await startTestBridge(h);
 
     expect(h.agent.botIdentity).toEqual({ openId: 'ou_bot', name: 'Bridge' });
+  });
+});
+
+describe('connected bot self-registration', () => {
+  it('persists the observed identity and keeps normal message flow available', async () => {
+    const h = await createHarness();
+    h.controls.configPath = join(h.tmp.root, 'config.json');
+    await saveRootConfig(
+      createRootConfig(h.controls.profile, h.profileConfig),
+      h.controls.configPath,
+    );
+
+    await startTestBridge(h);
+
+    await vi.waitFor(async () => {
+      const root = await loadRootConfig(h.controls.configPath);
+      expect(root?.botRegistry?.entries).toHaveLength(1);
+    });
+    expect((await loadRootConfig(h.controls.configPath))?.botRegistry).toEqual({
+      entries: [{ name: 'Bridge', aliases: [], appId: 'cli_test' }],
+    });
+
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_after_self_registration',
+        content: '@Bridge 继续处理',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+    expect(h.agent.runOptions).toHaveLength(1);
+  });
+
+  it('keeps connect and message handling available when the config lock path fails', async () => {
+    const h = await createHarness();
+    const blockingParent = join(h.tmp.root, 'not-a-directory');
+    await writeFile(blockingParent, 'blocks lock directory creation');
+    h.controls.configPath = join(blockingParent, 'config.json');
+
+    await startTestBridge(h);
+
+    expect(h.channel.connect).toHaveBeenCalledOnce();
+    await h.channel.handlers.message?.(
+      message({
+        messageId: 'om_after_registration_failure',
+        content: '@Bridge 连接仍然可用',
+      }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+    expect(h.agent.runOptions).toHaveLength(1);
   });
 });
 
@@ -527,7 +581,7 @@ function createFakeLarkChannel(): FakeLarkChannel & { handlers: MessageHandlerMa
     on(nextHandlers) {
       Object.assign(handlers, nextHandlers);
     },
-    async connect() {},
+    connect: vi.fn(async () => {}),
     async disconnect() {},
     async getChatMode() {
       return 'group';

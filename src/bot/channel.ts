@@ -32,6 +32,7 @@ import {
 } from '../card/run-state';
 import { renderText } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
+import { ensureBotRegistrySelfRegistration } from '../config/bot-registry-service';
 import type { AppConfig } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -1774,6 +1775,38 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     agent.setBotIdentity?.({
       openId: identity.openId,
       ...(identity.name ? { name: identity.name } : {}),
+    });
+  }
+  if (identity?.name && cfg.accounts.app.id) {
+    void ensureBotRegistrySelfRegistration({
+      configPath: controls.configPath,
+      name: identity.name,
+      appId: cfg.accounts.app.id,
+    }).then((outcome) => {
+      if (outcome.kind === 'created') {
+        log.info('bot-registry', 'self-registration-created', {
+          name: outcome.entry.name,
+          appId: outcome.entry.appId,
+        });
+      } else if (outcome.kind === 'conflict') {
+        log.warn('bot-registry', 'self-registration-conflict', {
+          appId: cfg.accounts.app.id,
+          message: outcome.message,
+        });
+      } else if (outcome.kind === 'failed') {
+        log.fail('bot-registry', outcome.error, {
+          step: 'self-registration',
+          appId: cfg.accounts.app.id,
+        });
+      }
+      // noop is intentionally silent.
+    }).catch((error) => {
+      // The service is non-throwing by contract; retain a final containment
+      // boundary so future implementation changes cannot affect the channel.
+      log.fail('bot-registry', error, {
+        step: 'self-registration-unhandled',
+        appId: cfg.accounts.app.id,
+      });
     });
   }
   log.info('ws', 'connected', {
