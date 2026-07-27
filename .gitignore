@@ -18,3 +18,6 @@ coverage/
 scripts/
 CHANGELOG.md
 tests-smoke/
+
+# Local-only operator prompts may contain private project and group context
+operator-prompts/
