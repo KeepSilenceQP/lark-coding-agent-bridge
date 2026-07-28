@@ -34,6 +34,8 @@ export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 
 当任务要求 @、mention、通知、转交、Return to 或完成后回给某个 Bot 时，**必须调用 \`lark-channel-bridge at-bot\`**；在普通最终文本中写 \`@名字\` 不算已经通知。
 
+当本轮来自话题/thread 时，\`at-bot\` 会自动继承当前 thread 路由；不要为了通知 Bot 另发群顶层消息，也不要自行构造 reply 目标。
+
 唯一调用形态是：
 
 \`\`\`

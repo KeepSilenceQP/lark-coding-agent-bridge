@@ -9,6 +9,8 @@
  */
 
 import { platform } from 'node:os';
+import { resolveAppPaths } from '../../config/app-paths';
+import { validateRouteLease } from '../../runtime/route-lease';
 import {
   runBoundedProcess,
   type BoundedProcessDeps,
@@ -45,6 +47,11 @@ interface LarkCliEnvelope {
     code?: number;
     message?: string;
   };
+}
+
+interface TopicReplyRoute {
+  replyTo: string;
+  threadId: string;
 }
 
 // ── lark-cli resolution ──
@@ -194,6 +201,35 @@ function validateArgs(opts: AtBotOptions): void {
   }
 }
 
+function positiveInt(value: string | undefined): number | undefined {
+  if (!value || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+async function resolveTopicReplyRoute(
+  chatId: string,
+  env: NodeJS.ProcessEnv,
+): Promise<TopicReplyRoute | undefined> {
+  const routeId = env.LARK_CHANNEL_ROUTE_ID?.trim();
+  const bridgePid = positiveInt(env.LARK_CHANNEL_BRIDGE_PID);
+  const profile = env.LARK_CHANNEL_PROFILE?.trim();
+  const rootDir = env.LARK_CHANNEL_HOME?.trim();
+  if (!routeId || !bridgePid || !profile || !rootDir) return undefined;
+
+  const appPaths = resolveAppPaths({ rootDir, profile });
+  const validation = await validateRouteLease(appPaths.profileDir, routeId, bridgePid);
+  if (!validation.ok) {
+    throw makeError('at-bot/context-unbound', formatError('at-bot/context-unbound'));
+  }
+  const lease = validation.lease;
+  if (lease.chatId !== chatId) {
+    throw makeError('at-bot/invalid-argument', formatError('at-bot/invalid-argument'));
+  }
+  if (!lease.threadId) return undefined;
+  return { replyTo: lease.replyTo, threadId: lease.threadId };
+}
+
 // ── discovery ──
 
 function validateBotItem(item: BotListItem): { bot_id: string; bot_name: string } {
@@ -300,16 +336,26 @@ async function sendMessage(
   chatId: string,
   postContent: object,
   env: NodeJS.ProcessEnv,
+  topicRoute?: TopicReplyRoute,
 ): Promise<string> {
   const contentStr = JSON.stringify(postContent);
+  const sendArgs = topicRoute
+    ? ['im', '+messages-reply',
+        '--message-id', topicRoute.replyTo,
+        '--reply-in-thread',
+        '--msg-type', 'post',
+        '--content', contentStr,
+        '--format', 'json',
+        '--as', 'bot']
+    : ['im', '+messages-send',
+        '--chat-id', chatId,
+        '--msg-type', 'post',
+        '--content', contentStr,
+        '--format', 'json',
+        '--as', 'bot'];
   const result = await runBoundedProcess(
     larkCliCommand(),
-    ['im', '+messages-send',
-      '--chat-id', chatId,
-      '--msg-type', 'post',
-      '--content', contentStr,
-      '--format', 'json',
-      '--as', 'bot'],
+    sendArgs,
     { timeoutMs: 20_000, maxOutputBytes: 1_048_576 },
   );
 
@@ -381,10 +427,15 @@ export async function runAtBot(opts: AtBotOptions): Promise<AtBotSuccess> {
   // 4. Build canonical post.
   const post = buildCanonicalPost(target, opts.message);
 
-  // 5. Send.
+  // 5. Preserve the current topic route when this Agent run originated in a
+  // thread. The opaque route lease is the authority; callers cannot choose an
+  // arbitrary reply target.
+  const topicRoute = await resolveTopicReplyRoute(opts.chatId, env);
+
+  // 6. Send.
   let messageId: string;
   try {
-    messageId = await sendMessage(opts.chatId, post, env);
+    messageId = await sendMessage(opts.chatId, post, env, topicRoute);
   } catch (err) {
     if ((err as AtBotError).code) throw err;
     const msg = String((err as Error).message ?? '');

@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const mockRunBounded = vi.hoisted(() => vi.fn());
 vi.mock('../../../src/cli/commands/at-bot-process', () => ({
@@ -11,9 +14,18 @@ vi.mock('node:os', async (importOriginal) => {
 });
 
 import { runAtBot } from '../../../src/cli/commands/at-bot';
+import { resolveAppPaths } from '../../../src/config/app-paths';
+import { createRouteLease } from '../../../src/runtime/route-lease';
 
 function withBridgeEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, LARK_CHANNEL: '1', LARK_CHANNEL_HOME: '/t', LARK_CHANNEL_PROFILE: 'p' };
+  return {
+    ...process.env,
+    LARK_CHANNEL: '1',
+    LARK_CHANNEL_HOME: '/t',
+    LARK_CHANNEL_PROFILE: 'p',
+    LARK_CHANNEL_BRIDGE_PID: undefined,
+    LARK_CHANNEL_ROUTE_ID: undefined,
+  };
 }
 
 const LISTED_BOT_ID = 'ou_target_bot';
@@ -125,6 +137,44 @@ describe('at-bot command', () => {
     expect(p.length).toBe(2);
     expect(p[0]).toEqual({ tag: 'at', user_id: LISTED_BOT_ID, user_name: LISTED_BOT_NAME });
     expect(p[1]).toEqual({ tag: 'text', text: ' hello' });
+  });
+
+  it('send: preserves the current topic via +messages-reply --reply-in-thread', async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), 'at-bot-topic-'));
+    try {
+      const profile = 'topic-profile';
+      const bridgePid = 4242;
+      const appPaths = resolveAppPaths({ rootDir, profile });
+      const lease = await createRouteLease(appPaths.profileDir, {
+        chatId: B.chatId,
+        threadId: 'omt_topic',
+        replyTo: 'om_trigger',
+        bridgePid,
+      });
+      expect(lease).not.toBeNull();
+
+      mockRunBounded.mockResolvedValueOnce(discRes());
+      mockRunBounded.mockResolvedValueOnce(sendRes());
+      await runAtBot({
+        ...B,
+        env: {
+          ...withBridgeEnv(),
+          LARK_CHANNEL_HOME: rootDir,
+          LARK_CHANNEL_PROFILE: profile,
+          LARK_CHANNEL_BRIDGE_PID: String(bridgePid),
+          LARK_CHANNEL_ROUTE_ID: lease!.routeId,
+        },
+      });
+
+      const sa = (mockRunBounded.mock.calls as Array<[string, string[]]>)[1]![1]!;
+      expect(sa).toContain('+messages-reply');
+      expect(sa).toContain('--reply-in-thread');
+      expect(sa).not.toContain('+messages-send');
+      expect(sa.slice(sa.indexOf('--message-id'), sa.indexOf('--message-id') + 2))
+        .toEqual(['--message-id', 'om_trigger']);
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
   });
 
   // ═══ canonical post special chars (7 variants) ═══
