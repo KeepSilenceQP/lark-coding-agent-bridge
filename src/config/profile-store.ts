@@ -66,6 +66,7 @@ type StoredProfileConfig = Pick<
   | 'codex'
   | 'attachments'
   | 'comments'
+  | 'meeting'
   | 'larkCli'
 >;
 
@@ -106,6 +107,7 @@ function serializeProfileConfig(profile: ProfileConfig): StoredProfileConfig {
     ...(profile.codex ? { codex: profile.codex } : {}),
     attachments: profile.attachments,
     comments: {},
+    meeting: profile.meeting,
     larkCli: profile.larkCli,
   };
 }

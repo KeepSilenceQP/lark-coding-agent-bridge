@@ -172,6 +172,8 @@ export async function savePreferencesConfig(
   groupResponseMode: GroupResponseMode,
   larkCliIdentity: ProfileConfig['larkCli']['identityPreset'],
   mode: ProfileMode,
+  /** In-meeting agent settings; omitted by callers that don't edit them. */
+  meeting?: ProfileConfig['meeting'],
 ): Promise<void> {
   const requireMentionInGroup = groupResponseMode !== 'all-messages';
   const larkCli = {
@@ -196,6 +198,7 @@ export async function savePreferencesConfig(
         groupResponseMode,
         requireMentionInGroup,
       };
+      if (meeting) state.profileConfig.meeting = meeting;
       await saveConfig(state.cfg, state.configPath);
       return;
     }
@@ -215,6 +218,7 @@ export async function savePreferencesConfig(
         groupResponseMode,
         requireMentionInGroup,
       },
+      ...(meeting ? { meeting } : {}),
       larkCli,
     };
     await saveRootConfig(root, state.configPath);
