@@ -547,11 +547,22 @@ async function fetchCommentContext(
   const targetIdx = parsed?.targetReplyId
     ? replies.findIndex((reply) => reply.reply_id === parsed.targetReplyId)
     : replies.length - 1;
+  const targetReply = targetIdx >= 0 ? replies[targetIdx] : replies.at(-1);
+  const isMentionOnly =
+    !parsed?.question &&
+    Boolean(targetReply?.content?.elements?.some((element) => element.type === 'person'));
   const priorReplies = (targetIdx > 0 ? replies.slice(0, targetIdx) : [])
     .map(replyElementsToText)
     .filter((text) => text.length > 0);
+  const question =
+    parsed?.question ||
+    (fetched && isMentionOnly
+      ? priorReplies.length > 0 || fetched.quote
+        ? '请结合这条评论 thread 里已有的讨论和上下文继续回应。'
+        : '（对方发来一条没有正文的评论回复——通常是只 @ 了你的唤醒（ping）。请简短回应。）'
+      : '');
   return {
-    question: parsed?.question ?? '',
+    question,
     quote: fetched?.quote,
     isWhole: Boolean(fetched?.isWhole),
     targetReplyId: parsed?.targetReplyId,

@@ -442,7 +442,7 @@ Each line carries `chatId` (group / DM id) and `senderId` (user `open_id`). Afte
 
 ## Cloud-doc comments
 
-Cloud-doc comments do not need a separate workspace binding or document allowlist. In supported document comments, mention the bot and the bridge replies in the same thread. Comment runs reuse the document session key and fall back to the user home directory when no document cwd was previously recorded.
+Cloud-doc comments do not need a separate workspace binding or document allowlist. In supported document comments, mention the bot and the bridge replies in the same thread. A mention-only reply wakes the bot and carries earlier replies in that comment thread as context; when there is no earlier discussion, it behaves as a simple ping. Comment runs reuse the document session key and fall back to the user home directory when no document cwd was previously recorded.
 
 ## FAQ
 

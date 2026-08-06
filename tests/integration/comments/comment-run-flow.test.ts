@@ -1,7 +1,7 @@
 import { mkdir, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { CommentEvent } from '@larksuite/channel';
+import type { CommentEvent, CommentReplyContentElement } from '@larksuite/channel';
 import type { AgentAdapter, AgentEvent, AgentRun, AgentRunOptions } from '../../../src/agent/types.js';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { handleCommentMention } from '../../../src/bot/comments.js';
@@ -88,6 +88,46 @@ describe('comment run flow', () => {
     expect(prompt).toContain('用户的问题：@bot 说说你的思考');
     const priorBlock = prompt.slice(prompt.indexOf('此前的讨论'), prompt.indexOf('用户的问题'));
     expect(priorBlock).not.toContain('说说你的思考');
+  });
+
+  it('uses prior comment discussion when the latest reply only mentions the bot', async () => {
+    const h = await createHarness({
+      commentReplies: [
+        { reply_id: 'reply-a', text: '云端大模型吐出来的是端上工具请求吗？' },
+        {
+          reply_id: 'reply-1',
+          elements: [{ type: 'person', person: { user_id: 'ou-bot' } }],
+        },
+      ],
+    });
+
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+
+    expect(h.agent.runOptions).toHaveLength(1);
+    const prompt = h.agent.runOptions[0]!.prompt;
+    expect(prompt).toContain('云端大模型吐出来的是端上工具请求吗？');
+    expect(prompt).toContain('继续回应');
+    expect(h.inThreadReplies).toEqual(['answer one']);
+  });
+
+  it('treats a mention-only comment without prior discussion as a wake-up ping', async () => {
+    const h = await createHarness({
+      commentReplies: [
+        {
+          reply_id: 'reply-1',
+          elements: [{ type: 'person', person: { user_id: 'ou-bot' } }],
+        },
+      ],
+    });
+
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+
+    expect(h.agent.runOptions).toHaveLength(1);
+    const prompt = h.agent.runOptions[0]!.prompt;
+    expect(prompt).toContain('唤醒');
+    expect(prompt).toContain('请简短回应');
+    expect(prompt).not.toContain('此前的讨论');
+    expect(h.inThreadReplies).toEqual(['answer one']);
   });
 
   it('shares Claude sessions across different comment threads in the same document', async () => {
@@ -332,7 +372,11 @@ async function createHarness(options: {
   reactionFails?: boolean;
   /** Full reply_list (chronological) returned by fileComment.get for comment-1.
    * Lets a test model a thread with replies preceding the @bot reply. */
-  commentReplies?: Array<{ reply_id: string; text: string }>;
+  commentReplies?: Array<{
+    reply_id: string;
+    text?: string;
+    elements?: CommentReplyContentElement[];
+  }>;
 } = {}): Promise<{
   tmp: TmpProfile;
   agent: FakeAgentAdapter;
@@ -400,7 +444,11 @@ async function createHarness(options: {
                   reply_list: {
                     replies: options.commentReplies.map((r) => ({
                       reply_id: r.reply_id,
-                      content: { elements: [{ type: 'text_run', text_run: { text: r.text } }] },
+                      content: {
+                        elements:
+                          r.elements ??
+                          [{ type: 'text_run', text_run: { text: r.text ?? '' } }],
+                      },
                     })),
                   },
                 },
