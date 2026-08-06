@@ -125,6 +125,55 @@ describe('comment run flow', () => {
     expect(h.agent.runOptions[2]?.threadId).toBe('thread-two');
   });
 
+  it('shares an activated Codex thread across document comments after restart', async () => {
+    const h = await createHarness({
+      agentKind: 'codex',
+      agentTexts: ['first answer', 'second answer'],
+      threadIds: ['thread-one', 'thread-two'],
+    });
+    await mkdir(join(h.tmp.profile, 'prompts', 'groups'), { recursive: true });
+    await writeFile(join(h.tmp.profile, 'prompts', 'groups', 'activation-chat.md'), 'activate');
+    const service = await PromptSessionService.open({
+      profileDir: h.tmp.profile,
+      profile: 'test',
+      sessionCatalog: h.sessionCatalog,
+      sessionStore: h.sessions,
+    });
+    await service.prepareSession({
+      identity: {
+        scopeId: 'activation-chat',
+        agentId: 'codex',
+        cwdRealpath: await realpath(h.tmp.workspace),
+        policyFingerprint: 'activation-policy',
+      },
+      origin: {
+        source: 'im',
+        scopeId: 'activation-chat',
+        chatId: 'activation-chat',
+        chatType: 'group',
+      },
+    });
+
+    const firstDeps = h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' }));
+    firstDeps.promptSessionService = service;
+    await handleCommentMention(firstDeps);
+
+    const restartedService = await PromptSessionService.open({
+      profileDir: h.tmp.profile,
+      profile: 'test',
+      sessionCatalog: h.sessionCatalog,
+      sessionStore: h.sessions,
+    });
+    const secondDeps = h.deps(event({ commentId: 'comment-2', replyId: 'reply-2' }));
+    secondDeps.promptSessionService = restartedService;
+    await handleCommentMention(secondDeps);
+
+    expect(h.agent.runOptions).toHaveLength(2);
+    expect(h.agent.runOptions[0]?.threadId).toBeUndefined();
+    expect(h.agent.runOptions[1]?.threadId).toBe('thread-one');
+    expect(h.inThreadReplies).toEqual(['first answer', 'second answer']);
+  });
+
   it('keeps Codex pre-tool progress text out of every comment reply', async () => {
     const h = await createHarness({
       agentKind: 'codex',

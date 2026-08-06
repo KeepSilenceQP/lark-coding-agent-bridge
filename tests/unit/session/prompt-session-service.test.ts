@@ -158,6 +158,92 @@ describe('PromptSessionService', () => {
     });
   });
 
+  it('treats comment thread ids as provenance while keeping the document origin strict', async () => {
+    const profileDir = await temporaryProfile();
+    await mkdir(join(profileDir, 'prompts', 'groups'), { recursive: true });
+    await writeFile(join(profileDir, 'prompts', 'groups', 'chat-1.md'), 'group role');
+    const service = await PromptSessionService.open({
+      profileDir,
+      profile: 'work',
+      sessionCatalog: new SessionCatalog(join(profileDir, 'sessions.json.catalog.json')),
+      sessionStore: new SessionStore(join(profileDir, 'sessions.json')),
+    });
+    await service.prepareSession({ identity: identity(), origin: groupOrigin() });
+    const commentIdentity = {
+      scopeId: 'doc:one',
+      agentId: 'codex' as const,
+      cwdRealpath: '/repo',
+      policyFingerprint: 'comment-policy',
+    };
+    const firstOrigin = {
+      source: 'comment' as const,
+      scopeId: 'doc:one',
+      documentId: 'comment-doc:one',
+      commentThreadId: 'comment:one',
+    };
+    const fresh = await service.prepareSession({ identity: commentIdentity, origin: firstOrigin });
+    if (fresh.kind !== 'fresh') throw new Error('expected fresh decision');
+    await service.recordIdentifier({
+      identity: commentIdentity,
+      origin: firstOrigin,
+      binding: fresh.binding,
+      generation: fresh.generation,
+      agentSessionId: 'thread-comment',
+    });
+
+    await expect(
+      service.prepareSession({
+        identity: commentIdentity,
+        origin: { ...firstOrigin, commentThreadId: 'comment:two' },
+        existingAgentSessionId: 'thread-comment',
+      }),
+    ).resolves.toMatchObject({
+      kind: 'resume',
+      agentSessionId: 'thread-comment',
+      binding: { kind: 'none' },
+    });
+    await expect(
+      service.prepareSession({
+        identity: commentIdentity,
+        origin: {
+          ...firstOrigin,
+          documentId: 'comment-doc:two',
+          commentThreadId: 'comment:two',
+        },
+        existingAgentSessionId: 'thread-comment',
+      }),
+    ).rejects.toThrow(/does not match the current identity and origin/i);
+  });
+
+  it('keeps activated IM origin matching exact', async () => {
+    const profileDir = await temporaryProfile();
+    await mkdir(join(profileDir, 'prompts', 'groups'), { recursive: true });
+    await writeFile(join(profileDir, 'prompts', 'groups', 'chat-1.md'), 'group role');
+    const service = await PromptSessionService.open({
+      profileDir,
+      profile: 'work',
+      sessionCatalog: new SessionCatalog(join(profileDir, 'sessions.json.catalog.json')),
+      sessionStore: new SessionStore(join(profileDir, 'sessions.json')),
+    });
+    const fresh = await service.prepareSession({ identity: identity(), origin: groupOrigin() });
+    if (fresh.kind !== 'fresh') throw new Error('expected fresh decision');
+    await service.recordIdentifier({
+      identity: identity(),
+      origin: groupOrigin(),
+      binding: fresh.binding,
+      generation: fresh.generation,
+      agentSessionId: 'thread-group',
+    });
+
+    await expect(
+      service.prepareSession({
+        identity: identity(),
+        origin: { ...groupOrigin(), chatId: 'chat-2' },
+        existingAgentSessionId: 'thread-group',
+      }),
+    ).rejects.toThrow(/does not match the current identity and origin/i);
+  });
+
   it('forces a fresh vendor session when an activated caller disallows concurrent resume', async () => {
     const profileDir = await temporaryProfile();
     await mkdir(join(profileDir, 'prompts', 'groups'), { recursive: true });

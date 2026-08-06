@@ -250,9 +250,11 @@ Each record contains:
 agent id and sessionId/threadId
 origin profile
 origin source (`im` or `comment`), scopeId, and source-specific identifiers
-(chatId/chatType/topic threadId for IM; document/comment thread scope for
-comments). Imported `legacy-none` may use `chatType: legacy-unknown` when old
-stores prove scope but not chat type.
+(chatId/chatType/topic threadId for IM; document identity plus the creating
+comment thread as provenance for comments). Comment Session continuity is
+document-scoped: a later sibling comment thread in the same document is the
+same logical origin, while a different document is not. Imported `legacy-none`
+may use `chatType: legacy-unknown` when old stores prove scope but not chat type.
 binding: none | legacy-none | pinned { sha256, byteCount }
 provenance: created | imported-active | adopted-legacy
 createdAt
@@ -466,8 +468,10 @@ eligible for Group Prompt content.
 - On an activated profile, every fresh comment Session records explicit `none`
   with `origin source: comment`, its document/comment scope, and the same
   authoritative commit/mirror sequence.
-- Comment automatic resume requires an exact comment-origin Sidecar record and
-  never consumes an IM group binding.
+- Comment automatic resume requires a matching document-scoped comment-origin
+  Sidecar record and never consumes an IM group binding. `commentThreadId`
+  remains immutable creation provenance and reply-routing context; it is not a
+  Session continuity boundary.
 - First-install migration imports active comment Catalog/legacy entries as
   `legacy-none` under their comment scopes.
 - Comment integration tests cover fresh, resume, restart, reset, mirror repair,

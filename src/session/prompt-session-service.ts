@@ -831,16 +831,24 @@ function isCompatibleRecordOrigin(
   current: PromptBindingOrigin,
 ): boolean {
   if (isDeepStrictEqual(record.origin, current)) return true;
-  if (record.binding.kind !== 'legacy-none' || record.provenance !== 'imported-active') {
+  if (record.origin.scopeId !== current.scopeId || record.origin.source !== current.source) {
     return false;
   }
-  if (record.origin.scopeId !== current.scopeId || record.origin.source !== current.source) {
+  if (record.origin.source === 'comment' && current.source === 'comment') {
+    // Comment sessions are document-scoped. The thread id records where a run
+    // originated, but sibling comment threads in that document share context.
+    if (record.binding.kind === 'legacy-none' && record.provenance === 'imported-active') {
+      return true;
+    }
+    return record.origin.documentId === current.documentId;
+  }
+  if (record.binding.kind !== 'legacy-none' || record.provenance !== 'imported-active') {
     return false;
   }
   if (record.origin.source === 'im' && current.source === 'im') {
     return record.origin.chatType === 'legacy-unknown';
   }
-  return record.origin.source === 'comment' && current.source === 'comment';
+  return false;
 }
 
 function mergeMigrationSources(

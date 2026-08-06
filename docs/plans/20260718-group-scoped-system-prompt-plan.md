@@ -386,6 +386,9 @@ RED:
   document/comment scope, and exact policy identity.
 - Activated comment resume, restart, reset, migration, mirror repair, and
   concurrent comment runs use the authoritative Sidecar.
+- After one activated comment run commits its identifier, a later sibling
+  comment thread in the same document resumes that document Session; a comment
+  from a different document does not.
 - No comment adapter invocation ever receives a group addendum.
 - The sessionless `/doctor` echo receives no group addendum, creates no Sidecar
   record, and can run without being misclassified as a dormant resumable run.
@@ -395,6 +398,9 @@ GREEN:
 - Route comment Session identity resolution and event recording through the
   shared service while retaining the current comment execution scope and
   document Session scope distinctions.
+- Match created comment origins by source, document Session scope, and document
+  identity. Preserve `commentThreadId` as provenance instead of treating it as
+  a Session continuity boundary; keep IM origin matching exact.
 - Preserve existing comment timeout and parallel-run behavior.
 
 Focused proof:
@@ -578,6 +584,15 @@ no live `<profileDir>/prompts/groups/<chatId>.md` file was created. Content
 activation, group behavior canary, version-edit `/new`, and post-restart
 runtime acceptance remain deliberately NOT_RUN until that deployment input is
 approved.
+
+Follow-up on 2026-08-06 found that the original implementation compared the
+entire created comment origin, which incorrectly made the first comment thread
+the continuity boundary for an otherwise document-scoped Session. The focused
+`group-prompt-comment-session.test.ts` named above was not present, and the
+existing activated concurrency test did not cover a completed first comment
+followed by a sibling thread. The roll-forward correction keeps Sidecar
+authority and explicit `none` bindings, matches created comment origins at the
+document level, and adds sequential cross-thread and boundary regression tests.
 
 ## Completion Criteria
 
