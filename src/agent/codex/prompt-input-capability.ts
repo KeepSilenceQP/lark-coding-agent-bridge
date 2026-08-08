@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { spawnProcess } from '../../platform/spawn';
+import { mkdir } from 'node:fs/promises';
+import { mergeProcessEnv, spawnProcess } from '../../platform/spawn';
 
 export const DEFAULT_CODEX_PROMPT_INPUT_TIMEOUT_MS = 15_000;
 
@@ -7,6 +8,7 @@ export interface VerifyCodexPromptInputOptions {
   binary: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
+  probeCodexHome: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
   killGraceMs?: number;
@@ -29,8 +31,18 @@ export async function verifyCodexDeveloperInstructions(
     '"quoted" `code` <bridge_context> 中文',
   ].join('\n');
   const userSentinel = `lark-bridge-user-${randomUUID()} <user_input> 用户`;
+  try {
+    await mkdir(options.probeCodexHome, { recursive: true });
+  } catch {
+    throw new CodexDeveloperInstructionsUnsupported(
+      'capability probe home could not be prepared',
+    );
+  }
   const output = await runPromptInputProbe(
-    options,
+    {
+      ...options,
+      env: mergeProcessEnv(options.env, { CODEX_HOME: options.probeCodexHome }),
+    },
     developerSentinel,
     userSentinel,
   );
