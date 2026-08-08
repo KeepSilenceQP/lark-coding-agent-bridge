@@ -56,7 +56,12 @@ describe('CodexAdapter prepareRun', () => {
       'codex 1.2.3',
       recordPath,
     );
-    const adapter = new CodexAdapter({ binary, profileStateDir: dir });
+    const configuredCodexHome = join(dir, 'configured-codex-home');
+    const adapter = new CodexAdapter({
+      binary,
+      profileStateDir: dir,
+      codexHome: configuredCodexHome,
+    });
 
     await adapter.prepareRun({
       runId: 'run-first-probe',
@@ -67,10 +72,15 @@ describe('CodexAdapter prepareRun', () => {
     const invocations = (await readFile(recordPath, 'utf8'))
       .trim()
       .split('\n')
-      .map((line) => JSON.parse(line) as { args: string[] });
-    expect(invocations.some(({ args }) => args[0] === 'debug' && args[1] === 'prompt-input')).toBe(
-      true,
+      .map(
+        (line) =>
+          JSON.parse(line) as { args: string[]; env: { CODEX_HOME?: string } },
+      );
+    const probe = invocations.find(
+      ({ args }) => args[0] === 'debug' && args[1] === 'prompt-input',
     );
+    expect(probe?.env.CODEX_HOME).toBe(join(dir, 'codex-prompt-probe-home'));
+    expect(probe?.env.CODEX_HOME).not.toBe(configuredCodexHome);
   });
 
   it('shares one successful capability probe for concurrent and sequential runs in the same context', async () => {

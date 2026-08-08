@@ -150,6 +150,7 @@ export class CodexAdapter implements AgentAdapter {
         binary: this.binary,
         cwd,
         env,
+        probeCodexHome: join(this.profileStateDir, 'codex-prompt-probe-home'),
         timeoutMs: this.promptCapabilityProbeTimeoutMs,
         maxOutputBytes: this.promptCapabilityProbeMaxOutputBytes,
         killGraceMs: this.promptCapabilityProbeKillGraceMs,
