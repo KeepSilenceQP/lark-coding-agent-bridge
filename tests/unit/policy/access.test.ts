@@ -51,16 +51,16 @@ describe('access policy', () => {
     expect(canRunAdminCommand(profile, controls, 'ou_owner').ok).toBe(false);
   });
 
-  it('does not grant creator access before owner refresh has resolved', () => {
+  it('uses the configured owner identity independently of refresh diagnostics', () => {
     const profile = profileWithAccess();
     const controls: RuntimeControls = {
       botOwnerId: 'ou_owner',
       ownerRefreshState: 'unknown',
     };
 
-    expect(isCreator(controls, 'ou_owner')).toBe(false);
-    expect(canUseDm(profile, controls, 'ou_owner').ok).toBe(false);
-    expect(canRunAdminCommand(profile, controls, 'ou_owner').ok).toBe(false);
+    expect(isCreator(controls, 'ou_owner')).toBe(true);
+    expect(canUseDm(profile, controls, 'ou_owner').ok).toBe(true);
+    expect(canRunAdminCommand(profile, controls, 'ou_owner').ok).toBe(true);
   });
 
   it('fails closed for non-owner DMs unless allowedUsers or admins include sender', () => {

@@ -377,6 +377,23 @@ describe('sender identity in bridge_context', () => {
 });
 
 describe('owner-default group intake', () => {
+  it('does not query owner again when a persisted owner is already loaded', async () => {
+    const h = await createHarness();
+    setOwner(h.controls, 'ok', 'ou_owner');
+
+    await startTestBridge(h);
+
+    expect(h.controls.refreshOwner).not.toHaveBeenCalled();
+  });
+
+  it('queries owner once on startup when no persisted owner exists', async () => {
+    const h = await createHarness();
+
+    await startTestBridge(h);
+
+    expect(h.controls.refreshOwner).toHaveBeenCalledOnce();
+  });
+
   it('starts a run for an owner message with no mention', async () => {
     const h = await createHarness();
     setGroupResponseMode(h.profileConfig, 'owner-default');
@@ -421,7 +438,7 @@ describe('owner-default group intake', () => {
     expect(h.channel.streamCalls).toHaveLength(0);
   });
 
-  it('fails closed after an owner refresh failure even with a stale matching owner id', async () => {
+  it('keeps accepting the persisted owner after a refresh failure', async () => {
     const h = await createHarness();
     setGroupResponseMode(h.profileConfig, 'owner-default');
     await startTestBridge(h);
@@ -431,15 +448,15 @@ describe('owner-default group intake', () => {
       message({
         messageId: 'om_stale_owner',
         senderId: 'ou_owner',
-        content: '不应该触发',
+        content: '继续处理这个需求',
         mentions: [],
         mentionedBot: false,
         rawSenderType: 'user',
       }),
     );
-    await settleIntake();
+    await waitFor(() => h.agent.runOptions.length === 1);
 
-    expect(h.agent.runOptions).toHaveLength(0);
+    expect(h.agent.runOptions).toHaveLength(1);
   });
 
   it('preserves explicit multi-mention wake-up behavior', async () => {
@@ -601,12 +618,14 @@ function createFakeLarkChannel(): FakeLarkChannel & { handlers: MessageHandlerMa
   };
 }
 
-function createControls(profileConfig: ReturnType<typeof createDefaultProfileConfig>): Controls {
+function createControls(
+  profileConfig: ReturnType<typeof createDefaultProfileConfig>,
+): Controls & { refreshOwner: ReturnType<typeof vi.fn> } {
   return {
     profile: 'test',
     profileConfig,
     ownerRefreshState: 'unknown' as const,
-    async refreshOwner() {},
+    refreshOwner: vi.fn(async () => {}),
     async restart() {},
     async exit() {},
     configPath: '/tmp/config.json',
