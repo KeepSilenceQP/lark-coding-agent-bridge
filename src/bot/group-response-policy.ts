@@ -1,12 +1,10 @@
 import type { GroupResponseMode } from '../config/profile-schema';
-import type { OwnerRefreshState } from '../policy/access';
 
 export interface GroupResponsePolicyInput {
   chatType: string;
   mode: GroupResponseMode;
   senderId: string;
   botOwnerId?: string;
-  ownerRefreshState: OwnerRefreshState;
   mentionedBot: boolean;
   mentionCount: number;
   mentionAll: boolean;
@@ -32,7 +30,6 @@ export function decideGroupResponse(
   if (input.mode === 'mention-only') return { accept: false, reason: 'mention-required' };
 
   const ownerEligible =
-    input.ownerRefreshState === 'ok' &&
     Boolean(input.botOwnerId) &&
     input.botOwnerId === input.senderId &&
     input.mentionCount === 0 &&

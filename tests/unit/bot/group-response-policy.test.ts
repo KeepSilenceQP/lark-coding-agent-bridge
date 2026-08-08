@@ -6,7 +6,6 @@ const base = {
   mode: 'owner-default' as const,
   senderId: 'ou-owner',
   botOwnerId: 'ou-owner',
-  ownerRefreshState: 'ok' as const,
   mentionedBot: false,
   mentionCount: 0,
   mentionAll: false,
@@ -24,8 +23,7 @@ describe('group response policy', () => {
     ['another mentioned bot', { mentionCount: 1 }],
     ['mention all', { mentionAll: true }],
     ['another sender', { senderId: 'ou-other' }],
-    ['unknown owner state', { ownerRefreshState: 'unknown' as const }],
-    ['failed owner refresh with stale owner id', { ownerRefreshState: 'failed' as const }],
+    ['missing owner identity', { botOwnerId: undefined }],
   ])('skips owner-default for %s', (_label, override) => {
     expect(decideGroupResponse({ ...base, ...override })).toEqual({
       accept: false,
@@ -84,7 +82,6 @@ const allowlistBase = {
   mode: 'owner-allowlist' as const,
   senderId: 'ou-owner',
   botOwnerId: 'ou-owner',
-  ownerRefreshState: 'ok' as const,
   mentionedBot: false,
   mentionCount: 0,
   mentionAll: false,
@@ -126,10 +123,7 @@ describe('group response policy — owner-allowlist', () => {
     ['only @ other bot', { mentionCount: 1 }],
     ['mention all', { mentionAll: true }],
     ['non-owner sender', { senderId: 'ou-other' }],
-    ['unknown owner state', { ownerRefreshState: 'unknown' as const }],
-    ['failed owner refresh', { ownerRefreshState: 'failed' as const }],
     ['missing botOwnerId', { botOwnerId: undefined }],
-    ['stale botOwnerId on failed state', { ownerRefreshState: 'failed' as const, botOwnerId: 'ou-owner' }],
   ])('skips owner-allowlist for %s', (_label, override) => {
     expect(decideGroupResponse({ ...allowlistBase, ...override })).toEqual({
       accept: false,
@@ -170,7 +164,6 @@ describe('group response policy — owner-allowlist', () => {
         mode: 'owner-default' as const,
         senderId: 'ou-owner',
         botOwnerId: 'ou-owner',
-        ownerRefreshState: 'ok' as const,
         mentionedBot: false,
         mentionCount: 0,
         mentionAll: false,
@@ -189,13 +182,11 @@ describe('group response policy — owner-allowlist', () => {
     ).toEqual({ accept: true, reason: 'all-messages' });
   });
 
-  it('uses strict owner state predicate (fail-closed)', () => {
-    // Even with a matching botOwnerId, if state is not 'ok', reject
+  it('requires a matching configured owner identity', () => {
     expect(
       decideGroupResponse({
         ...allowlistBase,
-        ownerRefreshState: 'unknown' as const,
-        botOwnerId: 'ou-owner',
+        botOwnerId: 'ou-other',
       }),
     ).toEqual({ accept: false, reason: 'owner-allowlist-not-eligible' });
   });

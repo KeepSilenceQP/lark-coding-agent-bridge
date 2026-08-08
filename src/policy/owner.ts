@@ -1,7 +1,11 @@
 import type { RuntimeControls } from './access';
 import { log } from '../core/logger';
-
-export const OWNER_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+import type { ProfileConfig } from '../config/profile-schema';
+import {
+  loadRootConfig,
+  saveRootConfig,
+  withConfigFileLock,
+} from '../config/profile-store';
 
 export interface AppInfoSource {
   getAppInfo(opts?: {
@@ -10,58 +14,65 @@ export interface AppInfoSource {
   }): Promise<{ ownerId?: string }>;
 }
 
-export interface OwnerRefreshControllerOptions {
-  controls: RuntimeControls;
-  source: AppInfoSource;
-  appId: string;
-  intervalMs?: number;
-}
-
-export interface OwnerRefreshController {
-  start(): Promise<void>;
-  stop(): void;
-}
-
 export async function refreshOwnerControls(
   controls: RuntimeControls,
   source: AppInfoSource,
   appId: string,
-): Promise<void> {
+): Promise<string | undefined> {
   try {
     const ownerId = await fetchOwnerId(source);
     controls.botOwnerId = ownerId;
     controls.ownerRefreshState = 'ok';
     controls.ownerRefreshedAt = Date.now();
     delete controls.ownerRefreshError;
+    return ownerId;
   } catch (err) {
-    controls.ownerRefreshState = 'failed';
-    controls.ownerRefreshedAt = Date.now();
+    // A persisted owner is stable configuration. A transient API failure must
+    // not revoke its access; only fail closed when no owner has ever been
+    // resolved for this app.
+    controls.ownerRefreshState = controls.botOwnerId ? 'ok' : 'failed';
     controls.ownerRefreshError = err instanceof Error ? err.message : String(err);
     log.warn('access', 'owner_refresh_failed', {
       appId,
       error: controls.ownerRefreshError,
     });
+    return undefined;
   }
 }
 
-export function createOwnerRefreshController(
-  opts: OwnerRefreshControllerOptions,
-): OwnerRefreshController {
-  let timer: ReturnType<typeof setInterval> | undefined;
-  const intervalMs = opts.intervalMs ?? OWNER_REFRESH_INTERVAL_MS;
+export function configuredOwnerId(
+  profile: Pick<ProfileConfig, 'access'>,
+  appId: string,
+): string | undefined {
+  const owner = profile.access.owner;
+  return owner?.appId === appId ? owner.openId : undefined;
+}
 
-  return {
-    async start(): Promise<void> {
-      await refreshOwnerControls(opts.controls, opts.source, opts.appId);
-      timer = setInterval(() => {
-        void refreshOwnerControls(opts.controls, opts.source, opts.appId);
-      }, intervalMs);
-    },
-    stop(): void {
-      if (timer) clearInterval(timer);
-      timer = undefined;
-    },
-  };
+export async function persistOwnerIdentity(opts: {
+  configPath: string;
+  profile: string;
+  appId: string;
+  openId: string;
+}): Promise<boolean> {
+  return withConfigFileLock(opts.configPath, async () => {
+    const root = await loadRootConfig(opts.configPath);
+    if (!root) throw new Error(`RootConfig not found or invalid: ${opts.configPath}`);
+    const profile = root.profiles[opts.profile];
+    if (!profile) throw new Error(`profile not found: ${opts.profile}`);
+
+    // Credentials may have changed while the API request was in flight. Never
+    // attach an old application's owner to the new application.
+    if (profile.accounts.app.id !== opts.appId) return false;
+    if (
+      profile.access.owner?.appId === opts.appId &&
+      profile.access.owner.openId === opts.openId
+    ) {
+      return true;
+    }
+    profile.access.owner = { appId: opts.appId, openId: opts.openId };
+    await saveRootConfig(root, opts.configPath);
+    return true;
+  });
 }
 
 async function fetchOwnerId(source: AppInfoSource): Promise<string> {

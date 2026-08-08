@@ -26,7 +26,6 @@ export interface AccessDecision {
 }
 
 export function isCreator(controls: RuntimeControls, senderId: string): boolean {
-  if (controls.ownerRefreshState === 'unknown') return false;
   return Boolean(controls.botOwnerId) && controls.botOwnerId === senderId;
 }
 

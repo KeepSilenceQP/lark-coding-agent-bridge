@@ -20,7 +20,13 @@ export type { AccessMode, PermissionConfig, PermissionSource };
 
 export type GroupResponseMode = 'mention-only' | 'owner-default' | 'all-messages' | 'owner-allowlist';
 
+export interface AppOwnerIdentity {
+  appId: string;
+  openId: string;
+}
+
 export interface ProfileAccess {
+  owner?: AppOwnerIdentity;
   allowedUsers: string[];
   allowedChats: string[];
   admins: string[];
@@ -296,7 +302,9 @@ function normalizeAccess(
     : legacyMention
       ? 'mention-only'
       : 'all-messages';
+  const owner = normalizeAppOwnerIdentity(access?.owner);
   return {
+    ...(owner ? { owner } : {}),
     allowedUsers: stringArray(access?.allowedUsers),
     allowedChats: stringArray(access?.allowedChats),
     admins: stringArray(access?.admins),
@@ -307,6 +315,14 @@ function normalizeAccess(
     requireMentionInGroup: groupResponseMode !== 'all-messages',
     ownerNoMentionChats: stringArray(access?.ownerNoMentionChats),
   };
+}
+
+function normalizeAppOwnerIdentity(input: unknown): AppOwnerIdentity | undefined {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const owner = input as { appId?: unknown; openId?: unknown };
+  const appId = typeof owner.appId === 'string' ? owner.appId.trim() : '';
+  const openId = typeof owner.openId === 'string' ? owner.openId.trim() : '';
+  return appId && openId ? { appId, openId } : undefined;
 }
 
 function isGroupResponseMode(value: unknown): value is GroupResponseMode {

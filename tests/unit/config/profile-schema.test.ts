@@ -138,6 +138,27 @@ describe('profile schema', () => {
     });
   });
 
+  it('normalizes a persisted application owner identity', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        owner: { appId: ' cli_test ', openId: ' ou_owner ' },
+      },
+    });
+
+    expect(cfg.access.owner).toEqual({ appId: 'cli_test', openId: 'ou_owner' });
+
+    const invalid = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      access: { owner: { appId: 'cli_test' } },
+    });
+    expect(invalid.access.owner).toBeUndefined();
+  });
+
   it('maps legacy mention booleans and lets the canonical group mode win', () => {
     const legacyAll = normalizeProfileConfig({
       schemaVersion: 2,

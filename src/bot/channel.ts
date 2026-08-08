@@ -50,7 +50,6 @@ import {
 } from '../media/attachment';
 import { canRunBotAdminCommand, canUseDm, canUseGroup } from '../policy/access';
 import type { ScopeContext } from '../policy/run-policy';
-import { createOwnerRefreshController } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
 import {
   consumeDeferredServiceRestart,
@@ -1575,7 +1574,6 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
                 mode: controls.profileConfig.access.groupResponseMode,
                 senderId,
                 botOwnerId: controls.botOwnerId,
-                ownerRefreshState: controls.ownerRefreshState,
                 mentionedBot: false,
                 mentionCount: 0,
                 mentionAll: false,
@@ -1759,12 +1757,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   });
 
   await channel.connect();
-  const ownerRefresh = createOwnerRefreshController({
-    controls,
-    source: channel,
-    appId: cfg.accounts.app.id,
-  });
-  await ownerRefresh.start();
+  // Owner identity is persisted per app. Resolve it only when missing; normal
+  // restarts do not depend on the application API and no polling timer exists.
+  if (!controls.botOwnerId) await controls.refreshOwner(channel);
   const knownChatsRefresh = startKnownChatsRefreshTimer(channel, controls);
 
   const identity = channel.botIdentity;
@@ -1860,7 +1855,6 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     channel,
     disconnect: async () => {
       activeRuns.pauseNewRuns('bridge-disconnect');
-      ownerRefresh.stop();
       knownChatsRefresh.stop();
       keepalive.stop();
       pending.cancelAll();
@@ -2050,7 +2044,6 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     mode: controls.profileConfig.access.groupResponseMode,
     senderId: msg.senderId,
     botOwnerId: controls.botOwnerId,
-    ownerRefreshState: controls.ownerRefreshState,
     mentionedBot: msg.mentionedBot,
     mentionCount: msg.mentions?.length ?? 0,
     mentionAll: msg.mentionAll,

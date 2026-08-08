@@ -41,7 +41,11 @@ import {
   type RuntimeLockMeta,
 } from '../../runtime/locks';
 import { resolveProfileRuntime } from '../../runtime/profile-runtime';
-import { refreshOwnerControls } from '../../policy/owner';
+import {
+  configuredOwnerId,
+  persistOwnerIdentity,
+  refreshOwnerControls,
+} from '../../policy/owner';
 import { SessionStore } from '../../session/store';
 import { SessionCatalog } from '../../session/catalog';
 import { PromptSessionService } from '../../session/prompt-session-service';
@@ -231,19 +235,49 @@ export async function runStart(opts: StartOptions): Promise<void> {
           currentCfg: AppConfig,
           currentProfileConfig: ProfileConfig,
         ): Controls => {
+          const storedOwnerId = configuredOwnerId(
+            currentProfileConfig,
+            currentCfg.accounts.app.id,
+          );
           const currentControls: Controls = {
             profile: currentPaths.profile,
             profileConfig: currentProfileConfig,
-            ownerRefreshState: 'unknown',
+            ...(storedOwnerId ? { botOwnerId: storedOwnerId } : {}),
+            ownerRefreshState: storedOwnerId ? 'ok' : 'unknown',
             knownChats: [],
             async refreshOwner(channelOverride) {
               const target = channelOverride ?? bridge?.channel;
               if (!target) return;
-              await refreshOwnerControls(
+              const ownerId = await refreshOwnerControls(
                 currentControls,
                 target,
                 currentControls.cfg.accounts.app.id,
               );
+              if (!ownerId) return;
+              const appId = currentControls.cfg.accounts.app.id;
+              try {
+                const stored = await persistOwnerIdentity({
+                  configPath: currentControls.configPath,
+                  profile: currentControls.profile,
+                  appId,
+                  openId: ownerId,
+                });
+                if (!stored) {
+                  log.warn('access', 'owner_persist_skipped', {
+                    appId,
+                    reason: 'app-changed',
+                  });
+                  return;
+                }
+                currentControls.profileConfig.access.owner = { appId, openId: ownerId };
+              } catch (err) {
+                // Runtime access already has the freshly resolved owner. A disk
+                // write failure is observable but must not take the bridge down.
+                log.warn('access', 'owner_persist_failed', {
+                  appId,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
             },
             configPath,
             cfg: currentCfg,
