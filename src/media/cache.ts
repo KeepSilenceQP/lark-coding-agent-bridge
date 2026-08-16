@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, open, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { LarkChannel, ResourceDescriptor, ResourceType } from '@larksuite/channel';
 import { paths } from '../config/paths';
@@ -23,6 +23,16 @@ export interface MediaResolveOptions extends Partial<AttachmentPolicyOptions> {
 export interface ResourceRequest {
   messageId: string;
   resource: ResourceDescriptor;
+}
+
+export interface DriveImageRequest {
+  sourceId: string;
+  fileToken: string;
+}
+
+export interface DriveImageResolveResult {
+  attachments: LocalAttachment[];
+  failedCount: number;
 }
 
 interface ResourceFileDownloader {
@@ -59,20 +69,31 @@ export class MediaCache {
         log.fail('media', err, { fileKey: item.resource.fileKey });
       }
     }
-    const normalized = normalizeAttachments(candidates, options);
-    await removeRejectedResolvedFiles(normalized);
-    if (typeof options.cacheMaxBytes === 'number') {
-      await enforceCacheMaxBytes(
-        this.rootDir,
-        options.cacheMaxBytes,
-        new Set(
-          normalized
-            .filter((attachment) => attachment.decision === 'accepted')
-            .map((attachment) => attachment.absPath),
-        ),
-      );
+    return this.normalizeResolvedCandidates(candidates, options);
+  }
+
+  /** Resolve image tokens returned in a cloud-document comment reply. */
+  async resolveDriveImages(
+    items: DriveImageRequest[],
+    options: MediaResolveOptions = {},
+  ): Promise<DriveImageResolveResult> {
+    if (items.length === 0) return { attachments: [], failedCount: 0 };
+    await mkdir(this.rootDir, { recursive: true });
+
+    const candidates: AttachmentCandidate[] = [];
+    let failedCount = 0;
+    for (const item of items) {
+      try {
+        candidates.push(await this.resolveDriveImage(item));
+      } catch (err) {
+        failedCount++;
+        log.fail('media', err, { source: 'comment-image' });
+      }
     }
-    return normalized;
+    return {
+      attachments: await this.normalizeResolvedCandidates(candidates, options),
+      failedCount,
+    };
   }
 
   private async resolveOne(item: ResourceRequest): Promise<AttachmentCandidate | null> {
@@ -96,34 +117,97 @@ export class MediaCache {
       tmpPath,
     );
 
-    const tmpStat = await stat(tmpPath);
-    const hash = await hashFile(tmpPath);
-    const mime = contentType ?? defaultMime(kind);
-    const ext = safeExtensionForMime(mime);
+    return this.finalizeResolvedFile({
+      tmpPath,
+      kind,
+      sourceMessageId: messageId,
+      sourceFileKey: r.fileKey,
+      mime: contentType ?? defaultMime(kind),
+      ...(r.fileName ? { originalName: r.fileName } : {}),
+    });
+  }
+
+  private async resolveDriveImage(item: DriveImageRequest): Promise<AttachmentCandidate> {
+    const tmpPath = join(
+      this.rootDir,
+      `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    try {
+      const response = await this.channel.rawClient.drive.v1.media.download({
+        path: { file_token: item.fileToken },
+      });
+      await response.writeFile(tmpPath);
+      const headerMime = headerValue(response.headers, 'content-type');
+      const mime =
+        await detectImageMime(tmpPath) ?? normalizeMime(headerMime) ?? 'application/octet-stream';
+      return await this.finalizeResolvedFile({
+        tmpPath,
+        kind: 'image',
+        sourceMessageId: item.sourceId,
+        sourceFileKey: item.fileToken,
+        mime,
+      });
+    } catch (err) {
+      await rm(tmpPath, { force: true }).catch(() => {});
+      throw err;
+    }
+  }
+
+  private async finalizeResolvedFile(input: {
+    tmpPath: string;
+    kind: AttachmentKind;
+    sourceMessageId: string;
+    sourceFileKey: string;
+    mime: string;
+    originalName?: string;
+  }): Promise<AttachmentCandidate> {
+    const tmpStat = await stat(input.tmpPath);
+    const hash = await hashFile(input.tmpPath);
+    const ext = safeExtensionForMime(input.mime);
     const absPath = join(this.rootDir, `${hash}.${ext}`);
     try {
       await stat(absPath);
-      await rm(tmpPath, { force: true });
+      await rm(input.tmpPath, { force: true });
       log.info('media', 'cache-hit', { path: absPath });
     } catch {
-      await rename(tmpPath, absPath);
+      await rename(input.tmpPath, absPath);
     }
     const candidate: AttachmentCandidate = {
       absPath,
-      kind,
+      kind: input.kind,
       size: tmpStat.size,
-      mime,
+      mime: input.mime,
       hash,
       source: 'lark',
-      sourceMessageId: messageId,
-      sourceFileKey: r.fileKey,
-      ...(r.fileName ? { originalName: r.fileName } : {}),
+      sourceMessageId: input.sourceMessageId,
+      sourceFileKey: input.sourceFileKey,
+      ...(input.originalName ? { originalName: input.originalName } : {}),
     };
     log.info('media', 'downloaded', {
       path: candidate.absPath,
       size: candidate.size,
     });
     return candidate;
+  }
+
+  private async normalizeResolvedCandidates(
+    candidates: AttachmentCandidate[],
+    options: MediaResolveOptions,
+  ): Promise<LocalAttachment[]> {
+    const normalized = normalizeAttachments(candidates, options);
+    await removeRejectedResolvedFiles(normalized);
+    if (typeof options.cacheMaxBytes === 'number') {
+      await enforceCacheMaxBytes(
+        this.rootDir,
+        options.cacheMaxBytes,
+        new Set(
+          normalized
+            .filter((attachment) => attachment.decision === 'accepted')
+            .map((attachment) => attachment.absPath),
+        ),
+      );
+    }
+    return normalized;
   }
 }
 
@@ -204,6 +288,50 @@ async function hashFile(path: string): Promise<string> {
     hash.update(chunk);
   }
   return hash.digest('hex');
+}
+
+async function detectImageMime(path: string): Promise<string | undefined> {
+  const handle = await open(path, 'r');
+  try {
+    const bytes = Buffer.alloc(12);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    const head = bytes.subarray(0, bytesRead);
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    if (
+      head.length >= pngSignature.length &&
+      head.subarray(0, pngSignature.length).equals(pngSignature)
+    ) {
+      return 'image/png';
+    }
+    if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) {
+      return 'image/jpeg';
+    }
+    const ascii = head.toString('ascii');
+    if (ascii.startsWith('GIF87a') || ascii.startsWith('GIF89a')) return 'image/gif';
+    if (ascii.startsWith('RIFF') && ascii.slice(8, 12) === 'WEBP') return 'image/webp';
+    return undefined;
+  } finally {
+    await handle.close();
+  }
+}
+
+function normalizeMime(value: string | undefined): string | undefined {
+  const mime = value?.split(';', 1)[0]?.trim().toLowerCase();
+  return mime || undefined;
+}
+
+function headerValue(headers: unknown, name: string): string | undefined {
+  if (!headers || typeof headers !== 'object') return undefined;
+  const getter = (headers as { get?: (key: string) => unknown }).get;
+  if (typeof getter === 'function') {
+    const value = getter.call(headers, name);
+    if (typeof value === 'string') return value;
+  }
+  const record = headers as Record<string, unknown>;
+  const value = record[name] ?? record[name.toLowerCase()];
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) && typeof value[0] === 'string') return value[0];
+  return undefined;
 }
 
 async function enforceCacheMaxBytes(

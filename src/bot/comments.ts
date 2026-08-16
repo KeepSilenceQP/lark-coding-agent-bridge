@@ -11,6 +11,8 @@ import { log } from '../core/logger';
 import { evaluateRunPolicy } from '../policy/run-policy';
 import { resolveWorkingDirectory } from '../policy/workspace';
 import { RunRejected } from '../runtime/errors';
+import type { MediaCache } from '../media/cache';
+import { toPolicyAttachment } from '../media/attachment';
 import type { ActiveRuns } from './active-runs';
 import { recordRunSessionEvent, recordRunSessionEventAwaited } from './run-flow';
 import type { RunExecutor } from '../runtime/run-executor';
@@ -38,6 +40,7 @@ export interface CommentDeps {
   workspaces: WorkspaceStore;
   activeRuns?: ActiveRuns;
   executor: RunExecutor;
+  media?: MediaCache;
   controls: Controls;
 }
 
@@ -56,6 +59,7 @@ export interface ReplyContentElement {
 export interface CommentReply {
   reply_id?: string;
   content?: { elements?: ReplyContentElement[] };
+  extra?: { image_list?: string[] };
 }
 
 export interface CommentContext {
@@ -66,6 +70,8 @@ export interface CommentContext {
    * we react on. Undefined when we couldn't pinpoint a reply (top-level
    * comment with no replies fetched, etc.). */
   targetReplyId?: string;
+  /** Drive media tokens attached to the reply that triggered this run. */
+  imageFileTokens?: string[];
   /** Text of the replies in this comment thread that came before the @bot
    * reply, chronological. Feishu delivers the whole thread but the bot is only
    * @-ed on one reply; without these it can't see what the thread is about (a
@@ -89,7 +95,7 @@ export interface ExtractCommentQuestionResult {
  * a reply in the same comment thread.
  */
 export async function handleCommentMention(deps: CommentDeps): Promise<void> {
-  const { channel, evt, sessions, sessionCatalog, workspaces, controls } = deps;
+  const { channel, evt, sessions, sessionCatalog, workspaces, media, controls } = deps;
   const eventDocScopeId = commentDocumentScopeId(evt.fileToken);
   const eventCommentScopeId = commentScopeId(evt.fileToken, evt.commentId);
   // Log every comment event we receive, regardless of whether we'll act on it.
@@ -192,6 +198,79 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
       controls.profileConfig.agentKind === 'codex'
         ? codexCapability(controls.profileConfig)
         : claudeCapability(controls.profileConfig);
+    const imageFileTokens = [...new Set(ctx.imageFileTokens ?? [])];
+    if (imageFileTokens.length > 0 && capability.agentId !== 'codex') {
+      log.info('comment', 'skip', {
+        reason: 'comment-images-unsupported-agent',
+        commentScopeId: runScopeId,
+        imageCount: imageFileTokens.length,
+      });
+      await postCommentReply(
+        channel,
+        target,
+        evt,
+        '当前 Agent 暂不支持读取评论图片，请改用 Codex profile 或把图片内容贴成文字。',
+        { isWhole: ctx.isWhole },
+      );
+      return;
+    }
+    let imageResolution = { attachments: [], failedCount: 0 } as Awaited<
+      ReturnType<MediaCache['resolveDriveImages']>
+    >;
+    if (imageFileTokens.length > 0) {
+      if (!media) {
+        log.warn('comment', 'image-unavailable', {
+          commentScopeId: runScopeId,
+          reason: 'media-cache-unavailable',
+          declaredCount: imageFileTokens.length,
+        });
+        await postCommentReply(channel, target, evt, '评论中的图片暂时无法读取，请稍后重新 @ 我。', {
+          isWhole: ctx.isWhole,
+        });
+        return;
+      }
+      imageResolution = await media.resolveDriveImages(
+        imageFileTokens.map((fileToken) => ({
+          sourceId: commentTokenDigest(ctx.targetReplyId ?? evt.commentId),
+          fileToken,
+        })),
+        controls.profileConfig.attachments,
+      );
+    }
+    const commentAttachments = imageResolution.attachments;
+    if (commentAttachments.length > 0) {
+      log.info('media', 'resolved', { source: 'comment', count: commentAttachments.length });
+      for (const attachment of commentAttachments) {
+        log.info('attachment', 'decision', {
+          source: 'comment',
+          decision: attachment.decision,
+          kind: attachment.kind,
+          hash: attachment.hash,
+          size: attachment.size,
+          sourceMessageId: attachment.sourceMessageId,
+          reason: attachment.rejectionReason,
+        });
+      }
+    }
+    const acceptedImages = commentAttachments.filter(
+      (attachment) => attachment.kind === 'image' && attachment.decision === 'accepted',
+    );
+    if (imageResolution.failedCount > 0 || acceptedImages.length !== imageFileTokens.length) {
+      log.warn('comment', 'image-unavailable', {
+        commentScopeId: runScopeId,
+        declaredCount: imageFileTokens.length,
+        acceptedCount: acceptedImages.length,
+        failedCount: imageResolution.failedCount,
+      });
+      await postCommentReply(
+        channel,
+        target,
+        evt,
+        '评论中的图片读取失败、格式不受支持或超过附件限制，请重新上传后再 @ 我。',
+        { isWhole: ctx.isWhole },
+      );
+      return;
+    }
     const runTimeoutMs = commentRunTimeoutMs(sessions, runScopeId);
     const threadTimeoutMs = commentRunTimeoutMs(sessions, commentThreadScopeId);
     const commentTimeoutMs = runTimeoutMs !== undefined ? runTimeoutMs : threadTimeoutMs;
@@ -205,7 +284,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
         commentScopeId: agentSessionScopeId,
         resourceBindings: [{ kind: 'doc', id: targetDocScopeId, verified: true }],
       },
-      attachments: [],
+      attachments: commentAttachments.map(toPolicyAttachment),
       prompt,
       requestedCwd,
       cwdRealpath,
@@ -328,6 +407,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
         policy,
         sessionId,
         threadId,
+        images: acceptedImages.map((attachment) => attachment.path),
         stopGraceMs: getAgentStopGraceMs(controls.cfg),
         observability: {
           profile: controls.profile,
@@ -538,7 +618,7 @@ async function fetchCommentContext(
   // access). A genuine no-access (1069307 on both) propagates here so the
   // caller's catch can log it as no-access.
   const fetched = await channel.comments.fetch(target, evt.commentId);
-  const replies = fetched?.replies ?? [];
+  const replies = (fetched?.replies ?? []) as CommentReply[];
   const parsed = extractCommentQuestionFromReplies({ replyId: evt.replyId, replies });
   // The whole thread comes back, but only one reply @-ed the bot. Carry the
   // replies before it as context so the agent sees the discussion it's being
@@ -566,6 +646,7 @@ async function fetchCommentContext(
     quote: fetched?.quote,
     isWhole: Boolean(fetched?.isWhole),
     targetReplyId: parsed?.targetReplyId,
+    imageFileTokens: targetReply?.extra?.image_list?.filter((token) => token.length > 0) ?? [],
     priorReplies,
   };
 }
@@ -624,6 +705,10 @@ export function buildCommentPrompt(
   }
   parts.push('');
   parts.push(`用户的问题：${ctx.question}`);
+  const imageCount = ctx.imageFileTokens?.length ?? 0;
+  if (imageCount > 0) {
+    parts.push(`触发本次 @ 的评论回复附带 ${imageCount} 张图片，已由 bridge 作为图像输入传入。`);
+  }
   parts.push('');
   parts.push(commentReadInstruction(target));
   parts.push('');

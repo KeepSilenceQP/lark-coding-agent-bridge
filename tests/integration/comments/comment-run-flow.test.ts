@@ -1,4 +1,4 @@
-import { mkdir, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { CommentEvent, CommentReplyContentElement } from '@larksuite/channel';
@@ -14,6 +14,7 @@ import { RunExecutor } from '../../../src/runtime/run-executor.js';
 import { SessionCatalog } from '../../../src/session/catalog.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { PromptSessionService } from '../../../src/session/prompt-session-service.js';
+import { MediaCache } from '../../../src/media/cache.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { makeFakeCommentSurface } from '../../helpers/fake-comment-surface.js';
@@ -37,6 +38,12 @@ interface FakeCommentChannel {
           get(input: { path: { comment_id: string } }): Promise<unknown>;
           list(input: unknown): Promise<unknown>;
           create(input: unknown): Promise<unknown>;
+        };
+        media: {
+          download(input: { path: { file_token: string } }): Promise<{
+            writeFile(path: string): Promise<void>;
+            headers: Record<string, string>;
+          }>;
         };
       };
     };
@@ -65,6 +72,102 @@ describe('comment run flow', () => {
     expect(opts.prompt).not.toContain('commentScopeId');
     expect(opts.prompt).not.toContain('docScopeId');
     expect(h.inThreadReplies).toEqual(['answer one']);
+  });
+
+  it('passes images attached to the triggering comment reply to Codex', async () => {
+    const h = await createHarness({
+      agentKind: 'codex',
+      commentReplies: [
+        {
+          reply_id: 'reply-before',
+          text: '前面的讨论',
+          imageTokens: ['prior-image-token'],
+        },
+        {
+          reply_id: 'reply-1',
+          text: '@bot 你看看这个截图',
+          imageTokens: ['comment-image-token'],
+        },
+      ],
+    });
+
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+
+    expect(h.agent.runOptions).toHaveLength(1);
+    expect(h.mediaDownloads).toEqual(['comment-image-token']);
+    const images = h.agent.runOptions[0]?.images ?? [];
+    expect(images).toHaveLength(1);
+    await expect(readFile(images[0]!)).resolves.toEqual(commentImageBytes());
+    expect(h.agent.runOptions[0]?.prompt).toContain('附带 1 张图片');
+  });
+
+  it('passes an image-only mention comment to Codex', async () => {
+    const h = await createHarness({
+      agentKind: 'codex',
+      commentReplies: [
+        {
+          reply_id: 'reply-1',
+          elements: [{ type: 'person', person: { user_id: 'ou-bot' } }],
+          imageTokens: ['comment-image-token'],
+        },
+      ],
+    });
+
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+
+    expect(h.agent.runOptions).toHaveLength(1);
+    expect(h.agent.runOptions[0]?.images).toHaveLength(1);
+    expect(h.agent.runOptions[0]?.prompt).toContain('附带 1 张图片');
+  });
+
+  it('fails closed when a declared comment image cannot be downloaded', async () => {
+    const h = await createHarness({
+      agentKind: 'codex',
+      mediaDownloadFails: true,
+      commentReplies: [
+        { reply_id: 'reply-1', text: '@bot 看截图', imageTokens: ['broken-image-token'] },
+      ],
+    });
+
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+
+    expect(h.agent.runOptions).toEqual([]);
+    expect(h.inThreadReplies).toEqual([
+      '评论中的图片读取失败、格式不受支持或超过附件限制，请重新上传后再 @ 我。',
+    ]);
+    await expect(readdir(join(h.tmp.profile, 'media'))).resolves.toEqual([]);
+  });
+
+  it('fails closed when a comment image exceeds the configured image limit', async () => {
+    const h = await createHarness({
+      agentKind: 'codex',
+      commentReplies: [
+        { reply_id: 'reply-1', text: '@bot 看截图', imageTokens: ['large-image-token'] },
+      ],
+    });
+    h.profileConfig.attachments.imageMaxBytes = commentImageBytes().length - 1;
+
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+
+    expect(h.agent.runOptions).toEqual([]);
+    expect(h.inThreadReplies.at(-1)).toContain('超过附件限制');
+  });
+
+  it('does not silently drop comment images for a Claude profile', async () => {
+    const h = await createHarness({
+      agentKind: 'claude',
+      commentReplies: [
+        { reply_id: 'reply-1', text: '@bot 看截图', imageTokens: ['comment-image-token'] },
+      ],
+    });
+
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+
+    expect(h.mediaDownloads).toEqual([]);
+    expect(h.agent.runOptions).toEqual([]);
+    expect(h.inThreadReplies).toEqual([
+      '当前 Agent 暂不支持读取评论图片，请改用 Codex profile 或把图片内容贴成文字。',
+    ]);
   });
 
   it('includes the prior thread replies as context when @-ed on a later reply', async () => {
@@ -370,12 +473,14 @@ async function createHarness(options: {
   sessionIds?: string[];
   threadIds?: string[];
   reactionFails?: boolean;
+  mediaDownloadFails?: boolean;
   /** Full reply_list (chronological) returned by fileComment.get for comment-1.
    * Lets a test model a thread with replies preceding the @bot reply. */
   commentReplies?: Array<{
     reply_id: string;
     text?: string;
     elements?: CommentReplyContentElement[];
+    imageTokens?: string[];
   }>;
 } = {}): Promise<{
   tmp: TmpProfile;
@@ -387,11 +492,13 @@ async function createHarness(options: {
   activeRuns: ActiveRuns;
   executor: RunExecutor;
   inThreadReplies: string[];
+  mediaDownloads: string[];
   deps(evt: CommentEvent): Parameters<typeof handleCommentMention>[0];
 }> {
   const tmp = await createTmpProfile('comment-run-flow-');
   const requests: RequestRecord[] = [];
   const inThreadReplies: string[] = [];
+  const mediaDownloads: string[] = [];
   const agentKind = options.agentKind ?? 'claude';
   const agentTexts = options.agentTexts ?? ['answer one'];
   const sessionIds = options.sessionIds ?? ['session-one'];
@@ -444,6 +551,7 @@ async function createHarness(options: {
                   reply_list: {
                     replies: options.commentReplies.map((r) => ({
                       reply_id: r.reply_id,
+                      ...(r.imageTokens ? { extra: { image_list: r.imageTokens } } : {}),
                       content: {
                         elements:
                           r.elements ??
@@ -463,6 +571,18 @@ async function createHarness(options: {
             return {};
           },
         },
+        media: {
+          async download(input) {
+            mediaDownloads.push(input.path.file_token);
+            if (options.mediaDownloadFails) throw new Error('media download failed');
+            return {
+              headers: { 'content-type': 'application/octet-stream' },
+              async writeFile(path) {
+                await writeFile(path, commentImageBytes());
+              },
+            };
+          },
+        },
       },
     },
   };
@@ -477,6 +597,10 @@ async function createHarness(options: {
   workspaces.setCwd(docSessionScope('doc-token'), tmp.workspace);
   const profileConfig = profile(tmp.workspace, agentKind);
   const activeRuns = new ActiveRuns();
+  const media = new MediaCache(
+    channel as unknown as Parameters<typeof handleCommentMention>[0]['channel'],
+    join(tmp.profile, 'media'),
+  );
   const executor = new RunExecutor({
     agent,
     pool: new ProcessPool(() => 1),
@@ -498,6 +622,7 @@ async function createHarness(options: {
     activeRuns,
     executor,
     inThreadReplies,
+    mediaDownloads,
     deps: (evt) => ({
       channel: channel as unknown as Parameters<typeof handleCommentMention>[0]['channel'],
       evt,
@@ -507,6 +632,7 @@ async function createHarness(options: {
       workspaces,
       activeRuns,
       executor,
+      media,
       controls: {
         profile: 'claude',
         profileConfig,
@@ -560,6 +686,16 @@ async function createBlockingHarness(options: {
             return {};
           },
         },
+        media: {
+          async download() {
+            return {
+              headers: { 'content-type': 'image/png' },
+              async writeFile(path) {
+                await writeFile(path, commentImageBytes());
+              },
+            };
+          },
+        },
       },
     },
   };
@@ -574,6 +710,10 @@ async function createBlockingHarness(options: {
   workspaces.setCwd(docSessionScope('doc-token'), tmp.workspace);
   const profileConfig = profile(tmp.workspace, options.agentKind);
   const activeRuns = new ActiveRuns();
+  const media = new MediaCache(
+    channel as unknown as Parameters<typeof handleCommentMention>[0]['channel'],
+    join(tmp.profile, 'media'),
+  );
   const executor = new RunExecutor({
     agent,
     pool: new ProcessPool(() => 2),
@@ -600,6 +740,7 @@ async function createBlockingHarness(options: {
       workspaces,
       activeRuns,
       executor,
+      media,
       controls: {
         profile: 'claude',
         profileConfig,
@@ -782,4 +923,8 @@ function apiError(code: number): Error {
   const err = new Error(`api ${code}`) as Error & { response: { data: { code: number } } };
   err.response = { data: { code } };
   return err;
+}
+
+function commentImageBytes(): Buffer {
+  return Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
 }

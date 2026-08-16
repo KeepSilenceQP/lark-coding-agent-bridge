@@ -1548,6 +1548,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           workspaces,
           activeRuns,
           executor,
+          media,
           controls,
         }).catch((err) => log.fail('comment', err));
       }).catch((err) => log.fail('comment', err));

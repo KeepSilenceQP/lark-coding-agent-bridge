@@ -436,6 +436,8 @@ grep '"event":"enter"' ~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y
 
 云文档评论不再需要单独绑定工作目录或维护文档白名单。支持的文档评论里 @bot 后，bridge 会在同一个评论线程里回复。评论运行复用文档级 session key；没有记录过文档 cwd 时回退到用户 home 目录。
 
+Codex profile 会读取触发 @ 的那条评论回复中附带的图片：bridge 通过 Drive 素材接口下载图片，执行与普通消息附件相同的限制检查，再作为图像输入交给 Codex。如果图片已声明但下载失败或未通过检查，bridge 会明确报错，不会在缺少图片的情况下继续运行。Claude profile 目前需要把图片内容改为文字后再发送。
+
 ## 常见问题
 
 **bot 没反应 / agent 不回复**：通常是本机 `claude` 或 `codex` CLI 没登录，或者当前会话指向了不存在的工作目录。发 `/status` 看当前状态；`/new` 重开会话往往就好。
