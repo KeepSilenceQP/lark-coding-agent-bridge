@@ -193,6 +193,33 @@ describe('profile logger observability', () => {
     expect(entry.trace).toContain('[truncated]');
   });
 
+  it('never throws while logging a circular stream-shaped API response', async () => {
+    const tmp = await createTmpProfile('logger-circular-api-data-');
+    cleanups.push(tmp.cleanup);
+    const logsDir = join(tmp.profile, 'logs');
+    configureLogger({
+      logsDir,
+      now: () => new Date('2026-05-25T00:00:00.000Z'),
+    });
+    const streamBody: Record<string, unknown> = { readable: true };
+    streamBody.self = streamBody;
+    const error = Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: streamBody },
+    });
+
+    expect(() => log.fail('media', error)).not.toThrow();
+    await flushLogger();
+
+    const text = await readFile(join(logsDir, 'bridge-20260525.jsonl'), 'utf8');
+    const entry = JSON.parse(text.trim()) as Record<string, unknown>;
+    expect(entry).toMatchObject({
+      phase: 'media',
+      event: 'fail',
+      apiStatus: 400,
+      apiData: { readable: true, self: '[Circular]' },
+    });
+  });
+
   it('sends sanitized events and errors to the optional telemetry adapter', async () => {
     const tmp = await createTmpProfile('logger-telemetry-redact-');
     cleanups.push(tmp.cleanup);

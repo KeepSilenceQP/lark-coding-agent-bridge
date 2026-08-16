@@ -1,6 +1,7 @@
 import { registerApp } from '@larksuite/channel';
 import qrcode from 'qrcode-terminal';
 import type { AppConfig, TenantBrand } from '../config/schema';
+import { DOCUMENT_MEDIA_DOWNLOAD_SCOPE } from './app-scope';
 
 export interface ScopeGrantLink {
   /** Authorization URL — opening it lands on the confirm page with the new
@@ -59,6 +60,7 @@ export async function runRegistrationWizard(): Promise<AppConfig> {
 
   const result = await registerApp({
     source: 'lark-channel-bridge',
+    addons: { scopes: { tenant: [DOCUMENT_MEDIA_DOWNLOAD_SCOPE] } },
     onQRCodeReady: (info) => {
       console.log('请用飞书 App 扫描以下二维码完成应用创建：\n');
       qrcode.generate(info.url, { small: true });

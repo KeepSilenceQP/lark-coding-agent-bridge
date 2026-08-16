@@ -9,6 +9,9 @@ import { log } from '../core/logger';
  */
 export const GROUP_MSG_SCOPE = 'im:message.group_msg';
 
+/** App-identity scope required to download images attached to cloud-doc comments. */
+export const DOCUMENT_MEDIA_DOWNLOAD_SCOPE = 'docs:document.media:download';
+
 /**
  * Fetch the set of scopes currently granted to this app via
  * `application.v6.application.get`. The channel's `getAppInfo()` only

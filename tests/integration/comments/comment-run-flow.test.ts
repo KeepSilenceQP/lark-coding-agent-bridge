@@ -138,6 +138,30 @@ describe('comment run flow', () => {
     await expect(readdir(join(h.tmp.profile, 'media'))).resolves.toEqual([]);
   });
 
+  it('replies safely when the media API rejects with a stream response body', async () => {
+    const streamBody: Record<string, unknown> = { readable: true };
+    streamBody.self = streamBody;
+    const error = Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: streamBody },
+    });
+    const h = await createHarness({
+      agentKind: 'codex',
+      mediaDownloadError: error,
+      commentReplies: [
+        { reply_id: 'reply-1', text: '@bot 看截图', imageTokens: ['broken-image-token'] },
+      ],
+    });
+
+    await expect(
+      handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' }))),
+    ).resolves.toBeUndefined();
+
+    expect(h.agent.runOptions).toEqual([]);
+    expect(h.inThreadReplies).toEqual([
+      '评论中的图片读取失败、格式不受支持或超过附件限制，请重新上传后再 @ 我。',
+    ]);
+  });
+
   it('fails closed when a comment image exceeds the configured image limit', async () => {
     const h = await createHarness({
       agentKind: 'codex',
@@ -474,6 +498,7 @@ async function createHarness(options: {
   threadIds?: string[];
   reactionFails?: boolean;
   mediaDownloadFails?: boolean;
+  mediaDownloadError?: unknown;
   /** Full reply_list (chronological) returned by fileComment.get for comment-1.
    * Lets a test model a thread with replies preceding the @bot reply. */
   commentReplies?: Array<{
@@ -574,6 +599,7 @@ async function createHarness(options: {
         media: {
           async download(input) {
             mediaDownloads.push(input.path.file_token);
+            if (options.mediaDownloadError) throw options.mediaDownloadError;
             if (options.mediaDownloadFails) throw new Error('media download failed');
             return {
               headers: { 'content-type': 'application/octet-stream' },
