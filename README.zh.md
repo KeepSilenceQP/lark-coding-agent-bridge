@@ -54,7 +54,7 @@ typecheck/build、release/npm clean-install 校验。
 | **Reaction 驱动控制** | 对相关消息添加 Reaction，可以同意下一步、要求进一步解释、确认手动步骤已完成，或停止当前工作链。Bridge 会把目标消息与校准后的 Reaction 状态一并交给 Agent，持久化防重状态，并保留未预埋 emoji 供 Agent 结合上下文判断。 | 若把 Reaction 当成孤立 emoji，可能重复旧任务、丢失被回应消息，或把停止信号错误地启动成新一轮 Agent。 |
 | **可靠的过程消息与最终回复** | COT/过程输出和最终答案彻底分开，卡片与纯文本模式都单独发送最终回复；同时补齐话题路由、CardKit 流过期、陈旧回读、Codex 空终态/持久化终态和 Markdown 渲染失败的恢复路径。 | 长任务可能留下陈旧卡片或运行中 footer、重复旧内容、误触发 fallback、回复跑出话题，或者本地已经结束却没有把最终答案送到飞书。 |
 | **延后自重启与结果回执** | 同 profile 自重启会等待当前回复和活跃任务排空，再由 detached helper 重启，并向原群、原话题或原私聊发送且只发送一条成功/失败回执。 | Bot 自部署时可能在回复中途把自己终止，重启后用户也无法确定新进程是否真正连接成功。 |
-| **维护版 Channel 与可安装产物** | Release 内置维护版 `@larksuite/channel` `0.4.0-qp.1`，修复 CardKit stream rollover，并以自包含的 `@penn.qp/lark-channel-bridge` npm 包和对应 GitHub Release 发布。 | rollover 可能先把前一张卡完整重发一遍再创建下一张卡，形成重复消息；file dependency 也可能在发布产物中丢失。 |
+| **维护版 Channel 与可安装产物** | Release 内置维护版 `@larksuite/channel` `0.6.0-qp.1`，基于上游 0.6.0 并保留 CardKit stream rollover 修复，以自包含的 `@penn.qp/lark-channel-bridge` npm 包和对应 GitHub Release 发布。 | rollover 可能先把前一张卡完整重发一遍再创建下一张卡，形成重复消息；file dependency 也可能在发布产物中丢失。 |
 
 ### Fork 扩展能力速查
 

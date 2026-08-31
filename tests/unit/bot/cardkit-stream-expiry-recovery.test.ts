@@ -215,6 +215,31 @@ describe('CardKit stream expiry recovery', () => {
     expect(content).toHaveBeenCalledOnce();
     expect(update).toHaveBeenCalledTimes(2);
   });
+
+  it('does not replay finalized rollover chunks on later full snapshots', async () => {
+    const content = vi.fn(async () => ({ code: 0, msg: 'success', data: {} }));
+    const update = vi.fn(async () => ({ code: 0, msg: 'success', data: {} }));
+    const channel = realStreamingChannel(content, update, 64);
+    const create = channel.rawClient.cardkit.v1.card.create as ReturnType<typeof vi.fn>;
+    const firstSnapshot = Array.from({ length: 8 }, (_, index) => `line-${index}-xx`).join('\n');
+
+    await channel.stream(
+      'oc_test',
+      {
+        markdown: async (controller) => {
+          await controller.setContent(firstSnapshot);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          await controller.setContent(`${firstSnapshot}\nlast-line`);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        },
+      },
+      { replyTo: 'om_parent' },
+    );
+
+    // Initial card + exactly one rollover. A regressed controller interprets
+    // the second full snapshot as fresh content and creates a duplicate card.
+    expect(create).toHaveBeenCalledTimes(2);
+  });
 });
 
 function fakeChannel(
@@ -248,11 +273,15 @@ function fakeChannel(
 function realStreamingChannel(
   content: (request: unknown) => Promise<unknown>,
   update: (request: unknown) => Promise<unknown>,
+  streamMaxElementChars?: number,
 ): LarkChannel {
   const channel = createLarkChannel({
     appId: 'test-app-id',
     appSecret: 'test-app-secret',
-    outbound: { streamThrottleMs: 1 },
+    outbound: {
+      streamThrottleMs: 1,
+      ...(streamMaxElementChars ? { streamMaxElementChars } : {}),
+    },
   });
   const raw = channel.rawClient as unknown as {
     cardkit: {
