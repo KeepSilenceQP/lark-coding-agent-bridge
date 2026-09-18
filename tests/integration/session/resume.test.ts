@@ -95,6 +95,62 @@ describe('agent-aware run-flow resume', () => {
     });
   });
 
+  it('keeps the Codex thread when access lists change without revoking the accepted request', async () => {
+    const h = await createHarness('codex');
+    const first = await start(h);
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error('expected initial run');
+    await collect(first.execution.subscribe());
+    h.catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codex',
+      cwdRealpath: first.cwdRealpath,
+      policyFingerprint: first.policy.policyFingerprint,
+      threadId: 'thread-catalog',
+      now: 1000,
+    });
+
+    h.profileConfig.access.allowedChats.push('chat-other');
+    h.profileConfig.access.ownerNoMentionChats.push('chat-1');
+    const resumed = await start(h);
+
+    expect(resumed.ok).toBe(true);
+    if (!resumed.ok) throw new Error('expected resumed run');
+    expect(resumed.resumeFrom).toBe('thread-catalog');
+    expect(h.agent.runOptions[1]).toMatchObject({
+      sessionId: undefined,
+      threadId: 'thread-catalog',
+    });
+  });
+
+  it('adopts a pre-fix Codex catalog fingerprint without starting fresh', async () => {
+    const h = await createHarness('codex');
+    const first = await start(h);
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error('expected initial run');
+    await collect(first.execution.subscribe());
+    const legacyFingerprint = first.policy.compatiblePolicyFingerprints?.[0];
+    expect(legacyFingerprint).toBeTruthy();
+    h.catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codex',
+      cwdRealpath: first.cwdRealpath,
+      policyFingerprint: legacyFingerprint!,
+      threadId: 'thread-before-fix',
+      now: 1000,
+    });
+
+    const resumed = await start(h);
+
+    expect(resumed.ok).toBe(true);
+    if (!resumed.ok) throw new Error('expected resumed run');
+    expect(resumed.resumeFrom).toBe('thread-before-fix');
+    expect(h.agent.runOptions[1]).toMatchObject({
+      sessionId: undefined,
+      threadId: 'thread-before-fix',
+    });
+  });
+
   it('does not resume when the policy fingerprint changes', async () => {
     const h = await createHarness('claude');
     const first = await start(h);

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema';
 import {
+  accessDecisionDigest,
   accessPolicyDigest,
   attachmentPolicyShapeDigest,
   policyFingerprint,
@@ -128,6 +129,15 @@ describe('policy fingerprint', () => {
         threadId: 'omt_1',
         resourceBindings: ['doc_a', 'doc_b'],
       }),
+    );
+  });
+
+  it('fingerprints the effective access decision without profile-wide allowlists', () => {
+    expect(accessDecisionDigest({ ok: true, reason: 'owner' })).toBe(
+      accessDecisionDigest({ ok: true, reason: 'owner' }),
+    );
+    expect(accessDecisionDigest({ ok: true, reason: 'owner' })).not.toBe(
+      accessDecisionDigest({ ok: true, reason: 'allowed-chat' }),
     );
   });
 

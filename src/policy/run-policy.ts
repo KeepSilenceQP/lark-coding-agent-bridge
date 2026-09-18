@@ -10,6 +10,7 @@ import {
 import type { ProfileConfig } from '../config/profile-schema';
 import type { AccessDecision } from './access';
 import {
+  accessDecisionDigest,
   accessPolicyDigest,
   attachmentPolicyConfigDigest,
   policyFingerprint,
@@ -68,6 +69,8 @@ export interface RunPolicyAllow {
   access: AccessDecision;
   attachments: AgentAttachment[];
   policyFingerprint: string;
+  /** Previous fingerprints that are safe to adopt under the same live policy. */
+  compatiblePolicyFingerprints?: string[];
   expiresAt: number;
 }
 
@@ -122,10 +125,26 @@ export function evaluateRunPolicy(input: RunPolicyInput): RunPolicyResult {
     resourceBindings: input.scope.resourceBindings?.map((binding) => binding.id),
   });
   const attachmentDigest = attachmentPolicyConfigDigest(input.profileConfig.attachments);
-  const accessDigest =
+  const legacyAccessDigest =
     input.scope.source === 'comment' && input.access.reason === 'comment-mention'
       ? 'comment-mention'
       : accessPolicyDigest(input.profileConfig.access);
+  const fingerprintBase = {
+    cwdRealpath: input.cwdRealpath,
+    sandbox,
+    resourceScopeDigest: resourceDigest,
+    attachmentPolicyShapeDigest: attachmentDigest,
+    codexHome: input.codexHome,
+    inheritCodexHome: input.inheritCodexHome ?? false,
+  };
+  const currentFingerprint = policyFingerprint({
+    ...fingerprintBase,
+    accessPolicyDigest: accessDecisionDigest(input.access),
+  });
+  const legacyFingerprint = policyFingerprint({
+    ...fingerprintBase,
+    accessPolicyDigest: legacyAccessDigest,
+  });
 
   return {
     ok: true,
@@ -138,15 +157,10 @@ export function evaluateRunPolicy(input: RunPolicyInput): RunPolicyResult {
     access: input.access,
     attachments: input.attachments,
     expiresAt: input.now + (input.ttlMs ?? DEFAULT_TTL_MS),
-    policyFingerprint: policyFingerprint({
-      cwdRealpath: input.cwdRealpath,
-      sandbox,
-      accessPolicyDigest: accessDigest,
-      resourceScopeDigest: resourceDigest,
-      attachmentPolicyShapeDigest: attachmentDigest,
-      codexHome: input.codexHome,
-      inheritCodexHome: input.inheritCodexHome ?? false,
-    }),
+    policyFingerprint: currentFingerprint,
+    ...(legacyFingerprint !== currentFingerprint
+      ? { compatiblePolicyFingerprints: [legacyFingerprint] }
+      : {}),
   };
 }
 

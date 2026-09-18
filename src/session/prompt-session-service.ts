@@ -48,6 +48,7 @@ export interface PreparePromptSessionInput {
   identity: PromptBindingIdentity;
   origin: PromptBindingOrigin;
   existingAgentSessionId?: string;
+  compatiblePolicyFingerprints?: string[];
   allowResume?: boolean;
   signal?: AbortSignal;
 }
@@ -182,6 +183,41 @@ export class PromptSessionService {
     if (input.allowResume === false) return this.prepareFreshSession(input);
     if (snapshot.resetTombstones[identityKey]) return this.prepareFreshSession(input);
     let sessionKey = snapshot.activeByIdentity[identityKey];
+    if (!sessionKey) {
+      const compatibleIdentityKeys = [
+        ...new Set(input.compatiblePolicyFingerprints ?? []),
+      ]
+        .filter((policyFingerprint) => policyFingerprint !== input.identity.policyFingerprint)
+        .map((policyFingerprint) =>
+          promptBindingIdentityKey({ ...input.identity, policyFingerprint }),
+        );
+      const compatibleIdentityKey = compatibleIdentityKeys.find(
+        (candidate) => snapshot.activeByIdentity[candidate] !== undefined,
+      );
+      const compatibleSessionKey = compatibleIdentityKey
+        ? snapshot.activeByIdentity[compatibleIdentityKey]
+        : undefined;
+      if (compatibleIdentityKey && compatibleSessionKey) {
+        if (
+          input.existingAgentSessionId &&
+          compatibleSessionKey !==
+            agentSessionKey(input.identity.agentId, input.existingAgentSessionId)
+        ) {
+          throw new Error('compatible prompt binding does not match the catalog session');
+        }
+        const promoted = await ledger.transactLatest((draft) => {
+          if (draft.activeByIdentity[identityKey]) return;
+          if (draft.activeByIdentity[compatibleIdentityKey] !== compatibleSessionKey) {
+            throw new Error('compatible prompt binding pointer changed during promotion');
+          }
+          draft.activeByIdentity[identityKey] = compatibleSessionKey;
+          delete draft.activeByIdentity[compatibleIdentityKey];
+        });
+        this.currentHealth = { health: 'healthy', ledger: promoted };
+        snapshot = promoted;
+        sessionKey = promoted.activeByIdentity[identityKey];
+      }
+    }
     if (!sessionKey) {
       const legacyIdentityKey = promptBindingLegacyIdentityKey(input.identity);
       const legacySessionKey = snapshot.legacyActiveByScopeCwd[legacyIdentityKey];

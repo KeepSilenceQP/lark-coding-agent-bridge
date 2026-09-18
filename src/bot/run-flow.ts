@@ -170,12 +170,20 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   let sessionId: string | undefined;
   let threadId: string | undefined;
   if (input.sessionCatalog) {
-    const catalogEntry = input.sessionCatalog.activeFor({
-      scopeId: input.scopeId,
-      agentId: input.capability.agentId,
-      cwdRealpath: workspace.cwdRealpath,
-      policyFingerprint: policy.policyFingerprint,
-    });
+    const sessionCatalog = input.sessionCatalog;
+    const catalogEntry = [
+      policy.policyFingerprint,
+      ...(policy.compatiblePolicyFingerprints ?? []),
+    ]
+      .map((policyFingerprint) =>
+        sessionCatalog.activeFor({
+          scopeId: input.scopeId,
+          agentId: input.capability.agentId,
+          cwdRealpath: workspace.cwdRealpath,
+          policyFingerprint,
+        }),
+      )
+      .find((entry) => entry !== undefined);
     if (catalogEntry?.agentId === 'claude') {
       sessionId = catalogEntry.sessionId;
       resumeFrom = sessionId;
@@ -216,6 +224,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
           identity,
           origin: input.promptSession.origin,
           signal: reservation.signal,
+          compatiblePolicyFingerprints: policy.compatiblePolicyFingerprints,
           ...(resumeFrom ? { existingAgentSessionId: resumeFrom } : {}),
         }));
       if (decision.kind === 'fresh') {
