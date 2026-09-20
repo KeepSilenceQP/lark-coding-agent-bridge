@@ -28,8 +28,10 @@
   "files": [
     "dist",
     "bin",
+    "AGENTS.md",
     "README.md",
     "README.zh.md",
+    "docs/runbooks/traex-codex-compatible-profile.md",
     "NOTICE.md",
     "LICENSE",
     "vendor"

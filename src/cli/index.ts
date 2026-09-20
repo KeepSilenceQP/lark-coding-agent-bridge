@@ -92,6 +92,18 @@ profile
   .option('--app-id <id>', 'use an existing Lark/Feishu app instead of QR app creation')
   .option('--app-secret <secret>', 'App Secret for --app-id; prefer interactive input on shared machines')
   .option('--tenant <tenant>', 'tenant for --app-id (feishu or lark; default feishu)')
+  .addHelpText(
+    'after',
+    [
+      '',
+      'Codex-compatible CLI override (for example TraeX):',
+      "  LARK_CHANNEL_CODEX_BIN='/absolute/path/to/traex' \\",
+      '    lark-channel-bridge profile create traex --agent codex',
+      '',
+      'The resolved executable path is persisted in the profile. See the packaged',
+      'docs/runbooks/traex-codex-compatible-profile.md for compatibility and verification.',
+    ].join('\n'),
+  )
   .action(async (name: string, opts: {
     agent?: string;
     workspace?: string;

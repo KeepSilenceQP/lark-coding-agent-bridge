@@ -275,6 +275,26 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 
 If a profile was created with the wrong agent kind, stop or unregister any matching background service first, then run `profile remove <name>` and recreate it with the intended `--agent`.
 
+### Connect TraeX through the Codex-compatible protocol
+
+TraeX is not a native bridge agent kind. If the installed TraeX CLI remains
+compatible with `codex exec --json`, `exec resume`, and the related arguments
+used by the bridge, create a profile whose agent kind is `codex` but whose
+executable is TraeX:
+
+```bash
+LARK_CHANNEL_CODEX_BIN='/absolute/path/to/traex' \
+  lark-channel-bridge profile create traex --agent codex
+```
+
+The resolved path is persisted during profile creation, so later starts only
+need `lark-channel-bridge start --profile traex`. TraeX continues to own its
+model, provider, reasoning, and authentication settings; the bridge UI and
+status output will label the profile as `codex`. See the
+[TraeX Codex-compatible Profile Runbook](./docs/runbooks/traex-codex-compatible-profile.md)
+for the compatibility contract, verification steps, upgrade checks, and
+troubleshooting boundary.
+
 ### Slash commands inside Feishu / Lark
 
 | Command | Effect |

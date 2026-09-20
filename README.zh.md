@@ -265,6 +265,23 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 
 如果某个 profile 被建成了错误的 agent 类型，先 `stop` 或 `unregister --profile <name>` 清理对应后台服务，再 `profile remove <name>`，然后用正确的 `--agent` 重新创建。
 
+### 通过 Codex 兼容协议接入 TraeX
+
+TraeX 当前不属于 Bridge 的原生 agent 类型；如果已安装的 TraeX CLI 兼容
+`codex exec --json`、`exec resume` 及 Bridge 使用的相关参数，可以创建一个
+`agentKind=codex`、但实际二进制指向 TraeX 的 profile：
+
+```bash
+LARK_CHANNEL_CODEX_BIN='/absolute/path/to/traex' \
+  lark-channel-bridge profile create traex --agent codex
+```
+
+该路径会在创建时持久化，后续直接执行
+`lark-channel-bridge start --profile traex`，无需重复传环境变量。TraeX 的模型、
+provider、推理强度和认证仍由 TraeX 自己管理；Bridge 的界面和状态会把它显示为
+`codex`。完整的兼容条件、验证步骤、升级检查和故障边界见
+[TraeX Codex-compatible Profile Runbook](./docs/runbooks/traex-codex-compatible-profile.md)。
+
 ### 飞书内斜杠命令
 
 | 命令 | 作用 |
