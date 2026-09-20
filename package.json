@@ -37,7 +37,7 @@
   "scripts": {
     "dev": "tsup --watch",
     "build:web": "vite build web",
-    "build": "pnpm build:web && tsup",
+    "build": "npm run build:web && tsup",
     "typecheck": "tsc --noEmit",
     "pretest": "pnpm build:web",
     "test": "vitest run",
