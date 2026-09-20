@@ -30,10 +30,19 @@ Codex 最终回复恢复机制和维护版 Channel 打包方式。在 Fork 当�
 该次集成通过 macOS、Ubuntu、Windows CI，以及 991 个通过、3 个跳过的测试、
 typecheck/build、release/npm clean-install 校验。
 
+第二次上游检查于 2026-09-20 完成，逐项审阅了
+[`36f7d382..5898681`](https://github.com/zarazhangrui/lark-coding-agent-bridge/compare/36f7d382806e11b21bf7329cf44deef604a1136b...5898681)
+范围内的全部 10 个 commit。此次纳入了 Web UI 与 supervisor、群选择器、
+合并转发失败处理、服务停止与自启动修复、Codex 双形态回复去重、会议支持，以及
+Channel 0.6.0。上游纯 merge/version commit 已审阅但没有机械重放；上游的
+no-content/最终回复修改则做了适配，保留本 Fork 的单流最终回复与 CardKit 恢复契约，
+没有恢复此前已替换掉的“撤回消息”行为。适配后的批次在发布前通过本机 1655 个测试
+（33 个跳过）、typecheck 和生产构建。
+
 **后续同步锚点：**将原仓库 commit
-[`36f7d382`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/36f7d382806e11b21bf7329cf44deef604a1136b)
+[`5898681`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/5898681)
 作为不包含在新范围内的下界；下次待检查范围是
-`36f7d382..upstream/main`。由于已纳入的修改在本 Fork 中经过冲突适配，这里记录的是
+`5898681..upstream/main`。由于已纳入的修改在本 Fork 中经过冲突适配，这里记录的是
 上游来源历史边界，不是两仓库的 Git merge base。只有下一批上游修改完成集成并通过
 验证后，才能更新这个锚点。
 

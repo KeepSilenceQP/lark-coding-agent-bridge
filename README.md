@@ -31,10 +31,21 @@ followed by fork-only compatibility and release commits.
 The integration was validated on macOS, Ubuntu, and Windows with 991 passing
 tests, 3 skipped tests, typecheck/build, and release/npm clean-install checks.
 
+A second upstream review was completed on 2026-09-20 for all 10 commits in
+[`36f7d382..5898681`](https://github.com/zarazhangrui/lark-coding-agent-bridge/compare/36f7d382806e11b21bf7329cf44deef604a1136b...5898681).
+It integrated the Web UI and supervisor, group picker, merge-forward failure
+handling, service stop/autostart fixes, Codex dual-shape reply deduplication,
+meeting support, and Channel 0.6.0. Upstream merge/version-only commits were
+reviewed but not replayed. The upstream no-content/final-reply changes were
+adapted to retain this fork's single-stream final-reply and CardKit recovery
+contracts instead of restoring the recalled-message behavior they had replaced.
+The adapted batch passed 1,655 tests locally (33 skipped), typecheck, and the
+production build before release.
+
 **Future upstream sync anchor:** use upstream commit
-[`36f7d382`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/36f7d382806e11b21bf7329cf44deef604a1136b)
+[`5898681`](https://github.com/zarazhangrui/lark-coding-agent-bridge/commit/5898681)
 as the exclusive lower bound. New candidates are
-`36f7d382..upstream/main`. This is a source-history boundary rather than a Git
+`5898681..upstream/main`. This is a source-history boundary rather than a Git
 merge base because the incorporated changes were conflict-adapted in the fork.
 Do not advance this anchor until the next upstream batch has been integrated
 and verified.
