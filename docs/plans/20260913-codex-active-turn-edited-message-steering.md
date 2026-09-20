@@ -4,7 +4,7 @@ Date: 2026-09-14
 
 Spec authority: `docs/specs/20260913-codex-active-turn-edited-message-steering.md`
 
-Workspace: `/Users/bytedance/repo/lark-coding-agent-bridge`
+Workspace: repository root
 
 Baseline: `main@c8aa2f4`
 
