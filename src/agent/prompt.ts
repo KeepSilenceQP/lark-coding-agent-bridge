@@ -1,4 +1,4 @@
-export type BridgePromptSource = 'im' | 'card' | 'comment' | 'reaction';
+export type BridgePromptSource = 'im' | 'card' | 'comment' | 'reaction' | 'message_edit_restart';
 
 export interface BridgePromptMention {
   openId?: string;
@@ -97,6 +97,15 @@ export interface BuildAgentPromptInput {
   comment?: BridgePromptComment;
   attachments?: BridgePromptAttachment[];
   reactionContexts?: unknown[];
+  correctedMessage?: {
+    messageId: string;
+    revision: string;
+    fingerprint: string;
+    text: string;
+    supersedesEarlierAsr: true;
+    priorEffectsRolledBack: false;
+    oldRunStartedTool: boolean;
+  };
 }
 
 export function buildAgentPrompt(input: BuildAgentPromptInput): string {
@@ -118,12 +127,14 @@ export function buildAgentPrompt(input: BuildAgentPromptInput): string {
     input.reactionContexts && input.reactionContexts.length > 0
       ? promptSection('reaction_contexts', input.reactionContexts)
       : undefined,
-    promptSection('user_input', {
-      text: input.userInput,
-      ...(input.attachments && input.attachments.length > 0
-        ? { attachments: input.attachments }
-        : {}),
-    }),
+    input.correctedMessage
+      ? promptSection('corrected_message', input.correctedMessage)
+      : promptSection('user_input', {
+          text: input.userInput,
+          ...(input.attachments && input.attachments.length > 0
+            ? { attachments: input.attachments }
+            : {}),
+        }),
   ];
 
   return sections.filter(Boolean).join('\n\n');

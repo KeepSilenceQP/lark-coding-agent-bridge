@@ -6,6 +6,8 @@ import {
   isPredefinedEmoji,
   isStopEmoji,
   STOP_EMOJI_TYPES,
+  EDITED_MESSAGE_RESTART_EMOJI_TYPE,
+  isEditedMessageRestartReaction,
 } from '../../../src/bot/reaction/semantics';
 
 // ── RED: schema version exists ──
@@ -167,5 +169,18 @@ describe('isStopEmoji / STOP_EMOJI_TYPES', () => {
   it('isStopEmoji returns false for non-stop emojiTypes', () => {
     expect(isStopEmoji('JIAYI')).toBe(false);
     expect(isStopEmoji('Get')).toBe(false);
+  });
+});
+
+describe('edited-message restart reaction', () => {
+  it('matches only exact case-sensitive added + Loudspeaker without becoming model-visible semantics', () => {
+    expect(EDITED_MESSAGE_RESTART_EMOJI_TYPE).toBe('Loudspeaker');
+    expect(isEditedMessageRestartReaction({ emojiType: 'Loudspeaker', action: 'added' })).toBe(true);
+    expect(isEditedMessageRestartReaction({ emojiType: 'loudspeaker', action: 'added' })).toBe(false);
+    expect(isEditedMessageRestartReaction({ emojiType: 'Loudspeaker', action: 'removed' })).toBe(false);
+    expect(SEMANTICS_TABLE.Loudspeaker).toBeUndefined();
+    expect(lookupReactionSemantics('Loudspeaker')).toMatchObject({
+      emojiMeaningSource: 'unmapped',
+    });
   });
 });

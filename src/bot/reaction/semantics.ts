@@ -128,6 +128,14 @@ export const SEMANTICS_TABLE: Record<string, ReactionSemanticEntry> = {
 
 /** emojiTypes that map to stop_current_work — used by the control plane fast path. */
 export const STOP_EMOJI_TYPES: readonly string[] = ['No', 'CrossMark', 'MinusOne'];
+export const EDITED_MESSAGE_RESTART_EMOJI_TYPE = 'Loudspeaker';
+
+export function isEditedMessageRestartReaction(input: {
+  emojiType: string;
+  action: 'added' | 'removed';
+}): boolean {
+  return input.action === 'added' && input.emojiType === EDITED_MESSAGE_RESTART_EMOJI_TYPE;
+}
 
 /** Look up a single emojiType. Returns predefined entry on hit, unmapped passthrough otherwise. */
 export function lookupReactionSemantics(emojiType: string): ReactionSemanticResult {

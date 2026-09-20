@@ -280,11 +280,109 @@ describe('RunExecutor', () => {
     expect(run.waitForExitCalls).toBe(1);
   });
 
-  it('stops the underlying process when it does not exit after a terminal event', async () => {
+  it('only releases an execution for replacement after exit is confirmed', async () => {
     const h = await createHarness({
-      events: [{ type: 'done', terminationReason: 'normal' }],
-      waitForExit: false,
+      events: [[{ type: 'text', delta: 'running' }], [{ type: 'done', terminationReason: 'normal' }]],
+      waitForExit: [true, true],
     });
+    const execution = await h.executor.submit({
+      scopeId: 'scope-1',
+      policy: policy(h.tmp.workspace),
+    });
+    const replacement = h.activeRuns.reserveReplacement('scope-1', execution.handle)!;
+    expect(replacement.beginStop()).toBe(true);
+
+    await expect(execution.stopAndConfirmExit()).resolves.toBe(true);
+    expect(replacement.confirmExit()).toBe(true);
+    const corrected = await h.executor.submit({
+      scopeId: 'scope-1',
+      policy: policy(h.tmp.workspace),
+      replacement,
+    });
+
+    expect(h.agent.runs.map((run) => run.runId)).toEqual(['run-1', 'run-2']);
+    expect(h.activeRuns.get('scope-1')).toBe(corrected.handle);
+    await collect(corrected.subscribe());
+    expect(h.pool.snapshot()).toMatchObject({ active: 0, waiting: 0 });
+  });
+
+  it('keeps the old execution authoritative when replacement exit is unconfirmed', async () => {
+    const h = await createHarness({ events: [{ type: 'text', delta: 'running' }], waitForExit: false });
+    const execution = await h.executor.submit({
+      scopeId: 'scope-1',
+      policy: policy(h.tmp.workspace),
+    });
+    const replacement = h.activeRuns.reserveReplacement('scope-1', execution.handle)!;
+    expect(replacement.beginStop()).toBe(true);
+
+    await expect(execution.stopAndConfirmExit()).resolves.toBe(false);
+
+    expect(h.activeRuns.get('scope-1')).toBe(execution.handle);
+    expect(h.activeRuns.hasReplacement('scope-1')).toBe(true);
+    expect(h.agent.runs).toHaveLength(1);
+    expect(h.pool.snapshot()).toMatchObject({ active: 1, waiting: 0 });
+  });
+
+  it('does not release the scope or pool when stream cleanup wins before process exit', async () => {
+    const agent = new ControlledExitAgent();
+    const h = await createHarness({ agent });
+    const execution = await h.executor.submit({
+      scopeId: 'scope-1',
+      policy: policy(h.tmp.workspace),
+    });
+    const replacement = h.activeRuns.reserveReplacement('scope-1', execution.handle)!;
+    expect(replacement.beginStop()).toBe(true);
+    const collecting = collect(execution.subscribe());
+
+    await expect(execution.stopAndConfirmExit()).resolves.toBe(false);
+    expect(h.activeRuns.get('scope-1')).toBe(execution.handle);
+    expect(h.pool.snapshot()).toMatchObject({ active: 1, waiting: 0 });
+
+    agent.currentRun!.confirmExit();
+    await execution.waitForConfirmedExit();
+    await collecting;
+    expect(h.activeRuns.get('scope-1')).toBe(execution.handle);
+    expect(h.pool.snapshot()).toMatchObject({ active: 0, waiting: 0 });
+
+    expect(replacement.confirmExit()).toBe(true);
+    expect(h.activeRuns.get('scope-1')).toBeUndefined();
+    replacement.release();
+  });
+
+  it('keeps authoritative tool observation isolated to each execution', async () => {
+    const h = await createHarness({
+      events: [
+        [
+          { type: 'tool_use', id: 'tool-1', name: 'exec', input: {} },
+          { type: 'done', terminationReason: 'normal' },
+        ],
+        [{ type: 'done', terminationReason: 'normal' }],
+      ],
+    });
+    const first = await h.executor.submit({ scopeId: 'scope-1', policy: policy(h.tmp.workspace) });
+    await collect(first.subscribe());
+    const second = await h.executor.submit({ scopeId: 'scope-1', policy: policy(h.tmp.workspace) });
+    await collect(second.subscribe());
+
+    expect(first.toolStartedEver()).toBe(true);
+    expect(second.toolStartedEver()).toBe(false);
+  });
+
+  it('fails closed instead of deadlocking when an exited run event source cannot drain', async () => {
+    const h = await createHarness({ agent: new NonDrainingExitAgent() });
+    const execution = await h.executor.submit({
+      scopeId: 'scope-1',
+      policy: policy(h.tmp.workspace),
+    });
+
+    await expect(execution.stopAndConfirmExit()).resolves.toBe(false);
+    expect(h.activeRuns.get('scope-1')).toBe(execution.handle);
+    expect(h.pool.snapshot()).toMatchObject({ active: 1, waiting: 0 });
+  });
+
+  it('stops the underlying process when it does not exit after a terminal event', async () => {
+    const agent = new TerminalDelayedExitAgent();
+    const h = await createHarness({ agent });
     const execution = await h.executor.submit({
       scopeId: 'scope-1',
       policy: policy(h.tmp.workspace),
@@ -292,8 +390,8 @@ describe('RunExecutor', () => {
 
     await collect(execution.subscribe());
 
-    const run = execution.run as FakeAgentRun;
-    expect(run.waitForExitCalls).toBe(1);
+    const run = agent.currentRun!;
+    expect(run.waitForExitCalls).toBe(2);
     expect(run.stopped).toBe(true);
     expect(h.activeRuns.get('scope-1')).toBeUndefined();
     expect(h.pool.snapshot()).toMatchObject({ active: 0, waiting: 0 });
@@ -396,5 +494,121 @@ class DelayedPrepareAgent extends FakeAgentAdapter {
 
   releasePrepare(): void {
     this.resolvePrepare();
+  }
+}
+
+class ControlledExitAgent implements AgentAdapter {
+  readonly id = 'controlled-exit';
+  readonly displayName = 'Controlled Exit';
+  currentRun: ControlledExitRun | undefined;
+
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+
+  run(opts: AgentRunOptions): AgentRun {
+    this.currentRun = new ControlledExitRun(opts.runId);
+    return this.currentRun;
+  }
+}
+
+class ControlledExitRun implements AgentRun {
+  readonly events: AsyncIterable<never>;
+  private streamEnded = false;
+  private exited = false;
+  private waitCalls = 0;
+  private resolveStreamEnd!: () => void;
+  private resolveExit!: () => void;
+  private readonly streamEnd = new Promise<void>((resolve) => { this.resolveStreamEnd = resolve; });
+  private readonly processExit = new Promise<void>((resolve) => { this.resolveExit = resolve; });
+
+  constructor(readonly runId: string) {
+    this.events = {
+      [Symbol.asyncIterator]: async function* (this: ControlledExitRun): AsyncIterator<never> {
+        await this.streamEnd;
+      }.bind(this),
+    };
+  }
+
+  async stop(): Promise<void> {
+    if (!this.streamEnded) {
+      this.streamEnded = true;
+      this.resolveStreamEnd();
+    }
+  }
+
+  async waitForExit(): Promise<boolean> {
+    this.waitCalls += 1;
+    if (this.exited) return true;
+    // The first bounded confirmation attempt times out; later callers wait
+    // for the test-controlled authoritative process-exit signal.
+    if (!this.streamEnded || this.waitCalls === 1) return false;
+    await this.processExit;
+    return true;
+  }
+
+  confirmExit(): void {
+    if (this.exited) return;
+    this.exited = true;
+    this.resolveExit();
+  }
+}
+
+class TerminalDelayedExitAgent implements AgentAdapter {
+  readonly id = 'terminal-delayed-exit';
+  readonly displayName = 'Terminal Delayed Exit';
+  currentRun: TerminalDelayedExitRun | undefined;
+
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+
+  run(opts: AgentRunOptions): AgentRun {
+    this.currentRun = new TerminalDelayedExitRun(opts.runId);
+    return this.currentRun;
+  }
+}
+
+class TerminalDelayedExitRun implements AgentRun {
+  stopped = false;
+  waitForExitCalls = 0;
+  readonly events: AsyncIterable<import('../../../src/agent/types').AgentEvent> = {
+    async *[Symbol.asyncIterator]() {
+      yield { type: 'done' as const, terminationReason: 'normal' as const };
+    },
+  };
+
+  constructor(readonly runId: string) {}
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+  }
+
+  async waitForExit(): Promise<boolean> {
+    this.waitForExitCalls += 1;
+    return this.waitForExitCalls >= 2;
+  }
+}
+
+class NonDrainingExitAgent implements AgentAdapter {
+  readonly id = 'non-draining-exit';
+  readonly displayName = 'Non Draining Exit';
+
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+
+  run(opts: AgentRunOptions): AgentRun {
+    const never = new Promise<void>(() => {});
+    return {
+      runId: opts.runId,
+      events: {
+        async *[Symbol.asyncIterator]() {
+          await never;
+        },
+      },
+      async stop() {},
+      async waitForExit() { return true; },
+    };
   }
 }

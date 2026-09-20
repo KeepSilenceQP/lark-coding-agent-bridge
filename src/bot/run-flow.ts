@@ -16,7 +16,7 @@ import {
   type WorkingDirectoryResolveResult,
 } from '../policy/workspace';
 import type { RunExecution, RunExecutor } from '../runtime/run-executor';
-import type { RunReservation } from './active-runs';
+import type { ReplacementReservation, RunReservation } from './active-runs';
 import { RunRejected, type RunRejectedCode } from '../runtime/errors';
 import type { SessionCatalog } from '../session/catalog';
 import type {
@@ -68,7 +68,218 @@ export type RunFlowRejectCode =
   | WorkingDirectoryRejectReason
   | RunPolicyReject['rejectReason']['code']
   | RunRejectedCode
-  | 'prompt-session-unavailable';
+  | 'prompt-session-unavailable'
+  | 'pinned-restart-not-codex'
+  | 'pinned-restart-cwd-changed'
+  | 'pinned-restart-policy-changed'
+  | 'pinned-restart-thread-unavailable'
+  | 'pinned-restart-thread-changed';
+
+export interface PreparePinnedCodexRunInput {
+  scopeId: string;
+  scope: ScopeContext;
+  prompt: string;
+  attachments: AgentAttachment[];
+  access: AccessDecision;
+  capability: AgentCapability;
+  profileConfig: ProfileConfig;
+  sessions: SessionStore;
+  sessionCatalog?: SessionCatalog;
+  promptSession?: {
+    service: PromptSessionService;
+    origin: PromptBindingOrigin;
+  };
+  workspaces: WorkspaceStore;
+  expected: {
+    cwdRealpath: string;
+    policyFingerprint: string;
+    threadId: string;
+  };
+  now: number;
+  systemPromptAddendum?: string;
+}
+
+export interface PreparedPinnedCodexRun {
+  scopeId: string;
+  policy: RunPolicyAllow;
+  cwdRealpath: string;
+  threadId: string;
+  systemPromptAddendum?: string;
+  promptSession?: {
+    service: PromptSessionService;
+    identity: PromptBindingIdentity;
+    origin: PromptBindingOrigin;
+    decision: PromptSessionDecision;
+  };
+}
+
+export type PreparePinnedCodexRunResult =
+  | { ok: true; prepared: PreparedPinnedCodexRun }
+  | { ok: false; rejectReason: { code: RunFlowRejectCode; userVisible: string } };
+
+/**
+ * Revalidate every durable identity used by an edit restart before the old
+ * process is stopped. The returned plan pins immutable policy/cwd/thread data;
+ * it never falls back to a fresh session.
+ */
+export async function preparePinnedCodexRun(
+  input: PreparePinnedCodexRunInput,
+): Promise<PreparePinnedCodexRunResult> {
+  const reject = (code: RunFlowRejectCode, userVisible: string): PreparePinnedCodexRunResult => ({
+    ok: false,
+    rejectReason: { code, userVisible },
+  });
+  if (input.capability.agentId !== 'codex' || input.profileConfig.agentKind !== 'codex') {
+    return reject('pinned-restart-not-codex', '当前运行不支持消息修正重启。');
+  }
+  const requestedCwd =
+    input.workspaces.cwdFor(input.scopeId) ?? input.profileConfig.workspaces.default ?? '';
+  const workspace = await resolveWorkingDirectory(requestedCwd);
+  if (!workspace.ok) return reject(workspace.reason, workspace.userVisible);
+  if (workspace.cwdRealpath !== input.expected.cwdRealpath) {
+    return reject('pinned-restart-cwd-changed', '工作目录已变化，未停止当前运行。');
+  }
+  const policy = evaluateRunPolicy({
+    scope: input.scope,
+    attachments: input.attachments,
+    prompt: input.prompt,
+    requestedCwd,
+    cwdRealpath: workspace.cwdRealpath,
+    access: input.access,
+    capability: input.capability,
+    profileConfig: input.profileConfig,
+    now: input.now,
+    codexHome: input.profileConfig.codex?.codexHome,
+    inheritCodexHome: input.profileConfig.codex?.inheritCodexHome,
+  });
+  if (!policy.ok) return { ok: false, rejectReason: policy.rejectReason };
+  if (policy.policyFingerprint !== input.expected.policyFingerprint) {
+    return reject('pinned-restart-policy-changed', '运行策略已变化，未停止当前运行。');
+  }
+  const catalogEntry = input.sessionCatalog?.activeFor({
+    scopeId: input.scopeId,
+    agentId: 'codex',
+    cwdRealpath: workspace.cwdRealpath,
+    policyFingerprint: policy.policyFingerprint,
+  });
+  if (!catalogEntry?.threadId) {
+    return reject('pinned-restart-thread-unavailable', '当前 Codex thread 尚未持久化，未停止当前运行。');
+  }
+  if (catalogEntry.threadId !== input.expected.threadId) {
+    return reject('pinned-restart-thread-changed', '当前 Codex thread 已变化，未停止当前运行。');
+  }
+
+  let preparedPromptSession: PreparedPinnedCodexRun['promptSession'];
+  let systemPromptAddendum = input.systemPromptAddendum;
+  if (input.promptSession) {
+    const identity: PromptBindingIdentity = {
+      scopeId: input.scopeId,
+      agentId: 'codex',
+      cwdRealpath: workspace.cwdRealpath,
+      policyFingerprint: policy.policyFingerprint,
+    };
+    let decision: PromptSessionDecision;
+    try {
+      decision = await input.promptSession.service.prepareSession({
+        identity,
+        origin: input.promptSession.origin,
+        existingAgentSessionId: input.expected.threadId,
+      });
+    } catch {
+      return reject('prompt-session-unavailable', '当前会话状态不可用，未停止当前运行。');
+    }
+    const decidedThread = decision.kind === 'resume'
+      ? decision.agentSessionId
+      : decision.kind === 'dormant'
+        ? decision.existingAgentSessionId
+        : undefined;
+    if (decidedThread !== input.expected.threadId) {
+      return reject('pinned-restart-thread-changed', '当前 prompt session 已变化，未停止当前运行。');
+    }
+    systemPromptAddendum = decision.kind === 'resume'
+      ? decision.systemPromptAddendum
+      : systemPromptAddendum;
+    preparedPromptSession = {
+      service: input.promptSession.service,
+      identity,
+      origin: input.promptSession.origin,
+      decision,
+    };
+  }
+  return {
+    ok: true,
+    prepared: {
+      scopeId: input.scopeId,
+      policy,
+      cwdRealpath: workspace.cwdRealpath,
+      threadId: input.expected.threadId,
+      ...(systemPromptAddendum !== undefined ? { systemPromptAddendum } : {}),
+      ...(preparedPromptSession ? { promptSession: preparedPromptSession } : {}),
+    },
+  };
+}
+
+export async function startPreparedPinnedCodexRun(input: {
+  prepared: PreparedPinnedCodexRun;
+  executor: RunExecutor;
+  replacement: ReplacementReservation;
+  profileConfig: ProfileConfig;
+  stopGraceMs?: number;
+  routeId?: string;
+  observability?: StartRunFlowInput['observability'];
+}): Promise<StartRunFlowResult> {
+  const promptSession = input.prepared.promptSession;
+  const admission = promptSession?.service.admitRun({
+    runId: `${input.prepared.scopeId}:${Date.now()}`,
+    source: promptSession.origin.source,
+  });
+  admission?.markIdentifierDurable();
+  try {
+    const execution = await input.executor.submit({
+      scopeId: input.prepared.scopeId,
+      policy: input.prepared.policy,
+      threadId: input.prepared.threadId,
+      systemPromptAddendum: input.prepared.systemPromptAddendum,
+      model: resolveModelArg(
+        input.profileConfig.agentKind,
+        input.profileConfig.preferences.model,
+      ),
+      stopGraceMs: input.stopGraceMs,
+      routeId: input.routeId,
+      observability: input.observability,
+      replacement: input.replacement,
+    });
+    return {
+      ok: true,
+      execution,
+      policy: input.prepared.policy,
+      cwdRealpath: input.prepared.cwdRealpath,
+      resumeFrom: input.prepared.threadId,
+      ...(promptSession && admission
+        ? {
+            promptSession: {
+              identity: promptSession.identity,
+              origin: promptSession.origin,
+              decision: promptSession.decision,
+              admission,
+            },
+          }
+        : {}),
+    };
+  } catch (err) {
+    admission?.finishWithoutIdentifier();
+    if (err instanceof RunRejected) {
+      return {
+        ok: false,
+        rejectReason: {
+          code: err.code,
+          userVisible: '修正后的运行启动失败，原运行已停止。',
+        },
+      };
+    }
+    throw err;
+  }
+}
 
 export type StartRunFlowResult =
   | {

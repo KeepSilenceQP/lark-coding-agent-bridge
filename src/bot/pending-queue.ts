@@ -60,6 +60,15 @@ export interface PendingPushOptions {
   registerAsTrigger?: boolean;
 }
 
+export interface PendingEditHold {
+  readonly scopeId: string;
+  release(): void;
+}
+
+interface EditHoldState {
+  released: boolean;
+}
+
 export type FlushHandler = (
   scope: string,
   batch: NormalizedMessage[],
@@ -69,6 +78,7 @@ export type FlushHandler = (
 export class PendingQueue {
   private readonly map = new Map<string, PendingEntry>();
   private readonly blocked = new Set<string>();
+  private readonly editHolds = new Map<string, Set<EditHoldState>>();
   private readonly delayMs: number;
   private readonly onFlush: FlushHandler;
   private readonly leaseHooks: LeaseHooks | undefined;
@@ -134,7 +144,7 @@ export class PendingQueue {
         if (lease && registerAsTrigger) this.leaseHooks?.registerTrigger?.(lease, msg.messageId);
         existing.units.push({ kind: 'regular', messages: [msg], lease, replyTo, triggerMessageIds });
       }
-      existing.timer = this.blocked.has(scope) ? undefined : this.armTimer(scope);
+      existing.timer = this.isScopeBlocked(scope) ? undefined : this.armTimer(scope);
       return totalLength(existing);
     }
     const lease = this.allocateLease(scope, replyTo);
@@ -143,7 +153,7 @@ export class PendingQueue {
     if (lease && registerAsTrigger) this.leaseHooks?.registerTrigger?.(lease, msg.messageId);
     this.map.set(scope, {
       units: [{ kind: 'regular', messages: [msg], lease, replyTo, triggerMessageIds }],
-      timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
+      timer: this.isScopeBlocked(scope) ? undefined : this.armTimer(scope),
     });
     return 1;
   }
@@ -169,7 +179,7 @@ export class PendingQueue {
 
   pushBarrier(scope: string, msg: NormalizedMessage, lease?: WorkLease): void {
     if (lease) this.acquireLease(lease);
-    if (this.blocked.has(scope)) {
+    if (this.isScopeBlocked(scope)) {
       const existing = this.map.get(scope);
       if (existing) {
         existing.units.push({ kind: 'barrier', message: msg, lease });
@@ -182,13 +192,13 @@ export class PendingQueue {
     const existing = this.map.get(scope);
     if (existing) {
       existing.units.push({ kind: 'barrier', message: msg, lease });
-      if (!this.blocked.has(scope) && !existing.timer) {
+      if (!this.isScopeBlocked(scope) && !existing.timer) {
         existing.timer = this.armTimer(scope);
       }
     } else {
       this.map.set(scope, {
         units: [{ kind: 'barrier', message: msg, lease }],
-        timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
+        timer: this.isScopeBlocked(scope) ? undefined : this.armTimer(scope),
       });
     }
   }
@@ -258,7 +268,7 @@ export class PendingQueue {
       this.map.delete(scope);
     } else {
       entry.units = kept;
-      if (!this.blocked.has(scope)) {
+      if (!this.isScopeBlocked(scope)) {
         if (entry.timer) clearTimeout(entry.timer);
         entry.timer = this.armTimer(scope);
       }
@@ -273,6 +283,7 @@ export class PendingQueue {
     }
     this.map.clear();
     this.blocked.clear();
+    this.editHolds.clear();
   }
 
   // ── block / unblock ──
@@ -293,7 +304,7 @@ export class PendingQueue {
     this.blocked.delete(scope);
     const entry = this.map.get(scope);
     log.info('queue', 'unblocked', { scope, queued: entry ? totalLength(entry) : 0 });
-    if (!entry || entry.units.length === 0) return;
+    if (!entry || entry.units.length === 0 || this.isScopeBlocked(scope)) return;
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = this.armTimer(scope);
   }
@@ -306,7 +317,36 @@ export class PendingQueue {
   }
 
   isBlocked(scope: string): boolean {
-    return this.blocked.has(scope);
+    return this.isScopeBlocked(scope);
+  }
+
+  acquireEditHold(scope: string): PendingEditHold {
+    const state: EditHoldState = { released: false };
+    const holds = this.editHolds.get(scope) ?? new Set<EditHoldState>();
+    if (holds.size === 0) {
+      this.editHolds.set(scope, holds);
+      const entry = this.map.get(scope);
+      if (entry?.timer) {
+        clearTimeout(entry.timer);
+        entry.timer = undefined;
+      }
+    }
+    holds.add(state);
+    return {
+      scopeId: scope,
+      release: () => {
+        if (state.released) return;
+        state.released = true;
+        const current = this.editHolds.get(scope);
+        if (!current?.delete(state)) return;
+        if (current.size > 0) return;
+        this.editHolds.delete(scope);
+        if (this.blocked.has(scope)) return;
+        const entry = this.map.get(scope);
+        if (!entry || entry.units.length === 0 || entry.timer) return;
+        entry.timer = this.armTimer(scope);
+      },
+    };
   }
 
   // ── private ──
@@ -320,7 +360,7 @@ export class PendingQueue {
     if (entry.units.length === 0) {
       this.map.delete(scope);
       if (entry.timer) clearTimeout(entry.timer);
-    } else if (!this.blocked.has(scope)) {
+    } else if (!this.isScopeBlocked(scope)) {
       if (entry.timer) clearTimeout(entry.timer);
       entry.timer = this.armTimer(scope);
     }
@@ -335,6 +375,7 @@ export class PendingQueue {
   }
 
   private flush(scope: string): void {
+    if (this.isScopeBlocked(scope)) return;
     const entry = this.map.get(scope);
     if (!entry || entry.units.length === 0) return;
 
@@ -349,6 +390,10 @@ export class PendingQueue {
     }
 
     this.invokeFlush(scope, unit);
+  }
+
+  private isScopeBlocked(scope: string): boolean {
+    return this.blocked.has(scope) || (this.editHolds.get(scope)?.size ?? 0) > 0;
   }
 
   private invokeFlush(scope: string, unit: PendingUnit): void {

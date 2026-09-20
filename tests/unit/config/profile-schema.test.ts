@@ -6,6 +6,7 @@ import {
 import {
   createDefaultProfileConfig,
   effectiveLarkCliIdentity,
+  isCodexEditedMessageRestartEnabled,
   normalizeProfileConfig,
 } from '../../../src/config/profile-schema';
 
@@ -16,6 +17,45 @@ const app = {
 };
 
 describe('profile schema', () => {
+  it('enables edited-message restart only for explicitly enabled Codex profiles', () => {
+    const codexDefault = createDefaultProfileConfig({
+      agentKind: 'codex',
+      accounts: { app },
+      codex: { binaryPath: '/usr/local/bin/codex' },
+    });
+    const codexEnabled = createDefaultProfileConfig({
+      agentKind: 'codex',
+      accounts: { app },
+      preferences: { codexEditedMessageRestart: true },
+      codex: { binaryPath: '/usr/local/bin/codex' },
+    });
+    const claudeEnabled = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app },
+      preferences: { codexEditedMessageRestart: true },
+    });
+
+    expect(codexDefault.preferences).not.toHaveProperty('codexEditedMessageRestart');
+    expect(isCodexEditedMessageRestartEnabled(codexDefault)).toBe(false);
+    expect(codexEnabled.preferences.codexEditedMessageRestart).toBe(true);
+    expect(isCodexEditedMessageRestartEnabled(codexEnabled)).toBe(true);
+    expect(claudeEnabled.preferences.codexEditedMessageRestart).toBe(true);
+    expect(isCodexEditedMessageRestartEnabled(claudeEnabled)).toBe(false);
+  });
+
+  it('does not enable edited-message restart for truthy non-boolean values', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'codex',
+      accounts: { app },
+      preferences: { codexEditedMessageRestart: 'true' },
+      codex: { binaryPath: '/usr/local/bin/codex' },
+    });
+
+    expect(cfg.preferences).not.toHaveProperty('codexEditedMessageRestart');
+    expect(isCodexEditedMessageRestartEnabled(cfg)).toBe(false);
+  });
+
   it('defaults Claude sandbox to danger-full-access through canonical permissions', () => {
     const cfg = createDefaultProfileConfig({
       agentKind: 'claude',

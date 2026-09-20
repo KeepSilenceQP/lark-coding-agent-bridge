@@ -3,6 +3,8 @@ import type { AgentRun } from '../agent/types';
 export interface RunHandle {
   run: AgentRun;
   interrupted: boolean;
+  /** Monotonic identity assigned by ActiveRuns; object identity is authoritative. */
+  generation?: number;
   /** Set when an explicit control-plane action requested termination. */
   controlPlaneInterrupted?: boolean;
   /** Set when interrupted due to reaction revision supersede (not /stop). */
@@ -15,21 +17,53 @@ export interface RunReservation {
   release(): void;
 }
 
+export type ReplacementPhase =
+  | 'held'
+  | 'stopping'
+  | 'exit-confirmed'
+  | 'registered'
+  | 'released'
+  | 'ownership-lost';
+
+export interface ReplacementReservation {
+  readonly scopeId: string;
+  readonly signal: AbortSignal;
+  readonly expectedHandle: RunHandle;
+  readonly phase: ReplacementPhase;
+  revalidate(): boolean;
+  beginStop(): boolean;
+  confirmExit(): boolean;
+  register(run: AgentRun): RunHandle;
+  release(): void;
+}
+
 interface ReservationState {
   controller: AbortController;
   released: boolean;
 }
 
+interface ReplacementState {
+  controller: AbortController;
+  expectedHandle: RunHandle;
+  phase: ReplacementPhase;
+}
+
 export class ActiveRuns {
   private readonly handles = new Map<string, RunHandle>();
   private readonly reservations = new Map<string, ReservationState>();
+  private readonly replacements = new Map<string, ReplacementState>();
   /** Monotonic per-scope epoch advanced only by explicit interrupt(). */
   private readonly interruptEpochs = new Map<string, number>();
   private pauseDepth = 0;
   private pauseReason: string | undefined;
+  private generation = 0;
 
   reserve(chatId: string): RunReservation | undefined {
-    if (this.handles.has(chatId) || this.reservations.has(chatId)) return undefined;
+    if (
+      this.handles.has(chatId) ||
+      this.reservations.has(chatId) ||
+      this.replacements.has(chatId)
+    ) return undefined;
     const state: ReservationState = {
       controller: new AbortController(),
       released: false,
@@ -47,16 +81,83 @@ export class ActiveRuns {
   }
 
   register(chatId: string, run: AgentRun, reservation?: RunReservation): RunHandle {
-    if (this.handles.has(chatId)) {
+    if (this.handles.has(chatId) || this.replacements.has(chatId)) {
       throw new Error(`run already active for scope: ${chatId}`);
     }
     if (reservation?.signal.aborted) {
       throw new Error(`run reservation was interrupted for scope: ${chatId}`);
     }
     this.reservations.delete(chatId);
-    const handle: RunHandle = { run, interrupted: false };
+    const handle: RunHandle = { run, interrupted: false, generation: ++this.generation };
     this.handles.set(chatId, handle);
     return handle;
+  }
+
+  reserveReplacement(
+    chatId: string,
+    expectedHandle: RunHandle,
+  ): ReplacementReservation | undefined {
+    if (
+      this.handles.get(chatId) !== expectedHandle ||
+      this.reservations.has(chatId) ||
+      this.replacements.has(chatId)
+    ) return undefined;
+    const state: ReplacementState = {
+      controller: new AbortController(),
+      expectedHandle,
+      phase: 'held',
+    };
+    this.replacements.set(chatId, state);
+    const isCurrent = (): boolean => this.replacements.get(chatId) === state;
+    const token: ReplacementReservation = {
+      scopeId: chatId,
+      signal: state.controller.signal,
+      expectedHandle,
+      get phase() {
+        return state.phase;
+      },
+      revalidate: () =>
+        isCurrent() &&
+        state.phase === 'held' &&
+        this.handles.get(chatId) === expectedHandle,
+      beginStop: () => {
+        if (!token.revalidate()) return false;
+        state.phase = 'stopping';
+        return true;
+      },
+      confirmExit: () => {
+        if (
+          !isCurrent() ||
+          state.phase !== 'stopping' ||
+          this.handles.get(chatId) !== expectedHandle
+        ) return false;
+        this.handles.delete(chatId);
+        state.phase = 'exit-confirmed';
+        return true;
+      },
+      register: (run) => {
+        if (
+          !isCurrent() ||
+          state.phase !== 'exit-confirmed' ||
+          state.controller.signal.aborted ||
+          this.handles.has(chatId)
+        ) {
+          throw new Error(`replacement reservation is not ready for scope: ${chatId}`);
+        }
+        const handle: RunHandle = { run, interrupted: false, generation: ++this.generation };
+        state.phase = 'registered';
+        this.replacements.delete(chatId);
+        this.handles.set(chatId, handle);
+        return handle;
+      },
+      release: () => {
+        if (!isCurrent()) return;
+        state.phase = 'released';
+        state.controller.abort();
+        this.replacements.delete(chatId);
+      },
+    };
+    return token;
   }
 
   pauseNewRuns(reason: string): () => void {
@@ -88,9 +189,17 @@ export class ActiveRuns {
     return this.reservations.has(chatId);
   }
 
+  hasReplacement(chatId: string): boolean {
+    return this.replacements.has(chatId);
+  }
+
   /** True when there is an active handle OR a reservation for this scope. */
   hasActiveOrReserved(chatId: string): boolean {
-    return this.handles.has(chatId) || this.reservations.has(chatId);
+    return (
+      this.handles.has(chatId) ||
+      this.reservations.has(chatId) ||
+      this.replacements.has(chatId)
+    );
   }
 
   interruptEpoch(chatId: string): number {
@@ -99,7 +208,19 @@ export class ActiveRuns {
 
   unregister(chatId: string, run: AgentRun): void {
     const existing = this.handles.get(chatId);
-    if (existing?.run === run) this.handles.delete(chatId);
+    if (existing?.run !== run) return;
+    const replacement = this.replacements.get(chatId);
+    if (replacement?.expectedHandle === existing) {
+      if (replacement.phase === 'stopping') {
+        return;
+      }
+      if (replacement.phase === 'held') {
+        replacement.phase = 'ownership-lost';
+        replacement.controller.abort();
+        this.replacements.delete(chatId);
+      }
+    }
+    this.handles.delete(chatId);
   }
 
   snapshot(): RunHandle[] {
@@ -128,6 +249,13 @@ export class ActiveRuns {
       reservation.controller.abort();
       interrupted = true;
     }
+    const replacement = this.replacements.get(chatId);
+    if (replacement) {
+      this.replacements.delete(chatId);
+      replacement.phase = 'released';
+      replacement.controller.abort();
+      interrupted = true;
+    }
     const h = this.handles.get(chatId);
     if (h) {
       h.interrupted = true;
@@ -149,6 +277,11 @@ export class ActiveRuns {
       reservation.controller.abort();
     }
     this.reservations.clear();
+    for (const replacement of this.replacements.values()) {
+      replacement.phase = 'released';
+      replacement.controller.abort();
+    }
+    this.replacements.clear();
     for (const h of all) {
       h.interrupted = true;
       h.controlPlaneInterrupted = true;

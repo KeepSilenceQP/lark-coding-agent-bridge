@@ -5,7 +5,9 @@ import { claudeCapability, codexCapability } from '../../../src/agent/capability
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { ProcessPool } from '../../../src/bot/process-pool.js';
 import {
+  preparePinnedCodexRun,
   recordRunSessionEvent,
+  startPreparedPinnedCodexRun,
   startRunFlow,
   type StartRunFlowInput,
 } from '../../../src/bot/run-flow.js';
@@ -171,6 +173,112 @@ describe('agent-aware run-flow resume', () => {
       }),
     ).toMatchObject({ threadId: 'thread-recorded' });
     expect(codex.sessions.getRaw('chat-1')).toBeUndefined();
+  });
+
+  it('validates cwd, policy, and catalog before pinning the exact Codex thread into replacement', async () => {
+    const h = await createHarness('codex');
+    const probe = await start(h);
+    if (!probe.ok) throw new Error('expected probe run');
+    await collect(probe.execution.subscribe());
+    h.catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codex',
+      cwdRealpath: probe.cwdRealpath,
+      policyFingerprint: probe.policy.policyFingerprint,
+      threadId: 'thread-pinned',
+      now: 1000,
+    });
+    const prepared = await preparePinnedCodexRun({
+      scopeId: 'chat-1',
+      scope: { source: 'im', chatId: 'chat-1', actorId: 'ou_user' },
+      prompt: 'corrected prompt',
+      attachments: [],
+      access: { ok: true, reason: 'allowed-user' },
+      capability: codexCapability(h.profileConfig),
+      profileConfig: h.profileConfig,
+      sessions: h.sessions,
+      sessionCatalog: h.catalog,
+      workspaces: h.workspaces,
+      expected: {
+        cwdRealpath: probe.cwdRealpath,
+        policyFingerprint: probe.policy.policyFingerprint,
+        threadId: 'thread-pinned',
+      },
+      now: 1000,
+    });
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) throw new Error('expected pinned plan');
+
+    const activeRuns = new ActiveRuns();
+    const oldReservation = activeRuns.reserve('chat-1')!;
+    const oldRun = {
+      runId: 'old',
+      events: { async *[Symbol.asyncIterator]() {} },
+      async stop() {},
+      async waitForExit() { return true; },
+    };
+    const oldHandle = activeRuns.register('chat-1', oldRun, oldReservation);
+    oldReservation.release();
+    const replacement = activeRuns.reserveReplacement('chat-1', oldHandle)!;
+    expect(replacement.beginStop()).toBe(true);
+    expect(replacement.confirmExit()).toBe(true);
+    const replacementExecutor = new RunExecutor({
+      agent: h.agent,
+      pool: new ProcessPool(() => 10),
+      activeRuns,
+      createRunId: () => 'corrected-run',
+      now: () => 1000,
+    });
+    const started = await startPreparedPinnedCodexRun({
+      prepared: prepared.prepared,
+      executor: replacementExecutor,
+      replacement,
+      profileConfig: h.profileConfig,
+    });
+    expect(started.ok).toBe(true);
+    expect(h.agent.runOptions.at(-1)).toMatchObject({
+      runId: 'corrected-run',
+      threadId: 'thread-pinned',
+      sessionId: undefined,
+      prompt: 'corrected prompt',
+    });
+  });
+
+  it('rejects a missing or different pinned Codex thread before a replacement can start', async () => {
+    const h = await createHarness('codex');
+    const probe = await start(h);
+    if (!probe.ok) throw new Error('expected probe run');
+    await collect(probe.execution.subscribe());
+    const base = {
+      scopeId: 'chat-1',
+      scope: { source: 'im' as const, chatId: 'chat-1', actorId: 'ou_user' },
+      prompt: 'corrected prompt',
+      attachments: [],
+      access: { ok: true as const, reason: 'allowed-user' as const },
+      capability: codexCapability(h.profileConfig),
+      profileConfig: h.profileConfig,
+      sessions: h.sessions,
+      sessionCatalog: h.catalog,
+      workspaces: h.workspaces,
+      expected: {
+        cwdRealpath: probe.cwdRealpath,
+        policyFingerprint: probe.policy.policyFingerprint,
+        threadId: 'thread-old',
+      },
+      now: 1000,
+    };
+    await expect(preparePinnedCodexRun(base)).resolves.toMatchObject({
+      ok: false,
+      rejectReason: { code: 'pinned-restart-thread-unavailable' },
+    });
+    h.catalog.upsertActive({
+      scopeId: 'chat-1', agentId: 'codex', cwdRealpath: probe.cwdRealpath,
+      policyFingerprint: probe.policy.policyFingerprint, threadId: 'thread-new', now: 1000,
+    });
+    await expect(preparePinnedCodexRun(base)).resolves.toMatchObject({
+      ok: false,
+      rejectReason: { code: 'pinned-restart-thread-changed' },
+    });
   });
 });
 

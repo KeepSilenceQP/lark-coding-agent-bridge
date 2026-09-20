@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto';
 import type {
   ApiMessageItem,
   LarkChannel,
+  NormalizedMessage,
   RawMessageEvent,
 } from '@larksuite/channel';
 import { normalize } from '@larksuite/channel';
@@ -105,6 +107,102 @@ function mapSenderType(raw: unknown): 'user' | 'bot' | undefined {
   if (raw === 'user') return 'user';
   if (raw === 'app' || raw === 'bot') return 'bot';
   return undefined;
+}
+
+type EditableApiMessageItem = ApiMessageItem & {
+  chat_id?: string;
+  thread_id?: string;
+  update_time?: string | number;
+  deleted?: boolean;
+};
+
+export interface EditableMessageExpectation {
+  messageId: string;
+  chatId: string;
+  chatType?: 'p2p' | 'group';
+  threadId?: string;
+  authorId: string;
+}
+
+export type EditableMessageNormalizeResult =
+  | {
+      ok: true;
+      snapshot: {
+        messageId: string;
+        text: string;
+        revision: string;
+        rawContentType: 'text' | 'post';
+        resources: NormalizedMessage['resources'];
+      };
+    }
+  | {
+      ok: false;
+      reason: 'malformed' | 'deleted' | 'route-mismatch' | 'author-mismatch' | 'unsupported-type';
+    };
+
+/** Normalize a message-get result already fetched by the edit controller. */
+export async function normalizeFetchedEditableMessage(
+  channel: Pick<LarkChannel, 'botIdentity'>,
+  items: ApiMessageItem[],
+  expected: EditableMessageExpectation,
+): Promise<EditableMessageNormalizeResult> {
+  if (items.length !== 1) return { ok: false, reason: 'malformed' };
+  const parent = items[0] as EditableApiMessageItem | undefined;
+  if (!parent?.message_id || parent.message_id !== expected.messageId || !parent.body) {
+    return { ok: false, reason: 'malformed' };
+  }
+  if (parent.deleted) return { ok: false, reason: 'deleted' };
+  if (
+    parent.chat_id !== expected.chatId ||
+    (parent.thread_id ?? undefined) !== expected.threadId
+  ) return { ok: false, reason: 'route-mismatch' };
+  if (parent.sender?.id !== expected.authorId || parent.sender.sender_type !== 'user') {
+    return { ok: false, reason: 'author-mismatch' };
+  }
+  if (parent.msg_type !== 'text' && parent.msg_type !== 'post') {
+    return { ok: false, reason: 'unsupported-type' };
+  }
+
+  const fakeRaw: RawMessageEvent = {
+    sender: {
+      sender_id: { open_id: parent.sender.id },
+      sender_type: parent.sender.sender_type,
+    },
+    message: {
+      message_id: parent.message_id,
+      chat_id: parent.chat_id,
+      chat_type: expected.chatType ?? 'group',
+      thread_id: parent.thread_id,
+      message_type: parent.msg_type,
+      content: parent.body.content ?? '',
+      create_time: parent.create_time !== undefined ? String(parent.create_time) : undefined,
+      update_time: parent.update_time !== undefined ? String(parent.update_time) : undefined,
+      mentions: parent.mentions,
+    },
+  };
+  try {
+    const normalized = await normalize(fakeRaw, {
+      botIdentity: channel.botIdentity ?? { openId: '', name: '' },
+      stripBotMentions: true,
+    });
+    if (normalized.resources.length > 0) return { ok: false, reason: 'unsupported-type' };
+    const text = normalized.content;
+    const revision = parent.update_time !== undefined
+      ? String(parent.update_time)
+      : createHash('sha256').update(text).digest('hex');
+    return {
+      ok: true,
+      snapshot: {
+        messageId: parent.message_id,
+        text,
+        revision,
+        rawContentType: parent.msg_type,
+        resources: normalized.resources,
+      },
+    };
+  } catch {
+    return { ok: false, reason: 'malformed' };
+  }
 }
 
 /**

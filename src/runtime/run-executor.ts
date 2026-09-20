@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentAdapter, AgentEvent, AgentRun } from '../agent/types';
-import { ActiveRuns, type RunHandle, type RunReservation } from '../bot/active-runs';
+import {
+  ActiveRuns,
+  type ReplacementReservation,
+  type RunHandle,
+  type RunReservation,
+} from '../bot/active-runs';
 import { ProcessPool } from '../bot/process-pool';
 import type { RunPolicyAllow } from '../policy/run-policy';
 import { log } from '../core/logger';
@@ -27,6 +32,7 @@ export interface SubmitRunInput {
   nowait?: boolean;
   routeId?: string;
   reservation?: RunReservation;
+  replacement?: ReplacementReservation;
   observability?: {
     profile: string;
     agent: string;
@@ -42,6 +48,12 @@ export interface RunExecution {
   handle: RunHandle;
   subscribe(): AsyncIterable<AgentEvent>;
   stop(): Promise<void>;
+  /** Stop and release lifecycle ownership only after process exit is confirmed. */
+  stopAndConfirmExit(): Promise<boolean>;
+  /** Resolve only after the underlying process has authoritatively exited. */
+  waitForConfirmedExit(): Promise<void>;
+  /** Monotonic tool-start observation from the authoritative event source. */
+  toolStartedEver(): boolean;
 }
 
 const DEFAULT_POST_DONE_EXIT_GRACE_MS = 2000;
@@ -73,24 +85,34 @@ export class RunExecutor {
 
   async submit(input: SubmitRunInput): Promise<RunExecution> {
     const submittedAt = this.now();
+    if (input.reservation && input.replacement) {
+      input.reservation.release();
+      input.replacement.release();
+      throw new RunRejected('run-interrupted', 'submission cannot use two reservations');
+    }
+    const suppliedReservation = input.replacement ?? input.reservation;
     if (input.policy.expiresAt <= this.now()) {
-      input.reservation?.release();
+      suppliedReservation?.release();
       throw new RunRejected('policy-expired', 'run policy expired before spawn');
     }
     if (this.activeRuns.newRunsPaused()) {
-      input.reservation?.release();
+      suppliedReservation?.release();
       throw new RunRejected(
         'reconnect-in-progress',
         this.activeRuns.newRunsPauseReason() ?? 'new runs are temporarily paused',
       );
     }
-    const reservation = input.reservation ?? this.activeRuns.reserve(input.scopeId);
+    const reservation = suppliedReservation ?? this.activeRuns.reserve(input.scopeId);
     if (!reservation) {
       throw new RunRejected('run-already-active', 'another run is already active for this scope');
     }
     if (reservation.scopeId !== input.scopeId) {
       reservation.release();
       throw new RunRejected('run-interrupted', 'run reservation scope does not match submission');
+    }
+    if (input.replacement && input.replacement.phase !== 'exit-confirmed') {
+      reservation.release();
+      throw new RunRejected('run-interrupted', 'replacement reservation is not exit-confirmed');
     }
 
     let release: (() => void) | undefined;
@@ -190,7 +212,9 @@ export class RunExecutor {
 
     let handle: RunHandle;
     try {
-      handle = this.activeRuns.register(input.scopeId, run, reservation);
+      handle = input.replacement
+        ? input.replacement.register(run)
+        : this.activeRuns.register(input.scopeId, run, reservation as RunReservation);
     } catch (err) {
       reservation.release();
       release();
@@ -200,37 +224,73 @@ export class RunExecutor {
         err instanceof Error ? err.message : 'another run is already active for this scope',
       );
     }
-    reservation.release();
+    if (!input.replacement) reservation.release();
     let cleaned = false;
-    const cleanup = async (waitForExit: boolean): Promise<void> => {
+    let explicitStopRequested = false;
+    let confirmedExitPromise: Promise<void> | undefined;
+    let toolStartedEver = false;
+    const cleanupConfirmedExit = (): void => {
       if (cleaned) return;
       cleaned = true;
       this.activeRuns.unregister(input.scopeId, run);
       release();
-      if (waitForExit) {
-        const exited = await run.waitForExit(this.postDoneExitGraceMs);
-        if (!exited) {
-          log.warn('run', 'post-done-exit-timeout', {
-            ...dimensions,
-            graceMs: this.postDoneExitGraceMs,
-          });
-          await run.stop().catch((err) => {
-            log.warn('run', 'post-done-stop-failed', {
-              ...dimensions,
-              err: err instanceof Error ? err.message : String(err),
+    };
+    const waitForConfirmedExit = (): Promise<void> => {
+      if (!confirmedExitPromise) {
+        confirmedExitPromise = (async () => {
+          while (!(await run.waitForExit(this.postDoneExitGraceMs))) {
+            // waitForExit itself provides the bounded delay. Keep ownership
+            // fail-closed until the adapter observes the OS process exit.
+            await new Promise<void>((resolve) => {
+              setTimeout(resolve, Math.max(1, this.postDoneExitGraceMs));
             });
+          }
+          cleanupConfirmedExit();
+        })();
+      }
+      return confirmedExitPromise;
+    };
+    const cleanupAfterTerminalEvent = async (): Promise<void> => {
+      if (cleaned) return;
+      const exited = await run.waitForExit(this.postDoneExitGraceMs);
+      if (exited) {
+        cleanupConfirmedExit();
+        return;
+      }
+      log.warn('run', 'post-done-exit-timeout', {
+        ...dimensions,
+        graceMs: this.postDoneExitGraceMs,
+      });
+      await run.stop().catch((err) => {
+        log.warn('run', 'post-done-stop-failed', {
+          ...dimensions,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
+      void waitForConfirmedExit().catch(() => {
+        // Unknown exit state remains fail-closed in ActiveRuns and the pool.
+      });
+    };
+    const fanout = new EventFanout(
+      observeRunEvents(run.events, {
+        dimensions,
+        startedAt,
+        now: this.now,
+        wasControlPlaneInterrupted: () => handle.controlPlaneInterrupted === true,
+      }),
+      async () => {
+        if (!handle.interrupted) {
+          await cleanupAfterTerminalEvent();
+        } else if (!explicitStopRequested) {
+          void waitForConfirmedExit().catch(() => {
+            // Unknown exit state remains fail-closed in ActiveRuns and the pool.
           });
         }
-      }
-    };
-    const fanout = new EventFanout(observeRunEvents(run.events, {
-      dimensions,
-      startedAt,
-      now: this.now,
-      wasControlPlaneInterrupted: () => handle.controlPlaneInterrupted === true,
-    }), async () => {
-      await cleanup(!handle.interrupted);
-    });
+      },
+      (event) => {
+        if (event.type === 'tool_use') toolStartedEver = true;
+      },
+    );
 
     return {
       runId,
@@ -239,12 +299,27 @@ export class RunExecutor {
       handle,
       subscribe: () => fanout.subscribe(),
       stop: async () => {
+        explicitStopRequested = true;
         handle.interrupted = true;
         handle.controlPlaneInterrupted = true;
         await run.stop();
-        await run.waitForExit(this.postDoneExitGraceMs);
-        await cleanup(false);
+        const exited = await run.waitForExit(this.postDoneExitGraceMs);
+        if (exited) cleanupConfirmedExit();
+        else await waitForConfirmedExit();
       },
+      stopAndConfirmExit: async () => {
+        explicitStopRequested = true;
+        handle.interrupted = true;
+        handle.controlPlaneInterrupted = true;
+        await run.stop();
+        const exited = await run.waitForExit(this.postDoneExitGraceMs);
+        if (!exited) return false;
+        if (!(await fanout.waitForDrain(this.postDoneExitGraceMs))) return false;
+        cleanupConfirmedExit();
+        return true;
+      },
+      waitForConfirmedExit,
+      toolStartedEver: () => toolStartedEver,
     };
   }
 }
@@ -291,15 +366,25 @@ function observeRunEvents(
 class EventFanout {
   private readonly source: AsyncIterable<AgentEvent>;
   private readonly onDone: () => Promise<void>;
+  private readonly onEvent: (event: AgentEvent) => void;
   private readonly buffer: AgentEvent[] = [];
   private readonly waiters = new Set<() => void>();
   private started = false;
   private done = false;
   private error: unknown;
+  private resolveDrained!: () => void;
+  private readonly drained = new Promise<void>((resolve) => {
+    this.resolveDrained = resolve;
+  });
 
-  constructor(source: AsyncIterable<AgentEvent>, onDone: () => Promise<void>) {
+  constructor(
+    source: AsyncIterable<AgentEvent>,
+    onDone: () => Promise<void>,
+    onEvent: (event: AgentEvent) => void = () => {},
+  ) {
     this.source = source;
     this.onDone = onDone;
+    this.onEvent = onEvent;
   }
 
   subscribe(): AsyncIterable<AgentEvent> {
@@ -332,6 +417,18 @@ class EventFanout {
     };
   }
 
+  async waitForDrain(timeoutMs: number): Promise<boolean> {
+    this.start();
+    if (this.done) return true;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), Math.max(1, timeoutMs));
+      void this.drained.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  }
+
   private start(): void {
     if (this.started) return;
     this.started = true;
@@ -341,6 +438,7 @@ class EventFanout {
   private async pump(): Promise<void> {
     try {
       for await (const event of this.source) {
+        this.onEvent(event);
         this.buffer.push(event);
         this.wakeAll();
         if (isTerminalEvent(event)) break;
@@ -348,9 +446,13 @@ class EventFanout {
     } catch (err) {
       this.error = err;
     } finally {
-      await this.onDone();
-      this.done = true;
-      this.wakeAll();
+      try {
+        await this.onDone();
+      } finally {
+        this.done = true;
+        this.resolveDrained();
+        this.wakeAll();
+      }
     }
   }
 

@@ -96,6 +96,12 @@ export interface AppAccess {
 }
 
 export interface AppPreferences {
+  /**
+   * Allow the original author to replace the currently active Codex turn by
+   * editing its sole source message and adding the Loudspeaker reaction.
+   * Hidden rollout switch; defaults off and is ignored for Claude profiles.
+   */
+  codexEditedMessageRestart?: boolean;
   /** Reply rendering mode for IM (group/p2p) messages. Default 'card'. */
   messageReply?: MessageReplyMode;
   /**

@@ -34,6 +34,7 @@ import { renderText } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
 import { ensureBotRegistrySelfRegistration } from '../config/bot-registry-service';
 import type { AppConfig } from '../config/schema';
+import { isCodexEditedMessageRestartEnabled } from '../config/profile-schema';
 import {
   getAgentStopGraceMs,
   getCotMessages,
@@ -93,7 +94,18 @@ import type {
   PromptSessionService,
 } from '../session/prompt-session-service';
 import type { WorkspaceStore } from '../workspace/store';
-import { ActiveRuns, type RunHandle, type RunReservation } from './active-runs';
+import {
+  ActiveRuns,
+  type ReplacementReservation,
+  type RunHandle,
+  type RunReservation,
+} from './active-runs';
+import {
+  EditedMessageRestartRegistry,
+  handleEditedMessageRestartReaction,
+  type EditedRunRecord,
+  type MaterializedEditedMessageCorrection,
+} from './edited-message-restart';
 import { resolveRunIdleTimeoutMs, resolveRunStartupTimeoutMs } from './run-idle-timeout';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
@@ -101,7 +113,11 @@ import { decideGroupResponse } from './group-response-policy';
 import {
   recordRunSessionEvent,
   recordRunSessionEventAwaited,
+  preparePinnedCodexRun,
+  startPreparedPinnedCodexRun,
   startRunFlow,
+  type PreparedPinnedCodexRun,
+  type StartRunFlowResult,
 } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
@@ -111,7 +127,11 @@ import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quo
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { handleReactionEvent } from './reaction/pipeline';
-import { isStopEmoji, lookupReactionSemantics } from './reaction/semantics';
+import {
+  EDITED_MESSAGE_RESTART_EMOJI_TYPE,
+  isStopEmoji,
+  lookupReactionSemantics,
+} from './reaction/semantics';
 import {
   reactionTurnIdOf,
   withReactionTurnId,
@@ -129,7 +149,10 @@ import { buildReactionTargetMessage } from './reaction/context-builder';
 import { decideStopAdded, executeStopAdded } from './reaction/stop-target';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
-import { readProjectRoleAssignment } from '../project/store';
+import {
+  readProjectRoleAssignment,
+  type ProjectRoleAssignment,
+} from '../project/store';
 import {
   consumeCotEvents,
   CotClient,
@@ -551,6 +574,47 @@ const BRIDGE_AGENT_INSTRUCTIONS = [
   'Codex bridge 默认使用 danger-full-access 对齐 Claude bridge 的 bypassPermissions 行为，因此 lark-cli 应能像用户本机终端一样访问 keychain。',
   '如果提示 lark-channel context detected but not bound，停止当前操作并请用户重启 bridge 或运行 bridge doctor/preflight；不要改用普通 profile，不要自行 bind，也不要直接读取 config.json 里的账号或密钥。',
 ];
+
+function buildEditedRestartPrompt(
+  record: EditedRunRecord,
+  corrected: MaterializedEditedMessageCorrection,
+  botIdentity: LarkChannel['botIdentity'],
+  projectRoleAssignment?: ProjectRoleAssignment,
+): string {
+  const original = record.originalMessage;
+  return buildAgentPrompt({
+    context: {
+      chatId: record.chatId,
+      chatType: record.chatType,
+      senderId: record.authorId,
+      ...(original.senderName ? { senderName: original.senderName } : {}),
+      senderType: 'user',
+      ...(botIdentity?.openId ? { botOpenId: botIdentity.openId } : {}),
+      ...(original.mentions.length > 0 ? { mentions: mergeMentions([original]) } : {}),
+      ...(projectRoleAssignment ? { projectRoleAssignment } : {}),
+      ...(record.threadId ? { threadId: record.threadId } : {}),
+      messageIds: [record.messageId],
+      source: 'message_edit_restart',
+    },
+    instructions: [
+      ...BRIDGE_AGENT_INSTRUCTIONS,
+      '这是用户对当前唯一触发消息的完整修正版。请以 corrected_message 的全文重新评估当前任务；若旧运行启动过工具，请先检查工作区现状，并且不要假设此前副作用已回滚。',
+    ],
+    userInput: '',
+    correctedMessage: {
+      ...corrected,
+      supersedesEarlierAsr: true,
+      priorEffectsRolledBack: false,
+    },
+  });
+}
+
+interface EditedRestartPrepared {
+  plan: PreparedPinnedCodexRun;
+  projectRoleAssignment?: ProjectRoleAssignment;
+  /** Present only after authoritative old-process exit. */
+  prompt?: string;
+}
 
 // Lark SDK logs API errors at error level even when the caller catches them.
 // These specific codes are EXPECTED in our flow (wiki-node lookup that
@@ -1098,6 +1162,7 @@ export interface StartChannelDeps {
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
   const { cfg, agent, sessions, sessionCatalog, workspaces, controls } = deps;
   const activeRuns = new ActiveRuns();
+  const editedMessageRestarts = new EditedMessageRestartRegistry();
   // WorkChainStore: maps message→workChainId for stop reaction validation (DD15).
   // In-memory store — restart fail-closed (all historical associations lost).
   const workChainStore = new WorkChainStore();
@@ -1323,7 +1388,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     stopControlLedger = await loadStopControlLedger(deps.appPaths.profileDir);
   }
 
-  const activePolicyFingerprints = new Map<string, string>();
+  const activePolicyFingerprints = new Map<
+    string,
+    { fingerprint: string; handle: RunHandle }
+  >();
   // Per-scope record of the model used on the last run, so a `/config` model
   // switch can inject a one-time "model changed" note into the next (resumed)
   // prompt. In-memory only: on restart the first run re-seeds silently.
@@ -1455,6 +1523,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           scope,
           mode,
           profileDir: deps.appPaths?.profileDir,
+          editedMessageRestarts,
           preparationReservation,
           initialInterruptEpoch,
           });
@@ -1532,7 +1601,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           pending,
           chatModeCache,
           callbackAuth,
-          callbackPolicyFingerprintForScope: (scope) => activePolicyFingerprints.get(scope),
+          callbackPolicyFingerprintForScope: (scope) =>
+            activePolicyFingerprints.get(scope)?.fingerprint,
         });
       }).catch((err) => log.fail('cardAction', err));
     },
@@ -1556,6 +1626,187 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     reaction: async (evt) => {
       await withTrace({ chatId: evt.messageId }, async () => {
         try {
+          if (
+            evt.emojiType === EDITED_MESSAGE_RESTART_EMOJI_TYPE &&
+            isCodexEditedMessageRestartEnabled(controls.profileConfig)
+          ) {
+            const editTarget = editedMessageRestarts.get(evt.messageId);
+            const editOutcome = await handleEditedMessageRestartReaction(evt, {
+              enabled: true,
+              botOpenId: channel.botIdentity?.openId,
+              registry: editedMessageRestarts,
+              activeRuns,
+              pending,
+              channel,
+              checkAccess: (record) => {
+                const access = record.chatType === 'p2p'
+                  ? canUseDm(controls.profileConfig, controls, record.authorId)
+                  : canUseGroup(
+                      controls.profileConfig,
+                      controls,
+                      record.chatId,
+                      record.authorId,
+                    );
+                return access.ok;
+              },
+              prepare: async (record, corrected): Promise<
+                { ok: true; prepared: EditedRestartPrepared } | { ok: false }
+              > => {
+                const projectRoleAssignment = deps.appPaths?.profileDir && !record.threadId
+                  ? await readProjectRoleAssignment(
+                      deps.appPaths.profileDir,
+                      record.chatId,
+                    ).catch(() => undefined)
+                  : undefined;
+                const access = record.chatType === 'p2p'
+                  ? canUseDm(controls.profileConfig, controls, record.authorId)
+                  : canUseGroup(
+                      controls.profileConfig,
+                      controls,
+                      record.chatId,
+                      record.authorId,
+                    );
+                const prepared = await preparePinnedCodexRun({
+                  scopeId: record.scope,
+                  scope: {
+                    source: 'im',
+                    chatId: record.chatId,
+                    actorId: record.authorId,
+                    ...(record.threadId ? { threadId: record.threadId } : {}),
+                  },
+                  // Prompt contents do not participate in the policy
+                  // fingerprint. Validate identity/cwd/access/policy/thread
+                  // now; build the adapter prompt only after old-process exit.
+                  prompt: corrected.text,
+                  attachments: [],
+                  access,
+                  capability: codexCapability(controls.profileConfig),
+                  profileConfig: controls.profileConfig,
+                  sessions,
+                  sessionCatalog,
+                  ...(deps.promptSessionService
+                    ? {
+                        promptSession: {
+                          service: deps.promptSessionService,
+                          origin: {
+                            source: 'im' as const,
+                            scopeId: record.scope,
+                            chatId: record.chatId,
+                            chatType: record.chatType === 'p2p' ? 'p2p' as const : 'group' as const,
+                            ...(record.threadId ? { threadId: record.threadId } : {}),
+                          },
+                        },
+                      }
+                    : {}),
+                  workspaces,
+                  expected: {
+                    cwdRealpath: record.cwdRealpath,
+                    policyFingerprint: record.policyFingerprint,
+                    threadId: record.codexThreadId!,
+                  },
+                  now: Date.now(),
+                });
+                return prepared.ok
+                  ? {
+                      ok: true as const,
+                      prepared: {
+                        plan: prepared.prepared,
+                        ...(projectRoleAssignment ? { projectRoleAssignment } : {}),
+                      },
+                    }
+                  : { ok: false as const };
+              },
+              materializePrepared: (record, corrected, prepared) => {
+                const pending = prepared;
+                const prompt = buildEditedRestartPrompt(
+                  record,
+                  corrected,
+                  channel.botIdentity,
+                  pending.projectRoleAssignment,
+                );
+                return {
+                  plan: {
+                    ...pending.plan,
+                    policy: { ...pending.plan.policy, prompt },
+                  },
+                  ...(pending.projectRoleAssignment
+                    ? { projectRoleAssignment: pending.projectRoleAssignment }
+                    : {}),
+                  prompt,
+                };
+              },
+              startCorrected: async ({ record, corrected, prepared, replacement }) => {
+                const direct = prepared;
+                if (!direct.prompt) return { ok: false as const };
+                const unitId = `edit-${corrected.fingerprint.slice(0, 16)}`;
+                const lease: WorkLease = { workChainId: record.workChainId, unitId };
+                workChainStore.acquireUnit(lease.workChainId, lease.unitId);
+                let resolveStarted!: (flow: Extract<StartRunFlowResult, { ok: true }> | undefined) => void;
+                const started = new Promise<Extract<StartRunFlowResult, { ok: true }> | undefined>(
+                  (resolve) => { resolveStarted = resolve; },
+                );
+                activeBatchCount += 1;
+                const completion = runAgentBatch({
+                  channel,
+                  executor,
+                  sessions,
+                  sessionCatalog,
+                  promptSessionService: deps.promptSessionService,
+                  workspaces,
+                  media,
+                  batch: [record.originalMessage],
+                  controls,
+                  cotClient,
+                  callbackAuth,
+                  activePolicyFingerprints,
+                  lastRunModelByScope,
+                  scope: record.scope,
+                  mode: record.threadId ? 'topic' : record.chatType === 'p2p' ? 'p2p' : 'group',
+                  profileDir: deps.appPaths?.profileDir,
+                  lease,
+                  editedMessageRestarts,
+                  directCorrection: {
+                    prepared: direct.plan,
+                    replacement,
+                    prompt: direct.prompt,
+                    corrected,
+                    onStarted: resolveStarted,
+                  },
+                }).catch((err) => {
+                  log.fail('edited-message-restart', err, { step: 'direct-run' });
+                }).finally(async () => {
+                  resolveStarted(undefined);
+                  workChainStore.releaseUnit(lease.workChainId, lease.unitId);
+                  activeBatchCount = Math.max(0, activeBatchCount - 1);
+                  await maybeLaunchDeferredRestart().catch((err) =>
+                    log.fail('service', err, { step: 'deferred-restart' }),
+                  );
+                });
+                const flow = await started;
+                return flow ? { ok: true as const, completion } : { ok: false as const };
+              },
+            });
+            if (editOutcome.handled) {
+              log.info('edited-message-restart', 'outcome', {
+                result: editOutcome.code,
+                messageHash: createHash('sha256').update(evt.messageId).digest('hex').slice(0, 12),
+                ...(editTarget
+                  ? {
+                      scopeHash: createHash('sha256')
+                        .update(editTarget.scope)
+                        .digest('hex')
+                        .slice(0, 12),
+                      pending: pending.pendingCount(editTarget.scope),
+                      toolStarted: editTarget.toolStartedEver,
+                    }
+                  : {}),
+                stopConfirmed:
+                  editOutcome.code === 'started' || editOutcome.code === 'corrected-start-failed',
+                sameThread: editOutcome.code === 'started',
+              });
+              return;
+            }
+          }
           // F1/F2: Guards pipeline: self-operator → route → own-message →
           // permission (using chatModeCache for chatType, not oc_/ou_ guessing).
           const pipelineResult = await handleReactionEvent(evt, {
@@ -2133,10 +2384,24 @@ interface RunBatchDeps {
   controls: Controls;
   cotClient: CotClient;
   callbackAuth?: CallbackAuth;
-  activePolicyFingerprints: Map<string, string>;
+  activePolicyFingerprints: Map<string, { fingerprint: string; handle: RunHandle }>;
   lastRunModelByScope: Map<string, string>;
   scope: string;
   mode: ChatMode;
+  editedMessageRestarts?: EditedMessageRestartRegistry;
+  directCorrection?: {
+    prepared: PreparedPinnedCodexRun;
+    replacement: ReplacementReservation;
+    prompt: string;
+    corrected: {
+      messageId: string;
+      revision: string;
+      fingerprint: string;
+      text: string;
+      oldRunStartedTool: boolean;
+    };
+    onStarted(flow: Extract<StartRunFlowResult, { ok: true }>): void;
+  };
   profileDir?: string;
   /** Acquired synchronously when PendingQueue dequeues the unit. */
   preparationReservation?: RunReservation;
@@ -2179,10 +2444,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
 
-  const resourceItems = batch.flatMap((m) =>
-    m.resources.map((r) => ({ messageId: m.messageId, resource: r })),
-  );
-  const attachments = await media.resolve(resourceItems, controls.profileConfig.attachments);
+  const resourceItems = deps.directCorrection
+    ? []
+    : batch.flatMap((m) =>
+        m.resources.map((r) => ({ messageId: m.messageId, resource: r })),
+      );
+  const attachments = deps.directCorrection
+    ? []
+    : await media.resolve(resourceItems, controls.profileConfig.attachments);
   if (attachments.length > 0) {
     log.info('media', 'resolved', { count: attachments.length });
     for (const attachment of attachments) {
@@ -2201,7 +2470,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // quoted by multiple messages in one batch only fetches once. Filter out
   // ids that are themselves in the batch — those are already in the prompt.
   const batchIds = new Set(batch.map((m) => m.messageId));
-  const quoteTargets = [
+  const quoteTargets = deps.directCorrection ? [] : [
     ...new Set(
       batch
         .map((m) => replyQuoteTargetForMessage(m, mode))
@@ -2228,7 +2497,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // the user is pointing at. An already-engaged topic keeps that history in its
   // resumed session, so we skip the fetch there.
   let topicContext: QuotedContext[] = [];
-  if (mode === 'topic' && threadId && !sessions.getRaw(scope)) {
+  if (!deps.directCorrection && mode === 'topic' && threadId && !sessions.getRaw(scope)) {
     const exclude = new Set([...batchIds, ...quoteTargets]);
     topicContext = await fetchTopicContext(channel, threadId, {
       maxMessages: 40,
@@ -2271,7 +2540,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // Project bootstrap binds one ordinary-group workspace. Topic sessions use
   // `chatId:threadId` cwd scope, so a chat-level assignment must never be
   // injected into them.
-  const projectRoleAssignment = deps.profileDir && mode !== 'topic'
+  const projectRoleAssignment = !deps.directCorrection && deps.profileDir && mode !== 'topic'
     ? await readProjectRoleAssignment(deps.profileDir, chatId).catch((err) => {
         log.warn('project', 'read-role-assignment-failed', {
           chatId,
@@ -2281,16 +2550,16 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       })
     : undefined;
 
-  const prompt = buildPrompt(
-    batch,
-    attachments,
-    quotes,
-    topicContext,
-    channel.botIdentity,
-    extraInstructions,
-    (reactionContexts && reactionContexts.length > 0) ? reactionContexts : undefined,
-    projectRoleAssignment,
-  );
+  const prompt = deps.directCorrection?.prompt ?? buildPrompt(
+      batch,
+      attachments,
+      quotes,
+      topicContext,
+      channel.botIdentity,
+      extraInstructions,
+      (reactionContexts && reactionContexts.length > 0) ? reactionContexts : undefined,
+      projectRoleAssignment,
+    );
   log.info('prompt', 'built', {
     promptChars: prompt.length,
     quotes: quotes.length,
@@ -2360,8 +2629,33 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     stage: 'submit' | 'startup-retry',
     reuseDecision?: PromptSessionDecision,
     reservation?: RunReservation,
-  ) =>
-    startRunFlow({
+  ) => {
+    if (deps.directCorrection) {
+      if (stage !== 'submit') {
+        return Promise.resolve({
+          ok: false as const,
+          rejectReason: {
+            code: 'run-interrupted' as const,
+            userVisible: '修正运行不执行启动重试。',
+          },
+        });
+      }
+      return startPreparedPinnedCodexRun({
+        prepared: deps.directCorrection.prepared,
+        executor,
+        replacement: deps.directCorrection.replacement,
+        profileConfig: controls.profileConfig,
+        stopGraceMs: getAgentStopGraceMs(controls.cfg),
+        routeId: routeLeaseId,
+        observability: {
+          profile: controls.profile,
+          agent: capability.agentId,
+          source: 'message_edit_restart',
+          stage,
+        },
+      });
+    }
+    return startRunFlow({
       scopeId: scope,
       scope: scopeContext,
       prompt,
@@ -2397,6 +2691,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         stage,
       },
     });
+  };
   // A removal may arrive while media/quote/prompt preparation is awaiting.
   // Check once more immediately before startRunFlow synchronously reserves the
   // scope; after this point ActiveRuns.interrupt can abort the reservation.
@@ -2426,6 +2721,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
     log.info('run-flow', 'rejected', { scope, code: flow.rejectReason.code });
     if (flow.rejectReason.code === 'run-interrupted') return;
+    if (deps.directCorrection) return;
     log.warn('policy', 'denied', {
       scope,
       source: 'im',
@@ -2438,8 +2734,42 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const { execution, cwdRealpath: cwd } = flow;
   let activeFlow = flow;
   const promptAdmissions = flow.promptSession ? [flow.promptSession.admission] : [];
-  activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
+  let editableHandle = handle;
+  activePolicyFingerprints.set(scope, {
+    fingerprint: flow.policy.policyFingerprint,
+    handle,
+  });
+
+  if (
+    deps.editedMessageRestarts &&
+    isCodexEditedMessageRestartEnabled(controls.profileConfig) &&
+    capability.agentId === 'codex'
+  ) {
+    const editableMessages = deps.directCorrection
+      ? [{
+          ...firstMsg,
+          content: deps.directCorrection.corrected.text,
+          rawContentType: firstMsg.rawContentType,
+          resources: [],
+        }]
+      : batch;
+    deps.editedMessageRestarts.registerRun({
+      scope,
+      chatId,
+      chatType: firstMsg.chatType,
+      threadId,
+      messages: editableMessages,
+      handle,
+      execution,
+      cwdRealpath: flow.cwdRealpath,
+      policyFingerprint: flow.policy.policyFingerprint,
+      codexThreadId: flow.resumeFrom,
+      workChainId: deps.lease?.workChainId ?? '',
+      lifecycleUnitId: deps.lease?.unitId ?? lifecycleUnitId,
+    });
+  }
+  deps.directCorrection?.onStarted(flow);
 
   // ── Run lifecycle: every input unit (ordinary + reaction) carries a
   // workChain (Spec DD15) so its visible outputs register for stop correlation. ──
@@ -2501,6 +2831,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           ? evt.sessionId
           : evt.threadId
         : undefined;
+    let dormantDurability: Promise<void> | undefined;
     if (promptSession?.decision.kind === 'fresh' && agentSessionId) {
       await promptSessionService!.recordIdentifier({
         identity: promptSession.identity,
@@ -2520,10 +2851,32 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         event: evt,
       });
       if (agentSessionId) {
+        dormantDurability = durability;
         promptSession.admission.trackIdentifierDurability(durability);
         void durability.catch((err) => {
           log.fail('session', err, { step: 'dormant-identifier-persist', scope });
         });
+      }
+    }
+    if (
+      evt.type === 'system' &&
+      evt.threadId &&
+      deps.editedMessageRestarts &&
+      isCodexEditedMessageRestartEnabled(controls.profileConfig)
+    ) {
+      if (!promptSession && sessionCatalog) {
+        await recordRunSessionEventAwaited({
+          scopeId: scope,
+          sessions,
+          sessionCatalog,
+          capability,
+          policy: activeFlow.policy,
+          event: evt,
+        });
+      }
+      if (dormantDurability) await dormantDurability;
+      if ((promptSession && promptSession.decision.kind !== 'dormant') || sessionCatalog) {
+        deps.editedMessageRestarts.markThreadDurable(editableHandle, evt.threadId);
       }
     }
     if (evt.type === 'system' && evt.sessionId) {
@@ -2589,12 +2942,40 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         });
         activeFlow = replacement;
         if (replacement.promptSession) promptAdmissions.push(replacement.promptSession.admission);
+        deps.editedMessageRestarts?.markTerminal(editableHandle);
+        editableHandle = replacement.execution.handle;
+        activePolicyFingerprints.set(scope, {
+          fingerprint: replacement.policy.policyFingerprint,
+          handle: editableHandle,
+        });
+        if (
+          deps.editedMessageRestarts &&
+          isCodexEditedMessageRestartEnabled(controls.profileConfig)
+        ) {
+          deps.editedMessageRestarts.registerRun({
+            scope,
+            chatId,
+            chatType: firstMsg.chatType,
+            threadId,
+            messages: batch,
+            handle: editableHandle,
+            execution: replacement.execution,
+            cwdRealpath: replacement.cwdRealpath,
+            policyFingerprint: replacement.policy.policyFingerprint,
+            codexThreadId: replacement.resumeFrom,
+            workChainId: deps.lease?.workChainId ?? '',
+            lifecycleUnitId: deps.lease?.unitId ?? lifecycleUnitId,
+          });
+        }
         return {
           handle: replacement.execution.handle,
           events: replacement.execution.subscribe(),
         };
       },
     });
+  };
+  const observeEditableToolStart = (): void => {
+    deps.editedMessageRestarts?.markToolStarted(editableHandle);
   };
 
   // Resolve idle-timeout for this run: scope override (on SessionEntry) wins
@@ -2657,7 +3038,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         originMessageId: lastMsg.messageId,
         runId: execution.runId,
         scope,
-        inputPreview: lastMsg.content,
+        inputPreview: deps.directCorrection?.corrected.text ?? lastMsg.content,
       });
       await cotPublisher.start();
       // A1: register the CoT bubble messageId immediately after start() so a
@@ -2678,6 +3059,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           recordSession,
           async () => {},
           recoverStartupTimeout,
+          observeEditableToolStart,
         );
         await cotDone;
         if (cotPublisher.degradedReason) {
@@ -2725,6 +3107,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           }
         },
         recoverStartupTimeout,
+        observeEditableToolStart,
       );
       const streamDone = channel.stream(
         chatId,
@@ -2821,6 +3204,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           }
         },
         recoverStartupTimeout,
+        observeEditableToolStart,
       );
       const streamDone = channel
         .stream(
@@ -2895,6 +3279,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         recordSession,
         async () => {},
         recoverStartupTimeout,
+        observeEditableToolStart,
       );
       const sendResult = await sendFinalReply({
         channel,
@@ -2915,8 +3300,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     // chain doesn't stay current forever on an error path.
     finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
   } finally {
+    deps.editedMessageRestarts?.markTerminal(editableHandle);
     for (const admission of promptAdmissions) admission.finishWithoutIdentifier();
-    activePolicyFingerprints.delete(scope);
+    if (activePolicyFingerprints.get(scope)?.handle === editableHandle) {
+      activePolicyFingerprints.delete(scope);
+    }
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
 }
@@ -3112,6 +3500,7 @@ export async function processAgentStream(
   recordSession: (event: AgentEvent) => void | Promise<void>,
   flush: (state: RunState) => Promise<void>,
   recoverStartupTimeout?: () => Promise<StartupRecoveryResult | undefined>,
+  onToolStarted?: () => void,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = initialState;
@@ -3177,6 +3566,7 @@ export async function processAgentStream(
       // sees the correct set size. tool_use opens a window; tool_result
       // closes it. Other event types are bookkept after the if/else.
       if (evt.type === 'tool_use') {
+        onToolStarted?.();
         inFlightTools.add(evt.id);
         log.info('agent', 'tool-in-flight', {
           tool: evt.name,
@@ -3257,6 +3647,8 @@ export async function processAgentStream(
           startupTimeoutMs,
           recordSession,
           flush,
+          undefined,
+          onToolStarted,
         );
       }
     } catch (err) {

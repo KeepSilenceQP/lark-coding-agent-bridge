@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   handleReactionEvent,
@@ -53,6 +55,14 @@ function pipelineCallbacks() {
 // ── End-to-end wiring contract ──
 
 describe('reaction pipeline wiring (Unit 10)', () => {
+  it('dispatches the feature-gated Loudspeaker control path before the ordinary reaction pipeline', () => {
+    const source = readFileSync(join(process.cwd(), 'src/bot/channel.ts'), 'utf8');
+    const editDispatch = source.indexOf('handleEditedMessageRestartReaction(evt');
+    const ordinaryDispatch = source.indexOf('const pipelineResult = await handleReactionEvent(evt');
+    expect(editDispatch).toBeGreaterThan(0);
+    expect(ordinaryDispatch).toBeGreaterThan(editDispatch);
+    expect(source).toContain('isCodexEditedMessageRestartEnabled(controls.profileConfig)');
+  });
   it('routes stop on a user message into the control plane after Reaction permission', async () => {
     const callbacks = pipelineCallbacks();
     const result = await handleReactionEvent(

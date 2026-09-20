@@ -137,6 +137,15 @@ export function effectiveLarkCliIdentity(
   return profile.mode === 'team' ? 'bot-only' : profile.larkCli.identityPreset;
 }
 
+export function isCodexEditedMessageRestartEnabled(
+  profile: Pick<ProfileConfig, 'agentKind' | 'preferences'>,
+): boolean {
+  return (
+    profile.agentKind === 'codex' &&
+    profile.preferences.codexEditedMessageRestart === true
+  );
+}
+
 export interface RootConfig {
   schemaVersion: 2;
   activeProfile: string;
@@ -277,15 +286,20 @@ function normalizePreferences(
     access: _access,
     requireMentionInGroup: _mention,
     messageReply,
+    codexEditedMessageRestart,
     ...rest
   } = preferences ?? {};
+  const normalized = {
+    ...rest,
+    ...(codexEditedMessageRestart === true ? { codexEditedMessageRestart: true } : {}),
+  };
   if (messageReply !== undefined && isMessageReply(messageReply)) {
     return {
-      ...rest,
+      ...normalized,
       messageReply,
     };
   }
-  return rest;
+  return normalized;
 }
 
 function isMessageReply(value: unknown): value is MessageReplyMode {
