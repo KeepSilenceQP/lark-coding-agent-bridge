@@ -12,6 +12,7 @@ export class CodexJsonlTranslator {
   private threadId: string | undefined;
   private terminal = false;
   private lastNonTerminalError: string | undefined;
+  private lastAgentMessage: string | undefined;
   private readonly startedItems = new Set<string>();
   private drift: ProtocolDriftState = {
     unknownEvents: 0,
@@ -29,6 +30,7 @@ export class CodexJsonlTranslator {
       case 'thread.started':
         return this.translateThreadStarted(raw);
       case 'turn.started':
+        this.lastAgentMessage = undefined;
         return [];
       case 'item.started':
         return this.translateItemStarted(raw);
@@ -86,6 +88,7 @@ export class CodexJsonlTranslator {
   private translateItemStarted(raw: Record<string, unknown>): AgentEvent[] {
     const item = recordValue(raw.item);
     if (!item || item.type !== 'command_execution') return [];
+    this.lastAgentMessage = undefined;
     const id = stringValue(item.id);
     if (!id) {
       this.drift.anomalies++;
@@ -109,9 +112,10 @@ export class CodexJsonlTranslator {
     if (!item) return [];
     if (item.type === 'agent_message') {
       const message = stringValue(item.text ?? item.message);
-      return message ? [{ type: 'text', delta: message }] : [];
+      return message ? this.emitAgentMessage(message) : [];
     }
     if (item.type !== 'command_execution') return [];
+    this.lastAgentMessage = undefined;
     const id = stringValue(item.id);
     if (!id) {
       this.drift.anomalies++;
@@ -135,6 +139,15 @@ export class CodexJsonlTranslator {
   private translateAgentMessage(raw: Record<string, unknown>): AgentEvent[] {
     const message = stringValue(raw.message ?? raw.text);
     if (!message) return [];
+    return this.emitAgentMessage(message);
+  }
+
+  private emitAgentMessage(message: string): AgentEvent[] {
+    // Codex versions may announce one message twice: once as a raw
+    // `agent_message` and once as a completed agent-message item. They are two
+    // protocol shapes for the same output, not two user-visible paragraphs.
+    if (message === this.lastAgentMessage) return [];
+    this.lastAgentMessage = message;
     return [{ type: 'text', delta: message }];
   }
 

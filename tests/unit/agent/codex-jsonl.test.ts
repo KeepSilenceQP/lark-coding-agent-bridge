@@ -93,6 +93,20 @@ describe('Codex JSONL translator', () => {
     ).toEqual([{ type: 'text', delta: 'hello from item' }]);
   });
 
+  it('deduplicates the same agent message emitted in both protocol shapes', () => {
+    const t = new CodexJsonlTranslator();
+
+    expect(t.translate({ type: 'agent_message', message: 'same answer' })).toEqual([
+      { type: 'text', delta: 'same answer' },
+    ]);
+    expect(
+      t.translate({
+        type: 'item.completed',
+        item: { id: 'msg-1', type: 'agent_message', text: 'same answer' },
+      }),
+    ).toEqual([]);
+  });
+
   it('treats missing command exit codes as successful command results', () => {
     const t = new CodexJsonlTranslator();
 
