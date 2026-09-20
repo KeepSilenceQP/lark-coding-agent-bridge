@@ -58,7 +58,10 @@ describe('Claude IM regression boundaries', () => {
 
     expect(source).toContain('respondToMentionAll: false');
     expect(source).toContain('decideGroupResponse({');
-    expect(source).toContain('mode: controls.profileConfig.access.groupResponseMode');
+    expect(source).toContain(
+      'const mentionOverride = controls.profileConfig.access.chatRequireMention?.[msg.chatId]',
+    );
+    expect(source).toContain(': controls.profileConfig.access.groupResponseMode');
     expect(source.indexOf('decideGroupResponse({')).toBeLessThan(
       source.indexOf('const handled = await tryHandleCommand({'),
     );
