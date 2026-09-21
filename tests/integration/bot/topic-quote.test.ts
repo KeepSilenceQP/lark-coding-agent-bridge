@@ -1,8 +1,10 @@
-import type { NormalizedMessage } from '@larksuite/channel';
-import { realpath } from 'node:fs/promises';
+import type { NormalizedMessage, ReactionEvent } from '@larksuite/channel';
+import { mkdir, writeFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
+import { PromptSessionService } from '../../../src/session/prompt-session-service.js';
+import { SessionCatalog } from '../../../src/session/catalog.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
@@ -28,6 +30,7 @@ vi.mock('@larksuite/channel', async (importOriginal) => {
 import { startChannel } from '../../../src/bot/channel.js';
 
 interface MessageHandlerMap {
+  reaction?: (event: ReactionEvent) => Promise<void> | void;
   message?: (msg: NormalizedMessage) => Promise<void> | void;
 }
 
@@ -41,8 +44,10 @@ interface FakeLarkChannel {
       v1: {
         message: {
           list: ReturnType<typeof vi.fn>;
+          get: ReturnType<typeof vi.fn>;
         };
         messageReaction: {
+          list: ReturnType<typeof vi.fn>;
           create: ReturnType<typeof vi.fn>;
           delete: ReturnType<typeof vi.fn>;
         };
@@ -56,7 +61,7 @@ interface FakeLarkChannel {
   on(handlers: MessageHandlerMap): void;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
-  getChatMode(chatId: string): Promise<'group' | 'topic'>;
+  getChatMode(chatId: string): Promise<'p2p' | 'group' | 'topic'>;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
   send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
   stream(chatId: string, input: unknown, options?: unknown): Promise<{ messageId: string }>;
@@ -394,6 +399,50 @@ describe('topic message quote handling', () => {
   });
 });
 
+describe('reaction continuation with activated prompt bindings', () => {
+  it.each((['claude', 'codex'] as const).flatMap(agentKind => [
+    { chatMode: 'p2p' as const, threadId: undefined },
+    { chatMode: 'group' as const, threadId: undefined },
+    { chatMode: 'group' as const, threadId: 'omt_topic' },
+    { chatMode: 'p2p' as const, threadId: 'omt_topic' },
+  ].map(route => ({ ...route, agentKind }))))('resumes $agentKind $chatMode thread=$threadId after GoGoGo', async ({ chatMode, threadId, agentKind }) => {
+    const h = await createHarness({
+      chatMode, agentKind, activatedPrompts: true,
+      rawThreadIds: threadId ? { om_stream_1: threadId } : {},
+      agentEvents: [
+        { type: 'system', ...(agentKind === 'codex' ? { threadId: 'sess_reaction' } : { sessionId: 'sess_reaction' }) },
+        { type: 'text', delta: 'Ready to continue' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+    });
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    await startTestBridge(h);
+    await h.channel.handlers.message?.({
+      ...message({ messageId: 'om_initial', rootId: 'om_initial', parentId: 'om_initial', threadId, content: 'prepare' }),
+      chatType: chatMode,
+    });
+    await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1);
+    expect(h.promptSessionService?.health.health).toBe('healthy');
+    await h.channel.handlers.reaction?.({
+      messageId: 'om_stream_1', operator: { openId: 'ou_user' },
+      emojiType: 'GoGoGo', action: 'added', actionTime: Date.now(), raw: { operator_type: 'user' },
+    });
+    await waitFor(() => h.agent.runOptions.length === 2 || h.channel.sent.some(
+      entry => JSON.stringify(entry.content).includes('当前会话状态不可用'),
+    ), 4000);
+    expect(h.channel.sent.map(entry => entry.content)).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ markdown: expect.stringContaining('当前会话状态不可用') }),
+    ]));
+    expect(h.agent.runOptions).toHaveLength(2);
+    expect(h.agent.runOptions[1]?.[agentKind === 'codex' ? 'threadId' : 'sessionId']).toBe('sess_reaction');
+    const prompt = h.agent.runOptions[1]?.prompt ?? '';
+    expect(prompt).toContain('<reaction_contexts>');
+    expect(prompt).toContain(`"chatType":"${chatMode}"`);
+    if (threadId) expect(prompt).toContain(`"threadId":"${threadId}"`);
+    await waitFor(() => h.agent.runs[1]?.waitForExitCalls === 1);
+  });
+});
+
 describe('merge_forward fetch failure', () => {
   it('skips the run and hints the user when the SDK could not fetch a merge_forward', async () => {
     // @larksuite/channel >= 0.4.1 normalizes an un-fetchable merge_forward to
@@ -443,11 +492,13 @@ describe('merge_forward fetch failure', () => {
 });
 
 async function createHarness(options: {
-  chatMode?: 'group' | 'topic';
+  chatMode?: 'p2p' | 'group' | 'topic';
   quotedMessages?: Record<string, string>;
   rawThreadIds?: Record<string, string>;
   threadMessages?: Array<Record<string, unknown>>;
   agentEvents?: AgentEvent[];
+  activatedPrompts?: boolean;
+  agentKind?: 'claude' | 'codex';
 } = {}):Promise<{
   tmp: TmpProfile;
   channel: FakeLarkChannel & { handlers: MessageHandlerMap };
@@ -456,11 +507,13 @@ async function createHarness(options: {
   workspaces: WorkspaceStore;
   profileConfig: ReturnType<typeof createDefaultProfileConfig>;
   controls: ReturnType<typeof createControls>;
+  promptSessionService?: PromptSessionService;
 }> {
   const tmp = await createTmpProfile('topic-quote-');
   const workspace = await realpath(tmp.workspace);
   const baseProfileConfig = createDefaultProfileConfig({
-    agentKind: 'claude',
+    agentKind: options.agentKind ?? 'claude',
+    ...(options.agentKind === 'codex' ? { codex: { binaryPath: '/test/codex' } } : {}),
     accounts: {
       app: {
         id: 'cli_test',
@@ -488,6 +541,19 @@ async function createHarness(options: {
   const channel = createFakeLarkChannel(options);
   sdkMock.channel = channel;
   const controls = createControls(profileConfig);
+  let promptSessionService: PromptSessionService | undefined;
+  if (options.activatedPrompts) {
+    await mkdir(join(tmp.profile, 'prompts', 'groups'), { recursive: true });
+    await writeFile(join(tmp.profile, 'prompts', 'groups', 'oc_activation.md'), 'activation');
+    promptSessionService = await PromptSessionService.open({
+      profileDir: tmp.profile, profile: 'test', sessionStore: sessions,
+      sessionCatalog: new SessionCatalog(join(tmp.profile, 'catalog.json')),
+    });
+    await promptSessionService.prepareSession({
+      identity: { scopeId: 'oc_activation', agentId: 'claude', cwdRealpath: workspace, policyFingerprint: 'activation' },
+      origin: { source: 'im', scopeId: 'oc_activation', chatId: 'oc_activation', chatType: 'group' },
+    });
+  }
   cleanups.push(async () => {
     await Promise.all([sessions.flush(), workspaces.flush()]);
     await tmp.cleanup();
@@ -500,15 +566,18 @@ async function createHarness(options: {
     workspaces,
     profileConfig,
     controls,
+    promptSessionService,
   };
 }
 
 async function startTestBridge(h: {
+  tmp: TmpProfile;
   profileConfig: ReturnType<typeof createDefaultProfileConfig>;
   agent: FakeAgentAdapter;
   sessions: SessionStore;
   workspaces: WorkspaceStore;
   controls: ReturnType<typeof createControls>;
+  promptSessionService?: PromptSessionService;
 }): Promise<void> {
   const bridge = await startChannel({
     cfg: h.profileConfig,
@@ -516,12 +585,19 @@ async function startTestBridge(h: {
     sessions: h.sessions,
     workspaces: h.workspaces,
     controls: h.controls,
+    promptSessionService: h.promptSessionService,
+    appPaths: {
+      profileDir: h.tmp.profile,
+      secretsFile: join(h.tmp.profile, 'secrets.json'),
+      keystoreSaltFile: join(h.tmp.profile, 'salt'),
+      mediaDir: join(h.tmp.profile, 'media'),
+    },
   });
   cleanups.push(() => bridge.disconnect());
 }
 
 function createFakeLarkChannel(options: {
-  chatMode?: 'group' | 'topic';
+  chatMode?: 'p2p' | 'group' | 'topic';
   quotedMessages?: Record<string, string>;
   rawThreadIds?: Record<string, string>;
   threadMessages?: Array<Record<string, unknown>>;
@@ -545,9 +621,18 @@ function createFakeLarkChannel(options: {
       im: {
         v1: {
           message: {
+            get: vi.fn(async () => ({ data: { items: [{
+              chat_id: 'oc_topic_chat', sender: { id: 'ou_bot', sender_type: 'app' },
+              ...(rawThreadIds.om_stream_1 ? { thread_id: rawThreadIds.om_stream_1 } : {}),
+            }] } })),
             list: vi.fn(async () => ({ data: { items: threadMessages, has_more: false } })),
           },
           messageReaction: {
+            list: vi.fn(async () => ({ data: { items: [{
+              reaction_id: 'user_reaction',
+              operator: { operator_id: 'ou_user', operator_type: 'user' },
+              reaction_type: { emoji_type: 'GoGoGo' },
+            }], has_more: false } })),
             create: vi.fn(async () => ({ data: { reaction_id: 'reaction_1' } })),
             delete: vi.fn(async () => ({})),
           },

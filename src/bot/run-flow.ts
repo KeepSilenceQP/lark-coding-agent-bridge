@@ -1,3 +1,4 @@
+import { log } from '../core/logger';
 import type { AgentCapability } from '../agent/capability';
 import { resolveModelArg } from '../agent/models';
 import type { AgentEvent } from '../agent/types';
@@ -185,7 +186,8 @@ export async function preparePinnedCodexRun(
         origin: input.promptSession.origin,
         existingAgentSessionId: input.expected.threadId,
       });
-    } catch {
+    } catch (err) {
+      log.warn('prompt-session', 'prepare-failed', { scope: input.scopeId, err: String(err) });
       return reject('prompt-session-unavailable', '当前会话状态不可用，未停止当前运行。');
     }
     const decidedThread = decision.kind === 'resume'
@@ -456,7 +458,12 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
         decision,
         admission,
       };
-    } catch {
+    } catch (err) {
+      log.warn('prompt-session', 'prepare-failed', {
+        scope: input.scopeId,
+        interrupted: reservation.signal.aborted,
+        err: String(err),
+      });
       reservation.release();
       return {
         ok: false,

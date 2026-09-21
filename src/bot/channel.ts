@@ -1239,6 +1239,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       return;
     }
 
+    // Rebuild the route from the reconciled scope and the same authoritative
+    // chat-mode cache used by intake. Hard-coding group or dropping threadId
+    // changes the prompt binding origin and rejects an otherwise valid resume.
+    const [chatId = result.components.scope, threadId] = result.components.scope.split(':');
+    const chatMode = await chatModeCache.resolve(channel, chatId);
+
     // B3: evict any previous in-flight entry for the same key FIRST — before
     // writing rev2 context. evictInFlightReactionEntry calls
     // contextStore.delete(reactionKey); if we set rev2 context first, evict
@@ -1282,8 +1288,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       // Keep the externally meaningful message id intact. The opaque turnId
       // lives on a private symbol and in WorkLease.unitId.
       messageId: result.components.targetMessageId,
-      chatId: result.components.scope.split(':')[0] ?? result.components.scope,
-      chatType: 'group' as const,
+      chatId,
+      chatType: chatMode === 'p2p' ? 'p2p' : 'group',
+      ...(threadId ? { threadId } : {}),
       senderId: result.components.operatorOpenId,
       content: `[reaction] ${events.map(e => e.emojiType).join(', ')}`,
       rawContentType: 'reaction' as never,
