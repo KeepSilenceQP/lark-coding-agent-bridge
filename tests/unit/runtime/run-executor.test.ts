@@ -21,6 +21,8 @@ describe('RunExecutor policy runtime options', () => {
 
     const execution = await executor.submit({
       scopeId: 'scope-policy',
+      reasoningEffort: 'high',
+      serviceTier: 'fast',
       policy: policy({
         sandbox: 'workspace-write',
         permissionMode: 'acceptEdits',
@@ -29,6 +31,8 @@ describe('RunExecutor policy runtime options', () => {
 
     expect(agent.runOptions[0]).toMatchObject({
       runId: 'run-policy',
+      reasoningEffort: 'high',
+      serviceTier: 'fast',
       sandbox: 'workspace-write',
       permissionMode: 'acceptEdits',
     });

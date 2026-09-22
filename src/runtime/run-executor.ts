@@ -27,6 +27,8 @@ export interface SubmitRunInput {
   threadId?: string;
   systemPromptAddendum?: string;
   model?: string;
+  reasoningEffort?: string;
+  serviceTier?: 'fast' | 'default';
   images?: readonly string[];
   stopGraceMs?: number;
   nowait?: boolean;
@@ -156,6 +158,8 @@ export class RunExecutor {
       threadId: input.threadId,
       systemPromptAddendum: input.systemPromptAddendum,
       model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      serviceTier: input.serviceTier,
       images: input.images,
       sandbox: input.policy.sandbox,
       permissionMode: input.policy.permissionMode,

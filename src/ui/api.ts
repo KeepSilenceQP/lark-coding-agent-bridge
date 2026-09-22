@@ -42,7 +42,7 @@ import {
   type ProfileAccess,
   type ProfileMode,
 } from '../config/profile-schema';
-import { DEFAULT_MODEL, normalizeModelSelection, supportedModels } from '../agent/models';
+import { DEFAULT_MODEL, isValidModelId, modelCatalogHome, normalizeModelSelection, supportedModels, parseRunTuning, REASONING_OPTIONS, FAST_MODE_OPTIONS } from '../agent/models';
 import { log } from '../core/logger';
 import { HttpError } from './http';
 import type { UiRuntime } from './types';
@@ -56,6 +56,10 @@ export interface ConfigView {
   agentKind: string;
   mode: ProfileMode;
   model: string;
+  reasoningEffort: string;
+  fastMode: string;
+  reasoningOptions: { value: string; label: string }[];
+  fastModeOptions: { value: string; label: string }[];
   models: { value: string; label: string }[];
   messageReply: MessageReplyMode;
   showToolCalls: boolean;
@@ -86,7 +90,11 @@ export function buildConfigView(state: MutableProfileState, live = false): Confi
     agentKind,
     mode: state.profileConfig.mode,
     model: normalizeModelSelection(agentKind, state.cfg.preferences?.model),
-    models: supportedModels(agentKind),
+    reasoningEffort: state.cfg.preferences?.reasoningEffort ?? 'default',
+    fastMode: state.cfg.preferences?.fastMode ?? 'default',
+    reasoningOptions: REASONING_OPTIONS,
+    fastModeOptions: FAST_MODE_OPTIONS,
+    models: supportedModels(agentKind, state.cfg.preferences?.model, modelCatalogHome(state)),
     messageReply: getMessageReplyMode(state.cfg),
     showToolCalls: getShowToolCalls(state.cfg),
     cotMessages: getCotMessages(state.cfg),
@@ -216,12 +224,19 @@ function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfi
       ? fv.larkCliIdentity
       : state.profileConfig.larkCli.identityPreset;
 
-  const rawModel = typeof fv.model === 'string' ? fv.model : '';
-  const modelValid = rawModel !== '' && supportedModels(agentKind).some((m) => m.value === rawModel);
-  const modelSelection = modelValid
-    ? rawModel
-    : normalizeModelSelection(agentKind, state.cfg.preferences?.model);
+  const rawModel = typeof fv.model === 'string' ? fv.model.trim() : '';
+  if (rawModel && !isValidModelId(rawModel)) {
+    throw new ApiError(400, '模型 ID 格式无效（不含空格，最多 200 个字符）');
+  }
+  const modelSelection = normalizeModelSelection(agentKind, rawModel || state.cfg.preferences?.model);
   const model = modelSelection === DEFAULT_MODEL ? undefined : modelSelection;
+  let tuning: Pick<AppPreferences, 'reasoningEffort' | 'fastMode'>;
+  try {
+    tuning = parseRunTuning(agentKind, state.cfg.preferences ?? {}, fv.reasoningEffort, fv.fastMode);
+  } catch (error) {
+    throw new ApiError(400, error instanceof Error ? error.message : '运行设置无效');
+  }
+
 
   const messageReply: MessageReplyMode =
     fv.messageReply === 'markdown' || fv.messageReply === 'text' || fv.messageReply === 'card'
@@ -275,6 +290,7 @@ function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfi
     nextPreferences: {
       ...(state.cfg.preferences ?? {}),
       model,
+      ...tuning,
       messageReply,
       messageReplyMigrated: true,
       showToolCalls,

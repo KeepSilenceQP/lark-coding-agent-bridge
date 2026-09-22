@@ -1,4 +1,4 @@
-import { modelLabel, supportedModels } from '../agent/models';
+import { modelLabel, supportedModels, REASONING_OPTIONS, FAST_MODE_OPTIONS } from '../agent/models';
 import type { KnownChat } from '../bot/lark-info';
 import type {
   AgentKind,
@@ -13,8 +13,11 @@ export interface ConfigFormOpts {
   agentKind: AgentKind;
   /** Deployment mode: 'personal' (default) or 'team'. */
   mode: ProfileMode;
-  /** Current model selection (a value from {@link supportedModels}). */
+  /** Current model selection, including IDs absent from the discovery cache. */
   model: string;
+  modelCatalogHome?: string;
+  reasoningEffort?: string;
+  fastMode?: string;
   messageReply: MessageReplyMode;
   showToolCalls: boolean;
   cotMessages: CotMessagesMode;
@@ -189,11 +192,30 @@ export function configFormCard(opts: ConfigFormOpts): object {
               tag: 'select_static',
               name: 'model',
               initial_option: opts.model,
-              options: supportedModels(opts.agentKind).map((m) => ({
+              options: supportedModels(opts.agentKind, opts.model, opts.modelCatalogHome).map((m) => ({
                 text: { tag: 'plain_text', content: m.label },
                 value: m.value,
               })),
             },
+            {
+              tag: 'input',
+              name: 'custom_model',
+              placeholder: { tag: 'plain_text', content: '自定义模型 ID（可选，填写后优先于上方选择）' },
+              input_type: 'text',
+            },
+            ...(opts.agentKind === 'codex' ? [
+              { tag: 'markdown', content: '**推理强度**\n具体档位取决于模型支持；跟随默认不覆盖 CLI 设置。' },
+              {
+                tag: 'select_static', name: 'reasoning_effort',
+                initial_option: opts.reasoningEffort ?? 'default',
+                options: REASONING_OPTIONS.map((m) => ({ text: { tag: 'plain_text', content: m.label }, value: m.value })),
+              },
+              { tag: 'markdown', content: '**快速模式**\n加快生成速度，会增加用量；与推理强度独立。' },
+              {
+                tag: 'select_static', name: 'fast_mode', initial_option: opts.fastMode ?? 'default',
+                options: FAST_MODE_OPTIONS.map((m) => ({ text: { tag: 'plain_text', content: m.label }, value: m.value })),
+              },
+            ] : []),
             { tag: 'hr' },
             {
               tag: 'markdown',
@@ -390,6 +412,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
             '✅ **偏好已保存**\n\n' +
             `**运行模式**:\`${opts.mode === 'team' ? '团队版' : '个人版'}\`\n` +
             `**模型**:\`${modelLabel(opts.agentKind, opts.model)}\`\n` +
+            (opts.agentKind === 'codex' ? `**推理强度**: ${opts.reasoningEffort ?? '跟随 CLI 默认'}\n**快速模式**: ${FAST_MODE_OPTIONS.find((m) => m.value === (opts.fastMode ?? 'default'))?.label}\n` : '') +
             `**消息回复方式**:${replyLabel}\n` +
             `**工具调用显示**:\`${opts.showToolCalls ? 'show' : 'hide'}\`\n` +
             `**COT 过程消息**:\`${cotLabel}\`\n` +

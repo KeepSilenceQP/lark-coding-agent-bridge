@@ -141,6 +141,36 @@ describe('profile-aware account and config commands', () => {
     expect(cleared.profiles.claude?.preferences.model).toBeUndefined();
   });
 
+  it('saves effort and Fast independently and restores CLI defaults', async () => {
+    vi.useFakeTimers();
+    const h = await createHarness({ agentKind: 'codex' });
+    await h.command('/config submit', { reasoning_effort: 'ultra', fast_mode: 'on' });
+    const saved = await waitForRoot(h.rootDir, (r) => r.profiles.claude?.preferences.fastMode === 'on');
+    expect(saved.profiles.claude?.preferences.reasoningEffort).toBe('ultra');
+    await h.command('/config submit', { fast_mode: 'off' });
+    const standard = await waitForRoot(h.rootDir, (r) => r.profiles.claude?.preferences.fastMode === 'off');
+    expect(standard.profiles.claude?.preferences.reasoningEffort).toBe('ultra');
+    await h.command('/config submit', { reasoning_effort: 'default', fast_mode: 'default' });
+    const cleared = await waitForRoot(h.rootDir, (r) => r.profiles.claude?.preferences.fastMode === undefined);
+    expect(cleared.profiles.claude?.preferences.reasoningEffort).toBeUndefined();
+  });
+
+  it('persists a custom model from the form and passes it unchanged to the agent', async () => {
+    vi.useFakeTimers();
+    const h = await createHarness();
+    await h.command('/config submit', { model: 'default', custom_model: 'provider/new-model' });
+    const saved = await waitForRoot(h.rootDir, (candidate) =>
+      candidate.profiles.claude?.preferences.model === 'provider/new-model',
+    );
+    const { resolveModelArg } = await import('../../../src/agent/models');
+    expect(resolveModelArg('claude', saved.profiles.claude?.preferences.model)).toBe('provider/new-model');
+    await h.command('/config submit', { model: 'default', custom_model: '' });
+    const cleared = await waitForRoot(h.rootDir, (candidate) =>
+      candidate.profiles.claude?.preferences.model === undefined,
+    );
+    expect(cleared.profiles.claude?.preferences.model).toBeUndefined();
+  });
+
   it('keeps the current message reply mode when the config submit payload omits it', async () => {
     vi.useFakeTimers();
     const h = await createHarness({
@@ -272,6 +302,7 @@ describe('profile-aware account and config commands', () => {
     await writeFile(join(rootDir, 'active-profile'), 'claude\n', 'utf8');
 
     const profileConfig = root.profiles.claude!;
+
     const appPaths = resolveAppPaths({ rootDir, profile: 'claude' });
     const channel = createFakeChannel();
     const sessions = new SessionStore(appPaths.sessionsFile);
@@ -570,6 +601,7 @@ describe('profile-aware account and config commands', () => {
 });
 
 async function createHarness(options: {
+  agentKind?: 'claude' | 'codex';
   preferences?: RootConfig['profiles'][string]['preferences'];
 } = {}): Promise<{
   rootDir: string;
@@ -582,6 +614,11 @@ async function createHarness(options: {
   await mkdir(workspace, { recursive: true });
   const root = await writeRoot(rootDir, workspace, options.preferences);
   const profileConfig = root.profiles.claude!;
+  if (options.agentKind) {
+    profileConfig.agentKind = options.agentKind;
+    profileConfig.codex = { binaryPath: 'codex' };
+    await writeJson(resolveAppPaths({ rootDir }).configFile, root);
+  }
   const appPaths = resolveAppPaths({ rootDir, profile: 'claude' });
   const channel = createFakeChannel();
   const sessions = new SessionStore(appPaths.sessionsFile);

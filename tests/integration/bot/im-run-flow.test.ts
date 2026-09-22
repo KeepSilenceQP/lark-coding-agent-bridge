@@ -1,7 +1,7 @@
 import { mkdir, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { claudeCapability } from '../../../src/agent/capability';
+import { claudeCapability, codexCapability } from '../../../src/agent/capability';
 import { ActiveRuns } from '../../../src/bot/active-runs';
 import { startRunFlow } from '../../../src/bot/run-flow';
 import { ProcessPool } from '../../../src/bot/process-pool';
@@ -21,6 +21,21 @@ afterEach(async () => {
 });
 
 describe('IM run flow', () => {
+  it('forwards saved Codex tuning through the IM run flow into the adapter', async () => {
+    const h = await createHarness({ defaultWorkspace: true });
+    h.profileConfig.agentKind = 'codex';
+    h.profileConfig.preferences.reasoningEffort = 'ultra';
+    h.profileConfig.preferences.fastMode = 'off';
+    const result = await startRunFlow({
+      scopeId: 'chat-tuning', scope: { source: 'im', chatId: 'chat-tuning', actorId: 'ou_user' },
+      prompt: 'hello', attachments: [], access: { ok: true, reason: 'allowed-user' },
+      capability: codexCapability(h.profileConfig), profileConfig: h.profileConfig,
+      sessions: h.sessions, workspaces: h.workspaces, executor: h.executor, now: 1000,
+    });
+    expect(result.ok).toBe(true);
+    expect(h.agent.runOptions[0]).toMatchObject({ reasoningEffort: 'ultra', serviceTier: 'default' });
+  });
+
   it('rejects missing cwd without falling back to the user home', async () => {
     const h = await createHarness();
 

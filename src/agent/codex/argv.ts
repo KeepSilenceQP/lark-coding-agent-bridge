@@ -10,6 +10,8 @@ export interface BuildCodexArgsInput {
   developerInstructions?: string;
   /** Forwarded to `codex exec --model`. Omitted uses the Codex default. */
   model?: string;
+  reasoningEffort?: string;
+  serviceTier?: 'fast' | 'default';
 }
 
 export function buildCodexArgs(input: BuildCodexArgsInput): string[] {
@@ -25,6 +27,9 @@ export function buildCodexArgs(input: BuildCodexArgsInput): string[] {
     '--sandbox',
     input.sandbox,
     ...(input.model ? ['--model', input.model] : []),
+    ...(input.reasoningEffort ? ['-c', `model_reasoning_effort=${JSON.stringify(input.reasoningEffort)}`] : []),
+    ...(input.serviceTier ? ['-c', `service_tier=${JSON.stringify(input.serviceTier)}`] : []),
+    ...(input.serviceTier === 'fast' ? ['-c', 'features.fast_mode=true'] : []),
     '-c',
     'approval_policy="never"',
     '-c',

@@ -35,6 +35,8 @@ export interface AgentRunOptions {
   threadId?: string;
   systemPromptAddendum?: string;
   model?: string;
+  reasoningEffort?: string;
+  serviceTier?: 'fast' | 'default';
   images?: readonly string[];
   sandbox?: CodexSandboxMode;
   permissionMode?: ClaudePermissionMode;

@@ -79,6 +79,8 @@ export function ConfigView({ profile }: { profile: string }) {
         mode: cfg.mode,
         meeting: cfg.meeting,
         model: cfg.model,
+        reasoningEffort: cfg.reasoningEffort,
+        fastMode: cfg.fastMode,
         messageReply: cfg.messageReply,
         showToolCalls: cfg.showToolCalls,
         cotMessages: cfg.cotMessages,
@@ -142,10 +144,23 @@ export function ConfigView({ profile }: { profile: string }) {
       <Card>
         <CardHeader><CardTitle>回复与运行</CardTitle></CardHeader>
         <CardContent className="space-y-4">
-          <Field label="模型">
-            <SelectRow value={cfg.model} onChange={(v) => set("model", v)}
-              options={cfg.models.map((m) => [m.value, m.label])} />
+          <Field label="模型" hint="可选择本机模型或填写自定义模型 ID；default 表示跟随 CLI 默认。">
+            <Input list="agent-model-options" value={cfg.model}
+              onChange={(e) => set("model", e.target.value)} />
+            <datalist id="agent-model-options">
+              {cfg.models.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+            </datalist>
           </Field>
+          {cfg.agentKind === 'codex' && <>
+            <Field label="推理强度" hint="具体档位取决于模型支持；跟随默认不覆盖 CLI 设置。">
+              <SelectRow value={cfg.reasoningEffort} onChange={(v) => set("reasoningEffort", v)}
+                options={cfg.reasoningOptions.map((m) => [m.value, m.label])} />
+            </Field>
+            <Field label="快速模式" hint="加快生成速度，会增加用量；与推理强度独立。">
+              <SelectRow value={cfg.fastMode} onChange={(v) => set("fastMode", v)}
+                options={cfg.fastModeOptions.map((m) => [m.value, m.label])} />
+            </Field>
+          </>}
           <Field label="消息回复方式">
             <SelectRow value={cfg.messageReply} onChange={(v) => set("messageReply", v as ConfigData["messageReply"])}
               options={[["markdown", "消息卡片（默认）"], ["text", "纯文本"]]} />

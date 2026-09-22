@@ -215,6 +215,8 @@ export class CodexAdapter implements AgentAdapter {
       ignoreUserConfig: this.ignoreUserConfig,
       ignoreRules: this.ignoreRules,
       model: opts.model,
+      reasoningEffort: opts.reasoningEffort,
+      serviceTier: opts.serviceTier,
       developerInstructions,
     });
     const redactPrompt = createPromptRedactor([

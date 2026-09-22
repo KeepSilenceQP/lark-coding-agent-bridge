@@ -316,6 +316,20 @@ provider、推理强度和认证仍由 TraeX 自己管理；Bridge 的界面和�
 
 ## 回复展示与 COT
 
+`/config` 的 Codex 模型列表读取该 profile 实际使用的 Codex home 中的
+`models_cache.json`，展示缓存里的可见模型；缓存不可用时显示内置候选。
+可在“自定义模型 ID”输入框指定其他模型（优先于下拉选择），模型是否可用由
+底层 CLI 和账号验证。已保存的自定义 ID 会保留在菜单中，不会因缓存变化退回默认。
+Web 控制台也支持直接输入模型 ID；选择 `default` 表示跟随 CLI 默认。
+
+Codex profile 还支持独立配置 **推理强度** 和 **快速模式**。两项均可选择
+“跟随 CLI 默认”，不覆盖已有设置；推理档位是否可用取决于所选模型。
+快速模式可选开启或关闭，开启会增加用量。保存后从下一次运行生效，
+包括新会话和继续会话；飞书与 Web 共用配置，Claude profile 不显示这两项。
+底层分别传入 `model_reasoning_effort` 和 `service_tier`，不会通过降低推理强度来模拟快速模式。
+参见 [Codex 配置说明](https://learn.chatgpt.com/docs/config-file/config-reference) 和
+[速度说明](https://learn.chatgpt.com/docs/agent-configuration/speed)。
+
 `/config` 可以调整三类展示选项：
 
 - **消息回复方式**：`消息卡片` 流式更新最终回复；`纯文本` 在 run 完成后一次性发送。

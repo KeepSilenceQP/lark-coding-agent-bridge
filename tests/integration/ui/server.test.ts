@@ -133,6 +133,31 @@ describe('ui server (supervisor-backed)', () => {
     expect(config.live).toBe(true);
   });
 
+  it('persists Codex tuning and rejects invalid effort without applying changes', async () => {
+    const root = (await loadRootConfig(configPath))!;
+    root.profiles.work!.agentKind = 'codex';
+    root.profiles.work!.codex = { binaryPath: 'codex' };
+    await saveRootConfig(root, configPath);
+    const view = await json(await post('/api/config?profile=work', handle.token, { reasoningEffort: 'max', fastMode: 'on' }));
+    expect(view).toMatchObject({ reasoningEffort: 'max', fastMode: 'on' });
+    expect((await post('/api/config?profile=work', handle.token, { reasoningEffort: 'invalid' })).status).toBe(400);
+    const saved = JSON.parse(await readFile(configPath, 'utf8'));
+    expect(saved.profiles.work.preferences).toMatchObject({ reasoningEffort: 'max', fastMode: 'on' });
+    const cleared = await json(await post('/api/config?profile=work', handle.token, { reasoningEffort: 'default', fastMode: 'default' }));
+    expect(cleared).toMatchObject({ reasoningEffort: 'default', fastMode: 'default' });
+  });
+
+  it('saves custom model IDs and returns them as selectable options', async () => {
+    const view = await json(await post('/api/config', handle.token, { model: 'provider/custom-v3' }));
+    expect(view.model).toBe('provider/custom-v3');
+    expect(view.models.some((m: { value: string }) => m.value === view.model)).toBe(true);
+    const saved = JSON.parse(await readFile(configPath, 'utf8'));
+    expect(saved.profiles.claude.preferences.model).toBe('provider/custom-v3');
+    expect((await post('/api/config', handle.token, { model: '--bad value' })).status).toBe(400);
+    const cleared = await json(await post('/api/config', handle.token, { model: 'default' }));
+    expect(cleared.model).toBe('default');
+  });
+
   it('applies a config change live to an online profile and persists it', async () => {
     const view = await json(
       await post('/api/config', handle.token, { mode: 'team', maxConcurrentRuns: 7, requireMentionInGroup: false }),

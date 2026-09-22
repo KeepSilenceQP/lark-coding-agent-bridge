@@ -1,6 +1,6 @@
 import { log } from '../core/logger';
 import type { AgentCapability } from '../agent/capability';
-import { resolveModelArg } from '../agent/models';
+import { resolveModelArg, resolveRunTuning } from '../agent/models';
 import type { AgentEvent } from '../agent/types';
 import type { ProfileConfig } from '../config/profile-schema';
 import type { AccessDecision } from '../policy/access';
@@ -242,6 +242,7 @@ export async function startPreparedPinnedCodexRun(input: {
       policy: input.prepared.policy,
       threadId: input.prepared.threadId,
       systemPromptAddendum: input.prepared.systemPromptAddendum,
+      ...resolveRunTuning(input.profileConfig.agentKind, input.profileConfig.preferences),
       model: resolveModelArg(
         input.profileConfig.agentKind,
         input.profileConfig.preferences.model,
@@ -488,6 +489,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       sessionId,
       threadId,
       systemPromptAddendum,
+      ...resolveRunTuning(input.profileConfig.agentKind, input.profileConfig.preferences),
       model: resolveModelArg(
         input.profileConfig.agentKind,
         input.profileConfig.preferences.model,

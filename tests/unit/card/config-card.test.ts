@@ -3,6 +3,23 @@ import { configFormCard, configSavedCard } from '../../../src/card/config-card';
 import type { ConfigFormOpts } from '../../../src/card/config-card';
 
 describe('config group response mode cards', () => {
+  it('shows Codex tuning and the saved values without exposing unsupported Claude controls', () => {
+    const codex = { ...options('owner-default'), agentKind: 'codex' as const, reasoningEffort: 'ultra', fastMode: 'on' };
+    expect(findNamed(configFormCard(codex), 'reasoning_effort')).toMatchObject({ initial_option: 'ultra' });
+    expect(findNamed(configFormCard(codex), 'fast_mode')).toMatchObject({ initial_option: 'on' });
+    expect(JSON.stringify(configSavedCard(codex))).toContain('ultra');
+    expect(JSON.stringify(configSavedCard(codex))).toContain('开启');
+    expect(findNamed(configFormCard(options('owner-default')), 'fast_mode')).toBeUndefined();
+  });
+
+  it('keeps a custom model as a valid selected option and offers a custom input', () => {
+    const card = configFormCard({ ...options('owner-default'), model: 'provider/custom-v3' });
+    const field = findNamed(card, 'model') as { initial_option: string; options: Array<{ value: string }> };
+    expect(field.initial_option).toBe('provider/custom-v3');
+    expect(field.options.some((m) => m.value === field.initial_option)).toBe(true);
+    expect(findNamed(card, 'custom_model')).toBeDefined();
+  });
+
   it('renders the 4-mode picker with owner-default selected', () => {
     const card = configFormCard(options('owner-default'));
     const field = findNamed(card, 'group_response_mode') as {

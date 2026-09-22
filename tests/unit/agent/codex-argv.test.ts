@@ -2,6 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { buildCodexArgs } from '../../../src/agent/codex/argv.js';
 
 describe('Codex argv contract', () => {
+  it.each([undefined, 'thread-123'])('passes independent effort and speed overrides for thread %s', (threadId) => {
+    const args = buildCodexArgs({ cwd: '/repo', sandbox: 'read-only', threadId,
+      reasoningEffort: 'ultra', serviceTier: 'fast' });
+    expect(args).toContain('model_reasoning_effort="ultra"');
+    expect(args).toContain('service_tier="fast"');
+    expect(args).toContain('features.fast_mode=true');
+    if (threadId) expect(args.indexOf('service_tier="fast"')).toBeLessThan(args.indexOf('resume'));
+    const standard = buildCodexArgs({ cwd: '/repo', sandbox: 'read-only', threadId, serviceTier: 'default' });
+    expect(standard).toContain('service_tier="default"');
+    expect(standard.some((arg) => arg.startsWith('model_reasoning_effort='))).toBe(false);
+  });
+
   it('builds the fresh exec argv without putting the prompt in argv', () => {
     expect(buildCodexArgs({ cwd: '/repo', sandbox: 'read-only' })).toEqual([
       'exec',

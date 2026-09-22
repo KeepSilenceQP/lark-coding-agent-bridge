@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
-import { DEFAULT_MODEL, normalizeModelSelection, supportedModels } from '../agent/models';
+import { DEFAULT_MODEL, isValidModelId, modelCatalogHome, normalizeModelSelection, parseRunTuning } from '../agent/models';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
@@ -3112,6 +3112,9 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
   const sidecar = await readUiSidecar(commandProfilePaths(ctx).hostUiFile).catch(() => undefined);
   const consoleUrl = sidecar && isAlive(sidecar.pid) ? sidecar.url : undefined;
   const card = configFormCard({
+    modelCatalogHome: modelCatalogHome(ctx.controls),
+    reasoningEffort: ctx.controls.cfg.preferences?.reasoningEffort,
+    fastMode: ctx.controls.cfg.preferences?.fastMode,
     agentKind: ctx.controls.profileConfig.agentKind,
     mode: ctx.controls.profileConfig.mode,
     model: normalizeModelSelection(
@@ -3174,16 +3177,26 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       : getMessageReplyMode(ctx.controls.cfg);
   const rawTools = String(fv.show_tool_calls ?? '').trim();
   const showToolCalls = rawTools !== 'hide';
-  // Parse the model picker. Unexpected / empty values keep the current
+  // Custom input takes precedence; omitted values keep the current
   // selection. Store `undefined` for the "default" sentinel to keep config
   // tidy (resolveModelArg treats both the same way).
   const agentKind = ctx.controls.profileConfig.agentKind;
-  const rawModel = String(fv.model ?? '').trim();
-  const modelValid = rawModel !== '' && supportedModels(agentKind).some((m) => m.value === rawModel);
-  const modelSelection = modelValid
-    ? rawModel
-    : normalizeModelSelection(agentKind, ctx.controls.cfg.preferences?.model);
+  const customModel = String(fv.custom_model ?? '').trim();
+  const rawModel = customModel || String(fv.model ?? '').trim();
+  if (rawModel && !isValidModelId(rawModel)) {
+    await reply(ctx, '模型 ID 格式无效，请填写不含空格的模型 ID（最多 200 个字符）。');
+    return;
+  }
+  const modelSelection = normalizeModelSelection(agentKind, rawModel || ctx.controls.cfg.preferences?.model);
   const model = modelSelection === DEFAULT_MODEL ? undefined : modelSelection;
+  let tuning: Pick<AppPreferences, 'reasoningEffort' | 'fastMode'>;
+  try {
+    tuning = parseRunTuning(agentKind, ctx.controls.cfg.preferences ?? {}, fv.reasoning_effort, fv.fast_mode);
+  } catch (error) {
+    await reply(ctx, error instanceof Error ? error.message : '运行设置无效');
+    return;
+  }
+
   const rawCotMessages = String(fv.cot_messages ?? '').trim();
   const cotMessages =
     rawCotMessages === 'brief'
@@ -3277,6 +3290,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
     const nextPreferences: AppPreferences = {
       ...(ctx.controls.cfg.preferences ?? {}),
       model,
+      ...tuning,
       messageReply,
       // Mark the messageReply value as living in the new (post-0.1.27)
       // semantic — `text` now means real plain text, not the lightweight
@@ -3349,6 +3363,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         agentKind,
         mode,
         model: modelSelection,
+        ...tuning,
         messageReply,
         showToolCalls,
         cotMessages,

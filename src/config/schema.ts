@@ -123,11 +123,15 @@ export interface AppPreferences {
   showToolCalls?: boolean;
   /**
    * Model the underlying agent runs with, forwarded as `--model`. The catalog
-   * of valid values is agent-kind specific — see `agent/models.ts`. `undefined`
+   * is a suggestion list, not a runtime allowlist. `undefined`
    * or the `'default'` sentinel means "don't pass `--model`" so the agent
    * CLI / account default applies. Default: unset.
    */
   model?: string;
+  /** Codex reasoning effort override. Unset inherits the CLI default. */
+  reasoningEffort?: string;
+  /** Codex Fast service tier. Unset inherits the CLI default. */
+  fastMode?: 'on' | 'off';
   /**
    * Whether to send a separate Lark COT process message before the final
    * answer. `brief` mirrors the lightweight tool/progress visibility from
