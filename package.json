@@ -41,7 +41,7 @@
     "build:web": "vite build web",
     "build": "npm run build:web && tsup",
     "typecheck": "tsc --noEmit",
-    "pretest": "pnpm build:web",
+    "pretest": "npm run build:web",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit --passWithNoTests",
     "test:integration": "vitest run tests/integration --passWithNoTests",
