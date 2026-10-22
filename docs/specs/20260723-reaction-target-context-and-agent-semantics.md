@@ -3,6 +3,10 @@
 Date: 2026-07-24
 Status: confirmed; `stop_current_work` trigger-message amendment independently reviewed PASS
 
+Current amendment: 2026-10-22 `DONE` passive handled marker; the original
+`user_step_completed` mapping is retired. Historical review records below refer
+to the earlier stop amendment.
+
 Amendment review history:
 
 - R1 `76e6f02` BLOCKED：user-target eligibility/no-work 顺序、removed ledger bypass、
@@ -20,7 +24,7 @@ Amendment review history:
 
 只完成任意一项都不算修复完成：只有 System Prompt 而没有目标消息，模型无从正确理解；只有消息入站而没有处理规则，模型仍可能把点赞、拒绝或撤回误当成普通文本。`stop_current_work` 和无需模型重新判断的撤回反馈是明确例外，由 Bridge 控制面确定性处理，不为了满足入站形式而额外启动 Agent。
 
-Reaction 语义采用双层模型：用户确认的常用语义作为预埋规则直接提供给模型；未预埋的 Reaction 也必须完整透传，由模型结合目标消息和会话上下文自行分析。预埋规则是高置信快捷知识，不是 Reaction 白名单。
+需要处理的 Reaction 语义采用双层模型：用户确认的常用语义作为预埋规则直接提供给模型；未预埋的 Reaction 也必须完整透传，由模型结合目标消息和会话上下文自行分析。预埋规则是高置信快捷知识，不是 Reaction 白名单。专用静默标记 `DONE` 按下节契约在 Bridge 中排除，不属于这两层模型输入。
 
 UI 继续引用被 Reaction 的原消息。普通语义仍只处理当前 Bot 自己消息上的 Reaction；
 `stop_current_work` 是控制面例外：除了当前 chain 中可添加 Reaction 的 Bot 消息外，也
@@ -38,13 +42,38 @@ Bot 的消息、未登记原消息，以及用户消息上的 `DONE` 等其他�
 workChain，确保后续 No 仍可作用于原消息。旧 No 可以保留在有效集合中，但不是新的
 停止事件。GoGoGo 的重复投递不重复启动；撤回 GoGoGo 后即使集合仍有 No，也只确认
 撤回、清理对应的待执行/进行中 Reaction，不新建 Agent turn、不回滚已完成动作。
-Agent 从已完成位置继续，不扩大原任务授权。11 项预埋映射保持不变；GoGoGo 仍携带
+Agent 从已完成位置继续，不扩大原任务授权。GoGoGo 不新增预埋映射，仍携带
 `unmapped`，其原消息续执行规则由共享 System Prompt 明确说明。
 
 inbound trigger 的关联沿用现有内存、TTL 和容量限制：重启、历史记录过期或被逐出后
 不能仅凭原消息 GoGoGo 重建关联，此时应发送新的普通消息继续。
 
-所有通过现有消息权限门禁、并被 Bridge 消费的有效 Reaction 都必须产生一条用户可见的回复。普通语义由 Agent 回复；需要立即抢占或无需重新唤起 Agent 的控制/撤回场景由 Bridge 给出确定性简短反馈，不能以“没有新 Agent turn”等价于“没有回复”。
+### 2026-10-22 DONE 静默“已处理”标记
+
+飞书 UI 的 [完成]（精确 `emojiType=DONE`）固定作为“已处理”标记。用户可以在话题
+首条消息上添加它，表示该话题已处理；移除它表示取消标记。该约定适用于所有 profile、
+操作者、私聊/普通群/话题及用户或 Bot 消息，不依赖 workChain 登记或目标内容。
+
+- Bridge 在事件入口直接忽略 DONE 的 added/removed，不读取目标消息或 Reaction list，
+  不入 buffer/queue，不写消费 ledger/revision，不启动或中断 Agent，也不发送任何回复。
+- 全分页快照同样排除 DONE：它不能进入 `effectiveReactionSet`、`triggerReactions`、
+  canonical fingerprint、动态 Reaction 上下文或触发文本；与其他表情同时存在时，只处理
+  其他表情的变化。共享 System Prompt 保留 DONE 静默规则，用于解释该约定。
+- DONE 的增删不影响已有普通输入或 Reaction 的 queued/reserved/active 生命周期。
+  同一消息保留 DONE 时撤回最后一个主动 Reaction，仍按空的有效集合处理。
+- 旧版 ledger 只保存 fingerprint 等元数据，不保存可供过滤的完整 Reaction 记录。
+  reconciliation 用当前主动记录加 DONE 重算旧版 fingerprint；只有持久 current 与
+  consumed fingerprint 都精确匹配时，才归一化为不含 DONE 的 fingerprint，保持 revision
+  不变且不重放已消费语义。真实主动集合变化仍按正常规则产生新 revision。
+- 标记的存储和展示由飞书原生 Reaction 提供，不额外建立话题状态库；不关闭话题、不停止
+  或恢复任务，也不宣称整个任务已经完成。其他群成员可看到该 Reaction。
+- 原 `DONE → user_step_completed` 语义退役。需要用户报告手动步骤完成并继续执行时，
+  使用文字回复；`GoGoGo` 原消息续执行和其他主动 Reaction 语义保持各自现有规则。
+
+下文关于未映射透传、全部有效 Reaction 可见回复、撤回确认及 revision 中断的要求，
+均只针对排除 DONE 后的主动 Reaction。DONE 不是未映射 Reaction，也不产生撤回确认。
+
+所有通过现有消息权限门禁、并被 Bridge 消费的主动 Reaction 都必须产生一条用户可见的回复。普通语义由 Agent 回复；需要立即抢占或无需重新唤起 Agent 的控制/撤回场景由 Bridge 给出确定性简短反馈，不能以“没有新 Agent turn”等价于“没有回复”。
 
 ## Goal And Completion Definition
 
@@ -124,7 +153,7 @@ Reaction 交给 Agent。
 }
 ```
 
-- `triggerReactions` 是有序数组，表示本次 buffer 中尚未消费、并共同导致当前 revision 的一个或多个添加/移除事件；按 action time、再按到达顺序排列。`effectiveReactionSet` 表示 reconciliation 后，该操作者在该目标消息上仍然有效的完整 Reaction 集合。两者必须同时提供：事件 delta 用来识别用户刚刚做了什么，权威快照用来判断现在仍有哪些 Reaction；模型不能把集合中早已处理且仍保留的 Reaction 再执行一次。
+- `triggerReactions` 是有序数组，表示本次 buffer 中尚未消费、并共同导致当前 revision 的一个或多个添加/移除事件；按 action time、再按到达顺序排列。`effectiveReactionSet` 表示 reconciliation 后，该操作者在该目标消息上仍然有效、且已排除 DONE 的完整主动 Reaction 集合。两者必须同时提供：事件 delta 用来识别用户刚刚做了什么，权威快照用来判断现在仍有哪些主动 Reaction；模型不能把集合中早已处理且仍保留的 Reaction 再执行一次。
 - 对需要模型解释的普通 Reaction，WebSocket event 只作为 reconciliation trigger，不是当前集合的权威来源。完成 self-operator、路由、own-message 和权限门禁后，Bridge 必须通过飞书 Reaction list API（当前仓库 SDK 调用面为 `rawClient.im.v1.messageReaction.list`）全量分页读取目标消息，指定 `user_id_type=open_id`，再按 `operator_type + operator_id` 重建该 operator 的 `effectiveReactionSet`。实现所用 Bot 身份必须具备 `im:message.reactions:read`。`stop_current_work` 仍按独立控制事件路径处理，不因新增 user-trigger 目标而进入普通 snapshot/revision 流程。
 - Bridge 必须持久记录每个 `scope + operatorOpenId + targetMessageId` 最近一次已确认的 Reaction record IDs、集合 fingerprint、最新 action time 和已消费 fingerprint；重启后先加载该 ledger，再处理新事件。集合 fingerprint 必须先对相关记录按稳定字段规范化、去重和确定性排序，不能因分页或 API 返回顺序变化而产生新 revision。首次没有历史 ledger 时，以本次真实事件为 delta、以 list 结果为当前上下文建立 baseline，不能仅因 reconciliation 看见旧 Reaction 就重放它们。
 - 除 `stop_current_work` 的 added/removed 独立控制事件路径外，同一 key 的事件先进入有最大等待上限的短时 buffer，按 action time、再按到达顺序排列；quiet window 或最大等待到达后只做一次全分页 reconciliation。实现以“buffer 开始前的持久 ledger snapshot → list 返回的最新权威 snapshot”的净变化决定 revision 和 Agent 行为，不要求飞书 list 暴露已经消失的中间状态。
@@ -134,7 +163,7 @@ Reaction 交给 Agent。
 - `emojiType` 原样保留飞书事件值。它只是平台标识符，不保证对模型可读；例如不在 v1 预埋表中的 `Get` 必须标记为 `unmapped` 并完整透传，不能要求模型仅凭该字符串猜测，也不能擅自把它提升为预埋语义。
 - Bridge 维护版本化、可测试的预埋语义表。语义定义先由用户确认，再把经飞书文档或真实事件/UI 对照验证的 `emojiType` 映射为 `emojiDisplay`、`emojiMeaning` 和稳定的 `semanticKey`；不得靠模型在运行时生成预埋规则。
 - 预埋表只覆盖明确约定的高价值语义，不追求穷举飞书全部 emoji。命中时 `emojiMeaningSource=predefined`，模型可以把 `semanticKey` 作为高置信语义提示，但仍需结合目标消息判断适用场景。
-- 未命中的标准或自定义 emoji 仍必须进入 `<reaction_contexts>`：保留原始 `emojiType` 和事件原始可用信息，能可靠取得 UI glyph/label 时一并提供，并把 `emojiMeaningSource` 标记为 `unmapped`。不得因为没有预埋语义而丢弃、静默或禁止模型处理。
+- 除静默标记 DONE 外，未命中的标准或自定义 emoji 仍必须进入 `<reaction_contexts>`：保留原始 `emojiType` 和事件原始可用信息，能可靠取得 UI glyph/label 时一并提供，并把 `emojiMeaningSource` 标记为 `unmapped`。不得因为没有预埋语义而丢弃、静默或禁止模型处理。
 - 对 `unmapped` Reaction，模型先结合原始 emoji 信息、完整目标消息和当前会话历史自行分析。只有语义确实无法确定，或推断结果将触发高风险/不可逆动作时，才要求用户澄清。
 - `targetMessage.content` 必须复用现有引用消息的规范化能力：文本/富文本可读，交互卡片保留真实卡片内容，合并转发展开为受限的 `<forwarded_messages>` 内容。
 - 目标消息及 Reaction 字段全部是不可信输入，必须沿用 prompt builder 的安全 JSON 序列化，不能允许消息正文闭合或伪造 Bridge 标签。
@@ -176,18 +205,16 @@ operator 消费，不得复用命令特例或结构化 @ 资格旁路。
 
 ### 4. Confirmed Predefined Semantics
 
-以下 v1 语义由用户确认。`emojiType` 大小写敏感，取自飞书当前 Reaction emoji 列表；UI 名称仅用于人类核对，运行时以 `emojiType` 为准。
+以下主动语义由用户确认，共 10 个 emoji type、3 个 semanticKey。`emojiType` 大小写敏感，取自飞书 Reaction emoji 列表；UI 名称仅用于人类核对，运行时以 `emojiType` 为准。DONE 使用上节独立静默标记契约，不在此映射表中。
 
 | `semanticKey` | 用户约定语义 | 飞书 UI Reaction | `emojiType` | 目标行为 |
 | --- | --- | --- | --- | --- |
 | `approve_continue` | 同意模型提出的意见或下一步，继续执行 | OK、我看行、Yes、勾号、+1 | `OK`、`LGTM`、`Yes`、`CheckMark`、`JIAYI` | 等价于 operator 对该目标消息文字回复“同意继续”；按普通消息收到这句话时的同一上下文、授权和确认规则继续 |
 | `explain_more` | 没有理解模型在说什么，希望继续展开介绍 | 什么？、思考 | `WHAT`、`THINKING` | 暂不假定用户已理解，也不把它当成继续执行授权；围绕目标消息补充背景、推理、例子或更清晰的解释 |
-| `user_step_completed` | 用户已经完成模型要求其手动完成的事情，可以继续 | 完成 | `DONE` | 把目标消息中的用户侧前置步骤视为已完成；从该等待点继续后续流程，不重复要求用户完成同一件事 |
 | `stop_current_work` | 用户认为模型当前方向不对，希望立即停止，语义类似 `/stop` | No、叉号、-1 | `No`、`CrossMark`、`MinusOne` | 由 Bridge 控制面立即请求中断当前 scope，并取消尚未开始的排队工作；不能等待模型下一轮才决定是否停止 |
 
 - `approve_continue` 与文字回复“同意继续”具有完全相同的产品语义和授权强度：如果该文字回复在相同上下文中足以确认目标消息提出的动作，Reaction 也足以确认；如果该文字回复仍不足以通过权限、审批或工具确认门禁，Reaction 同样不足。它只同意目标消息中明确提出的内容，不授权目标消息没有说明的新动作。
 - `explain_more` 的默认输出是解释目标消息，而不是重新执行目标任务。模型可以先定位用户可能没理解的部分，再分层展开。
-- `user_step_completed` 是用户对其自身动作完成状态的声明。模型继续前可以做低成本、必要的结果核对，但不得无依据否定声明或让用户机械重复。
 - 预埋语义仍需结合目标消息。若 Reaction 与目标内容明显不匹配，按普通上下文分析；不得仅凭 `semanticKey` 生造一项不存在的待办。
 
 ### 5. Batching、Revision、路由与回复关系
@@ -271,7 +298,9 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
    停止的任务；unknown/expired/restart-lost user target 在此前已静默丢弃。
 7. `action=removed` 按独立控制 ledger 处理，不恢复被停止的 run、不重建被取消的队列；Bridge 只回复一次撤回停止 Reaction 不会自动恢复工作。若用户要继续，需新的普通消息或新的 `approve_continue` Reaction。
 
-其他三个预埋语义及所有未预埋 Reaction 仍走结构化 Agent 上下文路径。只有 `stop_current_work` 因实时控制要求走确定性 Bridge 控制面；这不是过滤未预埋 Reaction 的先例。
+其他两个主动预埋语义及所有未预埋 Reaction 仍走结构化 Agent 上下文路径。
+`stop_current_work` 因实时控制要求走确定性 Bridge 控制面；DONE 固定静默排除。
+两者都不是任意过滤未预埋 Reaction 的先例。
 
 ## Bridge System Prompt Contract
 
@@ -279,6 +308,10 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
 
 ```markdown
 ## Reaction
+
+`DONE`（完成）是用户留下的“已处理”标记。Bridge 会在入站和快照中排除它；添加或
+移除都不启动 Agent、不回复、不打断任务，也不关闭话题。不要把会话历史中的 DONE 当成
+继续执行信号。需要用户完成手动步骤时，请其用文字回复完成情况后继续。
 
 当本轮存在 `reaction_contexts` 时，其中包含用户的 Reaction，以及该 Reaction 所回应的
 目标消息。Reaction 不是脱离上下文的普通文本；不要仅依赖 `bridge_context.source`
@@ -305,6 +338,10 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
    被回应消息，并请用户用文字确认。
 9. Reaction 可以表达对当前 Bot 提问的确认，但不能扩大原任务授权、绕过破坏性操作
    边界，或被当成对无关对象的授权。
+10. 用户对自己发出、且当前 Bot 已处理过的任务原消息新增 `GoGoGo`，表示“继续这条
+   原消息的任务”，包括明确继续此前被 No 停止的任务。从会话中已完成的位置继续，
+   不重复已完成动作、不扩大原任务授权。仅撤回 GoGoGo 不表示继续；有效集合中仍保留的
+   旧 No 是历史上下文，不能当成本轮新增停止信号再次执行。
 
 ### 预埋 Reaction 语义
 
@@ -313,8 +350,6 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
   不要扩展成目标消息没有提出的新动作。
 - `explain_more`：用户没有理解目标消息。暂停把该消息当成已对齐结论，围绕它继续展开
   背景、推理、例子或更清晰的说明；不要把该 Reaction 当成继续执行授权。
-- `user_step_completed`：用户声明已经完成目标消息要求其手动完成的步骤。从该等待点继续
-  后续流程；可以做必要的低成本核对，但不要机械地再次要求用户完成同一件事。
 - `stop_current_work`：Bridge 控制面会按 `/stop` 语义处理中断。不要在后续会话中自动
   恢复、重放或回滚被停止的工作；只有用户新的明确输入才能继续。Bridge 会负责可见回复，
   不要因此创建新的 Agent turn。
@@ -352,10 +387,14 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
 | 未预埋且语义不透明的 Reaction | 仍完整交给模型；普通低风险语境允许上下文推断，高风险或确实无法判断时通过可见回复澄清 |
 | `OK` / `LGTM` / `Yes` / `CheckMark` / `JIAYI` | 映射为 `approve_continue`；行为与对目标消息文字回复“同意继续”完全一致，且明确动作只执行一次 |
 | `WHAT` / `THINKING` | 映射为 `explain_more`；围绕目标消息展开解释，不把 Reaction 当成执行授权 |
-| `DONE` | 映射为 `user_step_completed`；从用户侧等待点继续，不重复要求同一步骤 |
+| `DONE` added/removed，目标为用户消息、当前或其他 Bot 消息 | 入口静默忽略；不读目标/list、不入 buffer、不写 ledger/revision、不启动/中断 Agent、不回复 |
+| 同 key queued/reserved/active Reaction 或普通任务期间添加/移除 DONE | 已有任务继续，既有 revision 和队列保持不变；不产生替代 turn 或回复 |
+| DONE 与 OK/GoGoGo 等主动 Reaction 共存 | list 快照、fingerprint、triggerReactions 和动态 Reaction 输入都不含 DONE；只处理主动信号；共享 System Prompt 仍包含 DONE 静默规则 |
+| DONE 仍保留时撤回最后一个主动 Reaction | 有效集合为空；遵守该主动 Reaction 的撤回规则，不因 DONE 启动替代 turn |
+| 升级前的持久 ledger fingerprint 包含 DONE | 识别并归一化旧版含 DONE fingerprint；仅 current/consumed 均精确匹配时保持 revision 并避免重放，真实主动变化仍正常处理 |
 | `No` / `CrossMark` / `MinusOne` 指向当前执行链路，且 scope 正在运行或准备运行 | 映射为 `stop_current_work`；在普通排队前触发与 `/stop` 等价的 interrupt，取消 pending，并由 Bridge 回复停止结果 |
 | 流式卡片仍在更新，operator 对触发当前任务的用户消息添加 `No` / `CrossMark` / `MinusOne` | trigger message 已在 enqueue 时映射到 current `workChainId`；允许立即 interrupt + cancel pending，不要求正在更新的卡片可添加 Reaction |
-| operator 对普通用户消息添加非停止 Reaction | 继续静默跳过；不进入 Agent、不建立普通 Reaction snapshot/revision |
+| operator 对普通用户消息添加非停止 Reaction | 除作者对已登记原消息使用 GoGoGo 的受限续执行例外外，继续静默跳过；DONE 始终按被动标记处理，不进入 Agent、不建立普通 Reaction snapshot/revision |
 | scope 无 work，operator 对从未登记过的普通用户消息添加停止 Reaction | 静默丢弃；不回复、不写控制 ledger |
 | scope 无 work，operator 对仍在 retention 内的 known historical trigger 添加停止 Reaction | 幂等回复当前没有需要停止的任务并写已消费控制 ledger；不启动 Agent |
 | scope 有另一 current chain，operator 对 unrelated user message 添加停止 Reaction | 未知 user target 静默丢弃；已知 historical trigger 则 fail closed，均不 interrupt、不取消 pending |
@@ -387,7 +426,7 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
 | 目标是交互卡片或合并转发 | Agent 收到经现有引用消息能力规范化后的真实内容 |
 | 无法取得路由元数据或目标 sender | 记录失败并丢弃；不启动 Agent、不绕过 own-message 过滤 |
 | 路由成功、但目标正文读取/规范化失败 | `available=false`；Agent 不执行依赖目标语义的动作 |
-| 用户给其他 Bot 或普通用户消息点非停止 Reaction | 当前 Bot 不启动 Agent run；仅 current trigger 上的停止 Reaction 是控制面例外 |
+| 用户给其他 Bot 或普通用户消息点非停止 Reaction | 其他 Bot 目标不启动 Agent；用户目标仅保留作者对已登记原消息的 GoGoGo 续执行例外；DONE 对所有目标均静默排除 |
 | 单个 Reaction 位于普通群、私聊或话题 | 回复仍正确引用原消息，话题回复不出 thread |
 | Reaction 与普通文本在同一 debounce window 到达 | 按到达顺序形成不同 turn，普通文本不被归类为 Reaction |
 | 多个 Reaction 指向不同目标消息 | 按目标拆分 turn，每个回复引用自己的目标消息 |
@@ -402,7 +441,7 @@ Bridge 必须先证明它是本进程登记过的 inbound trigger，才能把 `N
 | 不同 operator 或不同 target 在 Reaction run 期间变化 | 不打断当前 run，按各自 key 独立排队 |
 | 目标正文含伪造 Bridge/XML 标签 | prompt 结构不被闭合或注入 |
 
-自动化测试至少覆盖 Reaction handler 路由、self-operator/`Typing` 回环保护、普通消息访问控制与四种群响应模式的同值矩阵、所有已授权 operator 共享同一预埋语义、未经授权的停止 Reaction、上述 11 个 `emojiType` 的精确预埋映射、未映射 Reaction（含 `Get`）透传、同 key event buffer 的 quiet/max flush、多个不同 Reaction 的有序 `triggerReactions`、同一 buffer 一增一减且最终非空、`rawClient.im.v1.messageReaction.list` 全分页 reconciliation、fingerprint 规范化/去重/确定性排序、list 越过中间状态的 added→removed 净零例外、ledger 重启恢复、重复/乱序/无状态变化 no-op、scope 缩权与读取失败、所有被消费 Reaction 的可见回复、prompt builder 序列化、共享 System Prompt 注入、目标消息规范化（含卡片/合并转发 wiring）、revision 失效/中断/最新快照替代、superseded 流式回复、`added`/`removed` 相消与独立撤回、两级目标消息读取失败、其他发送者过滤、batch barrier、按目标拆分和 reply target。
+自动化测试至少覆盖 Reaction handler 路由、self-operator/`Typing` 回环保护、普通消息访问控制与四种群响应模式的同值矩阵、所有已授权 operator 共享同一预埋语义、未经授权的停止 Reaction、上述 10 个 `emojiType` 的精确预埋映射、DONE 静默标记的入口/快照过滤、旧版含 DONE fingerprint 归一化及任务期间无副作用、未映射 Reaction（含 `Get`）透传、同 key event buffer 的 quiet/max flush、多个不同 Reaction 的有序 `triggerReactions`、同一 buffer 一增一减且最终非空、`rawClient.im.v1.messageReaction.list` 全分页 reconciliation、fingerprint 规范化/去重/确定性排序、list 越过中间状态的 added→removed 净零例外、ledger 重启恢复、重复/乱序/无状态变化 no-op、scope 缩权与读取失败、所有被消费主动 Reaction 的可见回复、prompt builder 序列化、共享 System Prompt 注入、目标消息规范化（含卡片/合并转发 wiring）、revision 失效/中断/最新快照替代、superseded 流式回复、`added`/`removed` 相消与独立撤回、两级目标消息读取失败、其他发送者过滤、batch barrier、按目标拆分和 reply target。
 
 `stop_current_work` 另需覆盖 Reaction 无 @ 权限门禁与 `/stop` interrupt/cancel 效果、
 `workChainId` 在 inbound
@@ -424,14 +463,14 @@ live-model 对照使用隔离、可逆且带唯一标记的测试动作 X，orac
 - 对“是否继续执行 X？”的已知肯定 Reaction：结果必须与文字回复“同意继续”一致，允许执行一次 X；不允许零次或重复执行。
 - 对“X 已执行完成”的相同 Reaction：不允许再次调用执行工具；允许简短确认。
 - 对 `explain_more`：不允许继续执行 X；最终回复必须对目标消息作进一步说明。
-- 对 `user_step_completed`：允许从等待点继续；不允许再次要求用户完成相同步骤。
+- 对 DONE：添加和移除都没有 Agent turn、工具调用或回复；在同目标 active Reaction run 期间也不打断它。
 - 对未预埋但可从低风险上下文理解的 Reaction：必须给出符合上下文的处理，不得仅因未映射而拒绝分析。
 - 对未预埋且高风险歧义的 Reaction：不允许执行 X，必须澄清。
 - 对 `available=false`：不允许执行 X，必须说明目标消息不可读。
 - 对已经处理后的 `removed`：不允许重放 X 或自动回滚；必须有可见回复说明撤回已收到。
 
-每条验收保存实际动态 prompt、共享 System Prompt 版本、工具调用、可观察副作用、最终回复和飞书消息 ID。实机至少覆盖四个预埋 `semanticKey` 各一个代表 emoji、一次未预埋 Reaction 和一次 removed，核对 UI 引用、Agent 输入、System Prompt、工具副作用与最终行为一致；停止场景必须在流式卡片仍处于更新状态时，对触发当前任务的入站用户消息添加代表性 stop Reaction，证明 interrupt 发生在旧 run 完成之前，且没有后继 Agent run 自动启动。另需验证相同用户消息上的非停止 Reaction 不被消费。
+每条主动 Reaction 验收保存实际动态 prompt、共享 System Prompt 版本、工具调用、可观察副作用、最终回复和飞书消息 ID。实机至少覆盖三个预埋 `semanticKey` 各一个代表 emoji、一次未预埋 Reaction 和一次 removed，核对 UI 引用、Agent 输入、System Prompt、工具副作用与最终行为一致；停止场景必须在流式卡片仍处于更新状态时，对触发当前任务的入站用户消息添加代表性 stop Reaction，证明 interrupt 发生在旧 run 完成之前，且没有后继 Agent run 自动启动。DONE 单独核对用户/Bot 目标上的添加、移除及与主动 Reaction 共存，保存无 run/回复/interrupt 的证据。另需验证相同用户消息上的非停止 Reaction 除前述 GoGoGo 例外外不被消费。
 
-## Next Phase
+## Implementation Coverage
 
-本次 stop trigger-message amendment 独立 Review 通过后再修订 Coding Plan。Plan 必须把“权限与 self-operator 门禁”“Reaction event buffer/权威快照/持久 ledger/revision”“动态 Reaction 上下文”“共享 Bridge System Prompt 规则”“全部有效 Reaction 的可见回复”和“停止 Reaction 控制面”作为同一修复的必做单元，并覆盖普通消息权限函数复用、四种群响应模式、所有授权 operator 共用语义、11 个已确认 emoji 映射、未映射 Reaction 透传、`rawClient.im.v1.messageReaction.list` 全分页与 scope、净零 added→removed 例外、重复/乱序/重启幂等、in-flight revision 失效与替代、superseded 流式回复、terminal 后撤回的 Bridge 回复、Reaction 元数据在 pending batch 中的表示、目标消息规范化复用、inbound trigger 与 Bot outbound 两类 `workChainId` 停止目标关联、用户消息仅 stop 例外、stop added/removed 独立控制 ledger 与快路径、现有 `/stop`/ActiveRuns/PendingQueue 能力复用、两种 Agent 的 Prompt 注入、模型行为对照验收及实机验收；Plan 修订评审通过前不修改运行代码。
+实现必须把“权限与 self-operator 门禁”“Reaction event buffer/权威快照/持久 ledger/revision”“动态 Reaction 上下文”“共享 Bridge System Prompt 规则”“全部有效主动 Reaction 的可见回复”“停止 Reaction 控制面”和“DONE 静默标记”作为一套完整契约，并覆盖普通消息权限函数复用、四种群响应模式、所有授权 operator 共用语义、10 个已确认主动 emoji 映射、未映射 Reaction 透传、DONE 在入口/快照中的排除及旧版含 DONE fingerprint 的识别归一化、`rawClient.im.v1.messageReaction.list` 全分页与 scope、净零 added→removed 例外、重复/乱序/重启幂等、in-flight revision 失效与替代、superseded 流式回复、terminal 后主动 Reaction 撤回的 Bridge 回复、Reaction 元数据在 pending batch 中的表示、目标消息规范化复用、inbound trigger 与 Bot outbound 两类 `workChainId` 停止目标关联、用户消息上的 stop 和 GoGoGo 受限例外、stop added/removed 独立控制 ledger 与快路径、现有 `/stop`/ActiveRuns/PendingQueue 能力复用、两种 Agent 的 Prompt 注入、模型行为对照验收及实机验收。原 Coding Plan 中关于 11 项映射、DONE 继续执行和四个预埋 semanticKey 的记录属于历史状态，以本 Spec 的 2026-10-22 修订为准。

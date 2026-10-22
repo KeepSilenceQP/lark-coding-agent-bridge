@@ -133,7 +133,6 @@ import { handleReactionEvent } from './reaction/pipeline';
 import {
   EDITED_MESSAGE_RESTART_EMOJI_TYPE,
   isStopEmoji,
-  lookupReactionSemantics,
 } from './reaction/semantics';
 import {
   reactionTurnIdOf,
@@ -1275,7 +1274,6 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
 
     // Build ReactionContext (rev2) from reconciliation result with real target content.
     // Written AFTER evict so it survives — rev2 is the only context for this key.
-    const sem = lookupReactionSemantics(events[0]?.emojiType ?? '');
     const reactionContext = {
       operatorOpenId: result.components.operatorOpenId,
       reactionRevision: result.revision,
@@ -1297,7 +1295,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       chatType: chatMode === 'p2p' ? 'p2p' : 'group',
       ...(threadId ? { threadId } : {}),
       senderId: result.components.operatorOpenId,
-      content: `[reaction] ${events.map(e => e.emojiType).join(', ')}`,
+      content: `[reaction] ${result.triggerReactions.map(e => e.emojiType).join(', ')}`,
       rawContentType: 'reaction' as never,
       resources: [] as never[],
       mentions: [] as never[],

@@ -3,7 +3,7 @@ import type { AgentBotIdentity } from './types';
 /** Version identifier for the Reaction section embedded in BRIDGE_SYSTEM_PROMPT.
  *  Bump when the Reaction rules or predefined semantics change.  Included in
  *  live-model acceptance evidence (Spec Unit 11, F25). */
-export const BRIDGE_SYSTEM_PROMPT_REACTION_VERSION = '1.1.0';
+export const BRIDGE_SYSTEM_PROMPT_REACTION_VERSION = '2.0.0';
 
 export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 
@@ -193,6 +193,10 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
 
 ## Reaction
 
+\`DONE\`（完成）是用户留下的“已处理”标记。Bridge 会在入站和快照中排除它；添加或
+移除都不启动 Agent、不回复、不打断任务，也不关闭话题。不要把会话历史中的 DONE 当成
+继续执行信号。需要用户完成手动步骤时，请其用文字回复完成情况后继续。
+
 当本轮存在 \`reaction_contexts\` 时，其中包含用户的 Reaction，以及该 Reaction 所回应的
 目标消息。Reaction 不是脱离上下文的普通文本；不要仅依赖 \`bridge_context.source\`
 判断本轮是否包含 Reaction。
@@ -230,8 +234,6 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
   不要扩展成目标消息没有提出的新动作。
 - \`explain_more\`：用户没有理解目标消息。暂停把该消息当成已对齐结论，围绕它继续展开
   背景、推理、例子或更清晰的说明；不要把该 Reaction 当成继续执行授权。
-- \`user_step_completed\`：用户声明已经完成目标消息要求其手动完成的步骤。从该等待点继续
-  后续流程；可以做必要的低成本核对，但不要机械地再次要求用户完成同一件事。
 - \`stop_current_work\`：Bridge 控制面会按 \`/stop\` 语义处理中断。不要在后续会话中自动
   恢复、重放或回滚被停止的工作；只有用户新的明确输入才能继续。Bridge 会负责可见回复，
   不要因此创建新的 Agent turn。

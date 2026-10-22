@@ -1,16 +1,16 @@
 /**
  * Versioned, testable predefined reaction semantics table.
  *
- * v1 covers 11 emojiTypes across 4 semanticKeys as confirmed by the Spec
+ * v2 covers 10 emojiTypes across 3 semanticKeys as confirmed by the Spec
  * "Confirmed Predefined Semantics" table. The table is the single source of
  * truth — model runtimes MUST NOT generate predefined rules at runtime.
  *
  * emojiType values are case-sensitive and taken from the Feishu reaction emoji
- * list. Any emojiType NOT in this table is unmapped and MUST be passed through
- * to the agent with `emojiMeaningSource: 'unmapped'`.
+ * list. Passive markers are filtered before semantic lookup. Other emojiTypes
+ * NOT in this table pass through with `emojiMeaningSource: 'unmapped'`.
  */
 
-export const SEMANTICS_SCHEMA_VERSION = 1;
+export const SEMANTICS_SCHEMA_VERSION = 2;
 
 export interface ReactionSemanticEntry {
   emojiType: string;
@@ -30,13 +30,12 @@ export interface UnmappedReactionEntry {
 export type ReactionSemanticResult = ReactionSemanticEntry | UnmappedReactionEntry;
 
 /**
- * v1 predefined semantics table — strictly 11 entries.
+ * v2 predefined semantics table — strictly 10 entries.
  *
  * | semanticKey          | emojiType                             |
  * |----------------------|---------------------------------------|
  * | approve_continue     | OK, LGTM, Yes, CheckMark, JIAYI       |
  * | explain_more         | WHAT, THINKING                         |
- * | user_step_completed  | DONE                                   |
  * | stop_current_work    | No, CrossMark, MinusOne                |
  */
 export const SEMANTICS_TABLE: Record<string, ReactionSemanticEntry> = {
@@ -93,15 +92,6 @@ export const SEMANTICS_TABLE: Record<string, ReactionSemanticEntry> = {
     emojiMeaningSource: 'predefined',
   },
 
-  // ── user_step_completed ──
-  DONE: {
-    emojiType: 'DONE',
-    emojiDisplay: '完成',
-    emojiMeaning: '用户已经完成模型要求其手动完成的事情，可以继续',
-    semanticKey: 'user_step_completed',
-    emojiMeaningSource: 'predefined',
-  },
-
   // ── stop_current_work ──
   No: {
     emojiType: 'No',
@@ -130,6 +120,11 @@ export const SEMANTICS_TABLE: Record<string, ReactionSemanticEntry> = {
 export const STOP_EMOJI_TYPES: readonly string[] = ['No', 'CrossMark', 'MinusOne'];
 export const EDITED_MESSAGE_RESTART_EMOJI_TYPE = 'Loudspeaker';
 
+/** Visual "已处理" marker only; adding/removing it has no Bridge side effects. */
+export function isPassiveReaction(emojiType: string): boolean {
+  return emojiType === 'DONE';
+}
+
 export function isEditedMessageRestartReaction(input: {
   emojiType: string;
   action: 'added' | 'removed';
@@ -147,7 +142,7 @@ export function lookupReactionSemantics(emojiType: string): ReactionSemanticResu
   };
 }
 
-/** True when emojiType is one of the 11 predefined entries. */
+/** True when emojiType is one of the 10 predefined entries. */
 export function isPredefinedEmoji(emojiType: string): boolean {
   return emojiType in SEMANTICS_TABLE;
 }

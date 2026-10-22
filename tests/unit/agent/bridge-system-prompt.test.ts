@@ -253,8 +253,14 @@ describe('BRIDGE_SYSTEM_PROMPT Reaction section', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toContain('explain_more');
   });
 
-  it('documents user_step_completed semanticKey', () => {
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('user_step_completed');
+  it('reserves DONE as a passive handled marker and retires its old continuation meaning', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('`DONE`（完成）');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('已处理');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('不启动 Agent、不回复、不打断任务');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('不关闭话题');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('不要把会话历史中的 DONE 当成');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('用文字回复完成情况');
+    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('user_step_completed');
   });
 
   it('documents stop_current_work as Bridge control-plane handled', () => {
@@ -312,7 +318,7 @@ describe('BRIDGE_SYSTEM_PROMPT_REACTION_VERSION', () => {
 
   it('is exported from bridge-system-prompt module', () => {
     // The import at the top of this file already proves it exports.
-    expect(BRIDGE_SYSTEM_PROMPT_REACTION_VERSION).toBe('1.1.0');
+    expect(BRIDGE_SYSTEM_PROMPT_REACTION_VERSION).toBe('2.0.0');
   });
 });
 

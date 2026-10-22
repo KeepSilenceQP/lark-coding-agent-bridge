@@ -3,10 +3,11 @@ import { createHash } from 'node:crypto';
 import { log } from '../../core/logger';
 import {
   computeCanonicalFingerprint,
+  computeLegacyDoneFingerprint,
   EMPTY_FINGERPRINT,
   type ReactionLedger,
 } from './ledger';
-import { isPredefinedEmoji, lookupReactionSemantics } from './semantics';
+import { isPassiveReaction, isPredefinedEmoji, lookupReactionSemantics } from './semantics';
 import type {
   BufferedReactionEvent,
   CanonicalReactionRecord,
@@ -85,6 +86,18 @@ export async function reconcile(
     noOp: true,
   };
 
+  // Keep passive markers out of retries, triggers and net-zero withdrawal
+  // acknowledgements, including callers that bypass ordinary event intake.
+  events = events.filter(event => !isPassiveReaction(event.emojiType));
+  if (events.length === 0) {
+    const entry = deps.ledger.get(key);
+    return {
+      ...base,
+      revision: entry?.lastRevision ?? 0,
+      fingerprint: entry?.fingerprint ?? EMPTY_FINGERPRINT,
+    };
+  }
+
   // ── Fetch authoritative snapshot with finite retry (F4) ──
   // Retry on: (a) fetch throw, OR (b) stale success — snapshot doesn't
   // reflect the net change expected from buffered events.
@@ -148,8 +161,18 @@ export async function reconcile(
 
   // ── Load ledger state ──
   const ledgerEntry = deps.ledger.get(key);
-  const consumedFingerprint = ledgerEntry?.consumedFingerprint ?? EMPTY_FINGERPRINT;
-  const currentFingerprint = ledgerEntry?.fingerprint ?? EMPTY_FINGERPRINT;
+  let consumedFingerprint = ledgerEntry?.consumedFingerprint ?? EMPTY_FINGERPRINT;
+  let currentFingerprint = ledgerEntry?.fingerprint ?? EMPTY_FINGERPRINT;
+
+  // Older ledgers included DONE. Only normalize an exact, already-consumed
+  // legacy snapshot; actual actionable changes still create a new revision.
+  const legacyFingerprint = computeLegacyDoneFingerprint(operatorRecords, components.operatorOpenId);
+  if (currentFingerprint === legacyFingerprint && consumedFingerprint === legacyFingerprint) {
+    currentFingerprint = consumedFingerprint = fingerprint;
+    await persistLedgerEntry(deps, key, fingerprint, fingerprint,
+      operatorRecords.map(r => r.reaction_id).filter((id): id is string => Boolean(id)),
+      ledgerEntry?.lastRevision ?? 0);
+  }
 
   // ── No-op: fingerprint unchanged (F3/F5: check against consumed fingerprint) ──
   if (fingerprint === currentFingerprint && fingerprint === consumedFingerprint) {
@@ -251,8 +274,9 @@ async function fetchAllReactions(
       const opId = item.operator?.operator_id ?? '';
       const emoji = item.reaction_type?.emoji_type ?? '';
 
-      // Exclude self-app reactions (nested operator check)
-      if (isSelfApp(item, deps)) continue;
+      // Passive markers never participate in compatibility, fingerprints,
+      // effective sets, or ledger record IDs even beside actionable reactions.
+      if (isSelfApp(item, deps) || isPassiveReaction(emoji)) continue;
 
       collected.push({
         reaction_id: item.reaction_id,

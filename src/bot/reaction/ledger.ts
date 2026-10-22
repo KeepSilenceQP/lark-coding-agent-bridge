@@ -2,6 +2,7 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { writeFileAtomic } from '../../platform/atomic-write.js';
 import type { ReactionKey, ReactionLedgerEntry } from './types';
+import { isPassiveReaction } from './semantics';
 
 // ── Document shape ──
 
@@ -116,7 +117,7 @@ import type { CanonicalReactionRecord } from './types';
 /**
  * Compute a canonical fingerprint from a set of reaction records.
  *
- * 1. Dedup by reaction_id (if present), then by stable composite key
+ * 1. Exclude passive markers, then dedup by reaction_id (if present) and stable composite key
  *    (operator_type + operator_id + emoji_type) as secondary dedup (F8/F9).
  * 2. Normalize to { operator_type, operator_id, emoji_type }.
  * 3. Deterministic sort by operator_id then emoji_type (case-sensitive).
@@ -136,6 +137,22 @@ function byteCompare(a: string, b: string): number {
 }
 
 export function computeCanonicalFingerprint(records: CanonicalReactionRecord[]): string {
+  return hashReactionRecords(records.filter(r => !isPassiveReaction(r.emoji_type)));
+}
+
+/**
+ * v1 included DONE in persisted hashes. Reconstruct that exact prior snapshot
+ * for a user so reconciliation can normalize it without replaying consumed work,
+ * even when the visual marker has since been removed. Never use for new state.
+ */
+export function computeLegacyDoneFingerprint(records: CanonicalReactionRecord[], operatorId: string): string {
+  return hashReactionRecords([
+    ...records.filter(r => !isPassiveReaction(r.emoji_type)),
+    { operator_type: 'user', operator_id: operatorId, emoji_type: 'DONE' },
+  ]);
+}
+
+function hashReactionRecords(records: CanonicalReactionRecord[]): string {
   // Primary dedup: by reaction_id when available
   const seenIds = new Set<string>();
   // Secondary dedup (F8/F9): by stable composite key to prevent pseudo-revision

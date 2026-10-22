@@ -84,7 +84,7 @@ describe('reaction pipeline wiring (Unit 10)', () => {
   it('drops a non-stop reaction on a user message before permission or Agent work', async () => {
     const callbacks = pipelineCallbacks();
     const result = await handleReactionEvent(
-      reactionEvent({ emojiType: 'DONE' }),
+      reactionEvent({ emojiType: 'WHAT' }),
       { channel: channelWithTarget('ou_trigger_author'), ...BOT_DEPS },
       callbacks,
     );

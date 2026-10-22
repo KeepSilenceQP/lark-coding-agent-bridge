@@ -1,6 +1,6 @@
 import type { ReactionEvent, LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { log } from '../../core/logger';
-import { isStopEmoji, lookupReactionSemantics } from './semantics';
+import { isPassiveReaction, isStopEmoji, lookupReactionSemantics } from './semantics';
 import type { ReactionContext, ReactionKey } from './types';
 import { makeReactionKey } from './types';
 
@@ -99,7 +99,7 @@ async function resolveRoute(channel: LarkChannel, messageId: string) {
 
 /**
  * Guards pipeline for a reaction event:
- * self-operator → route/sender classification → stop/non-stop split.
+ * passive marker → self-operator → route/sender classification → stop/non-stop split.
  * Non-stop requires own-message (or the author's registered GoGoGo trigger); stop applies
  * Reaction permission before its target eligibility is resolved by the caller.
  *
@@ -111,6 +111,12 @@ export async function handleReactionEvent(
   deps: ReactionPipelineDeps,
   callbacks: ReactionPipelineCallbacks,
 ): Promise<ReactionPipelineAction> {
+  // A visual marker is independent of target ownership or work state. Drop
+  // both actions before routing, API calls, chain allocation, or buffering.
+  if (isPassiveReaction(evt.emojiType)) {
+    return { kind: 'drop', reason: 'passive-marker' };
+  }
+
   try {
     // 1. Self-operator guard
     if (isSelfOperator(evt, { botOpenId: deps.botOpenId, appId: deps.appId })) {

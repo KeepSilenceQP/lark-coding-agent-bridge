@@ -528,6 +528,139 @@ describe('reaction continuation with activated prompt bindings', () => {
   });
 });
 
+describe('passive handled-topic reactions', () => {
+  it.each(['normal', 'reaction'] as const)('ignores DONE while a %s run is active and after it finishes', async (runKind) => {
+    const h = await createHarness({
+      chatMode: 'group', activatedPrompts: true,
+      rawThreadIds: { om_stream_1: 'omt_topic' },
+      agentEvents: [
+        { type: 'system', sessionId: 'sess_passive' },
+        { type: 'text', delta: 'Ready to continue' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+    });
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    const originalRun = h.agent.run.bind(h.agent);
+    let ready = false;
+    let finish!: () => void;
+    const gate = new Promise<void>(resolve => { finish = resolve; });
+    const heldRunIndex = runKind === 'normal' ? 0 : 1;
+    vi.spyOn(h.agent, 'run').mockImplementation(opts => {
+      const run = originalRun(opts);
+      if (h.agent.runs.length - 1 !== heldRunIndex) return run;
+      return {
+        runId: run.runId,
+        events: (async function* (): AsyncIterable<AgentEvent> {
+          yield { type: 'system', sessionId: 'sess_passive' };
+          yield { type: 'text', delta: 'Working' };
+          ready = true;
+          await gate;
+          yield { type: 'done', terminationReason: 'normal' };
+        })(),
+        stop: async () => { await run.stop(); finish(); },
+        waitForExit: timeoutMs => run.waitForExit(timeoutMs),
+      };
+    });
+    const getChatMode = vi.spyOn(h.channel, 'getChatMode');
+    await startTestBridge(h);
+    await h.channel.handlers.message?.({
+      ...message({ messageId: 'om_original', rootId: 'om_original', parentId: 'om_original', threadId: 'omt_topic', content: 'handle this topic' }),
+      senderType: 'user',
+    });
+    if (runKind === 'reaction') {
+      await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1);
+      await h.channel.handlers.reaction?.(topicReaction('om_stream_1', 'GoGoGo'));
+    }
+    await waitFor(() => ready, 4000);
+
+    const observableState = () => ({
+      runCount: h.agent.runOptions.length,
+      stopped: h.agent.runs[heldRunIndex]?.stopped,
+      sent: h.channel.sent.length,
+      streams: h.channel.streams.length,
+      chatModeReads: getChatMode.mock.calls.length,
+      messageReads: h.channel.rawClient.im.v1.message.get.mock.calls.length,
+      messageLists: h.channel.rawClient.im.v1.message.list.mock.calls.length,
+      reactionLists: h.channel.rawClient.im.v1.messageReaction.list.mock.calls.length,
+      fetches: h.channel.fetchRawMessage.mock.calls.length,
+      requests: h.channel.rawClient.request.mock.calls.length,
+    });
+    const addAndRemoveMarkers = async () => {
+      const before = observableState();
+      vi.useFakeTimers();
+      try {
+        for (const target of ['om_original', 'om_stream_1']) {
+          for (const action of ['added', 'removed'] as const) {
+            await h.channel.handlers.reaction?.(topicReaction(target, 'DONE', action));
+            await vi.advanceTimersByTimeAsync(900);
+            expect(observableState()).toEqual(before);
+          }
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+    try {
+      await addAndRemoveMarkers();
+    } finally {
+      finish();
+    }
+    await waitFor(() => h.agent.runs[heldRunIndex]?.waitForExitCalls === 1);
+    await addAndRemoveMarkers();
+    expect(h.agent.runOptions).toHaveLength(heldRunIndex + 1);
+  });
+
+  it.each([
+    { target: 'om_stream_1', emojiType: 'JIAYI', senderType: 'app' },
+    { target: 'om_original', emojiType: 'GoGoGo', senderType: 'user' },
+  ])('excludes DONE from $emojiType context and treats $emojiType withdrawal as empty', async ({ target, emojiType, senderType }) => {
+    const h = await createHarness({
+      chatMode: 'group', activatedPrompts: true,
+      rawThreadIds: { om_stream_1: 'omt_topic', om_original: 'omt_topic' },
+      agentEvents: [
+        { type: 'system', sessionId: 'sess_mixed' },
+        { type: 'text', delta: 'Ready to continue' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+    });
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    const sender = { id: senderType === 'user' ? 'ou_user' : 'ou_bot', sender_type: senderType };
+    h.channel.rawClient.im.v1.message.get.mockResolvedValue({ data: { items: [{
+      chat_id: 'oc_topic_chat', sender, thread_id: 'omt_topic',
+    }] } });
+    h.channel.fetchRawMessage.mockResolvedValue([{
+      message_id: target, msg_type: 'text', sender, thread_id: 'omt_topic',
+      body: { content: JSON.stringify({ text: 'continue the remaining work' }) },
+    }]);
+    const reactionItems = (emojis: string[]) => ({ data: { items: emojis.map(emoji => ({
+      reaction_id: emoji, operator: { operator_id: 'ou_user', operator_type: 'user' },
+      reaction_type: { emoji_type: emoji },
+    })), has_more: false } });
+    h.channel.rawClient.im.v1.messageReaction.list.mockResolvedValue(reactionItems(['DONE', emojiType]));
+    await startTestBridge(h);
+    await h.channel.handlers.message?.({
+      ...message({ messageId: 'om_original', rootId: 'om_original', parentId: 'om_original', threadId: 'omt_topic', content: 'handle this topic' }),
+      senderType: 'user',
+    });
+    await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1);
+    await h.channel.handlers.reaction?.(topicReaction(target, 'DONE'));
+    await h.channel.handlers.reaction?.(topicReaction(target, emojiType));
+    await waitFor(() => h.agent.runOptions.length === 2, 4000);
+    const context = h.agent.runOptions[1]?.prompt.match(/<reaction_contexts>[\s\S]*?<\/reaction_contexts>/)?.[0];
+    expect(context).toContain(emojiType);
+    expect(context).not.toContain('DONE');
+    expect(context).not.toContain('user_step_completed');
+    await waitFor(() => h.agent.runs[1]?.waitForExitCalls === 1);
+
+    // The passive marker stays visible in Feishu, but it cannot turn removal
+    // of the only actionable reaction into another agent turn.
+    h.channel.rawClient.im.v1.messageReaction.list.mockResolvedValue(reactionItems(['DONE']));
+    await h.channel.handlers.reaction?.(topicReaction(target, emojiType, 'removed'));
+    await waitFor(() => JSON.stringify(h.channel.sent).includes('已收到撤回'), 4000);
+    expect(h.agent.runOptions).toHaveLength(2);
+  });
+});
+
 describe('merge_forward fetch failure', () => {
   it('skips the run and hints the user when the SDK could not fetch a merge_forward', async () => {
     // @larksuite/channel >= 0.4.1 normalizes an un-fetchable merge_forward to
@@ -575,6 +708,13 @@ describe('merge_forward fetch failure', () => {
     expect(h.channel.sent).toHaveLength(0);
   });
 });
+
+function topicReaction(messageId: string, emojiType: string, action: 'added' | 'removed' = 'added'): ReactionEvent {
+  return {
+    messageId, operator: { openId: 'ou_user' }, emojiType,
+    action, actionTime: Date.now(), raw: { operator_type: 'user' },
+  };
+}
 
 async function createHarness(options: {
   chatMode?: 'p2p' | 'group' | 'topic';

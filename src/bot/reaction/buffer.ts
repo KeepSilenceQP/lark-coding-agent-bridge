@@ -1,5 +1,5 @@
 import type { ReactionEvent } from '@larksuite/channel';
-import { lookupReactionSemantics, isStopEmoji } from './semantics';
+import { lookupReactionSemantics, isPassiveReaction, isStopEmoji } from './semantics';
 import type { BufferedReactionEvent, ReactionKey } from './types';
 
 // ── Configuration ──
@@ -48,9 +48,9 @@ export class ReactionBuffer {
     this.maxWaitMs = maxWaitMs;
   }
 
-  /** Push a non-stop reaction event. Stop events are silently ignored here. */
+  /** Push an actionable reaction; stop controls and passive markers are ignored. */
   push(key: ReactionKey, evt: ReactionEvent): void {
-    if (isStopEmoji(evt.emojiType)) return;
+    if (isStopEmoji(evt.emojiType) || isPassiveReaction(evt.emojiType)) return;
 
     const existing = this.map.get(key);
     const semantics = lookupReactionSemantics(evt.emojiType);

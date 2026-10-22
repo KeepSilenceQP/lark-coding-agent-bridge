@@ -8,6 +8,7 @@ import {
   STOP_EMOJI_TYPES,
   EDITED_MESSAGE_RESTART_EMOJI_TYPE,
   isEditedMessageRestartReaction,
+  isPassiveReaction,
 } from '../../../src/bot/reaction/semantics';
 
 // ── RED: schema version exists ──
@@ -15,7 +16,7 @@ import {
 describe('reaction semantics table', () => {
   it('has a schema version', () => {
     expect(typeof SEMANTICS_SCHEMA_VERSION).toBe('number');
-    expect(SEMANTICS_SCHEMA_VERSION).toBeGreaterThanOrEqual(1);
+    expect(SEMANTICS_SCHEMA_VERSION).toBe(2);
   });
 
   it('has a table export that is an object', () => {
@@ -23,13 +24,13 @@ describe('reaction semantics table', () => {
     expect(typeof SEMANTICS_TABLE).toBe('object');
   });
 
-  // ── Strictly 11 predefined emojiType entries ──
+  // ── Strictly 10 actionable predefined emojiType entries ──
 
-  it('contains strictly 11 predefined emojiType entries (v1)', () => {
+  it('contains strictly 10 predefined emojiType entries (v2)', () => {
     const predefined = Object.entries(SEMANTICS_TABLE).filter(
       ([, v]) => v.emojiMeaningSource === 'predefined',
     );
-    expect(predefined).toHaveLength(11);
+    expect(predefined).toHaveLength(10);
   });
 
   // ── approve_continue: OK, LGTM, Yes, CheckMark, JIAYI ──
@@ -64,14 +65,14 @@ describe('reaction semantics table', () => {
     expect(entry.emojiMeaningSource).toBe('predefined');
   });
 
-  // ── user_step_completed: DONE ──
-
-  it('maps DONE → user_step_completed', () => {
-    const entry = SEMANTICS_TABLE['DONE'];
-    expect(entry).toBeDefined();
-    if (!entry) return;
-    expect(entry.semanticKey).toBe('user_step_completed');
-    expect(entry.emojiMeaningSource).toBe('predefined');
+  it('reserves DONE as a passive marker outside actionable semantics', () => {
+    expect(isPassiveReaction('DONE')).toBe(true);
+    expect(isPassiveReaction('done')).toBe(false);
+    expect(SEMANTICS_TABLE.DONE).toBeUndefined();
+    expect(isPredefinedEmoji('DONE')).toBe(false);
+    for (const emoji of ['CheckMark', 'GoGoGo', 'JIAYI', 'No', 'Get', 'CUSTOM_EMOJI_123']) {
+      expect(isPassiveReaction(emoji)).toBe(false);
+    }
   });
 
   // ── stop_current_work: No, CrossMark, MinusOne ──
@@ -97,12 +98,12 @@ describe('reaction semantics table', () => {
     expect(SEMANTICS_TABLE['no']).toBeUndefined();
   });
 
-  // ── Get NOT in v1 table ──
+  // ── Get stays unmapped ──
 
-  it('does NOT include Get as a predefined emoji (v1 strict 11)', () => {
+  it('does NOT include Get as a predefined emoji', () => {
     const entry = SEMANTICS_TABLE['Get'];
     // Get must not exist in the table at all — not even as predefined.
-    expect(entry, 'Get must not be in the v1 predefined table').toBeUndefined();
+    expect(entry, 'Get must not be in the predefined table').toBeUndefined();
   });
 });
 
@@ -139,8 +140,8 @@ describe('lookupReactionSemantics', () => {
 // ── Helper predicates ──
 
 describe('isPredefinedEmoji', () => {
-  it('returns true for all 11 predefined emojiTypes', () => {
-    const predefined = ['OK', 'LGTM', 'Yes', 'CheckMark', 'JIAYI', 'WHAT', 'THINKING', 'DONE', 'No', 'CrossMark', 'MinusOne'];
+  it('returns true for all 10 predefined emojiTypes', () => {
+    const predefined = ['OK', 'LGTM', 'Yes', 'CheckMark', 'JIAYI', 'WHAT', 'THINKING', 'No', 'CrossMark', 'MinusOne'];
     for (const et of predefined) {
       expect(isPredefinedEmoji(et), `${et} should be predefined`).toBe(true);
     }

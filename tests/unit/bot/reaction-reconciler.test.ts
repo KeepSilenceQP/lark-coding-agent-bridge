@@ -196,13 +196,13 @@ describe('triggerReactions ordering (from buffered events)', () => {
   it('one add one remove with final non-empty set → both in buffer events', () => {
     const events = [
       evt({ action: 'added', emojiType: 'JIAYI', actionTime: 1000, arrivalOrder: 0 }),
-      evt({ action: 'removed', emojiType: 'DONE', actionTime: 1500, arrivalOrder: 1 }),
+      evt({ action: 'removed', emojiType: 'WHAT', actionTime: 1500, arrivalOrder: 1 }),
     ];
-    // JIAYI added, DONE removed — final set still has JIAYI but not DONE
+    // JIAYI added, WHAT removed — final set still has JIAYI but not WHAT
     expect(events).toHaveLength(2);
     const addedEmojis = events.filter((e) => e.action === 'added').map((e) => e.emojiType);
     const removedEmojis = events.filter((e) => e.action === 'removed').map((e) => e.emojiType);
     expect(addedEmojis).toContain('JIAYI');
-    expect(removedEmojis).toContain('DONE');
+    expect(removedEmojis).toContain('WHAT');
   });
 });
