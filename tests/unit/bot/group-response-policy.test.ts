@@ -14,6 +14,43 @@ const base = {
 };
 
 describe('group response policy', () => {
+  it.each(['owner-default', 'owner-allowlist', 'all-messages'] as const)(
+    'requires an explicit bot mention on topic roots before %s can accept', mode => {
+      const input = {
+        ...base, mode, ownerNoMentionChats: [base.chatId],
+        topicRootRequireMention: true,
+        topicMessageClassification: 'root' as const,
+      };
+      expect(decideGroupResponse(input)).toEqual({ accept: false, reason: 'topic-root-mention-required' });
+      expect(decideGroupResponse({ ...input, mentionAll: true })).toEqual({ accept: false, reason: 'topic-root-mention-required' });
+      expect(decideGroupResponse({ ...input, mentionCount: 1 })).toEqual({ accept: false, reason: 'topic-root-mention-required' });
+      expect(decideGroupResponse({ ...input, mentionedBot: true })).toEqual({ accept: true, reason: 'mentioned-bot' });
+      expect(decideGroupResponse({ ...input, topicRootRequireMention: false }).accept).toBe(true);
+      expect(decideGroupResponse({ ...input, topicMessageClassification: 'reply' }).accept).toBe(true);
+      expect(decideGroupResponse({ ...input, topicMessageClassification: 'not-topic' }).accept).toBe(true);
+    },
+  );
+
+  it('fails closed only for classified IM input when the enabled gate lacks metadata', () => {
+    expect(decideGroupResponse({
+      ...base, topicRootRequireMention: true, topicMessageClassification: 'unknown',
+    })).toEqual({ accept: false, reason: 'topic-metadata-unavailable' });
+    expect(decideGroupResponse({
+      ...base, topicRootRequireMention: true, topicMessageClassification: 'unknown', chatType: 'p2p',
+    })).toEqual({ accept: true, reason: 'p2p' });
+    // Reaction permission checks omit topic classification and keep their
+    // independent control/continuation behavior.
+    expect(decideGroupResponse({ ...base, topicRootRequireMention: true }))
+      .toEqual({ accept: true, reason: 'owner-default' });
+  });
+
+  it('still applies owner and mention-only restrictions to topic replies', () => {
+    const input = { ...base, topicRootRequireMention: true, topicMessageClassification: 'reply' as const };
+    expect(decideGroupResponse({ ...input, senderId: 'ou-other' }).accept).toBe(false);
+    expect(decideGroupResponse({ ...input, mentionCount: 1 }).accept).toBe(false);
+    expect(decideGroupResponse({ ...input, mode: 'mention-only' }).accept).toBe(false);
+  });
+
   it('accepts an owner message with no structured mention', () => {
     expect(decideGroupResponse(base)).toEqual({ accept: true, reason: 'owner-default' });
   });

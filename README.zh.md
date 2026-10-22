@@ -298,6 +298,7 @@ provider、推理强度和认证仍由 TraeX 自己管理；Bridge 的界面和�
 | `/resume` | 恢复同 agent、工作目录、权限模式兼容的历史会话 |
 | `/status` | 查看 profile、agent、工作目录、会话、lark-cli 身份和运行状态 |
 | `/config` | 调整展示偏好、访问控制和 lark-cli 身份策略 |
+| `/config topic-root-mention on\|off` | 设置本群的话题首条消息是否必须 @bot；需 owner/admin 在目标群显式 @ 当前 Bot |
 | `/invite user @某人` | 允许用户私聊使用 bot |
 | `/invite admin @某人` | 添加访问控制管理员 |
 | `/invite group` | 允许当前群使用 bot |
@@ -466,6 +467,18 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 `groupResponseMode` 支持 `mention-only`（仅显式 @bot，默认）、`owner-default`（应用所有者未 @ 任何账号时默认响应）、`all-messages`（响应所有群消息）和 `owner-allowlist`（仅在指定群响应 owner 无 @ 消息）。`requireMentionInGroup` 是兼容旧版本的降级字段：`all-messages` 写 `false`，其他写 `true`。建议通过 `/config` 修改，避免字段不一致。
 
 `owner-allowlist` 模式下，需配合 `ownerNoMentionChats` 指定生效的群聊。该字段独立于 `allowedChats`，只对 owner 的无 @ 消息生效。维护命令（需在目标群 @ 当前 Bot）：`/invite owner-default group` 和 `/remove owner-default group`。多 Bot 各自独立配置，不做中央互斥。
+
+`access.topicRootRequireMention` 控制指定群的话题首条消息是否必须显式 @ 当前 Bot，
+默认关闭。owner 或管理员在目标群 @ 当前 Bot 并发送
+`/config topic-root-mention on` 即可开启，也可以使用 Web 控制台对应群的开关；
+`off` 恢复原响应策略。配置按群保存，例如 `{ "oc_example": true }`。
+
+开启后，没有真实 @ 当前 Bot 的话题首条消息会被静默忽略，不启动或排队 Agent 工作。
+后续话题回复仍按原有 `owner-default`、`owner-allowlist` 或 `all-messages` 策略处理，
+不要求 Bot 曾经在该话题响应过。规则覆盖独立话题群及普通群的话题消息模式，也覆盖
+事件遗漏 `threadId` 的首条消息；普通聊天、私聊和 Reaction 仍使用各自原有策略。
+显式 @ 仍需通过访问权限校验。开启规则后，如果元数据不足以判断无 @ 消息是否为
+话题首条，Bridge 会保持静默，避免误启动。
 
 `allowedUsers` / `admins` 填用户 `open_id`，`allowedChats` 填群 `chat_id`。手动找 ID 最简单的办法：让对方给 bot 发条消息（群里就 @ 它一下），然后看当前 profile 的日志：
 

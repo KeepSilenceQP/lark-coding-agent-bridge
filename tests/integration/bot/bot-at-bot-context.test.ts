@@ -52,6 +52,7 @@ interface FakeLarkChannel {
     };
     im: {
       v1: {
+        chat: { get: ReturnType<typeof vi.fn> };
         message: {
           get: ReturnType<typeof vi.fn>;
         };
@@ -585,6 +586,9 @@ function createFakeLarkChannel(): FakeLarkChannel & { handlers: MessageHandlerMa
       },
       im: {
         v1: {
+          chat: {
+            get: vi.fn(async () => ({ data: { chat_mode: 'group', group_message_type: 'chat' } })),
+          },
           message: {
             get: vi.fn(async () => ({ data: { items: [] } })),
           },

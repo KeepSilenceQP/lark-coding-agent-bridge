@@ -95,6 +95,9 @@ export interface AppAccess {
   ownerNoMentionChats?: string[];
   /** Per-chat @-mention override; true requires @, false accepts all messages. */
   chatRequireMention?: Record<string, boolean>;
+  /** Per-chat topic-root mention gate. Missing/false is off; replies use the
+   * existing group response policy. */
+  topicRootRequireMention?: Record<string, boolean>;
 }
 
 export interface AppPreferences {

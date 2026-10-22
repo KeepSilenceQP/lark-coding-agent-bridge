@@ -2759,9 +2759,12 @@ async function handleRemove(args: string, ctx: CommandContext): Promise<void> {
       const list = new Set(current.allowedChats);
       missing = !list.has(chatId);
       list.delete(chatId);
+      const topicRootRequireMention = { ...current.topicRootRequireMention };
+      delete topicRootRequireMention[chatId];
       return {
         ...current,
         allowedChats: [...list],
+        topicRootRequireMention,
       };
     });
     if (missing) {
@@ -3049,6 +3052,8 @@ async function saveAccessConfig(
             admins: access.admins,
             botAdmins: access.botAdmins,
             ownerNoMentionChats: access.ownerNoMentionChats,
+            chatRequireMention: access.chatRequireMention,
+            topicRootRequireMention: access.topicRootRequireMention,
           },
           requireMentionInGroup: access.requireMentionInGroup,
         };
@@ -3092,9 +3097,37 @@ async function handleConfig(args: string, ctx: CommandContext): Promise<void> {
       return submitConfig(ctx);
     case 'cancel':
       return cancelConfig(ctx);
+    case 'topic-root-mention':
+      return configureTopicRootMention(args, ctx);
     default:
-      await reply(ctx, '用法:`/config`');
+      await reply(ctx, '用法:`/config` 或在目标群中 @ 当前 Bot 发送 `/config topic-root-mention on|off`');
   }
+}
+
+async function configureTopicRootMention(args: string, ctx: CommandContext): Promise<void> {
+  const parts = args.trim().split(/\s+/);
+  if (parts.length !== 2 || (parts[1] !== 'on' && parts[1] !== 'off')) {
+    await reply(ctx, '用法：在目标群中 @ 当前 Bot 发送 `/config topic-root-mention on` 或 `/config topic-root-mention off`。');
+    return;
+  }
+  if (ctx.msg.chatType === 'p2p' || ctx.chatMode === 'p2p') {
+    await reply(ctx, '请在目标群中 @ 当前 Bot 设置「话题首条必须 @」，私聊无法指定目标群。');
+    return;
+  }
+  if (!ctx.msg.mentionedBot) {
+    await reply(ctx, '请显式 @ 当前 Bot 后设置「话题首条必须 @」。');
+    return;
+  }
+  const enabled = parts[1] === 'on';
+  await saveAccessConfig(ctx, current => {
+    const topicRootRequireMention = { ...current.topicRootRequireMention };
+    if (enabled) topicRootRequireMention[ctx.msg.chatId] = true;
+    else delete topicRootRequireMention[ctx.msg.chatId];
+    return { ...current, topicRootRequireMention };
+  });
+  await reply(ctx, enabled
+    ? '✅ 已开启当前群的「话题首条必须 @」：首条未显式 @ 当前 Bot 时静默，后续消息继续按原群响应策略处理。'
+    : '✅ 已关闭当前群的「话题首条必须 @」，所有消息恢复按原群响应策略处理。');
 }
 
 async function showConfigForm(ctx: CommandContext): Promise<void> {

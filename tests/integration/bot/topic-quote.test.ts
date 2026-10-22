@@ -7,6 +7,7 @@ import { PromptSessionService } from '../../../src/session/prompt-session-servic
 import { SessionCatalog } from '../../../src/session/catalog.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
+import { PendingQueue } from '../../../src/bot/pending-queue.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
@@ -42,6 +43,9 @@ interface FakeLarkChannel {
     request: ReturnType<typeof vi.fn>;
     im: {
       v1: {
+        chat: {
+          get: ReturnType<typeof vi.fn>;
+        };
         message: {
           list: ReturnType<typeof vi.fn>;
           get: ReturnType<typeof vi.fn>;
@@ -399,6 +403,125 @@ describe('topic message quote handling', () => {
   });
 });
 
+describe('per-chat topic-root mention policy', () => {
+  it.each([
+    { chatMode: 'topic' as const, threadId: 'omt_new_topic' },
+    { chatMode: 'group' as const, threadId: 'omt_new_topic' },
+    { chatMode: 'group' as const, threadId: undefined },
+  ])('requires a real bot mention on a $chatMode topic root with threadId=$threadId', async ({ chatMode, threadId }) => {
+    const h = await createHarness({
+      chatMode, groupMessageType: 'thread',
+      rawThreadIds: { om_unmentioned: 'omt_new_topic', om_mentioned: 'omt_new_topic' },
+    });
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    h.profileConfig.access.topicRootRequireMention = { oc_topic_chat: true };
+    await startTestBridge(h);
+
+    await expectSilentIntake(h, intakeMessage({
+      messageId: 'om_unmentioned', threadId,
+      // Text that looks like a mention is not a structured @bot.
+      content: '@Bridge unmentioned-topic-content',
+    }));
+    expect(h.sessions.getRaw('oc_topic_chat:omt_new_topic')).toBeUndefined();
+
+    await h.channel.handlers.message?.(intakeMessage({
+      messageId: 'om_mentioned', threadId, content: 'please handle this topic',
+      mentionedBot: true,
+      mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'Bridge', isBot: true }],
+    }));
+    await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1, 4000);
+    expect(h.agent.runOptions).toHaveLength(1);
+    expect(h.agent.runOptions[0]?.prompt).toContain('please handle this topic');
+    expect(h.agent.runOptions[0]?.prompt).not.toContain('unmentioned-topic-content');
+    expect(h.agent.runOptions[0]?.prompt).toContain('"threadId":"omt_new_topic"');
+  });
+
+  it.each(['owner-default', 'owner-allowlist', 'all-messages'] as const)('keeps %s responses for a reply in an unseen topic', async (mode) => {
+    const h = await createHarness({ chatMode: 'group', groupMessageType: 'thread' });
+    h.profileConfig.access.groupResponseMode = mode;
+    h.profileConfig.access.ownerNoMentionChats = ['oc_topic_chat'];
+    h.profileConfig.access.topicRootRequireMention = { oc_topic_chat: true };
+    h.controls.botOwnerId = 'ou_user';
+    await startTestBridge(h);
+    expect(h.sessions.getRaw('oc_topic_chat:omt_unseen')).toBeUndefined();
+
+    await h.channel.handlers.message?.(intakeMessage({
+      messageId: 'om_followup', rootId: 'om_someone_elses_root',
+      replyToMessageId: 'om_someone_elses_root', threadId: 'omt_unseen',
+      content: 'follow up without a bot mention',
+    }));
+    await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1, 4000);
+    expect(h.agent.runOptions).toHaveLength(1);
+    expect(h.agent.runOptions[0]?.prompt).toContain('follow up without a bot mention');
+    expect(h.agent.runOptions[0]?.prompt).toContain('"threadId":"omt_unseen"');
+  });
+
+  it.each([undefined, false])('preserves unmentioned topic-root intake when the flag is %s', async (enabled) => {
+    const h = await createHarness({ chatMode: 'group', groupMessageType: 'thread' });
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    if (enabled !== undefined) h.profileConfig.access.topicRootRequireMention = { oc_topic_chat: enabled };
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(intakeMessage({ threadId: 'omt_default', content: 'existing unmentioned root' }));
+    await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1, 4000);
+    expect(h.agent.runOptions[0]?.prompt).toContain('existing unmentioned root');
+  });
+
+  it.each(['group', 'p2p'] as const)('does not require mentions in ordinary %s chats because of the topic flag', async (chatMode) => {
+    const h = await createHarness({ chatMode, groupMessageType: 'chat' });
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    h.profileConfig.access.topicRootRequireMention = { oc_topic_chat: true };
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(intakeMessage({ chatType: chatMode, content: 'ordinary conversation' }));
+    await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1, 4000);
+    expect(h.agent.runOptions[0]?.prompt).toContain('ordinary conversation');
+  });
+
+  it('fails closed for an unmentioned message when chat and topic metadata are unavailable', async () => {
+    const h = await createHarness({ chatMode: 'group' });
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    h.profileConfig.access.topicRootRequireMention = { oc_topic_chat: true };
+    h.channel.rawClient.im.v1.chat.get.mockRejectedValue(new Error('chat metadata unavailable'));
+    h.channel.fetchRawMessage.mockRejectedValue(new Error('message metadata unavailable'));
+    await startTestBridge(h);
+    await expectSilentIntake(h, intakeMessage({ content: 'unknown topic shape' }));
+    expect(h.channel.rawClient.im.v1.chat.get).toHaveBeenCalled();
+  });
+
+  it('still enforces access permissions on an explicitly mentioned topic root', async () => {
+    const h = await createHarness();
+    h.profileConfig.access.allowedChats = [];
+    h.profileConfig.access.topicRootRequireMention = { oc_topic_chat: true };
+    await startTestBridge(h);
+    vi.useFakeTimers();
+    try {
+      await h.channel.handlers.message?.(intakeMessage({
+        threadId: 'omt_denied', mentionedBot: true,
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'Bridge', isBot: true }],
+      }));
+      await vi.advanceTimersByTimeAsync(900);
+      expect(h.agent.runOptions).toHaveLength(0);
+      expect(h.channel.streams).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not apply the root mention gate to a reaction in a topic without an existing session', async () => {
+    const h = await createHarness({
+      chatMode: 'group', groupMessageType: 'thread',
+      rawThreadIds: { om_stream_1: 'omt_reaction' },
+    });
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    h.profileConfig.access.topicRootRequireMention = { oc_topic_chat: true };
+    await startTestBridge(h);
+    await h.channel.handlers.reaction?.(topicReaction('om_stream_1', 'GoGoGo'));
+    await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1, 4000);
+    expect(h.agent.runOptions).toHaveLength(1);
+    expect(h.agent.runOptions[0]?.prompt).toContain('<reaction_contexts>');
+    expect(h.agent.runOptions[0]?.prompt).toContain('GoGoGo');
+  });
+});
+
 describe('reaction continuation with activated prompt bindings', () => {
   it.each((['claude', 'codex'] as const).flatMap(agentKind => [
     { chatMode: 'p2p' as const, threadId: undefined },
@@ -561,7 +684,6 @@ describe('passive handled-topic reactions', () => {
         waitForExit: timeoutMs => run.waitForExit(timeoutMs),
       };
     });
-    const getChatMode = vi.spyOn(h.channel, 'getChatMode');
     await startTestBridge(h);
     await h.channel.handlers.message?.({
       ...message({ messageId: 'om_original', rootId: 'om_original', parentId: 'om_original', threadId: 'omt_topic', content: 'handle this topic' }),
@@ -578,7 +700,7 @@ describe('passive handled-topic reactions', () => {
       stopped: h.agent.runs[heldRunIndex]?.stopped,
       sent: h.channel.sent.length,
       streams: h.channel.streams.length,
-      chatModeReads: getChatMode.mock.calls.length,
+      chatModeReads: h.channel.rawClient.im.v1.chat.get.mock.calls.length,
       messageReads: h.channel.rawClient.im.v1.message.get.mock.calls.length,
       messageLists: h.channel.rawClient.im.v1.message.list.mock.calls.length,
       reactionLists: h.channel.rawClient.im.v1.messageReaction.list.mock.calls.length,
@@ -716,8 +838,36 @@ function topicReaction(messageId: string, emojiType: string, action: 'added' | '
   };
 }
 
+function intakeMessage(overrides: Partial<NormalizedMessage> = {}): NormalizedMessage {
+  return {
+    messageId: 'om_new_topic', chatId: 'oc_topic_chat', chatType: 'group',
+    senderId: 'ou_user', senderName: 'User', senderType: 'user',
+    content: 'topic root', rawContentType: 'text', resources: [],
+    mentions: [], mentionAll: false, mentionedBot: false,
+    createTime: 1760000001000,
+    ...overrides,
+  } as NormalizedMessage;
+}
+
+async function expectSilentIntake(h: Awaited<ReturnType<typeof createHarness>>, msg: NormalizedMessage): Promise<void> {
+  const enqueue = vi.spyOn(PendingQueue.prototype, 'push');
+  vi.useFakeTimers();
+  try {
+    await h.channel.handlers.message?.(msg);
+    expect(enqueue).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(900);
+    expect(h.agent.runOptions).toHaveLength(0);
+    expect(h.channel.sent).toHaveLength(0);
+    expect(h.channel.streams).toHaveLength(0);
+  } finally {
+    vi.useRealTimers();
+    enqueue.mockRestore();
+  }
+}
+
 async function createHarness(options: {
   chatMode?: 'p2p' | 'group' | 'topic';
+  groupMessageType?: 'chat' | 'thread';
   quotedMessages?: Record<string, string>;
   rawThreadIds?: Record<string, string>;
   threadMessages?: Array<Record<string, unknown>>;
@@ -823,6 +973,7 @@ async function startTestBridge(h: {
 
 function createFakeLarkChannel(options: {
   chatMode?: 'p2p' | 'group' | 'topic';
+  groupMessageType?: 'chat' | 'thread';
   quotedMessages?: Record<string, string>;
   rawThreadIds?: Record<string, string>;
   threadMessages?: Array<Record<string, unknown>>;
@@ -845,6 +996,12 @@ function createFakeLarkChannel(options: {
       request: vi.fn(async () => ({ data: { items: [] } })),
       im: {
         v1: {
+          chat: {
+            get: vi.fn(async () => ({ data: {
+              chat_mode: chatMode,
+              group_message_type: options.groupMessageType ?? (chatMode === 'topic' ? 'thread' : 'chat'),
+            } })),
+          },
           message: {
             get: vi.fn(async () => ({ data: { items: [{
               chat_id: 'oc_topic_chat', sender: { id: 'ou_bot', sender_type: 'app' },
@@ -910,6 +1067,7 @@ function createControls(profileConfig: ReturnType<typeof createDefaultProfileCon
   return {
     profile: 'test',
     profileConfig,
+    botOwnerId: undefined as string | undefined,
     ownerRefreshState: 'unknown' as const,
     async refreshOwner() {},
     async restart() {},
@@ -948,7 +1106,6 @@ function message(input: {
     mentionAll: false,
     mentionedBot,
     rootId: input.rootId,
-    parentId: input.parentId,
     ...(input.threadId ? { threadId: input.threadId } : {}),
     replyToMessageId: input.parentId,
     createTime: 1760000001000,

@@ -26,7 +26,7 @@ export interface FakeChannel {
    * card dispatcher reads to scope topic-group clicks. Empty by default.
    */
   readonly rawThreadIds: Map<string, string>;
-  fetchRawMessage(messageId: string): Promise<Array<{ thread_id?: string }>>;
+  fetchRawMessage(messageId: string): Promise<Array<{ message_id: string; thread_id?: string }>>;
   readonly rawClient: {
     readonly requests: FakeRawClientRequest[];
     request(method: string, params: unknown): Promise<unknown>;
@@ -40,6 +40,9 @@ export interface FakeChannel {
     };
     readonly im: {
       readonly v1: {
+        readonly chat: {
+          get(params: unknown): Promise<unknown>;
+        };
         readonly message: {
           create(params: unknown): Promise<unknown>;
           reply(params: unknown): Promise<unknown>;
@@ -78,9 +81,9 @@ export function createFakeChannel(): FakeChannel {
     sent,
     streams,
     rawThreadIds,
-    async fetchRawMessage(messageId: string): Promise<Array<{ thread_id?: string }>> {
+    async fetchRawMessage(messageId: string): Promise<Array<{ message_id: string; thread_id?: string }>> {
       const threadId = rawThreadIds.get(messageId);
-      return [threadId ? { thread_id: threadId } : {}];
+      return [{ message_id: messageId, ...(threadId ? { thread_id: threadId } : {}) }];
     },
     rawClient: {
       requests,
@@ -106,6 +109,12 @@ export function createFakeChannel(): FakeChannel {
       },
       im: {
         v1: {
+          chat: {
+            async get(params: unknown): Promise<unknown> {
+              requests.push({ method: 'im.v1.chat.get', params });
+              return { data: { chat_mode: 'group', group_message_type: 'chat' } };
+            },
+          },
           message: {
             async create(params: unknown): Promise<unknown> {
               return { data: pushManagedCardMessage(params, '') };

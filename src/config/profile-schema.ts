@@ -36,6 +36,9 @@ export interface ProfileAccess {
   ownerNoMentionChats: string[];
   /** Per-chat @-mention override. Missing chats follow groupResponseMode. */
   chatRequireMention?: Record<string, boolean>;
+  /** Require an explicit bot mention on topic roots in selected chats.
+   * Missing/false is off; topic replies still follow the chat response policy. */
+  topicRootRequireMention?: Record<string, boolean>;
 }
 
 export interface SandboxConfig {
@@ -372,6 +375,7 @@ function normalizeAccess(
       : 'all-messages';
   const owner = normalizeAppOwnerIdentity(access?.owner);
   const chatRequireMention = normalizeChatMentionMap(access?.chatRequireMention);
+  const topicRootRequireMention = normalizeChatMentionMap(access?.topicRootRequireMention);
   return {
     ...(owner ? { owner } : {}),
     allowedUsers: stringArray(access?.allowedUsers),
@@ -384,6 +388,7 @@ function normalizeAccess(
     requireMentionInGroup: groupResponseMode !== 'all-messages',
     ownerNoMentionChats: stringArray(access?.ownerNoMentionChats),
     ...(Object.keys(chatRequireMention).length > 0 ? { chatRequireMention } : {}),
+    ...(Object.keys(topicRootRequireMention).length > 0 ? { topicRootRequireMention } : {}),
   };
 }
 

@@ -77,6 +77,8 @@ export interface ConfigView {
     /** Per-chat @-mention override (chat_id → bool); overrides the global
      * requireMentionInGroup. Absent chats follow the global setting. */
     chatRequireMention: Record<string, boolean>;
+    /** Optional topic-root gate per chat; missing entries are disabled. */
+    topicRootRequireMention: Record<string, boolean>;
   };
   /** True when edits to this profile apply live (its process hosts the UI). */
   live: boolean;
@@ -109,6 +111,7 @@ export function buildConfigView(state: MutableProfileState, live = false): Confi
       allowedChats: state.profileConfig.access.allowedChats,
       admins: state.profileConfig.access.admins,
       chatRequireMention: state.profileConfig.access.chatRequireMention ?? {},
+      topicRootRequireMention: state.profileConfig.access.topicRootRequireMention ?? {},
     },
     live,
   };
@@ -372,11 +375,13 @@ const ACCESS_LIST: Record<AccessKind, 'allowedUsers' | 'admins' | 'allowedChats'
 };
 
 /**
- * Mutate the profile's access. Two operations:
+ * Mutate the profile's access:
  *  - `add`/`remove` a single id from a list (user/admin/chat) — mirrors
- *    `/invite` `/remove`. Removing a chat also drops its @-mention override.
+ *    `/invite` `/remove`. Removing a chat also drops its mention settings.
  *  - `set-mention`: set (or clear) a chat's per-chat @-mention override. Pass
  *    `requireMention: true|false` to override, or `null` to follow the global.
+ *  - `set-topic-root-mention`: require an explicit bot mention on topic roots
+ *    in one chat. Pass `requireMention: true|false`, or `null` to clear (off).
  */
 export async function mutateAccess(
   state: MutableProfileState,
@@ -386,6 +391,22 @@ export async function mutateAccess(
   const action = fv.action;
   const kind = fv.kind;
   const id = typeof fv.id === 'string' ? fv.id.trim() : '';
+
+  if (action === 'set-topic-root-mention') {
+    if (kind !== 'chat') throw new ApiError(400, 'kind must be chat');
+    if (!id) throw new ApiError(400, 'id is required');
+    if (fv.requireMention !== null && typeof fv.requireMention !== 'boolean') {
+      throw new ApiError(400, 'requireMention must be boolean or null');
+    }
+    const requireMention = fv.requireMention;
+    const access = await saveAccessConfig(state, (current) => {
+      const map = { ...(current.topicRootRequireMention ?? {}) };
+      if (requireMention === null) delete map[id];
+      else map[id] = requireMention;
+      return { ...current, topicRootRequireMention: map };
+    });
+    return accessView(access);
+  }
 
   if (action === 'set-mention') {
     if (!id) throw new ApiError(400, 'id is required');
@@ -407,7 +428,7 @@ export async function mutateAccess(
   }
 
   if (action !== 'add' && action !== 'remove') {
-    throw new ApiError(400, 'action must be add|remove|set-mention');
+    throw new ApiError(400, 'action must be add|remove|set-mention|set-topic-root-mention');
   }
   if (kind !== 'user' && kind !== 'admin' && kind !== 'chat') {
     throw new ApiError(400, 'kind must be user|admin|chat');
@@ -420,11 +441,16 @@ export async function mutateAccess(
     if (action === 'add') set.add(id);
     else set.delete(id);
     const next = { ...current, [listKey]: [...set] };
-    // Dropping a chat also drops its @-mention override so it can't linger.
+    // Dropping a chat also drops its mention settings so they can't linger.
     if (action === 'remove' && kind === 'chat' && next.chatRequireMention?.[id] !== undefined) {
       const map = { ...next.chatRequireMention };
       delete map[id];
       next.chatRequireMention = map;
+    }
+    if (action === 'remove' && kind === 'chat' && next.topicRootRequireMention?.[id] !== undefined) {
+      const map = { ...next.topicRootRequireMention };
+      delete map[id];
+      next.topicRootRequireMention = map;
     }
     return next;
   });
@@ -437,6 +463,7 @@ function accessView(access: ProfileAccess): ConfigView['access'] {
     allowedChats: access.allowedChats,
     admins: access.admins,
     chatRequireMention: access.chatRequireMention ?? {},
+    topicRootRequireMention: access.topicRootRequireMention ?? {},
   };
 }
 

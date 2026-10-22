@@ -10,11 +10,14 @@ export interface GroupResponsePolicyInput {
   mentionAll: boolean;
   chatId: string;
   ownerNoMentionChats: string[];
+  /** Independent per-chat gate for new topic messages, not Reaction inputs. */
+  topicRootRequireMention?: boolean;
+  topicMessageClassification?: 'root' | 'reply' | 'not-topic' | 'unknown';
 }
 
 export type GroupResponsePolicyDecision =
   | { accept: true; reason: 'p2p' | 'mentioned-bot' | 'all-messages' | 'owner-default' | 'owner-allowlist' }
-  | { accept: false; reason: 'mention-required' | 'owner-default-not-eligible' | 'owner-allowlist-not-eligible' | 'owner-allowlist-chat-not-listed' };
+  | { accept: false; reason: 'mention-required' | 'owner-default-not-eligible' | 'owner-allowlist-not-eligible' | 'owner-allowlist-chat-not-listed' | 'topic-root-mention-required' | 'topic-metadata-unavailable' };
 
 /**
  * Decide whether a normalized IM message may enter command/pending/run intake.
@@ -26,6 +29,14 @@ export function decideGroupResponse(
 ): GroupResponsePolicyDecision {
   if (input.chatType === 'p2p') return { accept: true, reason: 'p2p' };
   if (input.mentionedBot) return { accept: true, reason: 'mentioned-bot' };
+  if (input.topicRootRequireMention) {
+    if (input.topicMessageClassification === 'root') {
+      return { accept: false, reason: 'topic-root-mention-required' };
+    }
+    if (input.topicMessageClassification === 'unknown') {
+      return { accept: false, reason: 'topic-metadata-unavailable' };
+    }
+  }
   if (input.mode === 'all-messages') return { accept: true, reason: 'all-messages' };
   if (input.mode === 'mention-only') return { accept: false, reason: 'mention-required' };
 

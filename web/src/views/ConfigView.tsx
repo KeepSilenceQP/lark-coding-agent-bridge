@@ -124,6 +124,18 @@ export function ConfigView({ profile }: { profile: string }) {
     }
   }
 
+  async function setTopicRootMention(id: string, requireMention: boolean) {
+    try {
+      const acc = await apiPost<ConfigData["access"]>(
+        `/api/access?profile=${encodeURIComponent(profile)}`,
+        { action: "set-topic-root-mention", kind: "chat", id, requireMention },
+      );
+      setCfg((c) => (c ? { ...c, access: acc } : c));
+    } catch (e) {
+      toast.error(String((e as Error).message ?? e));
+    }
+  }
+
   return (
     <div className="space-y-4">
       <Card>
@@ -211,7 +223,7 @@ export function ConfigView({ profile }: { profile: string }) {
         <CardHeader><CardTitle>访问控制</CardTitle></CardHeader>
         <CardContent className="space-y-4">
           {team && (
-            <p className="text-xs text-primary">团队版下访问控制不生效（任何人可用）；以下配置保留，切回个人版后恢复。</p>
+            <p className="text-xs text-primary">团队版下用户和群白名单不生效（任何人可用）；白名单配置保留，切回个人版后恢复。群响应设置仍生效。</p>
           )}
           <AccessList label="允许私聊的用户（open_id）" placeholder="ou_..." ids={cfg.access.allowedUsers}
             onAdd={(id) => access("add", "user", id)} onRemove={(id) => access("remove", "user", id)} />
@@ -220,6 +232,7 @@ export function ConfigView({ profile }: { profile: string }) {
             profile={profile}
             ids={cfg.access.allowedChats}
             chatRequireMention={cfg.access.chatRequireMention}
+            topicRootRequireMention={cfg.access.topicRootRequireMention}
             chatNames={chatNames}
             globalRequire={cfg.requireMentionInGroup}
             onAdd={(id, name) => {
@@ -228,6 +241,7 @@ export function ConfigView({ profile }: { profile: string }) {
             }}
             onRemove={(id) => access("remove", "chat", id)}
             onSetMention={setMention}
+            onSetTopicRootMention={setTopicRootMention}
           />
           <Separator />
           <AccessList label="管理员（open_id）" placeholder="ou_..." ids={cfg.access.admins}
@@ -577,20 +591,24 @@ function AllowedChats({
   profile,
   ids,
   chatRequireMention,
+  topicRootRequireMention,
   chatNames,
   globalRequire,
   onAdd,
   onRemove,
   onSetMention,
+  onSetTopicRootMention,
 }: {
   profile: string;
   ids: string[];
   chatRequireMention: Record<string, boolean>;
+  topicRootRequireMention: Record<string, boolean>;
   chatNames: Record<string, string>;
   globalRequire: boolean;
   onAdd: (id: string, name?: string) => void;
   onRemove: (id: string) => void;
   onSetMention: (id: string, requireMention: boolean | null) => void;
+  onSetTopicRootMention: (id: string, requireMention: boolean) => void;
 }) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [draft, setDraft] = useState("");
@@ -604,23 +622,31 @@ function AllowedChats({
           const override = chatRequireMention[id];
           const value = override === undefined ? "global" : override ? "on" : "off";
           return (
-            <div key={id} className="flex items-center gap-2 px-3 py-2">
-              <div className="min-w-0 flex-1">
-                {chatNames[id] && <div className="truncate text-sm">{chatNames[id]}</div>}
-                <div className="truncate font-mono text-xs text-muted-foreground">{id}</div>
+            <div key={id} className="space-y-3 px-3 py-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="min-w-0 flex-1">
+                  {chatNames[id] && <div className="truncate text-sm">{chatNames[id]}</div>}
+                  <div className="truncate font-mono text-xs text-muted-foreground">{id}</div>
+                </div>
+                <Select
+                  value={value}
+                  onValueChange={(v) => onSetMention(id, v === "global" ? null : v === "on")}
+                >
+                  <SelectTrigger className="h-8 w-[150px]"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="global">@：跟随全局（{globalRequire ? "需@" : "无需@"}）</SelectItem>
+                    <SelectItem value="on">需要 @</SelectItem>
+                    <SelectItem value="off">无需 @</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Button variant="ghost" size="sm" onClick={() => onRemove(id)}>移除</Button>
               </div>
-              <Select
-                value={value}
-                onValueChange={(v) => onSetMention(id, v === "global" ? null : v === "on")}
-              >
-                <SelectTrigger className="h-8 w-[150px]"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="global">@：跟随全局（{globalRequire ? "需@" : "无需@"}）</SelectItem>
-                  <SelectItem value="on">需要 @</SelectItem>
-                  <SelectItem value="off">无需 @</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button variant="ghost" size="sm" onClick={() => onRemove(id)}>移除</Button>
+              <ToggleRow
+                label="话题首条必须 @ 本 Bot"
+                hint="默认关闭。开启后，话题首条消息必须显式 @ 本 Bot；后续回复沿用该群响应规则。"
+                checked={topicRootRequireMention[id] === true}
+                onChange={(enabled) => onSetTopicRootMention(id, enabled)}
+              />
             </div>
           );
         })}

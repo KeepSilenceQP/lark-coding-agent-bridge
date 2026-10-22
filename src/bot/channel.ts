@@ -128,6 +128,7 @@ import { PendingQueue, type WorkLease } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
+import { resolveTopicMessage } from './topic-message';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { handleReactionEvent } from './reaction/pipeline';
 import {
@@ -2311,29 +2312,22 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
   // downstream consumer keys off these.
-  const resolvedMode = await chatModeCache.resolve(channel, msg.chatId);
-  // Feishu delivers a sizable fraction of topic-group message events without a
-  // `thread_id` (notably the message that opens a new topic). We route topic
-  // replies (`replyInThread`) and isolate per-topic session scope off it, so a
-  // missing one makes the reply escape into a brand-new topic AND collapses the
-  // scope to the chat level. When getChatMode says this is a topic group but
-  // the event dropped `thread_id`, backfill it from the raw message — the same
-  // recovery the card-click path uses.
-  let threadId = msg.threadId;
-  if (!threadId && resolvedMode === 'topic') {
-    threadId = await lookupMessageThreadId(channel, msg.messageId);
-    if (threadId) {
-      log.info('intake', 'thread-id-backfilled', {
-        chatId: msg.chatId,
-        msgId: msg.messageId,
-        threadId,
-      });
-    }
+  const knownMode = await chatModeCache.resolveKnown(channel, msg.chatId);
+  const resolvedMode = knownMode ?? 'group';
+  const topicRootRequireMention = controls.profileConfig.access.topicRootRequireMention?.[msg.chatId] === true;
+  const topicMessage = await resolveTopicMessage({
+    channel,
+    message: msg,
+    chatMode: knownMode,
+    requireClassification: topicRootRequireMention && msg.chatType !== 'p2p' && !msg.mentionedBot,
+  });
+  // Share recovered topic/root/parent metadata with command, quote and run
+  // handling, so classification and actual routing refer to the same message.
+  const emsg = topicMessage.message;
+  const threadId = emsg.threadId;
+  if (threadId && !msg.threadId) {
+    log.info('intake', 'thread-id-backfilled', { chatId: msg.chatId, msgId: msg.messageId, threadId });
   }
-  // Carry the (possibly backfilled) threadId on the message so the batched
-  // flush — which reads `firstMsg.threadId` for reply routing and topic scope —
-  // sees it.
-  const emsg: NormalizedMessage = threadId === msg.threadId ? msg : { ...msg, threadId };
   // Some groups are converted into topic groups after creation. In that state
   // getChatMode can lag behind the message event shape, so threadId is the
   // stronger signal for topic-scoped sessions and reply routing.
@@ -2407,6 +2401,8 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     mentionAll: msg.mentionAll,
     chatId: msg.chatId,
     ownerNoMentionChats: controls.profileConfig.access.ownerNoMentionChats,
+    topicRootRequireMention,
+    topicMessageClassification: topicMessage.classification,
   });
   if (!groupResponseDecision.accept) {
     log.info('intake', 'skip-group-response-policy', {

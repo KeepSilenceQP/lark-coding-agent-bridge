@@ -313,6 +313,7 @@ troubleshooting boundary.
 | `/resume` | Resume compatible history for the same agent, working directory, and permission mode |
 | `/status` | Show profile, agent, working directory, session, lark-cli identity, and run state |
 | `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy |
+| `/config topic-root-mention on\|off` | Require an explicit @bot on topic-opening messages in the current group; run as owner/admin and mention this bot |
 | `/invite user @name` | Allow a user to use the bot in DMs |
 | `/invite admin @name` | Add an access-control admin |
 | `/invite group` | Allow the current group to use the bot |
@@ -467,6 +468,23 @@ If you'd rather not do it inside Feishu, `/invite` and `/config` write the match
 `groupResponseMode` 支持 `mention-only`（仅显式 @bot，默认）、`owner-default`（应用所有者未 @ 任何账号时默认响应）、`all-messages`（响应所有群消息）和 `owner-allowlist`（仅在指定群响应 owner 无 @ 消息）。`requireMentionInGroup` 是兼容旧版本的降级字段：`all-messages` 写 `false`，其他写 `true`；建议通过 `/config` 修改，避免字段不一致。
 
 `owner-allowlist` 模式下，需配合 `ownerNoMentionChats` 指定生效的群聊。该字段独立于 `allowedChats`，只对 owner 的无 @ 消息生效；管理员和已开放群用户仍需 @bot 才能触发。维护命令（需在目标群 @ 当前 Bot）：`/invite owner-default group` 和 `/remove owner-default group`。多 Bot 各自独立配置，不做中央互斥。
+
+`access.topicRootRequireMention` optionally requires a real @mention of this bot
+on the opening message of each topic, independently for each group. It defaults
+to off. An owner or admin can enable it by mentioning the bot in the target group
+with `/config topic-root-mention on`, or use the group's switch in the web
+console; use `off` to restore the existing response policy. The stored shape is
+`{ "oc_example": true }`.
+
+When enabled, an unmentioned topic root stays silent and creates no agent work.
+Later replies follow the existing `owner-default`, `owner-allowlist`, or
+`all-messages` policy even if the bot has never joined that topic before. The
+rule covers both dedicated topic groups and ordinary groups using thread mode,
+including roots whose incoming event omits `threadId`. Ordinary chat messages,
+DMs, and Reactions retain their existing policies. Explicit mentions still need
+to pass access checks; if metadata cannot establish whether an unmentioned
+message is a topic root, an enabled rule keeps it silent until classification
+can succeed.
 
 `allowedUsers` / `admins` take user `open_id`s; `allowedChats` takes group `chat_id`s. The easiest way to find an ID by hand: have the person message the bot (or `@` it in the group), then check the active profile's log:
 

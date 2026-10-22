@@ -97,6 +97,9 @@ export async function saveAccessConfig(
             ...(access.chatRequireMention && Object.keys(access.chatRequireMention).length > 0
               ? { chatRequireMention: access.chatRequireMention }
               : {}),
+            ...(access.topicRootRequireMention && Object.keys(access.topicRootRequireMention).length > 0
+              ? { topicRootRequireMention: access.topicRootRequireMention }
+              : {}),
           },
           requireMentionInGroup: access.requireMentionInGroup,
         };

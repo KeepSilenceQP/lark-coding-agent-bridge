@@ -4,7 +4,7 @@ import { log } from '../core/logger';
 export type ChatMode = 'p2p' | 'group' | 'topic';
 
 /**
- * In-memory cache for `channel.getChatMode()` results.
+ * In-memory cache for authoritative chat metadata.
  *
  * Why: chat mode (`p2p` / `group` / `topic`) doesn't change within a chat's
  * lifetime under normal use, and the SDK doesn't expose it on the message
@@ -15,18 +15,38 @@ export type ChatMode = 'p2p' | 'group' | 'topic';
  * the next resolve re-probes and a stale `group` entry can't outlive one
  * message.
  *
- * On lookup failure (network / permission / unknown chatId) we **fall back
- * to 'group'** — that's the conservative default since it means "treat as
- * a normal chat, one session per chatId, no thread split". Doesn't crash.
+ * Read both chat_mode and group_message_type in one request: the SDK's
+ * getChatMode only reads chat_mode and loses ordinary groups in thread mode.
+ * resolveKnown preserves lookup failures for policy callers that must fail
+ * closed; resolve retains the existing group fallback for routing callers.
  */
 export class ChatModeCache {
   private readonly cache = new Map<string, ChatMode>();
 
   async resolve(channel: LarkChannel, chatId: string): Promise<ChatMode> {
+    return await this.resolveKnown(channel, chatId) ?? 'group';
+  }
+
+  async resolveKnown(channel: LarkChannel, chatId: string): Promise<ChatMode | undefined> {
     const hit = this.cache.get(chatId);
     if (hit) return hit;
     try {
-      const mode = await channel.getChatMode(chatId);
+      const response = await channel.rawClient.im.v1.chat.get({ path: { chat_id: chatId } });
+      if (response.code !== undefined && response.code !== 0) {
+        throw new Error(`chat.get returned code ${response.code}`);
+      }
+      const metadata = response.data;
+      const rawMode = metadata?.chat_mode;
+      if (rawMode !== 'p2p' && rawMode !== 'group' && rawMode !== 'topic') {
+        throw new Error('chat.get returned no recognized chat_mode');
+      }
+      if (rawMode === 'group' && metadata?.group_message_type
+        && metadata.group_message_type !== 'chat' && metadata.group_message_type !== 'thread') {
+        throw new Error('chat.get returned an unrecognized group_message_type');
+      }
+      const mode: ChatMode = rawMode === 'group' && metadata?.group_message_type === 'thread'
+        ? 'topic'
+        : rawMode;
       this.cache.set(chatId, mode);
       log.info('chat', 'mode-resolved', { chatId, mode });
       return mode;
@@ -36,7 +56,7 @@ export class ChatModeCache {
         err: err instanceof Error ? err.message : String(err),
       });
       // Don't poison the cache — next message gets another try.
-      return 'group';
+      return undefined;
     }
   }
 

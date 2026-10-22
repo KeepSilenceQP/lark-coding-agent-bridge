@@ -56,6 +56,7 @@ describe('profile v2 migration', () => {
           allowedUsers: ['ou_allowed'],
           allowedChats: ['oc_allowed'],
           admins: ['ou_admin'],
+          topicRootRequireMention: { oc_allowed: true, oc_other: false },
         },
       },
     };
@@ -90,6 +91,7 @@ describe('profile v2 migration', () => {
       groupResponseMode: 'all-messages',
       requireMentionInGroup: false,
       ownerNoMentionChats: [],
+      topicRootRequireMention: { oc_allowed: true, oc_other: false },
     });
     expect(next.profiles.claude?.preferences).toEqual({ messageReply: 'card' });
     expect(next.profiles.claude?.workspaces).toEqual({});

@@ -131,6 +131,7 @@ describe('ui server (supervisor-backed)', () => {
     const config = await json(await get('/api/config', handle.token));
     expect(config.mode).toBe('personal');
     expect(config.live).toBe(true);
+    expect(config.access.topicRootRequireMention).toEqual({});
   });
 
   it('persists Codex tuning and rejects invalid effort without applying changes', async () => {
@@ -213,6 +214,75 @@ describe('ui server (supervisor-backed)', () => {
     );
     expect(afterRemove.allowedChats).not.toContain('oc_grp');
     expect(afterRemove.chatRequireMention).toEqual({});
+  });
+
+  it('sets a topic-root mention gate independently, applies it live, and clears it with the chat', async () => {
+    await json(await post('/api/access', handle.token, { action: 'add', kind: 'chat', id: 'oc_topic' }));
+    await json(await post('/api/access', handle.token, {
+      action: 'set-mention', kind: 'chat', id: 'oc_topic', requireMention: false,
+    }));
+    const set = await json(await post('/api/access', handle.token, {
+      action: 'set-topic-root-mention', kind: 'chat', id: 'oc_topic', requireMention: true,
+    }));
+    expect(set.topicRootRequireMention).toEqual({ oc_topic: true });
+    expect(set.chatRequireMention).toEqual({ oc_topic: false });
+    expect(online.get('claude').profileConfig.access.topicRootRequireMention).toEqual({ oc_topic: true });
+    expect(online.get('claude').cfg.access.topicRootRequireMention).toEqual({ oc_topic: true });
+    const saved = (await loadRootConfig(configPath))!;
+    expect(saved.profiles.claude!.access.topicRootRequireMention).toEqual({ oc_topic: true });
+    const view = await json(await get('/api/config', handle.token));
+    expect(view.access.topicRootRequireMention).toEqual({ oc_topic: true });
+
+    const off = await json(await post('/api/access', handle.token, {
+      action: 'set-topic-root-mention', kind: 'chat', id: 'oc_topic', requireMention: false,
+    }));
+    expect(off.topicRootRequireMention).toEqual({ oc_topic: false });
+    const cleared = await json(await post('/api/access', handle.token, {
+      action: 'set-topic-root-mention', kind: 'chat', id: 'oc_topic', requireMention: null,
+    }));
+    expect(cleared.topicRootRequireMention).toEqual({});
+    expect(cleared.chatRequireMention).toEqual({ oc_topic: false });
+
+    for (const id of ['oc_topic', 'oc_other']) {
+      await json(await post('/api/access', handle.token, {
+        action: 'set-topic-root-mention', kind: 'chat', id, requireMention: true,
+      }));
+    }
+    const removed = await json(await post('/api/access', handle.token, {
+      action: 'remove', kind: 'chat', id: 'oc_topic',
+    }));
+    expect(removed.topicRootRequireMention).toEqual({ oc_other: true });
+    expect(removed.chatRequireMention).toEqual({});
+    expect(removed.allowedChats).not.toContain('oc_topic');
+  });
+
+  it('keeps topic-root gates isolated by profile and preserves them when saving other settings', async () => {
+    await json(await post('/api/access?profile=work', handle.token, {
+      action: 'set-topic-root-mention', kind: 'chat', id: 'oc_topic', requireMention: true,
+    }));
+    const view = await json(await post('/api/config?profile=work', handle.token, { maxConcurrentRuns: 7 }));
+    expect(view.live).toBe(false);
+    expect(view.access.topicRootRequireMention).toEqual({ oc_topic: true });
+    expect((await json(await get('/api/config', handle.token))).access.topicRootRequireMention).toEqual({});
+    const saved = (await loadRootConfig(configPath))!;
+    expect(saved.profiles.work!.access.topicRootRequireMention).toEqual({ oc_topic: true });
+    expect(saved.profiles.claude!.access.topicRootRequireMention).toBeUndefined();
+  });
+
+  it('rejects unauthorized or malformed topic-root mention changes without persisting them', async () => {
+    const change = { action: 'set-topic-root-mention', kind: 'chat', id: 'oc_topic', requireMention: true };
+    expect((await post('/api/access', 'wrong-token', change)).status).toBe(401);
+    for (const patch of [
+      { kind: 'user' },
+      { id: '' },
+      { requireMention: 'true' },
+      { requireMention: 1 },
+      { requireMention: undefined },
+    ]) {
+      expect((await post('/api/access', handle.token, { ...change, ...patch })).status).toBe(400);
+    }
+    expect(online.get('claude').profileConfig.access.topicRootRequireMention).toBeUndefined();
+    expect((await loadRootConfig(configPath))!.profiles.claude!.access.topicRootRequireMention).toBeUndefined();
   });
 
   it('lists profiles with online flag from the supervisor', async () => {

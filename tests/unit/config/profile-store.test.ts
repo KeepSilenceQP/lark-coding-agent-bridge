@@ -10,6 +10,7 @@ import {
   createRootConfig,
   loadRootConfig,
   removeProfile,
+  runtimeProfileConfig,
   saveRootConfig,
 } from '../../../src/config/profile-store';
 import { resolveAppPaths } from '../../../src/config/app-paths';
@@ -226,6 +227,30 @@ describe('profile store canonical serialization', () => {
       oc_open: false,
       oc_strict: true,
     });
+  });
+
+  it('persists independent topic-root mention settings and exposes them to the runtime', async () => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const profile = createDefaultProfileConfig({
+      agentKind: 'claude',
+      accounts: { app },
+      access: {
+        groupResponseMode: 'owner-default',
+        chatRequireMention: { oc_topic: false },
+        topicRootRequireMention: { oc_topic: true, oc_other: false },
+      },
+    });
+
+    await saveRootConfig(createRootConfig('claude', profile), configPath);
+    const saved = JSON.parse(await readFile(configPath, 'utf8'));
+    expect(saved.profiles.claude.access.topicRootRequireMention).toEqual({ oc_topic: true, oc_other: false });
+
+    const loaded = (await loadRootConfig(configPath))!;
+    const runtime = runtimeProfileConfig(loaded, 'claude');
+    expect(runtime.access.topicRootRequireMention).toEqual({ oc_topic: true, oc_other: false });
+    expect(runtime.access.chatRequireMention).toEqual({ oc_topic: false });
+    expect(runtime.access.groupResponseMode).toBe('owner-default');
   });
 
   it('persists the in-meeting agent settings across save→load round-trip', async () => {

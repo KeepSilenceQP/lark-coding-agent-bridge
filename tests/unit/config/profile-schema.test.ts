@@ -17,6 +17,50 @@ const app = {
 };
 
 describe('profile schema', () => {
+  it('defaults the topic-root mention gate off and normalizes only boolean per-chat values', () => {
+    const fresh = createDefaultProfileConfig({ agentKind: 'claude', accounts: { app } });
+    expect(fresh.access).not.toHaveProperty('topicRootRequireMention');
+
+    const configured = normalizeProfileConfig({
+      ...fresh,
+      access: {
+        ...fresh.access,
+        groupResponseMode: 'owner-default',
+        chatRequireMention: { oc_topic: false },
+        topicRootRequireMention: {
+          oc_topic: true,
+          oc_disabled: false,
+          oc_string: 'true',
+          oc_number: 1,
+          oc_null: null,
+          '': true,
+        },
+      },
+    });
+    expect(configured.access.topicRootRequireMention).toEqual({ oc_topic: true, oc_disabled: false });
+    expect(configured.access.chatRequireMention).toEqual({ oc_topic: false });
+    expect(configured.access.groupResponseMode).toBe('owner-default');
+
+    const malformed = normalizeProfileConfig({
+      ...fresh,
+      access: { ...fresh.access, topicRootRequireMention: ['oc_topic'] },
+    });
+    expect(malformed.access).not.toHaveProperty('topicRootRequireMention');
+  });
+
+  it('preserves the topic-root mention gate when normalizing legacy preferences access', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      preferences: {
+        access: { topicRootRequireMention: { oc_topic: true, oc_disabled: false } },
+      },
+    });
+    expect(cfg.access.topicRootRequireMention).toEqual({ oc_topic: true, oc_disabled: false });
+    expect(cfg.preferences).not.toHaveProperty('access');
+  });
+
   it('enables edited-message restart only for explicitly enabled Codex profiles', () => {
     const codexDefault = createDefaultProfileConfig({
       agentKind: 'codex',

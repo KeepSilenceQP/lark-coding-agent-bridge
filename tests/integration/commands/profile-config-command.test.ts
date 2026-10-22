@@ -352,6 +352,91 @@ describe('profile-aware account and config commands', () => {
     };
   }
 
+  it('toggles topic-root mention only for the current group and keeps owner response policy', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
+    const before = await h.readRoot();
+    before.profiles.claude!.access.topicRootRequireMention = { oc_other_group: true };
+    before.profiles.claude!.access.chatRequireMention = { oc_test_group: false };
+    before.profiles.claude!.access.ownerNoMentionChats = ['oc_test_group'];
+    await writeJson(resolveAppPaths({ rootDir: h.rootDir }).configFile, before);
+
+    await h.command('/config topic-root-mention on');
+    const enabled = (await h.readRoot()).profiles.claude!.access;
+    expect(enabled.topicRootRequireMention).toEqual({ oc_other_group: true, oc_test_group: true });
+    expect(h.controls.profileConfig.access.topicRootRequireMention).toEqual(enabled.topicRootRequireMention);
+    expect(enabled.groupResponseMode).toBe('owner-allowlist');
+    expect(enabled.ownerNoMentionChats).toEqual(['oc_test_group']);
+    expect(enabled.chatRequireMention).toEqual({ oc_test_group: false });
+    expect(JSON.stringify(h.channel.sent.at(-1)?.content)).toContain('已开启');
+
+    await h.command('/config topic-root-mention off');
+    const disabled = (await h.readRoot()).profiles.claude!.access;
+    expect(disabled.topicRootRequireMention).toEqual({ oc_other_group: true });
+    expect(h.controls.profileConfig.access.topicRootRequireMention).toEqual(disabled.topicRootRequireMention);
+    expect(JSON.stringify(h.channel.sent.at(-1)?.content)).toContain('已关闭');
+  });
+
+  it.each([
+    '/config topic-root-mention',
+    '/config topic-root-mention yes',
+    '/config topic-root-mention on extra',
+  ])('rejects malformed topic-root configuration: %s', async command => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
+    const before = await h.readRoot();
+    await h.command(command);
+    expect(await h.readRoot()).toEqual(before);
+    expect(JSON.stringify(h.channel.sent.at(-1)?.content)).toContain('用法');
+  });
+
+  it('preserves legacy per-chat mention overrides when saving the topic-root rule', async () => {
+    const h = await createGroupHarness('owner-default', { mentionedBot: true });
+    const overrides = { oc_test_group: false, oc_other_group: true };
+    h.controls.profileConfig.access.chatRequireMention = overrides;
+    h.controls.cfg.preferences = {
+      ...h.controls.cfg.preferences,
+      access: { chatRequireMention: overrides },
+    };
+    // Exercise the legacy config projection instead of the v2 profile path.
+    await writeJson(h.controls.configPath, h.controls.cfg);
+    await h.command('/config topic-root-mention on');
+    const enabled = JSON.parse(await readFile(h.controls.configPath, 'utf8'));
+    expect(enabled.preferences.access.chatRequireMention).toEqual(overrides);
+    expect(enabled.preferences.access.topicRootRequireMention).toEqual({ oc_test_group: true });
+    await h.command('/config topic-root-mention off');
+    const disabled = JSON.parse(await readFile(h.controls.configPath, 'utf8'));
+    expect(disabled.preferences.access.chatRequireMention).toEqual(overrides);
+    expect(disabled.preferences.access.topicRootRequireMention?.oc_test_group).toBeUndefined();
+  });
+
+  it.each([
+    { mentionedBot: false, senderId: 'ou-admin', botAdmins: [] },
+    { mentionedBot: true, senderId: 'ou-stranger', botAdmins: [] },
+    { mentionedBot: true, senderId: 'ou-bot-admin', botAdmins: ['ou-bot-admin'] },
+  ])('rejects topic-root configuration without explicit mention or human administration: $senderId @=$mentionedBot', async opts => {
+    const h = await createGroupHarness('owner-allowlist', opts);
+    const before = await h.readRoot();
+    await h.command('/config topic-root-mention on');
+    expect(await h.readRoot()).toEqual(before);
+  });
+
+  it('does not set a topic-root rule from p2p', async () => {
+    const h = await createHarness();
+    const before = await readRoot(h.rootDir);
+    await h.command('/config topic-root-mention on');
+    expect(await readRoot(h.rootDir)).toEqual(before);
+    expect(JSON.stringify(h.channel.sent.at(-1)?.content)).toContain('目标群');
+  });
+
+  it('clears the topic-root rule when removing the group from the response list', async () => {
+    const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
+    await h.command('/invite group');
+    await h.command('/config topic-root-mention on');
+    await h.command('/remove group');
+    const access = (await h.readRoot()).profiles.claude!.access;
+    expect(access.allowedChats).not.toContain('oc_test_group');
+    expect(access.topicRootRequireMention?.oc_test_group).toBeUndefined();
+  });
+
   it('adds current group to ownerNoMentionChats with @bot', async () => {
     const h = await createGroupHarness('owner-allowlist', { mentionedBot: true });
 
