@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "rules": {
+    "OK": {
+      "behavior": "agent",
+      "semanticKey": "approve_continue",
+      "emojiDisplay": "OK",
+      "emojiMeaning": "同意模型提出的意见或下一步，继续执行。目标消息确实在请求确认时，等价于文字回复“同意继续”；按相同授权强度执行，不要扩展成目标消息没有提出的新动作。"
+    },
+    "LGTM": {
+      "behavior": "agent",
+      "semanticKey": "approve_continue",
+      "emojiDisplay": "LGTM",
+      "emojiMeaning": "同意模型提出的意见或下一步，继续执行。目标消息确实在请求确认时，等价于文字回复“同意继续”；按相同授权强度执行，不要扩展成目标消息没有提出的新动作。"
+    },
+    "Yes": {
+      "behavior": "agent",
+      "semanticKey": "approve_continue",
+      "emojiDisplay": "Yes",
+      "emojiMeaning": "同意模型提出的意见或下一步，继续执行。目标消息确实在请求确认时，等价于文字回复“同意继续”；按相同授权强度执行，不要扩展成目标消息没有提出的新动作。"
+    },
+    "CheckMark": {
+      "behavior": "agent",
+      "semanticKey": "approve_continue",
+      "emojiDisplay": "✓",
+      "emojiMeaning": "同意模型提出的意见或下一步，继续执行。目标消息确实在请求确认时，等价于文字回复“同意继续”；按相同授权强度执行，不要扩展成目标消息没有提出的新动作。"
+    },
+    "JIAYI": {
+      "behavior": "agent",
+      "semanticKey": "approve_continue",
+      "emojiDisplay": "+1",
+      "emojiMeaning": "同意模型提出的意见或下一步，继续执行。目标消息确实在请求确认时，等价于文字回复“同意继续”；按相同授权强度执行，不要扩展成目标消息没有提出的新动作。"
+    },
+    "WHAT": {
+      "behavior": "agent",
+      "semanticKey": "explain_more",
+      "emojiDisplay": "什么？",
+      "emojiMeaning": "没有理解模型在说什么，希望继续展开介绍。暂停把目标消息当成已对齐结论，围绕它展开背景、推理、例子或更清晰的说明；不要把该 Reaction 当成继续执行授权。"
+    },
+    "THINKING": {
+      "behavior": "agent",
+      "semanticKey": "explain_more",
+      "emojiDisplay": "思考",
+      "emojiMeaning": "没有理解模型在说什么，希望继续展开介绍。暂停把目标消息当成已对齐结论，围绕它展开背景、推理、例子或更清晰的说明；不要把该 Reaction 当成继续执行授权。"
+    },
+    "No": {
+      "behavior": "stop",
+      "semanticKey": "stop_current_work",
+      "emojiDisplay": "No",
+      "emojiMeaning": "用户认为模型当前方向不对，希望立即停止，语义类似 /stop。Bridge 控制面负责中断和可见回复，不创建新的 Agent turn；不要自动恢复、重放或回滚被停止的工作，只有用户新的明确输入才能继续。"
+    },
+    "CrossMark": {
+      "behavior": "stop",
+      "semanticKey": "stop_current_work",
+      "emojiDisplay": "✗",
+      "emojiMeaning": "用户认为模型当前方向不对，希望立即停止，语义类似 /stop。Bridge 控制面负责中断和可见回复，不创建新的 Agent turn；不要自动恢复、重放或回滚被停止的工作，只有用户新的明确输入才能继续。"
+    },
+    "MinusOne": {
+      "behavior": "stop",
+      "semanticKey": "stop_current_work",
+      "emojiDisplay": "-1",
+      "emojiMeaning": "用户认为模型当前方向不对，希望立即停止，语义类似 /stop。Bridge 控制面负责中断和可见回复，不创建新的 Agent turn；不要自动恢复、重放或回滚被停止的工作，只有用户新的明确输入才能继续。"
+    },
+    "DONE": {
+      "behavior": "passive",
+      "semanticKey": "handled_marker",
+      "emojiDisplay": "完成",
+      "emojiMeaning": "用户留下的“已处理”标记。添加和撤回都不启动 Agent、不回复、不打断任务，也不关闭话题；不要把它当成继续执行信号。需要用户完成手动步骤时，请其用文字回复完成情况后继续。"
+    },
+    "GoGoGo": {
+      "behavior": "continue",
+      "semanticKey": "continue_original_task",
+      "emojiDisplay": "GoGoGo",
+      "emojiMeaning": "用户对自己发出、且当前 Bot 已处理过的任务原消息新增此 Reaction，表示继续这条原消息的任务，包括明确继续此前被停止的任务。从会话中已完成的位置继续，不重复已完成动作、不扩大原任务授权；仅作者可继续自己的原任务，不为无关消息创建任务。仅撤回不表示继续；有效集合中仍保留的旧停止 Reaction 是历史上下文，不能当成本轮新增停止信号再次执行。"
+    },
+    "Loudspeaker": {
+      "behavior": "restart",
+      "semanticKey": "restart_edited_message",
+      "emojiDisplay": "喇叭",
+      "emojiMeaning": "原消息作者修改正在执行的唯一任务原消息后，新增此 Reaction 表示按修改后的内容重启该次运行。Bridge 验证作者、权限、可编辑消息与运行状态，读取最新消息并确认原运行已停止后，再启动修正后的运行；仅撤回不触发重启。"
+    }
+  }
+}

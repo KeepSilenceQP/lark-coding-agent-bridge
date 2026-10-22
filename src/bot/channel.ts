@@ -132,9 +132,10 @@ import { resolveTopicMessage } from './topic-message';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { handleReactionEvent } from './reaction/pipeline';
 import {
-  EDITED_MESSAGE_RESTART_EMOJI_TYPE,
-  isStopEmoji,
+  isContinuationReaction,
+  isRestartEmoji,
 } from './reaction/semantics';
+import { DEFAULT_REACTION_POLICY, ReactionPolicyStore } from './reaction/policy';
 import {
   reactionTurnIdOf,
   withReactionTurnId,
@@ -1166,6 +1167,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const { cfg, agent, sessions, sessionCatalog, workspaces, controls } = deps;
   const activeRuns = new ActiveRuns();
   const editedMessageRestarts = new EditedMessageRestartRegistry();
+  const reactionPolicyStore = deps.appPaths?.profileDir
+    ? new ReactionPolicyStore(deps.appPaths.profileDir, message => log.warn('reaction', message))
+    : undefined;
+  await reactionPolicyStore?.initialize();
+  let reactionIntakeSequence = 0;
   // WorkChainStore: maps message→workChainId for stop reaction validation (DD15).
   // In-memory store — restart fail-closed (all historical associations lost).
   const workChainStore = new WorkChainStore();
@@ -1181,11 +1187,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   let reactionLedger: ReactionLedger | null = null;
   let stopControlLedger: StopControlLedger | null = null;
   // ReactionBuffer: buffers non-stop events before reconciliation (F4/F5).
-  const reactionBuffer = new ReactionBuffer(async (key, events) => {
+  const reactionBuffer = new ReactionBuffer(async (key, events, policy) => {
     if (!reactionLedger) return;
     const result = await reconcile(key, events, {
       channel,
       ledger: reactionLedger,
+      policy,
       botOpenId: channel.botIdentity?.openId,
       appId: cfg.accounts.app.id,
     });
@@ -1207,10 +1214,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       reconciliationFailed: result.reconciliationFailed,
       noOp: result.noOp,
       netZeroConsumed: result.netZeroConsumed,
-      // Original-message continuation has one actionable emoji. A retained No
-      // must not turn GoGoGo withdrawal into a new Agent run.
+      // Only configured continuation reactions can keep an original-message
+      // continuation active; retained stop signals cannot start a new run.
       effectiveReactionSetLength: userTrigger
-        ? result.effectiveReactionSet.filter(entry => entry.emojiType === 'GoGoGo').length
+        ? result.effectiveReactionSet.filter(entry => isContinuationReaction(entry.emojiType, policy)).length
         : result.effectiveReactionSet.length,
       hasMatchingInFlightRun: hasMatchingInFlight,
       targetMessageId: result.components.targetMessageId,
@@ -1278,6 +1285,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     const reactionContext = {
       operatorOpenId: result.components.operatorOpenId,
       reactionRevision: result.revision,
+      policyVersion: policy.version,
       triggerReactions: result.triggerReactions,
       effectiveReactionSet: result.effectiveReactionSet,
       targetMessage: targetMsg,
@@ -1638,15 +1646,18 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       }).catch((err) => log.fail('comment', err));
     },
     reaction: async (evt) => {
+      const reactionPolicy = reactionPolicyStore?.snapshot() ?? DEFAULT_REACTION_POLICY;
+      const reactionIntakeOrder = ++reactionIntakeSequence;
       await withTrace({ chatId: evt.messageId }, async () => {
         try {
           if (
-            evt.emojiType === EDITED_MESSAGE_RESTART_EMOJI_TYPE &&
+            isRestartEmoji(evt.emojiType, reactionPolicy) &&
             isCodexEditedMessageRestartEnabled(controls.profileConfig)
           ) {
             const editTarget = editedMessageRestarts.get(evt.messageId);
             const editOutcome = await handleEditedMessageRestartReaction(evt, {
               enabled: true,
+              reactionPolicy,
               botOpenId: channel.botIdentity?.openId,
               registry: editedMessageRestarts,
               activeRuns,
@@ -1825,6 +1836,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           // permission (using chatModeCache for chatType, not oc_/ou_ guessing).
           const pipelineResult = await handleReactionEvent(evt, {
             channel,
+            policy: reactionPolicy,
             botOpenId: channel.botIdentity?.openId,
             appId: cfg.accounts.app.id,
           }, {
@@ -1873,7 +1885,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
 
           // F1/F4/F5: Non-stop → push into buffer for reconciliation
           if (pipelineResult.kind === 'buffer-reaction') {
-            reactionBuffer.push(pipelineResult.key, evt);
+            reactionBuffer.push(pipelineResult.key, evt, reactionPolicy, reactionIntakeOrder);
             log.info('reaction', 'buffered', {
               key: pipelineResult.key,
               emojiType: evt.emojiType,

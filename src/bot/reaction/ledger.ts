@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { writeFileAtomic } from '../../platform/atomic-write.js';
 import type { ReactionKey, ReactionLedgerEntry } from './types';
 import { isPassiveReaction } from './semantics';
+import { DEFAULT_REACTION_POLICY, type ReactionPolicy } from './policy';
 
 // ── Document shape ──
 
@@ -56,7 +57,7 @@ export class ReactionLedger {
 
   get(key: ReactionKey): ReactionLedgerEntry | undefined {
     const entry = this.doc.entries[key];
-    return entry ? { ...entry } : undefined;
+    return entry ? structuredClone(entry) : undefined;
   }
 
   /**
@@ -136,8 +137,11 @@ function byteCompare(a: string, b: string): number {
   return a.length - b.length;
 }
 
-export function computeCanonicalFingerprint(records: CanonicalReactionRecord[]): string {
-  return hashReactionRecords(records.filter(r => !isPassiveReaction(r.emoji_type)));
+export function computeCanonicalFingerprint(
+  records: CanonicalReactionRecord[],
+  policy: ReactionPolicy = DEFAULT_REACTION_POLICY,
+): string {
+  return hashReactionRecords(records.filter(r => !isPassiveReaction(r.emoji_type, policy)));
 }
 
 /**
@@ -147,7 +151,8 @@ export function computeCanonicalFingerprint(records: CanonicalReactionRecord[]):
  */
 export function computeLegacyDoneFingerprint(records: CanonicalReactionRecord[], operatorId: string): string {
   return hashReactionRecords([
-    ...records.filter(r => !isPassiveReaction(r.emoji_type)),
+    // This reconstructs a historical hash, independent of today's policy.
+    ...records.filter(r => r.emoji_type !== 'DONE'),
     { operator_type: 'user', operator_id: operatorId, emoji_type: 'DONE' },
   ]);
 }

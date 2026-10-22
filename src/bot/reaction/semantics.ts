@@ -1,22 +1,14 @@
-/**
- * Versioned, testable predefined reaction semantics table.
- *
- * v2 covers 10 emojiTypes across 3 semanticKeys as confirmed by the Spec
- * "Confirmed Predefined Semantics" table. The table is the single source of
- * truth — model runtimes MUST NOT generate predefined rules at runtime.
- *
- * emojiType values are case-sensitive and taken from the Feishu reaction emoji
- * list. Passive markers are filtered before semantic lookup. Other emojiTypes
- * NOT in this table pass through with `emojiMeaningSource: 'unmapped'`.
- */
+import { DEFAULT_REACTION_POLICY, type ReactionBehavior, type ReactionPolicy } from './policy';
 
-export const SEMANTICS_SCHEMA_VERSION = 2;
+/** Emoji bindings and their meaning live in JSON; code only implements behaviors. */
+export const SEMANTICS_SCHEMA_VERSION = 3;
 
 export interface ReactionSemanticEntry {
   emojiType: string;
   emojiDisplay: string;
   emojiMeaning: string;
   semanticKey: string;
+  behavior: ReactionBehavior;
   emojiMeaningSource: 'predefined';
 }
 
@@ -25,129 +17,73 @@ export interface UnmappedReactionEntry {
   emojiDisplay?: string;
   emojiMeaningSource: 'unmapped';
   semanticKey?: undefined;
+  behavior?: undefined;
 }
 
 export type ReactionSemanticResult = ReactionSemanticEntry | UnmappedReactionEntry;
 
-/**
- * v2 predefined semantics table — strictly 10 entries.
- *
- * | semanticKey          | emojiType                             |
- * |----------------------|---------------------------------------|
- * | approve_continue     | OK, LGTM, Yes, CheckMark, JIAYI       |
- * | explain_more         | WHAT, THINKING                         |
- * | stop_current_work    | No, CrossMark, MinusOne                |
- */
-export const SEMANTICS_TABLE: Record<string, ReactionSemanticEntry> = {
-  // ── approve_continue ──
-  OK: {
-    emojiType: 'OK',
-    emojiDisplay: 'OK',
-    emojiMeaning: '同意模型提出的意见或下一步，继续执行',
-    semanticKey: 'approve_continue',
-    emojiMeaningSource: 'predefined',
-  },
-  LGTM: {
-    emojiType: 'LGTM',
-    emojiDisplay: 'LGTM',
-    emojiMeaning: '同意模型提出的意见或下一步，继续执行',
-    semanticKey: 'approve_continue',
-    emojiMeaningSource: 'predefined',
-  },
-  Yes: {
-    emojiType: 'Yes',
-    emojiDisplay: 'Yes',
-    emojiMeaning: '同意模型提出的意见或下一步，继续执行',
-    semanticKey: 'approve_continue',
-    emojiMeaningSource: 'predefined',
-  },
-  CheckMark: {
-    emojiType: 'CheckMark',
-    emojiDisplay: '✓',
-    emojiMeaning: '同意模型提出的意见或下一步，继续执行',
-    semanticKey: 'approve_continue',
-    emojiMeaningSource: 'predefined',
-  },
-  JIAYI: {
-    emojiType: 'JIAYI',
-    emojiDisplay: '+1',
-    emojiMeaning: '同意模型提出的意见或下一步，继续执行',
-    semanticKey: 'approve_continue',
-    emojiMeaningSource: 'predefined',
-  },
+export function reactionBehavior(
+  emojiType: string,
+  policy: ReactionPolicy = DEFAULT_REACTION_POLICY,
+): ReactionBehavior | undefined {
+  return Object.hasOwn(policy.rules, emojiType) ? policy.rules[emojiType]?.behavior : undefined;
+}
 
-  // ── explain_more ──
-  WHAT: {
-    emojiType: 'WHAT',
-    emojiDisplay: '什么？',
-    emojiMeaning: '没有理解模型在说什么，希望继续展开介绍',
-    semanticKey: 'explain_more',
-    emojiMeaningSource: 'predefined',
-  },
-  THINKING: {
-    emojiType: 'THINKING',
-    emojiDisplay: '思考',
-    emojiMeaning: '没有理解模型在说什么，希望继续展开介绍',
-    semanticKey: 'explain_more',
-    emojiMeaningSource: 'predefined',
-  },
+export function isPassiveReaction(emojiType: string, policy?: ReactionPolicy): boolean {
+  return reactionBehavior(emojiType, policy) === 'passive';
+}
 
-  // ── stop_current_work ──
-  No: {
-    emojiType: 'No',
-    emojiDisplay: 'No',
-    emojiMeaning: '用户认为模型当前方向不对，希望立即停止，语义类似 /stop',
-    semanticKey: 'stop_current_work',
-    emojiMeaningSource: 'predefined',
-  },
-  CrossMark: {
-    emojiType: 'CrossMark',
-    emojiDisplay: '✗',
-    emojiMeaning: '用户认为模型当前方向不对，希望立即停止，语义类似 /stop',
-    semanticKey: 'stop_current_work',
-    emojiMeaningSource: 'predefined',
-  },
-  MinusOne: {
-    emojiType: 'MinusOne',
-    emojiDisplay: '-1',
-    emojiMeaning: '用户认为模型当前方向不对，希望立即停止，语义类似 /stop',
-    semanticKey: 'stop_current_work',
-    emojiMeaningSource: 'predefined',
-  },
-};
+export function isContinuationReaction(emojiType: string, policy?: ReactionPolicy): boolean {
+  return reactionBehavior(emojiType, policy) === 'continue';
+}
 
-/** emojiTypes that map to stop_current_work — used by the control plane fast path. */
-export const STOP_EMOJI_TYPES: readonly string[] = ['No', 'CrossMark', 'MinusOne'];
-export const EDITED_MESSAGE_RESTART_EMOJI_TYPE = 'Loudspeaker';
-
-/** Visual "已处理" marker only; adding/removing it has no Bridge side effects. */
-export function isPassiveReaction(emojiType: string): boolean {
-  return emojiType === 'DONE';
+export function isRestartEmoji(emojiType: string, policy?: ReactionPolicy): boolean {
+  return reactionBehavior(emojiType, policy) === 'restart';
 }
 
 export function isEditedMessageRestartReaction(input: {
   emojiType: string;
   action: 'added' | 'removed';
-}): boolean {
-  return input.action === 'added' && input.emojiType === EDITED_MESSAGE_RESTART_EMOJI_TYPE;
+}, policy?: ReactionPolicy): boolean {
+  return input.action === 'added' && isRestartEmoji(input.emojiType, policy);
 }
 
-/** Look up a single emojiType. Returns predefined entry on hit, unmapped passthrough otherwise. */
-export function lookupReactionSemantics(emojiType: string): ReactionSemanticResult {
-  const entry = SEMANTICS_TABLE[emojiType];
-  if (entry) return entry;
-  return {
-    emojiType,
-    emojiMeaningSource: 'unmapped',
-  };
+/** Keep behavior attached to retained control signals in effective snapshots. */
+export function lookupReactionSemantics(
+  emojiType: string,
+  policy: ReactionPolicy = DEFAULT_REACTION_POLICY,
+): ReactionSemanticResult {
+  const behavior = reactionBehavior(emojiType, policy);
+  const rule = policy.rules[emojiType];
+  if (rule && behavior && behavior !== 'passive') {
+    return {
+      emojiType,
+      emojiDisplay: rule.emojiDisplay ?? emojiType,
+      emojiMeaning: rule.emojiMeaning,
+      semanticKey: rule.semanticKey,
+      behavior,
+      emojiMeaningSource: 'predefined',
+    };
+  }
+  return { emojiType, emojiMeaningSource: 'unmapped' };
 }
 
-/** True when emojiType is one of the 10 predefined entries. */
-export function isPredefinedEmoji(emojiType: string): boolean {
-  return emojiType in SEMANTICS_TABLE;
+export function isPredefinedEmoji(emojiType: string, policy?: ReactionPolicy): boolean {
+  return lookupReactionSemantics(emojiType, policy).emojiMeaningSource === 'predefined';
 }
 
-/** True when emojiType maps to stop_current_work. */
-export function isStopEmoji(emojiType: string): boolean {
-  return STOP_EMOJI_TYPES.includes(emojiType);
+export function isStopEmoji(emojiType: string, policy?: ReactionPolicy): boolean {
+  return reactionBehavior(emojiType, policy) === 'stop';
 }
+
+/** Default-policy exports for callers inspecting the shipped defaults, never runtime routing. */
+export const SEMANTICS_TABLE: Readonly<Record<string, ReactionSemanticEntry>> = Object.freeze(
+  Object.fromEntries(Object.keys(DEFAULT_REACTION_POLICY.rules)
+    .map(emojiType => [emojiType, lookupReactionSemantics(emojiType)] as const)
+    .filter((entry): entry is readonly [string, ReactionSemanticEntry] => entry[1].emojiMeaningSource === 'predefined')),
+);
+export const STOP_EMOJI_TYPES: readonly string[] = Object.freeze(
+  Object.keys(DEFAULT_REACTION_POLICY.rules).filter(emoji => isStopEmoji(emoji)),
+);
+export const EDITED_MESSAGE_RESTART_EMOJI_TYPE = Object.keys(DEFAULT_REACTION_POLICY.rules)
+  .find(emoji => isRestartEmoji(emoji))!;

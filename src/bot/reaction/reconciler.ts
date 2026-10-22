@@ -8,6 +8,7 @@ import {
   type ReactionLedger,
 } from './ledger';
 import { isPassiveReaction, isPredefinedEmoji, lookupReactionSemantics } from './semantics';
+import { DEFAULT_REACTION_POLICY, type ReactionPolicy } from './policy';
 import type {
   BufferedReactionEvent,
   CanonicalReactionRecord,
@@ -53,6 +54,7 @@ export interface ReconcilerDeps {
   ledger: ReactionLedger;
   botOpenId?: string;
   appId?: string;
+  policy?: ReactionPolicy;
 }
 
 /**
@@ -73,6 +75,9 @@ export async function reconcile(
   events: BufferedReactionEvent[],
   deps: ReconcilerDeps,
 ): Promise<ReconciliationResult> {
+  // A flush keeps the policy accepted at intake across every paginated read,
+  // retry, fingerprint and semantic lookup, even if the file changes meanwhile.
+  const policy = deps.policy ?? DEFAULT_REACTION_POLICY;
   const components = parseReactionKey(key);
   const base: ReconciliationResult = {
     key,
@@ -88,7 +93,7 @@ export async function reconcile(
 
   // Keep passive markers out of retries, triggers and net-zero withdrawal
   // acknowledgements, including callers that bypass ordinary event intake.
-  events = events.filter(event => !isPassiveReaction(event.emojiType));
+  events = events.filter(event => !isPassiveReaction(event.emojiType, policy));
   if (events.length === 0) {
     const entry = deps.ledger.get(key);
     return {
@@ -146,43 +151,96 @@ export async function reconcile(
   }
 
   // ── Filter to this operator only ──
-  const operatorRecords = records.filter(
+  const rawOperatorRecords = records.filter(
     (r) => r.operator_id === components.operatorOpenId,
+  );
+  const operatorRecords = rawOperatorRecords.filter(
+    (r) => !isPassiveReaction(r.emoji_type, policy),
   );
 
   // ── Compute canonical fingerprint (F8/F9: cross-platform deterministic) ──
-  const fingerprint = computeCanonicalFingerprint(operatorRecords);
+  const fingerprint = computeCanonicalFingerprint(operatorRecords, policy);
 
   // ── Build effectiveReactionSet from API records (authoritative) ──
-  const effectiveSet = buildEffectiveSet(operatorRecords);
+  const effectiveSet = buildEffectiveSet(operatorRecords, policy);
 
   // ── Build ordered triggerReactions from buffered events ──
-  const triggers = buildTriggerReactions(events);
+  const triggers = buildTriggerReactions(events, policy);
 
   // ── Load ledger state ──
   const ledgerEntry = deps.ledger.get(key);
   let consumedFingerprint = ledgerEntry?.consumedFingerprint ?? EMPTY_FINGERPRINT;
   let currentFingerprint = ledgerEntry?.fingerprint ?? EMPTY_FINGERPRINT;
 
-  // Older ledgers included DONE. Only normalize an exact, already-consumed
-  // legacy snapshot; actual actionable changes still create a new revision.
-  const legacyFingerprint = computeLegacyDoneFingerprint(operatorRecords, components.operatorOpenId);
-  if (currentFingerprint === legacyFingerprint && consumedFingerprint === legacyFingerprint) {
-    currentFingerprint = consumedFingerprint = fingerprint;
-    await persistLedgerEntry(deps, key, fingerprint, fingerprint,
-      operatorRecords.map(r => r.reaction_id).filter((id): id is string => Boolean(id)),
-      ledgerEntry?.lastRevision ?? 0);
+  // Re-project both sides with the same policy. Otherwise making a retained
+  // emoji passive (or actionable) looks like new user input and can replay an
+  // already consumed reaction. Only an exactly consumed snapshot is rebased;
+  // do not accidentally consume a previously unconsumed state.
+  if (ledgerEntry?.rawRecords && currentFingerprint === consumedFingerprint) {
+    currentFingerprint = consumedFingerprint = computeCanonicalFingerprint(
+      ledgerEntry.rawRecords,
+      policy,
+    );
   }
 
+  // The immediately preceding release excluded DONE but did not save rawRecords.
+  // Recognize an exactly consumed snapshot using that historical policy before
+  // applying today's mapping. A retained DONE becoming actionable is not new
+  // input; an actual DONE event must still be evaluated against the old baseline.
+  // Newly added markers that are passive today may already appear in the list
+  // without ever entering intake, so also check the old recorded-ID projection.
+  if (ledgerEntry && !ledgerEntry.rawRecords && !ledgerEntry.policyVersion
+    && currentFingerprint === consumedFingerprint
+    && !events.some(event => event.emojiType === 'DONE')) {
+    const previousIds = new Set(ledgerEntry.recordIds);
+    const historicalRecords = rawOperatorRecords.filter(record =>
+      !isPassiveReaction(record.emoji_type, policy)
+        || !record.reaction_id || previousIds.has(record.reaction_id));
+    if (currentFingerprint === computeCanonicalFingerprint(rawOperatorRecords, DEFAULT_REACTION_POLICY)
+      || currentFingerprint === computeCanonicalFingerprint(historicalRecords, DEFAULT_REACTION_POLICY)) {
+      currentFingerprint = consumedFingerprint = fingerprint;
+    }
+  }
+
+  // Older ledgers included DONE. Only normalize an exact, already-consumed
+  // legacy snapshot; actual actionable changes still create a new revision.
+  const legacyFingerprint = computeLegacyDoneFingerprint(rawOperatorRecords, components.operatorOpenId);
+  if (!ledgerEntry?.rawRecords && isPassiveReaction('DONE', policy)
+    && currentFingerprint === legacyFingerprint && consumedFingerprint === legacyFingerprint) {
+    currentFingerprint = consumedFingerprint = fingerprint;
+  }
+
+  // A passive marker may have been removed while intake ignored it, then
+  // explicitly re-added after being configured as actionable. Its canonical
+  // membership is unchanged, but a new API reaction ID proves this is fresh
+  // input. Only use this evidence across a policy change and when the old
+  // record was excluded from active recordIds; a mere meaning edit must not
+  // turn API ID churn for an already-active reaction into a replay.
+  const reactivatedPassiveAddition = Boolean(
+    ledgerEntry?.rawRecords && ledgerEntry.policyVersion
+      && ledgerEntry.policyVersion !== policy.version
+      && events.some(event => {
+        if (event.action !== 'added'
+          || events.some(other => other.emojiType === event.emojiType && other.action === 'removed')) return false;
+        const previous = ledgerEntry.rawRecords!.filter(record => record.emoji_type === event.emojiType);
+        if (previous.length === 0 || previous.some(record => !record.reaction_id
+          || ledgerEntry.recordIds.includes(record.reaction_id))) return false;
+        const previousIds = new Set(previous.map(record => record.reaction_id));
+        return operatorRecords.some(record => record.emoji_type === event.emojiType
+          && record.reaction_id && !previousIds.has(record.reaction_id));
+      }),
+  );
+
   // ── No-op: fingerprint unchanged (F3/F5: check against consumed fingerprint) ──
-  if (fingerprint === currentFingerprint && fingerprint === consumedFingerprint) {
+  if (fingerprint === currentFingerprint && fingerprint === consumedFingerprint && !reactivatedPassiveAddition) {
+    // Also refresh raw passive records on a no-op. Their presence is needed
+    // to project this consumed state after a later policy change.
+    await persistLedgerEntry(deps, key, fingerprint, consumedFingerprint,
+      operatorRecords.map((r) => r.reaction_id).filter((id): id is string => Boolean(id)),
+      ledgerEntry?.lastRevision ?? 0, rawOperatorRecords, policy.version);
     // Check for net-zero added→removed exception (DD7)
     const netZero = detectNetZeroPair(events);
     if (netZero) {
-      // Persist the event-pair consumption (F3)
-      await persistLedgerEntry(deps, key, fingerprint, consumedFingerprint,
-        operatorRecords.map((r) => r.reaction_id).filter((id): id is string => Boolean(id)),
-        (ledgerEntry?.lastRevision ?? 0));
       return {
         ...base,
         triggerReactions: triggers,
@@ -209,7 +267,7 @@ export async function reconcile(
 
   await persistLedgerEntry(deps, key, fingerprint, fingerprint,
     operatorRecords.map((r) => r.reaction_id).filter((id): id is string => Boolean(id)),
-    newRevision);
+    newRevision, rawOperatorRecords, policy.version);
 
   return {
     ...base,
@@ -230,6 +288,8 @@ async function persistLedgerEntry(
   consumedFingerprint: string,
   recordIds: string[],
   revision: number,
+  rawRecords: CanonicalReactionRecord[],
+  policyVersion: string,
 ): Promise<void> {
   try {
     await deps.ledger.updateEntry(key, (prev) => ({
@@ -237,6 +297,8 @@ async function persistLedgerEntry(
       consumedFingerprint,
       latestActionTime: Date.now(),
       recordIds,
+      rawRecords,
+      policyVersion,
       lastRevision: revision > (prev?.lastRevision ?? 0) ? revision : (prev?.lastRevision ?? 0),
     }));
   } catch (err) {
@@ -274,9 +336,9 @@ async function fetchAllReactions(
       const opId = item.operator?.operator_id ?? '';
       const emoji = item.reaction_type?.emoji_type ?? '';
 
-      // Passive markers never participate in compatibility, fingerprints,
-      // effective sets, or ledger record IDs even beside actionable reactions.
-      if (isSelfApp(item, deps) || isPassiveReaction(emoji)) continue;
+      // Keep passive records as a baseline for future policy changes. They
+      // are filtered before building effective sets and active fingerprints.
+      if (isSelfApp(item, deps)) continue;
 
       collected.push({
         reaction_id: item.reaction_id,
@@ -303,21 +365,22 @@ function isSelfApp(item: ReactionListItem, deps: ReconcilerDeps): boolean {
 
 // ── Build effective set from API records ──
 
-function buildEffectiveSet(records: CanonicalReactionRecord[]): EffectiveReactionEntry[] {
+function buildEffectiveSet(records: CanonicalReactionRecord[], policy: ReactionPolicy): EffectiveReactionEntry[] {
   const seen = new Set<string>();
   const result: EffectiveReactionEntry[] = [];
   for (const r of records) {
     if (seen.has(r.emoji_type)) continue;
     seen.add(r.emoji_type);
 
-    if (isPredefinedEmoji(r.emoji_type)) {
-      const sem = lookupReactionSemantics(r.emoji_type);
+    if (isPredefinedEmoji(r.emoji_type, policy)) {
+      const sem = lookupReactionSemantics(r.emoji_type, policy);
       result.push({
         emojiType: r.emoji_type,
         emojiDisplay: sem.emojiDisplay,
         emojiMeaning: 'emojiMeaning' in sem ? sem.emojiMeaning : undefined,
         semanticKey: 'semanticKey' in sem ? sem.semanticKey : undefined,
         emojiMeaningSource: sem.emojiMeaningSource,
+        behavior: sem.behavior,
       });
     } else {
       result.push({
@@ -331,16 +394,20 @@ function buildEffectiveSet(records: CanonicalReactionRecord[]): EffectiveReactio
 
 // ── Build trigger reactions from buffered events ──
 
-function buildTriggerReactions(events: BufferedReactionEvent[]): ReactionTriggerEntry[] {
-  return events.map((e) => ({
-    action: e.action,
-    emojiType: e.emojiType,
-    emojiDisplay: e.semantics.emojiDisplay,
-    emojiMeaning: 'emojiMeaning' in e.semantics ? e.semantics.emojiMeaning : undefined,
-    semanticKey: 'semanticKey' in e.semantics ? e.semantics.semanticKey : undefined,
-    emojiMeaningSource: e.semantics.emojiMeaningSource,
-    actionTime: e.actionTime,
-  }));
+function buildTriggerReactions(events: BufferedReactionEvent[], policy: ReactionPolicy): ReactionTriggerEntry[] {
+  return events.map((e) => {
+    const semantics = lookupReactionSemantics(e.emojiType, policy);
+    return {
+      action: e.action,
+      emojiType: e.emojiType,
+      emojiDisplay: semantics.emojiDisplay,
+      emojiMeaning: 'emojiMeaning' in semantics ? semantics.emojiMeaning : undefined,
+      semanticKey: 'semanticKey' in semantics ? semantics.semanticKey : undefined,
+      emojiMeaningSource: semantics.emojiMeaningSource,
+      behavior: semantics.behavior,
+      actionTime: e.actionTime,
+    };
+  });
 }
 
 // ── F4: Snapshot compatibility check ──

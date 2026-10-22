@@ -1,3 +1,4 @@
+import { parseReactionPolicy } from '../../../src/bot/reaction/policy';
 import type { ApiMessageItem, NormalizedMessage } from '@larksuite/channel';
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentAdapter, AgentEvent, AgentRun, AgentRunOptions } from '../../../src/agent/types';
@@ -136,6 +137,24 @@ const loudspeaker = {
 };
 
 describe('edited message restart transaction', () => {
+  it('uses the configured restart binding with the same author and execution checks', async () => {
+    const h = createHarness();
+    const reactionPolicy = parseReactionPolicy(JSON.stringify({ schemaVersion: 1, rules: {
+      CustomRestart: { behavior: 'restart', semanticKey: 'edit_again', emojiMeaning: '按最新编辑重启' },
+    } }));
+    const deps = { ...h.deps, reactionPolicy };
+    expect(await handleEditedMessageRestartReaction(loudspeaker, deps)).toEqual({ handled: false, code: 'ignored' });
+    expect(await handleEditedMessageRestartReaction({ ...loudspeaker, emojiType: 'CustomRestart', operator: { openId: 'ou_other' } }, deps))
+      .toEqual({ handled: true, code: 'ignored' });
+    expect(h.run.stop).not.toHaveBeenCalled();
+    expect(await handleEditedMessageRestartReaction({ ...loudspeaker, emojiType: 'CustomRestart' }, deps))
+      .toEqual({ handled: true, code: 'started' });
+    expect(h.run.stop).toHaveBeenCalledOnce();
+    expect(h.deps.startCorrected).toHaveBeenCalledOnce();
+    h.finish();
+    await Promise.resolve();
+  });
+
   it('orders fetch/precheck/hold/CAS/stop/exit/direct start and retains ordinary pending work', async () => {
     const h = createHarness();
     const outcome = await handleEditedMessageRestartReaction(loudspeaker, h.deps);

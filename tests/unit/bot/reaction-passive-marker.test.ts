@@ -168,8 +168,13 @@ describe('passive DONE reconciliation and persistence', () => {
       expect(result.triggerReactions.map(r => r.emojiType)).toEqual(['JIAYI']);
       expect(result.effectiveReactionSet.map(r => r.emojiType)).toEqual(['JIAYI']);
     }
-    expect(update).not.toHaveBeenCalled();
-    expect(ledger.snapshot()).toEqual(before);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(ledger.get(key)).toMatchObject({
+      fingerprint: before.entries[key]!.fingerprint,
+      consumedFingerprint: before.entries[key]!.consumedFingerprint,
+      lastRevision: before.entries[key]!.lastRevision,
+      rawRecords: [active],
+    });
   });
 
   it.each([true, false])('normalizes a consumed v1 ledger without replay (DONE present: %s)', async hasDone => {
@@ -240,7 +245,7 @@ describe('passive DONE buffering', () => {
     expect(flush).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(flush).toHaveBeenCalledOnce();
-    expect(flush).toHaveBeenCalledWith(key, [expect.objectContaining({ emojiType: 'JIAYI' })]);
+    expect(flush).toHaveBeenCalledWith(key, [expect.objectContaining({ emojiType: 'JIAYI' })], expect.anything());
     expect(buffer.pendingKeys).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
   });

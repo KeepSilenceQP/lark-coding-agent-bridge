@@ -1,6 +1,7 @@
 import type { ReactionEvent, LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { log } from '../../core/logger';
-import { isPassiveReaction, isStopEmoji, lookupReactionSemantics } from './semantics';
+import { isContinuationReaction, isPassiveReaction, isStopEmoji, isRestartEmoji } from './semantics';
+import type { ReactionPolicy } from './policy';
 import type { ReactionContext, ReactionKey } from './types';
 import { makeReactionKey } from './types';
 
@@ -51,6 +52,7 @@ export type ReactionPipelineAction =
 // ── Pipeline deps ──
 
 export interface ReactionPipelineDeps {
+  policy?: ReactionPolicy;
   channel: LarkChannel;
   botOpenId?: string;
   appId?: string;
@@ -100,7 +102,7 @@ async function resolveRoute(channel: LarkChannel, messageId: string) {
 /**
  * Guards pipeline for a reaction event:
  * passive marker → self-operator → route/sender classification → stop/non-stop split.
- * Non-stop requires own-message (or the author's registered GoGoGo trigger); stop applies
+ * Non-stop requires own-message (or the author's registered continuation trigger); stop applies
  * Reaction permission before its target eligibility is resolved by the caller.
  *
  * This does NOT do reconciliation — that's handled by the buffer's flush
@@ -113,8 +115,13 @@ export async function handleReactionEvent(
 ): Promise<ReactionPipelineAction> {
   // A visual marker is independent of target ownership or work state. Drop
   // both actions before routing, API calls, chain allocation, or buffering.
-  if (isPassiveReaction(evt.emojiType)) {
+  if (isPassiveReaction(evt.emojiType, deps.policy)) {
     return { kind: 'drop', reason: 'passive-marker' };
+  }
+  // The dedicated feature-gated control plane runs before this pipeline. A
+  // disabled/unhandled restart must never fall through to model interpretation.
+  if (isRestartEmoji(evt.emojiType, deps.policy)) {
+    return { kind: 'drop', reason: 'restart-control-only' };
   }
 
   try {
@@ -138,12 +145,12 @@ export async function handleReactionEvent(
       messageSenderId,
       { botOpenId: deps.botOpenId, appId: deps.appId },
     );
-    const stopEmoji = isStopEmoji(evt.emojiType);
+    const stopEmoji = isStopEmoji(evt.emojiType, deps.policy);
     const senderType = item?.sender?.sender_type as string | undefined;
 
-    // GoGoGo is an explicit continuation request on the author's own task.
+    // The configured continuation behavior is an explicit request on the author's own task.
     // Correlation is checked after resolving the authoritative scope below.
-    const userContinuation = evt.emojiType === 'GoGoGo'
+    const userContinuation = isContinuationReaction(evt.emojiType, deps.policy)
       && senderType === 'user' && messageSenderId === evt.operator.openId;
     if (!stopEmoji && !ownMessage && !userContinuation) {
       log.info('reaction', 'skip-other-sender', { messageId: evt.messageId, messageSenderId });

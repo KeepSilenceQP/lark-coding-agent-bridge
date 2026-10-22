@@ -56,6 +56,14 @@ function pipelineCallbacks() {
 // ── End-to-end wiring contract ──
 
 describe('reaction pipeline wiring (Unit 10)', () => {
+  it.each(['added', 'removed'] as const)('never routes an unhandled restart control to the Agent (%s)', async action => {
+    const channel = channelWithTarget('ou_bot_self', 'app');
+    expect(await handleReactionEvent(reactionEvent({ emojiType: 'Loudspeaker', action }),
+      { channel, ...BOT_DEPS }, pipelineCallbacks()))
+      .toEqual({ kind: 'drop', reason: 'restart-control-only' });
+    expect(channel.rawClient.im.v1.message.get).not.toHaveBeenCalled();
+  });
+
   it('dispatches the feature-gated Loudspeaker control path before the ordinary reaction pipeline', () => {
     const source = readFileSync(join(process.cwd(), 'src/bot/channel.ts'), 'utf8');
     const editDispatch = source.indexOf('handleEditedMessageRestartReaction(evt');

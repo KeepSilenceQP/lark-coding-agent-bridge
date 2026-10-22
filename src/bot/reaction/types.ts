@@ -1,3 +1,4 @@
+import type { ReactionBehavior } from './policy';
 import type { ReactionSemanticResult } from './semantics';
 
 // ── Reaction context (Spec §Agent Input Contract 2) ──
@@ -9,6 +10,7 @@ export interface ReactionTriggerEntry {
   emojiMeaning?: string;
   semanticKey?: string;
   emojiMeaningSource: 'predefined' | 'unmapped';
+  behavior?: ReactionBehavior;
   actionTime: number;
 }
 
@@ -18,6 +20,7 @@ export interface EffectiveReactionEntry {
   emojiMeaning?: string;
   semanticKey?: string;
   emojiMeaningSource: 'predefined' | 'unmapped';
+  behavior?: ReactionBehavior;
 }
 
 export interface ReactionTargetMessage {
@@ -31,6 +34,7 @@ export interface ReactionTargetMessage {
 }
 
 export interface ReactionContext {
+  policyVersion?: string;
   operatorOpenId: string;
   reactionRevision: number;
   triggerReactions: ReactionTriggerEntry[];
@@ -92,6 +96,9 @@ export interface CanonicalReactionRecord {
 // ── Ledger record ──
 
 export interface ReactionLedgerEntry {
+  /** Complete operator snapshot for rebasing consumed state after configuration changes. */
+  rawRecords?: CanonicalReactionRecord[];
+  policyVersion?: string;
   /** Canonical fingerprint of the last confirmed effectiveReactionSet. */
   fingerprint: string;
   /** Fingerprint that was last consumed (produced an Agent turn or Bridge reply). */

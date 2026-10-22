@@ -198,10 +198,13 @@ describe('BRIDGE_SYSTEM_PROMPT Reaction section', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toMatch(/不要.*重新执行|不.*重放|此前已处理/);
   });
 
-  it('documents predefined emojiMeaningSource with semanticKey as high-confidence hint', () => {
+  it('uses the current policy meaning rather than assigning semantics to semanticKey', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toContain('emojiMeaningSource');
     expect(BRIDGE_SYSTEM_PROMPT).toContain('predefined');
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('semanticKey');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('emojiMeaning');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('semanticKey` 只是自由标识');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('policyVersion');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('配置变化本身不表示新的用户执行请求');
   });
 
   it('requires checking target message fit even for predefined semanticKey', () => {
@@ -243,34 +246,51 @@ describe('BRIDGE_SYSTEM_PROMPT Reaction section', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toMatch(/不能.*扩大.*授权|破坏性.*操作.*边界|绕过.*边界/);
   });
 
-  // ── Predefined semantics subsection ──
+  // ── Runtime policy contract ──
 
-  it('documents approve_continue semanticKey', () => {
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('approve_continue');
+  it('uses a runtime configuration instead of embedding emoji or semanticKey mappings', () => {
+    const reactionSection = BRIDGE_SYSTEM_PROMPT.slice(BRIDGE_SYSTEM_PROMPT.indexOf('## Reaction'));
+    expect(reactionSection).toContain('reaction-semantics.json');
+    expect(reactionSection).toContain('可在运行时修改');
+    expect(reactionSection).toContain('历史轮次中的旧映射');
+    for (const hardcodedMeaning of [
+      'DONE', 'GoGoGo', 'Loudspeaker', 'CheckMark', 'No',
+      'approve_continue', 'explain_more', 'user_step_completed', 'stop_current_work',
+    ]) {
+      expect(reactionSection).not.toContain(hardcodedMeaning);
+    }
   });
 
-  it('documents explain_more semanticKey', () => {
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('explain_more');
+  it('routes agent behavior through the configured meaning and target message', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('behavior=agent');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('不要从标识符推导额外任务');
   });
 
-  it('reserves DONE as a passive handled marker and retires its old continuation meaning', () => {
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('`DONE`（完成）');
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('已处理');
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('不启动 Agent、不回复、不打断任务');
+  it('keeps passive behavior silent without binding it to an emoji', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('behavior=passive');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('Bridge 在入站和快照中排除');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('不启动 Agent、不回复');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('不打断任务');
     expect(BRIDGE_SYSTEM_PROMPT).toContain('不关闭话题');
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('不要把会话历史中的 DONE 当成');
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('用文字回复完成情况');
-    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('user_step_completed');
   });
 
-  it('documents stop_current_work as Bridge control-plane handled', () => {
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('stop_current_work');
+  it('documents stop and restart as Bridge control-plane behaviors', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('behavior=stop');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('behavior=restart');
     expect(BRIDGE_SYSTEM_PROMPT).toMatch(/Bridge.*控制面|控制面.*处理|不.*创建.*新的.*Agent.*turn/);
   });
 
-  it('states that stop_current_work removal does not auto-restore work', () => {
-    // "不要在后续会话中自动恢复、重放或回滚被停止的工作"
+  it('states that stop behavior removal does not auto-restore work', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toMatch(/不要在后续会话中自动[\s\S]*恢复、重放或回滚被停止的工作/);
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('撤回停止信号不自动恢复工作');
+  });
+
+  it('limits continue behavior to the author and an already-handled, correlated original task', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('behavior=continue');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('操作者就是消息作者');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('该原消息已由当前 Bot 处理并具有有效关联');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('从已完成位置继续');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('旧停止信号是历史上下文');
   });
 
   // ── Injection path tests (Claude + Codex both receive the rules) ──
@@ -278,8 +298,8 @@ describe('BRIDGE_SYSTEM_PROMPT Reaction section', () => {
   it('is injected through composeBridgeSystemPrompt (shared constant)', () => {
     const prompt = composeBridgeSystemPrompt({ openId: 'ou_test', name: 'Test' });
     expect(prompt).toContain('## Reaction');
-    expect(prompt).toContain('approve_continue');
-    expect(prompt).toContain('stop_current_work');
+    expect(prompt).toContain('emojiMeaning');
+    expect(prompt).toContain('behavior=stop');
   });
 
   it('is injected through buildBridgeSystemPrompt (no group addendum)', () => {
@@ -318,7 +338,7 @@ describe('BRIDGE_SYSTEM_PROMPT_REACTION_VERSION', () => {
 
   it('is exported from bridge-system-prompt module', () => {
     // The import at the top of this file already proves it exports.
-    expect(BRIDGE_SYSTEM_PROMPT_REACTION_VERSION).toBe('2.0.0');
+    expect(BRIDGE_SYSTEM_PROMPT_REACTION_VERSION).toBe('3.0.0');
   });
 });
 
@@ -329,8 +349,8 @@ describe('Claude/Codex adapter receives Reaction rules', () => {
     const prompt = composeBridgeSystemPrompt({ openId: 'ou_claude', name: 'Claude' });
     // Shared prompt constant is used by both adapters
     expect(prompt).toContain('## Reaction');
-    expect(prompt).toContain('approve_continue');
-    expect(prompt).toContain('stop_current_work');
+    expect(prompt).toContain('emojiMeaning');
+    expect(prompt).toContain('behavior=stop');
     // Claude adapter path: claude/adapter.ts uses buildBridgeSystemPrompt internally
   });
 

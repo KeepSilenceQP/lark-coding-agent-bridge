@@ -16,7 +16,7 @@ import {
 describe('reaction semantics table', () => {
   it('has a schema version', () => {
     expect(typeof SEMANTICS_SCHEMA_VERSION).toBe('number');
-    expect(SEMANTICS_SCHEMA_VERSION).toBe(2);
+    expect(SEMANTICS_SCHEMA_VERSION).toBe(3);
   });
 
   it('has a table export that is an object', () => {
@@ -24,13 +24,13 @@ describe('reaction semantics table', () => {
     expect(typeof SEMANTICS_TABLE).toBe('object');
   });
 
-  // ── Strictly 10 actionable predefined emojiType entries ──
+  // ── Strictly 12 non-passive predefined emojiType entries ──
 
-  it('contains strictly 10 predefined emojiType entries (v2)', () => {
+  it('contains 12 default predefined entries including continuation and restart (v3)', () => {
     const predefined = Object.entries(SEMANTICS_TABLE).filter(
       ([, v]) => v.emojiMeaningSource === 'predefined',
     );
-    expect(predefined).toHaveLength(10);
+    expect(predefined).toHaveLength(12);
   });
 
   // ── approve_continue: OK, LGTM, Yes, CheckMark, JIAYI ──
@@ -174,14 +174,15 @@ describe('isStopEmoji / STOP_EMOJI_TYPES', () => {
 });
 
 describe('edited-message restart reaction', () => {
-  it('matches only exact case-sensitive added + Loudspeaker without becoming model-visible semantics', () => {
+  it('matches the default added restart control and labels retained snapshots', () => {
     expect(EDITED_MESSAGE_RESTART_EMOJI_TYPE).toBe('Loudspeaker');
     expect(isEditedMessageRestartReaction({ emojiType: 'Loudspeaker', action: 'added' })).toBe(true);
     expect(isEditedMessageRestartReaction({ emojiType: 'loudspeaker', action: 'added' })).toBe(false);
     expect(isEditedMessageRestartReaction({ emojiType: 'Loudspeaker', action: 'removed' })).toBe(false);
-    expect(SEMANTICS_TABLE.Loudspeaker).toBeUndefined();
+    expect(SEMANTICS_TABLE.Loudspeaker?.behavior).toBe('restart');
     expect(lookupReactionSemantics('Loudspeaker')).toMatchObject({
-      emojiMeaningSource: 'unmapped',
+      emojiMeaningSource: 'predefined',
+      behavior: 'restart',
     });
   });
 });

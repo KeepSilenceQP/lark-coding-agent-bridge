@@ -60,7 +60,7 @@ no-content/最终回复修改则做了适配，保留本 Fork 的单流最终回
 | **原生 Bot-to-Bot 交接** | `lark-channel-bridge at-bot` 会用当前群实时 Bot 列表校验目标，并以当前 profile 的 Bot 身份发送飞书原生结构化 mention。 | 纯文本 `@名字`、手拼 mention JSON、过期的 `open_id` 或选错回传对象，都可能让交接静默丢失，但 Agent 仍误以为已经通知成功。 |
 | **按群定制行为** | 支持按群加载 operator prompt，并提供 `mention-only`、`owner-default`、`all-messages`、按群 `owner-allowlist` 四种响应模式，不需要为了免 @ 而向所有群成员开放 Bot。 | 一套全局 Prompt 和全局 @ 策略无法满足不同项目群的角色分工；Bot 可能在 owner 希望它响应时保持沉默，或响应范围过大。 |
 | **结构化 Agent 上下文** | Bridge 会注入消息、发送者/Bot 身份、引用消息、交互卡片和回传路由信息，并在每次 Codex run 中用 developer instructions 传递 Bridge 规则。 | 把协议规则混在普通用户文本里更容易被忽略或误解，尤其是在引用回复、卡片、Bot 发送者和 Codex 恢复会话场景。 |
-| **Reaction 驱动控制** | 对相关消息添加 Reaction，可以同意下一步、要求进一步解释，或停止当前工作链；[完成] 仅留下“已处理”标记。Bridge 会把需要处理的 Reaction 与目标消息一并交给 Agent，持久化防重状态，并保留其他未预埋 emoji 供 Agent 结合上下文判断。 | 若把 Reaction 当成孤立 emoji，可能重复旧任务、丢失被回应消息，或把停止信号错误地启动成新一轮 Agent。 |
+| **Reaction 驱动控制** | 每个 profile 的配置文件承载 Reaction 含义与行为，运行时修改即可生效；默认支持同意下一步、进一步解释、停止任务和 [完成] 静默标记。Bridge 会把需要处理的 Reaction 与目标消息一并交给 Agent，持久化防重状态，并保留其他未预埋 emoji 供 Agent 结合上下文判断。 | 若把 Reaction 当成孤立 emoji，可能重复旧任务、丢失被回应消息，或把停止信号错误地启动成新一轮 Agent。 |
 | **可靠的过程消息与最终回复** | COT/过程输出和最终答案彻底分开，卡片与纯文本模式都单独发送最终回复；同时补齐话题路由、CardKit 流过期、陈旧回读、Codex 空终态/持久化终态和 Markdown 渲染失败的恢复路径。 | 长任务可能留下陈旧卡片或运行中 footer、重复旧内容、误触发 fallback、回复跑出话题，或者本地已经结束却没有把最终答案送到飞书。 |
 | **延后自重启与结果回执** | 同 profile 自重启会等待当前回复和活跃任务排空，再由 detached helper 重启，并向原群、原话题或原私聊发送且只发送一条成功/失败回执。 | Bot 自部署时可能在回复中途把自己终止，重启后用户也无法确定新进程是否真正连接成功。 |
 | **维护版 Channel 与可安装产物** | Release 内置维护版 `@larksuite/channel` `0.6.0-qp.1`，基于上游 0.6.0 并保留 CardKit stream rollover 修复，以自包含的 `@penn.qp/lark-channel-bridge` npm 包和对应 GitHub Release 发布。 | rollover 可能先把前一张卡完整重发一遍再创建下一张卡，形成重复消息；file dependency 也可能在发布产物中丢失。 |
@@ -87,21 +87,26 @@ lark-channel-bridge secrets list [--profile <name>]
 lark-channel-bridge secrets remove --app-id <cli_xxx> [--profile <name>]
 ```
 
-需要处理的 Reaction 输入会经过权限校验、状态校准和持久化，并与目标消息一起交给
-Agent。10 个预埋飞书 emoji type 映射为 3 类意图：
+Reaction 含义和行为由 `<profileDir>/reaction-semantics.json` 承载，首次启动会自动生成
+默认文件，各 profile 相互隔离。修改后从下一次 Reaction 事件生效，无需重启；运行期
+配置无效时保留上一次有效配置并告警。完整格式、校验规则和“手动步骤完成”快捷表情
+示例见 [Reaction 配置指南](docs/runbooks/reaction-semantics.md)。
 
-| 意图 | 预埋 emoji type | 行为 |
+初始默认值如下：
+
+| 意图 | emoji type | 行为 |
 |---|---|---|
-| 同意并继续 | `OK`, `LGTM`, `Yes`, `CheckMark`, `JIAYI`（`+1`） | 仅当目标消息提出下一步时继续 |
+| 同意并继续 | `OK`, `LGTM`, `Yes`, `CheckMark`, `JIAYI`（`+1`） | 结合目标消息判断是否继续 |
 | 进一步解释 | `WHAT`, `THINKING` | 展开或澄清目标消息 |
 | 停止当前工作 | `No`, `CrossMark`, `MinusOne`（`-1`） | 按 `/stop` 语义中断匹配的工作链 |
+| 标记已处理 | `DONE`（完成） | 静默标记；不启动 Agent、不回复、不打断任务、不关闭话题 |
+| 继续原任务 | `GoGoGo` | 作者可继续当前 Bot 已处理且仍有关联的原任务 |
+| 按编辑内容重跑 | `Loudspeaker` | 重跑能力启用时，原消息作者编辑消息后可重启符合条件的当前任务运行 |
 
-**[完成]（`DONE`）固定作为“已处理”标记**：给话题首条消息点 [完成] 即可留下标记，
-取消 Reaction 即可移除标记。添加和移除都不会启动 Agent、发送回复、打断任务或关闭
-话题。若要告知 Agent 手动步骤已完成并继续执行，请用文字回复。
-
-其他未预埋 emoji 仍会交给 Agent 结合上下文判断。重复事件、重试、重启和仍显示在消息上的
-旧 Reaction 不会重放已完成工作；移除 Reaction 也不会回滚已完成的外部操作。
+这些都是可修改的默认值，包括 `DONE`。配置是全量映射，删除条目后该 emoji 变为未映射；
+符合目标及权限条件的未映射 emoji 仍交给 Agent 结合上下文判断。主动 Reaction 保留
+访问控制、完整目标消息和持久化防重机制；修改配置不重放已有 Reaction，撤回也不回滚
+已完成的外部操作。
 
 其他已经落地、但容易遗漏的 Fork 能力：
 

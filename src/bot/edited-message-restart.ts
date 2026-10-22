@@ -1,3 +1,5 @@
+import { isRestartEmoji } from './reaction/semantics';
+import type { ReactionPolicy } from './reaction/policy';
 import { createHash } from 'node:crypto';
 import type { NormalizedMessage } from '@larksuite/channel';
 import type { RunExecution } from '../runtime/run-executor';
@@ -228,6 +230,7 @@ export interface MaterializedEditedMessageCorrection extends EditedMessageCorrec
 }
 
 export interface EditedMessageRestartControlDeps<TPrepared = unknown> {
+  reactionPolicy?: ReactionPolicy;
   enabled: boolean;
   botOpenId?: string;
   registry: EditedMessageRestartRegistry;
@@ -277,7 +280,7 @@ export async function handleEditedMessageRestartReaction<TPrepared>(
   event: EditedRestartEvent,
   deps: EditedMessageRestartControlDeps<TPrepared>,
 ): Promise<EditedMessageRestartOutcome> {
-  if (!deps.enabled || event.emojiType !== 'Loudspeaker') return { handled: false, code: 'ignored' };
+  if (!deps.enabled || !isRestartEmoji(event.emojiType, deps.reactionPolicy)) return { handled: false, code: 'ignored' };
   if (event.action === 'removed') return { handled: true, code: 'ignored' };
   if (event.action !== 'added' || event.operator.openId === deps.botOpenId) {
     return { handled: true, code: 'ignored' };

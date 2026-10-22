@@ -65,7 +65,7 @@ Lark coding sessions:
 | **Native bot-to-bot handoff** | `lark-channel-bridge at-bot` validates the target against the current group's live bot list and sends a native structured mention with the current profile's bot identity. | Plain-text `@name`, hand-built mention JSON, stale `open_id` values, and replying to the wrong bot could silently lose a handoff while the agent still claimed it had notified the target. |
 | **Per-group behavior** | Group-scoped operator prompts and four response modes (`mention-only`, `owner-default`, `all-messages`, and per-chat `owner-allowlist`) let each bot behave differently by group without opening access to everyone. | One global prompt and one global mention policy could not serve project groups with different roles; bots either stayed silent when the owner expected a reply or responded too broadly. |
 | **Structured agent context** | The Bridge injects message, sender/bot identity, quote, card, and return-route context, and sends Bridge rules to Codex as developer instructions on every run. | Protocol rules mixed into ordinary user text were easier to ignore or misinterpret, especially for quoted messages, interactive cards, bot senders, and resumed Codex sessions. |
-| **Reaction-driven control** | Reactions on relevant messages can approve a proposed next step, request more explanation, or stop the active work chain; `DONE` only marks a message as handled. The Bridge supplies active Reaction state and the target message to the agent, persists deduplication state, and keeps other unmapped emoji available for contextual interpretation. | Treating a Reaction as an isolated emoji could repeat old work, lose the message it referred to, or turn a stop signal into another agent run. |
+| **Reaction-driven control** | Profile-local configuration controls Reaction meanings and behaviors at runtime; defaults include approval, explanation, stopping work, and a passive `DONE` marker. The Bridge supplies active Reaction state and the target message to the agent, persists deduplication state, and keeps other unmapped emoji available for contextual interpretation. | Treating a Reaction as an isolated emoji could repeat old work, lose the message it referred to, or turn a stop signal into another agent run. |
 | **Reliable progress and final replies** | COT/progress output is separated from the dedicated final reply in both card and plain-text modes. Topic routing, expired CardKit streams, stale readback, empty or persisted Codex terminal turns, and markdown-render failures all have targeted recovery paths. | Long tasks could leave a stale card/footer, repeat earlier content, fall back unnecessarily, reply outside the topic, or finish locally without delivering the final answer. |
 | **Deferred self-restart with receipt** | A same-profile restart waits for the current reply and active runs to drain, restarts through a detached helper, and sends exactly one success or failure receipt back to the original chat or topic. | Self-deployment could terminate the bot mid-reply, and users had no reliable evidence that the replacement process connected successfully. |
 | **Maintained Channel and release artifact** | Releases bundle the maintained `@larksuite/channel` `0.6.0-qp.1`, based on upstream 0.6.0 while preserving the CardKit stream-rollover fix, and are published as a self-contained `@penn.qp/lark-channel-bridge` package plus a matching GitHub Release. | A rollover could resend the full earlier card before opening the next card, producing repeated messages; file-based Channel dependencies could also be missing from a published package. |
@@ -94,25 +94,29 @@ lark-channel-bridge secrets list [--profile <name>]
 lark-channel-bridge secrets remove --app-id <cli_xxx> [--profile <name>]
 ```
 
-Active Reaction input is access-controlled, reconciled, persisted, and delivered
-with the target message. Ten predefined Feishu emoji types map to three intents:
+Reaction meanings and behaviors are configured in
+`<profileDir>/reaction-semantics.json`, created with defaults on first startup.
+Each profile has its own file. Edits take effect on the next Reaction event
+without a restart; invalid runtime edits keep the last valid configuration and
+produce a warning. See the [Reaction configuration runbook](docs/runbooks/reaction-semantics.md)
+for the schema, validation rules, and a manual-step-completed shortcut example.
 
-| Intent | Predefined emoji types | Behavior |
+The initial defaults are:
+
+| Intent | Emoji types | Behavior |
 |---|---|---|
-| Approve and continue | `OK`, `LGTM`, `Yes`, `CheckMark`, `JIAYI` (`+1`) | Continue only when the target message proposed a next step |
+| Approve and continue | `OK`, `LGTM`, `Yes`, `CheckMark`, `JIAYI` (`+1`) | Interpret the target message before continuing |
 | Explain more | `WHAT`, `THINKING` | Expand or clarify the target message |
 | Stop current work | `No`, `CrossMark`, `MinusOne` (`-1`) | Interrupt the matching work chain with `/stop` semantics |
+| Mark as handled | `DONE` (完成) | Silent marker; no agent run, reply, interruption, or topic closure |
+| Continue the original task | `GoGoGo` | The original author can continue an already-handled, correlated task |
+| Restart an edited task | `Loudspeaker` | When restart control is enabled, restart an eligible active run using its author's edited message |
 
-`DONE` (完成) is reserved as a passive **handled** marker. Add it to a topic's
-opening message to mark the topic as handled; remove it to clear the mark.
-Adding or removing it never starts an Agent, sends a reply, interrupts work, or
-closes the topic. To confirm a requested manual step is complete and continue,
-reply in text.
-
-Other unmapped emoji remain available to the agent for contextual interpretation.
-Duplicate events, retries, restarts, and old still-visible Reactions do not
-replay completed work; removing a Reaction does not roll back completed
-external actions.
+These defaults are editable, including `DONE`; the file is the complete mapping,
+so removing a rule makes that emoji unmapped. Eligible unmapped emoji remain
+available to the agent for contextual interpretation. Active input retains access
+checks, target-message context, and persistent deduplication. Editing the mapping
+does not replay existing Reactions; removal does not roll back completed actions.
 
 Additional fork surfaces that are implemented but easy to miss:
 
