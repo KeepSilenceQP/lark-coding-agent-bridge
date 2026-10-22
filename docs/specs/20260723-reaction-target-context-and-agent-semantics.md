@@ -25,8 +25,24 @@ Reaction 语义采用双层模型：用户确认的常用语义作为预埋规�
 UI 继续引用被 Reaction 的原消息。普通语义仍只处理当前 Bot 自己消息上的 Reaction；
 `stop_current_work` 是控制面例外：除了当前 chain 中可添加 Reaction 的 Bot 消息外，也
 允许作用于**触发当前 queued/reserved/active work 的入站用户消息**。这是流式卡片在更新
-期间不能添加 Reaction、但用户仍需在任务完成前表达 stop 的必要入口；非停止 Reaction
-不得因此扩展到用户消息。
+期间不能添加 Reaction、但用户仍需在任务完成前表达 stop 的必要入口。
+
+### 2026-10-22 原消息 GoGoGo 续执行修正
+
+用户对自己发出、且本进程已登记为当前 Bot inbound trigger 的原消息添加 `GoGoGo`，
+表示明确请求继续原任务，包括已被 No 停止的任务。这是普通 Reaction 的窄例外；下文
+“用户消息上的非停止 Reaction 被过滤”的约束均保留本节例外。其他用户的消息、其他
+Bot 的消息、未登记原消息，以及用户消息上的 `DONE` 等其他非停止表情继续被过滤。
+
+该路径复用现有权限、权威快照、持久 ledger、revision、队列和会话 resume；继承原
+workChain，确保后续 No 仍可作用于原消息。旧 No 可以保留在有效集合中，但不是新的
+停止事件。GoGoGo 的重复投递不重复启动；撤回 GoGoGo 后即使集合仍有 No，也只确认
+撤回、清理对应的待执行/进行中 Reaction，不新建 Agent turn、不回滚已完成动作。
+Agent 从已完成位置继续，不扩大原任务授权。11 项预埋映射保持不变；GoGoGo 仍携带
+`unmapped`，其原消息续执行规则由共享 System Prompt 明确说明。
+
+inbound trigger 的关联沿用现有内存、TTL 和容量限制：重启、历史记录过期或被逐出后
+不能仅凭原消息 GoGoGo 重建关联，此时应发送新的普通消息继续。
 
 所有通过现有消息权限门禁、并被 Bridge 消费的有效 Reaction 都必须产生一条用户可见的回复。普通语义由 Agent 回复；需要立即抢占或无需重新唤起 Agent 的控制/撤回场景由 Bridge 给出确定性简短反馈，不能以“没有新 Agent turn”等价于“没有回复”。
 

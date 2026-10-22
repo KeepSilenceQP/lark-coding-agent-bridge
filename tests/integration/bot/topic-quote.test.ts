@@ -403,6 +403,91 @@ describe('reaction continuation with activated prompt bindings', () => {
   it.each((['claude', 'codex'] as const).flatMap(agentKind => [
     { chatMode: 'p2p' as const, threadId: undefined },
     { chatMode: 'group' as const, threadId: undefined },
+    { chatMode: 'group' as const, threadId: 'omt_original' },
+  ].map(route => ({ ...route, agentKind }))))('continues $agentKind $chatMode thread=$threadId after No via original-message GoGoGo', async ({ agentKind, chatMode, threadId }) => {
+    const h = await createHarness({
+      chatMode, agentKind, activatedPrompts: true,
+      quotedMessages: { om_original: 'continue the original task' },
+      rawThreadIds: threadId ? { om_original: threadId } : {},
+    });
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    h.channel.rawClient.im.v1.message.get.mockResolvedValue({ data: { items: [{
+      chat_id: 'oc_topic_chat', sender: { id: 'ou_user', sender_type: 'user' },
+      ...(threadId ? { thread_id: threadId } : {}),
+    }] } });
+    h.channel.fetchRawMessage.mockResolvedValue([{
+      message_id: 'om_original', msg_type: 'text',
+      body: { content: JSON.stringify({ text: 'continue the original task' }) },
+      sender: { id: 'ou_user', sender_type: 'user' },
+      ...(threadId ? { thread_id: threadId } : {}),
+    }]);
+    h.channel.rawClient.im.v1.messageReaction.list.mockResolvedValue({ data: { items: ['No', 'GoGoGo'].map(emoji => ({
+      reaction_id: emoji, operator: { operator_id: 'ou_user', operator_type: 'user' },
+      reaction_type: { emoji_type: emoji },
+    })), has_more: false } });
+    const originalRun = h.agent.run.bind(h.agent);
+    let ready = false;
+    let stopped!: () => void;
+    const stopGate = new Promise<void>(resolve => { stopped = resolve; });
+    vi.spyOn(h.agent, 'run').mockImplementationOnce(opts => {
+      const run = originalRun(opts);
+      return {
+        runId: run.runId,
+        events: (async function* (): AsyncIterable<AgentEvent> {
+          yield { type: 'system', ...(agentKind === 'codex' ? { threadId: 'sess_original' } : { sessionId: 'sess_original' }) };
+          ready = true;
+          await stopGate;
+          yield { type: 'done', terminationReason: 'interrupted' };
+        })(),
+        stop: async () => { await run.stop(); stopped(); },
+        waitForExit: timeoutMs => run.waitForExit(timeoutMs),
+      };
+    });
+    h.agent.setEvents([{ type: 'done', terminationReason: 'normal' }]);
+    await startTestBridge(h);
+    await h.channel.handlers.message?.({
+      ...message({ messageId: 'om_original', rootId: 'om_original', parentId: 'om_original', threadId, content: 'continue the original task' }),
+      chatType: chatMode,
+      senderType: 'user',
+    });
+    await waitFor(() => ready, 4000);
+    const event = (emojiType: string, action: 'added' | 'removed' = 'added'): ReactionEvent => ({
+      messageId: 'om_original', operator: { openId: 'ou_user' }, emojiType,
+      action, actionTime: Date.now(), raw: { operator_type: 'user' },
+    });
+    await h.channel.handlers.reaction?.(event('No'));
+    await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1);
+    expect(h.agent.runs[0]?.stopped).toBe(true);
+    expect(JSON.stringify(h.channel.sent)).toContain('已停止当前任务');
+
+    await h.channel.handlers.reaction?.(event('GoGoGo'));
+    await waitFor(() => h.agent.runOptions.length === 2, 4000);
+    expect(h.agent.runOptions[1]?.[agentKind === 'codex' ? 'threadId' : 'sessionId']).toBe('sess_original');
+    const prompt = h.agent.runOptions[1]?.prompt ?? '';
+    expect(prompt).toContain('<reaction_contexts>');
+    expect(prompt).toContain('continue the original task');
+    expect(prompt).toContain('GoGoGo');
+    expect(prompt).toContain(`"chatType":"${chatMode}"`);
+    if (threadId) expect(prompt).toContain(`"threadId":"${threadId}"`);
+    await waitFor(() => h.agent.runs[1]?.waitForExitCalls === 1);
+    // The still-present No is context, not a fresh stop; duplicate deliveries
+    // must not start another continuation.
+    await h.channel.handlers.reaction?.(event('GoGoGo'));
+    await new Promise(resolve => setTimeout(resolve, 900));
+    expect(h.agent.runOptions).toHaveLength(2);
+    // Removing GoGoGo while No remains acknowledges withdrawal without a run.
+    h.channel.rawClient.im.v1.messageReaction.list.mockResolvedValue({ data: { items: [{
+      reaction_id: 'No', operator: { operator_id: 'ou_user', operator_type: 'user' },
+      reaction_type: { emoji_type: 'No' },
+    }], has_more: false } });
+    await h.channel.handlers.reaction?.(event('GoGoGo', 'removed'));
+    await waitFor(() => JSON.stringify(h.channel.sent).includes('已收到撤回'), 4000);
+    expect(h.agent.runOptions).toHaveLength(2);
+  });
+
+  it.each((['claude', 'codex'] as const).flatMap(agentKind => [
+    { chatMode: 'p2p' as const, threadId: undefined },
+    { chatMode: 'group' as const, threadId: undefined },
     { chatMode: 'group' as const, threadId: 'omt_topic' },
     { chatMode: 'p2p' as const, threadId: 'omt_topic' },
   ].map(route => ({ ...route, agentKind }))))('resumes $agentKind $chatMode thread=$threadId after GoGoGo', async ({ chatMode, threadId, agentKind }) => {

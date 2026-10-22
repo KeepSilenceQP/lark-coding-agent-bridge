@@ -1202,11 +1202,16 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       ),
     );
 
+    const userTrigger = workChainStore.resolveTrigger(result.components.scope, result.components.targetMessageId);
     const decision = decideReactionFlush({
       reconciliationFailed: result.reconciliationFailed,
       noOp: result.noOp,
       netZeroConsumed: result.netZeroConsumed,
-      effectiveReactionSetLength: result.effectiveReactionSet.length,
+      // Original-message continuation has one actionable emoji. A retained No
+      // must not turn GoGoGo withdrawal into a new Agent run.
+      effectiveReactionSetLength: userTrigger
+        ? result.effectiveReactionSet.filter(entry => entry.emojiType === 'GoGoGo').length
+        : result.effectiveReactionSet.length,
       hasMatchingInFlightRun: hasMatchingInFlight,
       targetMessageId: result.components.targetMessageId,
       scope: result.components.scope,
@@ -1307,7 +1312,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       // A3: register the target→chain mapping here (after reconcile decided
       // enqueue-agent + target body read succeeded) so stop correlation only
       // resolves chains for actual in-flight work, not dropped events.
-      _workChainStore?.registerOutbound(wcId, result.components.targetMessageId);
+      if (!userTrigger) _workChainStore?.registerOutbound(wcId, result.components.targetMessageId);
     }
     // Per-key metadata. turnId links the barrier NormalizedMessage to its meta/context.
     setReactionTurnMeta(result.key, result.components.targetMessageId, result.components.scope, wcId, result.revision, turnId);
@@ -1861,6 +1866,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
               // events that later drop/noOp/net-zero/empty-set/reconciliationFailed.
               return '';
             },
+            isKnownUserTrigger: (scope, messageId) =>
+              workChainStore.resolveTrigger(scope, messageId) !== undefined,
           });
 
           if (pipelineResult.kind === 'drop') return;

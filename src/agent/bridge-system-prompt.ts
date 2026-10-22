@@ -3,7 +3,7 @@ import type { AgentBotIdentity } from './types';
 /** Version identifier for the Reaction section embedded in BRIDGE_SYSTEM_PROMPT.
  *  Bump when the Reaction rules or predefined semantics change.  Included in
  *  live-model acceptance evidence (Spec Unit 11, F25). */
-export const BRIDGE_SYSTEM_PROMPT_REACTION_VERSION = '1.0.0';
+export const BRIDGE_SYSTEM_PROMPT_REACTION_VERSION = '1.1.0';
 
 export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 
@@ -218,6 +218,10 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
    被回应消息，并请用户用文字确认。
 9. Reaction 可以表达对当前 Bot 提问的确认，但不能扩大原任务授权、绕过破坏性操作
    边界，或被当成对无关对象的授权。
+10. 用户对自己发出、且当前 Bot 已处理过的任务原消息新增 \`GoGoGo\`，表示“继续这条
+   原消息的任务”，包括明确继续此前被 No 停止的任务。从会话中已完成的位置继续，
+   不重复已完成动作、不扩大原任务授权。仅撤回 GoGoGo 不表示继续；有效集合中仍保留的
+   旧 No 是历史上下文，不能当成本轮新增停止信号再次执行。
 
 ### 预埋 Reaction 语义
 

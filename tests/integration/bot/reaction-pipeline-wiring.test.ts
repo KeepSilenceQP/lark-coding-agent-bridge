@@ -49,6 +49,7 @@ function pipelineCallbacks() {
     checkGroupResponse: vi.fn(() => ({ accept: true, reason: 'all-messages' })),
     resolveChatMode: vi.fn(async () => 'group' as const),
     resolveWorkChain: vi.fn(() => ''),
+    isKnownUserTrigger: vi.fn(() => false),
   };
 }
 
@@ -92,6 +93,47 @@ describe('reaction pipeline wiring (Unit 10)', () => {
     expect(callbacks.checkAccess).not.toHaveBeenCalled();
     expect(callbacks.checkGroupResponse).not.toHaveBeenCalled();
     expect(callbacks.resolveWorkChain).not.toHaveBeenCalled();
+  });
+
+  it.each(['added', 'removed'] as const)('routes GoGoGo %s on the author\'s registered trigger through reconciliation', async action => {
+    const callbacks = pipelineCallbacks();
+    callbacks.isKnownUserTrigger.mockReturnValue(true);
+    const result = await handleReactionEvent(
+      reactionEvent({ emojiType: 'GoGoGo', action }),
+      { channel: channelWithTarget('ou_user'), ...BOT_DEPS },
+      callbacks,
+    );
+    expect(result).toMatchObject({ kind: 'buffer-reaction', scope: 'oc_chat' });
+    expect(callbacks.isKnownUserTrigger).toHaveBeenCalledWith('oc_chat', 'om_test');
+    expect(callbacks.checkAccess).toHaveBeenCalledOnce();
+    expect(callbacks.checkGroupResponse).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { sender: 'ou_user', senderType: 'user' as const, known: false },
+    { sender: 'ou_other_user', senderType: 'user' as const, known: true },
+    { sender: 'ou_other_bot', senderType: 'app' as const, known: true },
+  ])('rejects GoGoGo on an ineligible original message: $sender known=$known', async ({ sender, senderType, known }) => {
+    const callbacks = pipelineCallbacks();
+    callbacks.isKnownUserTrigger.mockReturnValue(known);
+    expect(await handleReactionEvent(
+      reactionEvent({ emojiType: 'GoGoGo' }),
+      { channel: channelWithTarget(sender, senderType), ...BOT_DEPS },
+      callbacks,
+    )).toEqual({ kind: 'drop', reason: 'not-own-message' });
+    expect(callbacks.checkAccess).not.toHaveBeenCalled();
+  });
+
+  it.each(['access', 'group-response'])('applies %s permission to original-message GoGoGo', async gate => {
+    const callbacks = pipelineCallbacks();
+    callbacks.isKnownUserTrigger.mockReturnValue(true);
+    if (gate === 'access') callbacks.checkAccess.mockReturnValue({ ok: false, reason: 'denied-user' });
+    else callbacks.checkGroupResponse.mockReturnValue({ accept: false, reason: 'mention-required' });
+    expect(await handleReactionEvent(
+      reactionEvent({ emojiType: 'GoGoGo' }),
+      { channel: channelWithTarget('ou_user'), ...BOT_DEPS },
+      callbacks,
+    )).toEqual({ kind: 'drop', reason: gate === 'access' ? 'access-denied-user' : 'group-response' });
   });
 
   it('does not treat another Bot message as an inbound user stop trigger', async () => {

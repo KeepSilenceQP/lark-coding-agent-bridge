@@ -65,6 +65,8 @@ export interface ReactionPipelineCallbacks {
   resolveChatMode: (chatId: string) => Promise<'p2p' | 'group' | 'topic'>;
   /** Allocate or inherit a workChainId for this reaction turn. */
   resolveWorkChain: (scope: string, replyToMessageId?: string) => string;
+  /** Only real inbound messages already handled by this Bot may be continued. */
+  isKnownUserTrigger?: (scope: string, messageId: string) => boolean;
 }
 
 // ── Self-operator guard ──
@@ -98,7 +100,7 @@ async function resolveRoute(channel: LarkChannel, messageId: string) {
 /**
  * Guards pipeline for a reaction event:
  * self-operator → route/sender classification → stop/non-stop split.
- * Non-stop requires own-message before Reaction permission; stop applies
+ * Non-stop requires own-message (or the author's registered GoGoGo trigger); stop applies
  * Reaction permission before its target eligibility is resolved by the caller.
  *
  * This does NOT do reconciliation — that's handled by the buffer's flush
@@ -133,9 +135,11 @@ export async function handleReactionEvent(
     const stopEmoji = isStopEmoji(evt.emojiType);
     const senderType = item?.sender?.sender_type as string | undefined;
 
-    // Ordinary Reaction semantics remain Bot-message only and are rejected
-    // before permission/snapshot work.
-    if (!stopEmoji && !ownMessage) {
+    // GoGoGo is an explicit continuation request on the author's own task.
+    // Correlation is checked after resolving the authoritative scope below.
+    const userContinuation = evt.emojiType === 'GoGoGo'
+      && senderType === 'user' && messageSenderId === evt.operator.openId;
+    if (!stopEmoji && !ownMessage && !userContinuation) {
       log.info('reaction', 'skip-other-sender', { messageId: evt.messageId, messageSenderId });
       return { kind: 'drop', reason: 'not-own-message' };
     }
@@ -165,6 +169,11 @@ export async function handleReactionEvent(
     const effectiveChatMode = threadId ? 'topic' : chatMode;
     const scope = (effectiveChatMode === 'topic' && threadId) ? `${chatId}:${threadId}` : chatId;
     const chatType: 'p2p' | 'group' = chatMode === 'p2p' ? 'p2p' : 'group';
+
+    if (userContinuation && !callbacks.isKnownUserTrigger?.(scope, evt.messageId)) {
+      log.info('reaction', 'skip-unknown-continuation-trigger', { scope, messageId: evt.messageId });
+      return { kind: 'drop', reason: 'not-own-message' };
+    }
 
     // 5. Permission gates (F2): access control + group response
     const accessResult = callbacks.checkAccess(chatType, chatId, evt.operator.openId);

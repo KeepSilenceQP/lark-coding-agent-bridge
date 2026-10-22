@@ -312,7 +312,7 @@ describe('BRIDGE_SYSTEM_PROMPT_REACTION_VERSION', () => {
 
   it('is exported from bridge-system-prompt module', () => {
     // The import at the top of this file already proves it exports.
-    expect(BRIDGE_SYSTEM_PROMPT_REACTION_VERSION).toBe('1.0.0');
+    expect(BRIDGE_SYSTEM_PROMPT_REACTION_VERSION).toBe('1.1.0');
   });
 });
 

@@ -70,6 +70,21 @@ describe('WorkChainStore', () => {
     // Should NOT match any existing chain (it's a new one)
   });
 
+  it('continues a historical inbound trigger in the same chain so No can stop it again', () => {
+    const chainId = store.allocate('oc_scope');
+    store.registerTrigger(chainId, 'om_original');
+    store.markTerminal(chainId);
+    expect(store.resolveOrAllocate('oc_scope', 'om_original')).toBe(chainId);
+    expect(store.resolveTrigger('oc_scope', 'om_original')).toEqual({ chainId, status: 'current' });
+    expect(store.resolveOutbound('om_original')).toBeUndefined();
+  });
+
+  it('does not inherit an inbound trigger from another scope', () => {
+    const chainId = store.allocate('oc_other');
+    store.registerTrigger(chainId, 'om_other');
+    expect(store.resolveOrAllocate('oc_scope', 'om_other')).not.toBe(chainId);
+  });
+
   // ── Current vs Historical ──
 
   it('marks a chain as current during queued/reserved/active, historical after terminal', () => {
