@@ -58,6 +58,7 @@ interface FakeLarkChannel {
     };
     im: {
       v1: {
+        image: { create: ReturnType<typeof vi.fn> };
         chat: { get: ReturnType<typeof vi.fn> };
         message: {
           get: ReturnType<typeof vi.fn>;
@@ -1154,6 +1155,7 @@ function createFakeLarkChannel(options: {
       },
       im: {
         v1: {
+          image: { create: vi.fn(async () => ({ image_key: 'img_uploaded' })) },
           chat: {
             get: vi.fn(async () => ({ data: { chat_mode: 'group', group_message_type: 'chat' } })),
           },

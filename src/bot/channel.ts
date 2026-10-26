@@ -135,6 +135,7 @@ import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
 import { resolveTopicMessage } from './topic-message';
+import { buildLocalImagePost } from './local-images';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { handleReactionEvent } from './reaction/pipeline';
 import {
@@ -3458,6 +3459,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         else void cotPublisher.finish(reason).catch(() => {});
       }
       const cotResult = await sendFinalReply({
+        cwd,
         channel,
         chatId,
         scope,
@@ -3518,19 +3520,20 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       await awaitRenderAwareStream({
         mode: replyMode,
         streamDone,
-        renderDone,
+        renderDone: renderDone,
+        deliverFinal: async (state) => {
+          const result = await sendFinalReply({ cwd, localImagesOnly: true, channel, chatId, scope,
+            state: filterForPrefs(state), replyMode, sendOpts, cardRenderOptions });
+          if (result) _registerOutboundOnStream(result);
+          return result !== undefined;
+        },
         producerStarted: () => producerStarted,
         onStartupFailure: () => notifyStartupDisplayFailure('stream'),
         fallback: async (state) => {
-          // F18: If this reaction run was superseded, mark the card state
           const fallbackState = isReactionTurn ? markSuperseded(state) : state;
-          // R2-F4: register the fallback outbound so stop can correlate it.
-          const fbResult = await channel.send(
-            chatId,
-            { card: renderCard(filterForPrefs(fallbackState), cardRenderOptions) },
-            sendOpts,
-          );
-          _registerOutboundOnStream(fbResult);
+          const result = await sendFinalReply({ cwd, channel, chatId, scope,
+            state: filterForPrefs(fallbackState), replyMode, sendOpts, cardRenderOptions });
+          _registerOutboundOnStream(result);
         },
       });
       // Reaction lifecycle: mark terminal after render+stream complete
@@ -3632,7 +3635,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       await awaitRenderAwareStream({
         mode: replyMode,
         streamDone,
-        renderDone,
+        renderDone: renderDone,
+        deliverFinal: async (state) => {
+          const result = await sendFinalReply({ cwd, localImagesOnly: true, channel, chatId, scope,
+            state: filterForPrefs(state), replyMode, sendOpts, cardRenderOptions });
+          if (result) _registerOutboundOnStream(result);
+          return result !== undefined;
+        },
         producerStarted: () => producerStarted,
         onStartupFailure: () => notifyStartupDisplayFailure('stream'),
         verifyFinal: async (streamValue, state) =>
@@ -3642,12 +3651,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             renderMarkdownStreamText(filterForPrefs(state)),
           ),
         fallback: async (state) => {
-          const body = renderText(filterForPrefs(state));
-          if (body.trim()) {
-            // R2-F4: register the fallback outbound so stop can correlate it.
-            const fbResult = await channel.send(chatId, { markdown: body }, sendOpts);
-            _registerOutboundOnStream(fbResult);
-          }
+          const result = await sendFinalReply({ cwd, channel, chatId, scope,
+            state: filterForPrefs(state), replyMode: 'text', sendOpts, cardRenderOptions });
+          _registerOutboundOnStream(result);
         },
       });
       // Reaction lifecycle: mark terminal after render+stream complete
@@ -3668,6 +3674,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         observeEditableToolStart,
       );
       const sendResult = await sendFinalReply({
+        cwd,
         channel,
         chatId,
         scope,
@@ -3696,6 +3703,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 }
 
 async function sendFinalReply(input: {
+  cwd: string;
+  localImagesOnly?: boolean;
   channel: LarkChannel;
   chatId: string;
   scope: string;
@@ -3706,6 +3715,21 @@ async function sendFinalReply(input: {
 }): Promise<unknown> {
   const body = renderText(input.state);
   let lastResult: unknown;
+
+  const post = await buildLocalImagePost({
+    body, scope: input.scope, cwd: input.cwd,
+    uploadImage: async (image) => {
+      const result = await input.channel.rawClient.im.v1.image.create({ data: { image_type: 'message', image } });
+      return result?.image_key ?? '';
+    },
+  });
+  if (post) {
+    lastResult = await input.channel.send(input.chatId, { post }, input.sendOpts);
+    if (!streamMessageId(lastResult)) throw new Error('Image reply returned no message receipt');
+    log.info('outbound', 'sent', outboundLogFields(input, 'post', body, lastResult as { messageId?: string }));
+    return lastResult;
+  }
+  if (input.localImagesOnly) return undefined;
 
   if (input.replyMode === 'card') {
     lastResult = await input.channel.send(
@@ -4181,6 +4205,7 @@ async function awaitRenderAwareStream(input: {
   renderDone: Promise<RunState>;
   producerStarted: () => boolean;
   onStartupFailure: () => void;
+  deliverFinal?: (state: RunState) => Promise<boolean>;
   verifyFinal?: (streamValue: unknown, state: RunState) => Promise<boolean | undefined>;
   fallback: (state: RunState) => Promise<void>;
 }): Promise<void> {
@@ -4208,9 +4233,12 @@ async function awaitRenderAwareStream(input: {
   if (first.kind === 'stream') {
     const rendered = await renderResult;
     if (!rendered.ok) throw rendered.err;
+    if (await input.deliverFinal?.(rendered.state)) return;
     await runFallbackOnFinalMismatch(input, first.value, rendered.state);
     return;
   }
+
+  if (await input.deliverFinal?.(first.state)) return;
 
   if (!input.producerStarted()) {
     log.warn('stream', 'producer-not-started-before-agent-terminal', { mode: input.mode });
