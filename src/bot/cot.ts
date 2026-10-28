@@ -33,18 +33,21 @@ export class CotClient {
   async tenantToken(): Promise<string> {
     const now = Date.now();
     if (this.token && this.tokenExpiresAt - now > 60_000) return this.token;
-    const resp = await fetch(`${this.baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
-      signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
+    const data = await this.withRequestDiagnostics('tenant-auth', async () => {
+      const resp = await fetch(`${this.baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
+        signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
+      });
+      if (!resp.ok) throw new Error(`tenant token HTTP ${resp.status}`);
+      const body = await resp.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
+      if (body.code !== 0 || !body.tenant_access_token) {
+        throw new Error(`tenant token failed: code=${body.code ?? '?'} msg=${body.msg ?? '<no msg>'}`);
+      }
+      return { token: body.tenant_access_token, expire: body.expire };
     });
-    if (!resp.ok) throw new Error(`tenant token HTTP ${resp.status}`);
-    const data = await resp.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
-    if (data.code !== 0 || !data.tenant_access_token) {
-      throw new Error(`tenant token failed: code=${data.code ?? '?'} msg=${data.msg ?? '<no msg>'}`);
-    }
-    this.token = data.tenant_access_token;
+    this.token = data.token;
     const expireSeconds = typeof data.expire === 'number' ? data.expire : 7200;
     this.tokenExpiresAt = now + Math.max(60, expireSeconds - 60) * 1000;
     return this.token;
@@ -52,23 +55,48 @@ export class CotClient {
 
   async request(path: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
     const token = await this.tenantToken();
-    const resp = await fetch(`${this.baseUrl}${path}`, {
-      signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
-      ...init,
-      headers: {
-        'Content-Type': 'application/json;charset=utf-8',
-        Authorization: `Bearer ${token}`,
-        ...(init.headers ?? {}),
-      },
+    const operation = path.includes('/complete/') ? 'cot-complete'
+      : init.method === 'PUT' ? 'cot-update' : 'cot-create';
+    return this.withRequestDiagnostics(operation, async () => {
+      const resp = await fetch(`${this.baseUrl}${path}`, {
+        signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
+        ...init,
+        headers: {
+          'Content-Type': 'application/json;charset=utf-8',
+          Authorization: `Bearer ${token}`,
+          ...(init.headers ?? {}),
+        },
+      });
+      if (!resp.ok) throw new Error(`COT HTTP ${resp.status}`);
+      const text = await resp.text();
+      if (!text) return {};
+      const data = JSON.parse(text) as { code?: number; msg?: string; data?: Record<string, unknown> } & Record<string, unknown>;
+      if (data.code !== undefined && data.code !== 0) {
+        throw new Error(`COT API failed: code=${data.code} msg=${data.msg ?? '<no msg>'}`);
+      }
+      return data.data ?? data;
     });
-    if (!resp.ok) throw new Error(`COT HTTP ${resp.status}`);
-    const text = await resp.text();
-    if (!text) return {};
-    const data = JSON.parse(text) as { code?: number; msg?: string; data?: Record<string, unknown> } & Record<string, unknown>;
-    if (data.code !== undefined && data.code !== 0) {
-      throw new Error(`COT API failed: code=${data.code} msg=${data.msg ?? '<no msg>'}`);
+  }
+
+  private async withRequestDiagnostics<T>(operation: string, request: () => Promise<T>): Promise<T> {
+    const startedAt = Date.now();
+    try {
+      return await request();
+    } catch (err) {
+      // Do not log request/response bodies, headers or transport error objects:
+      // they can contain credentials. Fetch's useful socket code is in cause.
+      const error = err instanceof Error ? err : undefined;
+      const cause = error?.cause;
+      const causeCode = cause && typeof cause === 'object' && 'code' in cause ? cause.code : undefined;
+      log.warn('cot', 'request-failed', {
+        operation,
+        durationMs: Date.now() - startedAt,
+        timeoutMs: COT_REQUEST_TIMEOUT_MS,
+        errorName: error?.name,
+        causeCode: typeof causeCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(causeCode) ? causeCode : undefined,
+      });
+      throw err;
     }
-    return data.data ?? data;
   }
 
   async create(chatId: string, originMessageId?: string): Promise<Record<string, unknown>> {

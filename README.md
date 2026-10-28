@@ -508,6 +508,8 @@ For Codex profiles, images attached to the reply that mentions the bot are downl
 
 **The bot stays silent or the local CLI never replies.** Usually the local `claude` or `codex` CLI is not logged in, or the current session points to a working directory that no longer exists. Send `/status` to inspect; `/new` often fixes it by starting a fresh session.
 
+**The task is running but no progress card appears.** If CoT or streaming card creation fails, the bridge immediately attempts one plain message in the original conversation without waiting for the agent to finish. The task and final reply continue normally. A complete network outage can also prevent this notice from being delivered. The `cot.request-failed` log records the operation, elapsed time, and available transport error code to distinguish authentication failures from CoT request failures, without logging request bodies or credentials.
+
 **The agent subprocess looks frozen (card stuck on the last frame).** The bridge supports an idle watchdog: if the agent emits nothing for N minutes, the process is killed and the card is annotated with the auto-termination reason. Disabled by default. Enable with `/config` globally, or `/timeout 10` for the current session; `/timeout off` disables it for the session; `/timeout default` clears the session override.
 
 **The agent says it cannot see an image I sent.** Upgrade to the latest version. Releases before 0.1.0 had a filename-dedup bug.

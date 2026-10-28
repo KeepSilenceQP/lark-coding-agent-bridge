@@ -570,6 +570,7 @@ const TAIL_COMPARE_CHARS = 500;
 // currently returns only the head messageId from MarkdownStreamController.run().
 const MARKDOWN_STREAM_MAX_ELEMENT_CHARS = 30_000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
+const STARTUP_NOTICE_TIMEOUT_MS = 5000;
 const STREAM_HASH_HEX_CHARS = 12;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
@@ -3129,6 +3130,21 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   log.info('flush', 'reply-mode', { mode: replyMode });
   const cotMessages = getCotMessages(controls.cfg);
   const cotEnabled = cotMessages !== 'off';
+  let startupNoticeAttempted = false;
+  const notifyStartupDisplayFailure = (source: 'cot' | 'stream'): void => {
+    if (startupNoticeAttempted) return;
+    startupNoticeAttempted = true;
+    // Keep draining the agent even if the independent plain-post send hangs.
+    // CoT and stream creation can both fail in one turn; acknowledge only once.
+    void sendStartupDisplayFailureNotice({
+      channel,
+      chatId,
+      scope,
+      source,
+      sendOpts,
+      onSent: _registerOutboundOnStream,
+    });
+  };
 
   // Re-read prefs on every flush so toggling /config mid-stream takes
   // effect immediately. Cheap object lookups, no allocation when on.
@@ -3216,6 +3232,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         return;
       }
       log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
+      notifyStartupDisplayFailure('cot');
     }
 
     if (replyMode === 'card') {
@@ -3267,6 +3284,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         streamDone,
         renderDone,
         producerStarted: () => producerStarted,
+        onStartupFailure: () => notifyStartupDisplayFailure('stream'),
         fallback: async (state) => {
           // F18: If this reaction run was superseded, mark the card state
           const fallbackState = isReactionTurn ? markSuperseded(state) : state;
@@ -3380,6 +3398,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         streamDone,
         renderDone,
         producerStarted: () => producerStarted,
+        onStartupFailure: () => notifyStartupDisplayFailure('stream'),
         verifyFinal: async (streamValue, state) =>
           verifyMarkdownFinalReadback(
             channel,
@@ -3493,6 +3512,49 @@ async function sendFinalReply(input: {
     log.info('outbound', 'sent', outboundLogFields(input, 'text', body, lastResult as { messageId?: string } | undefined));
   }
   return lastResult;
+}
+
+async function sendStartupDisplayFailureNotice(input: {
+  channel: LarkChannel;
+  chatId: string;
+  scope: string;
+  source: 'cot' | 'stream';
+  sendOpts: { replyTo: string; replyInThread?: boolean };
+  onSent: (result: unknown) => void;
+}): Promise<void> {
+  const fields = { scope: input.scope, source: input.source };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // Promise.resolve also isolates a synchronous send failure. Observe late
+  // settlement, but never retry an ambiguous send or delay the final answer.
+  const sent = Promise.resolve().then(async () => {
+    const result = await input.channel.send(input.chatId, {
+      markdown: '请求已收到。进度展示暂时不可用，请以最终回复为准。',
+    }, input.sendOpts);
+    input.onSent(result);
+    log.info('outbound', 'startup-notice-sent', fields);
+  }).catch((err) => {
+    log.warn('outbound', 'startup-notice-failed', {
+      ...fields,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
+  try {
+    await Promise.race([
+      sent,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          log.warn('outbound', 'startup-notice-timeout', {
+            ...fields,
+            timeoutMs: STARTUP_NOTICE_TIMEOUT_MS,
+          });
+          resolve();
+        }, STARTUP_NOTICE_TIMEOUT_MS);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function sendCotDegradedNotice(input: {
@@ -3815,6 +3877,7 @@ async function awaitRenderAwareStream(input: {
   streamDone: Promise<unknown>;
   renderDone: Promise<RunState>;
   producerStarted: () => boolean;
+  onStartupFailure: () => void;
   verifyFinal?: (streamValue: unknown, state: RunState) => Promise<boolean | undefined>;
   fallback: (state: RunState) => Promise<void>;
 }): Promise<void> {
@@ -3830,6 +3893,7 @@ async function awaitRenderAwareStream(input: {
   if (!first.ok) {
     if (first.kind === 'stream') {
       log.fail('stream', first.err, { mode: input.mode, step: 'stream' });
+      if (!input.producerStarted()) input.onStartupFailure();
       const rendered = await renderResult;
       if (!rendered.ok) throw rendered.err;
       await runFallbackReply(input.mode, rendered.state, input.fallback);

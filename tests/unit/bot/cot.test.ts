@@ -1,7 +1,53 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { consumeCotEvents, CotClient, CotPublisher, cotBriefToolTitle, finalAnswerOnlyState } from '../../../src/bot/cot.js';
+import { log } from '../../../src/core/logger.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 import type { RunState } from '../../../src/card/run-state.js';
+
+describe('COT request diagnostics', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('identifies a tenant authentication timeout without logging credentials', async () => {
+    const error = new DOMException('request secret must not be logged', 'TimeoutError');
+    const fetchMock = vi.fn().mockRejectedValue(error);
+    vi.stubGlobal('fetch', fetchMock);
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const client = new CotClient({ tenant: 'feishu', appId: 'private-app', appSecret: 'private-secret' });
+
+    await expect(client.create('oc_chat', 'om_origin')).rejects.toBe(error);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith('cot', 'request-failed', expect.objectContaining({
+      operation: 'tenant-auth', errorName: 'TimeoutError', timeoutMs: 15_000,
+      durationMs: expect.any(Number),
+    }));
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private-app|private-secret|request secret/);
+  });
+
+  it('identifies a create response-body failure and preserves its transport cause code', async () => {
+    const cause = Object.assign(new Error('private socket details'), { code: 'ECONNRESET' });
+    const error = new TypeError('fetch failed', { cause });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ code: 0, tenant_access_token: 'private-token', expire: 7200 }) })
+      .mockResolvedValueOnce({ ok: true, text: async () => { throw error; } });
+    vi.stubGlobal('fetch', fetchMock);
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const client = new CotClient({ tenant: 'feishu', appId: 'private-app', appSecret: 'private-secret' });
+
+    await expect(client.create('oc_chat', 'om_origin')).rejects.toBe(error);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith('cot', 'request-failed', expect.objectContaining({
+      operation: 'cot-create', errorName: 'TypeError', causeCode: 'ECONNRESET',
+      durationMs: expect.any(Number), timeoutMs: 15_000,
+    }));
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private-token|private-secret|private socket/);
+  });
+});
 
 describe('COT event mapping', () => {
   it('publishes assistant progress text and brief tool summaries', async () => {

@@ -9,6 +9,8 @@ import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { requestDeferredServiceRestart } from '../../../src/runtime/deferred-service-restart.js';
 import { readRouteLease } from '../../../src/runtime/route-lease.js';
 import { makeReactionKey } from '../../../src/bot/reaction/types.js';
+import type { AgentEvent } from '../../../src/agent/types.js';
+import { CotClient } from '../../../src/bot/cot.js';
 import { withReactionTurnId } from '../../../src/bot/reaction/turn-message.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
@@ -102,6 +104,86 @@ afterEach(async () => {
 });
 
 describe('markdown stream startup failures', () => {
+  it.each([
+    { cotFails: false, streamFails: true, mode: 'markdown' as const },
+    { cotFails: false, streamFails: true, mode: 'card' as const },
+    { cotFails: true, streamFails: false, mode: 'markdown' as const },
+    { cotFails: true, streamFails: true, mode: 'markdown' as const },
+  ])('acknowledges startup display failures before the agent finishes: $cotFails/$streamFails/$mode', async ({ cotFails, streamFails, mode }) => {
+    const streamed: string[] = [];
+    const h = await createHarness({
+      stream: async (_chatId, input) => {
+        if (streamFails) throw new Error('CardKit create timed out');
+        const producer = (input as {
+          markdown: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer({ setContent: async (markdown) => { streamed.push(markdown); } });
+        return { messageId: 'om_stream' };
+      },
+    });
+    h.profileConfig.preferences.messageReply = mode;
+    h.profileConfig.preferences.cotMessages = cotFails ? 'brief' : 'off';
+    h.profileConfig.access.allowedChats.push('oc_topic');
+    if (cotFails) vi.spyOn(CotClient.prototype, 'create').mockRejectedValue(new Error('CoT create timed out'));
+    const releaseAgent = holdFirstAgentRun(h.agent);
+    await startTestBridge(h);
+
+    try {
+      await h.channel.handlers.message?.({
+        ...message('om_startup_failure', 'create document'),
+        chatId: 'oc_topic',
+        chatType: 'group',
+        mentionedBot: true,
+        threadId: 'omt_topic',
+      } as NormalizedMessage);
+      await waitFor(() => h.agent.runOptions.length === 1);
+      await waitFor(() => startupNotices(h.channel).length === 1);
+      expect(h.agent.runs[0]?.stopped).toBe(false);
+      expect(startupNotices(h.channel)[0]).toMatchObject({
+        chatId: 'oc_topic',
+        content: { markdown: '请求已收到。进度展示暂时不可用，请以最终回复为准。' },
+        options: { replyTo: 'om_startup_failure', replyInThread: true },
+      });
+      expect(JSON.stringify(h.channel.sent)).not.toContain('完成文档');
+    } finally {
+      releaseAgent();
+    }
+
+    await waitFor(() => JSON.stringify([...h.channel.sent, ...streamed]).includes('完成文档'));
+    expect(startupNotices(h.channel)).toHaveLength(1);
+  });
+
+  it.each(['reject', 'hang'] as const)('preserves the final reply and queued follow-up when the startup notice send %s', async (noticeFailure) => {
+    const h = await createHarness({ stream: async () => { throw new Error('CardKit create timed out'); } });
+    const releaseAgent = holdFirstAgentRun(h.agent);
+    const send = h.channel.send.bind(h.channel);
+    const delayedNotice = deferred<void>();
+    let noticeAttempts = 0;
+    vi.spyOn(h.channel, 'send').mockImplementation(async (chatId, content, options) => {
+      if ((content as { markdown?: string }).markdown?.includes('进度展示暂时不可用')) {
+        noticeAttempts++;
+        if (noticeFailure === 'reject') throw new Error('IM unavailable');
+        await delayedNotice.promise;
+      }
+      return send(chatId, content, options);
+    });
+    await startTestBridge(h);
+
+    try {
+      await h.channel.handlers.message?.(message('om_first', 'first'));
+      await waitFor(() => noticeAttempts === 1);
+      await h.channel.handlers.message?.(message('om_second', 'second'));
+      expect(h.agent.runOptions).toHaveLength(1);
+    } finally {
+      releaseAgent();
+    }
+
+    await waitFor(() => h.agent.runOptions.length === 2);
+    expect(h.channel.sent.filter((entry) => JSON.stringify(entry.content).includes('完成文档'))).toHaveLength(1);
+    expect(h.agent.runs[0]?.stopped).toBe(false);
+    delayedNotice.resolve();
+  });
+
   it('routes a Reaction-triggered restart receipt back to the real target message', async () => {
     const h = await createHarness();
     await startTestBridge(h);
@@ -729,6 +811,36 @@ function deferred<T>(): {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function holdFirstAgentRun(agent: FakeAgentAdapter): () => void {
+  const gate = deferred<void>();
+  const runAgent = agent.run.bind(agent);
+  vi.spyOn(agent, 'run').mockImplementationOnce((opts) => {
+    const run = runAgent(opts);
+    const events: AsyncIterable<AgentEvent> = {
+      async *[Symbol.asyncIterator]() {
+        yield { type: 'tool_use', id: 'tool_pending', name: 'write_document', input: {} };
+        await gate.promise;
+        yield { type: 'tool_result', id: 'tool_pending', output: 'written', isError: false };
+        yield { type: 'text', delta: '完成文档。' };
+        yield { type: 'done', terminationReason: 'normal' };
+      },
+    };
+    return {
+      runId: run.runId,
+      events,
+      stop: async () => { gate.resolve(); await run.stop(); },
+      waitForExit: (timeoutMs) => run.waitForExit(timeoutMs),
+    };
+  });
+  return () => gate.resolve();
+}
+
+function startupNotices(channel: FakeLarkChannel): FakeLarkChannel['sent'] {
+  return channel.sent.filter((entry) =>
+    (entry.content as { markdown?: string }).markdown?.includes('进度展示暂时不可用'),
+  );
 }
 
 function createControls(profileConfig: ReturnType<typeof createDefaultProfileConfig>) {
