@@ -12,8 +12,8 @@ importers:
         specifier: ^1.4.0
         version: 1.4.0
       '@larksuite/channel':
-        specifier: file:vendor/larksuite-channel-0.6.0-qp.1.tgz
-        version: file:vendor/larksuite-channel-0.6.0-qp.1.tgz
+        specifier: file:vendor/larksuite-channel-0.6.0-qp.2.tgz
+        version: file:vendor/larksuite-channel-0.6.0-qp.2.tgz
       commander:
         specifier: ^12.1.0
         version: 12.1.0
@@ -471,9 +471,9 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@larksuite/channel@file:vendor/larksuite-channel-0.6.0-qp.1.tgz':
-    resolution: {integrity: sha512-IBDS3gaj03LJbuSNQCRhTB19UNjh83Sge4AvI+I1y3xGo+9S2x7yjSydvtPi0Crog9Tw/4BBt1N8BHRDcw0eRw==, tarball: file:vendor/larksuite-channel-0.6.0-qp.1.tgz}
-    version: 0.6.0-qp.1
+  '@larksuite/channel@file:vendor/larksuite-channel-0.6.0-qp.2.tgz':
+    resolution: {integrity: sha512-fEsbEn4VjgMrRlHkzuA76ol6RMnKbdxlnljWqI7MxDfE56JbubI8w43yBV2FESKA95yqw+fvXKHXUMOzcGYwZQ==, tarball: file:vendor/larksuite-channel-0.6.0-qp.2.tgz}
+    version: 0.6.0-qp.2
     engines: {node: '>=18'}
 
   '@larksuiteoapi/node-sdk@1.74.0':
@@ -2444,7 +2444,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@larksuite/channel@file:vendor/larksuite-channel-0.6.0-qp.1.tgz':
+  '@larksuite/channel@file:vendor/larksuite-channel-0.6.0-qp.2.tgz':
     dependencies:
       '@larksuiteoapi/node-sdk': 1.74.0
       https-proxy-agent: 9.0.0

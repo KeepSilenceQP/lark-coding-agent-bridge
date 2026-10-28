@@ -144,13 +144,23 @@ describe('profile-aware account and config commands', () => {
   it('saves effort and Fast independently and restores CLI defaults', async () => {
     vi.useFakeTimers();
     const h = await createHarness({ agentKind: 'codex' });
-    await h.command('/config submit', { reasoning_effort: 'ultra', fast_mode: 'on' });
+    const savedReceipts = () => h.channel.sent.filter((entry) =>
+      JSON.stringify(entry.content).includes('偏好已保存'),
+    ).length;
+    const submitAndWaitForSave = async (formValue: Record<string, unknown>): Promise<void> => {
+      const previousReceipts = savedReceipts();
+      await h.command('/config submit', formValue);
+      // Atomic rename exposes the file before fsync and runtime-state commit.
+      // Sequential form submissions must wait for the visible save receipt.
+      await vi.waitFor(() => expect(savedReceipts()).toBe(previousReceipts + 1), { timeout: 5000 });
+    };
+    await submitAndWaitForSave({ reasoning_effort: 'ultra', fast_mode: 'on' });
     const saved = await waitForRoot(h.rootDir, (r) => r.profiles.claude?.preferences.fastMode === 'on');
     expect(saved.profiles.claude?.preferences.reasoningEffort).toBe('ultra');
-    await h.command('/config submit', { fast_mode: 'off' });
+    await submitAndWaitForSave({ fast_mode: 'off' });
     const standard = await waitForRoot(h.rootDir, (r) => r.profiles.claude?.preferences.fastMode === 'off');
     expect(standard.profiles.claude?.preferences.reasoningEffort).toBe('ultra');
-    await h.command('/config submit', { reasoning_effort: 'default', fast_mode: 'default' });
+    await submitAndWaitForSave({ reasoning_effort: 'default', fast_mode: 'default' });
     const cleared = await waitForRoot(h.rootDir, (r) => r.profiles.claude?.preferences.fastMode === undefined);
     expect(cleared.profiles.claude?.preferences.reasoningEffort).toBeUndefined();
   });

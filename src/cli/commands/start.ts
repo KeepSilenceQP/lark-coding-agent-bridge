@@ -329,13 +329,10 @@ export async function runStart(opts: StartOptions): Promise<void> {
                   `[restart] connecting new bridge with appId=${next.accounts.app.id} tenant=${next.accounts.app.tenant}...`,
                 );
                 const nextControls = makeControls(nextRuntime.appPaths, next, nextRuntime.profileConfig);
-                // Connect-before-disconnect: if the new bridge fails to come up
-                // (e.g. network outage during a force-reconnect), throwing here
-                // leaves the old bridge — and its keepalive timer — untouched, so
-                // the next keepalive tick (~15s later) can retry restart. Without
-                // this ordering, a failed restart would tear down the only
-                // keepalive in the process and the bot would never recover until
-                // someone manually restarts it.
+                // Connect-before-disconnect: if explicit reconfiguration cannot
+                // connect, retain the old bridge, its runs and socket watchdog.
+                // Automatic network recovery stays inside that channel; it must
+                // never rebuild this run owner or cancel active work.
                 const next_bridge = await startChannel({
                   cfg: next,
                   agent: nextAgent,

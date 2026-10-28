@@ -229,9 +229,93 @@ describe('COT event mapping', () => {
 
     expect(publisher.disabled).toBe(true);
     expect(publisher.degradedReason).toBe('field validation failed');
-    expect(client.completed).toEqual([]);
+    expect(client.completed).toEqual(['error']);
   });
 });
+
+describe('COT mid-run degradation', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('notifies and closes the stale bubble before the agent finishes, without replaying updates', async () => {
+    vi.useFakeTimers();
+    const client = new FakeCotClient();
+    const update = vi.spyOn(client, 'update').mockRejectedValue(new Error('fetch failed'));
+    const onDegraded = vi.fn();
+    const publisher = degradedPublisher(client, onDegraded);
+    await publisher.start();
+    publisher.enqueue('TOOL_CALL_START', { toolCallId: 'running-tool' });
+
+    await vi.advanceTimersByTimeAsync(600);
+
+    expect(onDegraded).toHaveBeenCalledTimes(1);
+    expect(onDegraded).toHaveBeenCalledWith('fetch failed');
+    expect(client.completed).toEqual(['error']);
+    publisher.enqueue('TOOL_CALL_RESULT', { toolCallId: 'running-tool' });
+    await publisher.finish('done');
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(client.completed).toEqual(['error']);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['throw', 'reject', 'hang'] as const)('does not block terminal consumption when the notification %s and completion hangs', async (failure) => {
+    vi.useFakeTimers();
+    const client = new FakeCotClient();
+    vi.spyOn(client, 'update').mockRejectedValue(new Error('fetch failed'));
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const complete = vi.spyOn(client, 'complete').mockReturnValue(pending);
+    const onDegraded = vi.fn(() => {
+      if (failure === 'throw') throw new Error('notice failed');
+      return failure === 'hang' ? pending : Promise.reject(new Error('notice failed'));
+    });
+    const publisher = degradedPublisher(client, onDegraded);
+    await publisher.start();
+    await vi.advanceTimersByTimeAsync(600);
+
+    await consumeCotEvents(iterate([
+      { type: 'text', delta: 'final answer' },
+      { type: 'done', terminationReason: 'normal' },
+    ]), publisher, { detail: 'brief' });
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(onDegraded).toHaveBeenCalledTimes(1);
+    release();
+  });
+
+  it('retries a failed bubble close at terminal without sending another degradation notice', async () => {
+    vi.useFakeTimers();
+    const client = new FakeCotClient();
+    vi.spyOn(client, 'update').mockRejectedValue(new Error('fetch failed'));
+    const complete = vi.spyOn(client, 'complete')
+      .mockRejectedValueOnce(new Error('network still down'))
+      .mockResolvedValueOnce();
+    const onDegraded = vi.fn();
+    const publisher = degradedPublisher(client, onDegraded);
+    await publisher.start();
+    await vi.advanceTimersByTimeAsync(600);
+    expect(complete).toHaveBeenCalledTimes(1);
+
+    await publisher.finish('done');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(complete).toHaveBeenLastCalledWith(publisher.ref, 'error');
+    expect(onDegraded).toHaveBeenCalledTimes(1);
+  });
+});
+
+function degradedPublisher(client: FakeCotClient, onDegraded: (reason: string) => void | Promise<void>): CotPublisher {
+  return new CotPublisher({
+    client,
+    chatId: 'oc_chat',
+    originMessageId: 'om_origin',
+    runId: 'run-degraded',
+    scope: 'oc_chat',
+    inputPreview: 'run',
+    onDegraded,
+  });
+}
 
 class FakeCotClient {
   events: Array<{ event_type: string; content: string; timestamp: number }> = [];

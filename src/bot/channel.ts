@@ -123,7 +123,6 @@ import {
   type StartRunFlowResult,
 } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
-import { startKeepalive } from './keepalive';
 import { PendingQueue, type WorkLease } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
@@ -1474,6 +1473,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     httpTimeoutMs: 30_000,
     // Route WS + REST through HTTPS_PROXY / HTTP_PROXY when set (no-op otherwise).
     respectProxyEnv: true,
+    // Recover only the socket. Rebuilding the bridge through controls.restart()
+    // disconnects the run owner and stops active agents and queued follow-ups.
+    keepalive: {
+      enabled: true,
+      onUnrecoverable: (err) => log.fail('keepalive', err, { step: 'force-reconnect' }),
+    },
   };
 
   const channel = createLarkChannel(opts);
@@ -2165,25 +2170,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     );
   }
 
-  // App-level keepalive: 15s probe + wake-up detection + HTTP reachability.
-  // Defense-in-depth — the SDK's pingTimeout watchdog handles half-dead WS,
-  // this catches anything that the SDK misses (silent state stuck, etc.).
-  const probeDomain =
-    cfg.accounts.app.tenant === 'lark'
-      ? 'https://open.larksuite.com'
-      : 'https://open.feishu.cn';
-  const keepalive = startKeepalive({
-    channel,
-    domain: probeDomain,
-    forceReconnect: () => controls.restart(),
-  });
-
   return {
     channel,
     disconnect: async () => {
       activeRuns.pauseNewRuns('bridge-disconnect');
       knownChatsRefresh.stop();
-      keepalive.stop();
       // Stop meeting timers but stay in the meetings: /reconnect tears the
       // channel down and rebuilds it, and auto-leaving every meeting on a
       // reconnect would be surprising.
@@ -3186,6 +3177,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         runId: execution.runId,
         scope,
         inputPreview: deps.directCorrection?.corrected.text ?? lastMsg.content,
+        onDegraded: (reason) => {
+          // Notify when progress fails, independently of agent completion.
+          // An unavailable IM send must not hold the final reply or next run.
+          void sendCotDegradedNotice({
+            channel,
+            chatId,
+            scope,
+            sendOpts,
+            reason,
+            onSent: _registerOutboundOnStream,
+          });
+        },
       });
       await cotPublisher.start();
       // A1: register the CoT bubble messageId immediately after start() so a
@@ -3209,15 +3212,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           observeEditableToolStart,
         );
         await cotDone;
-        if (cotPublisher.degradedReason) {
-          await sendCotDegradedNotice({
-            channel,
-            chatId,
-            scope,
-            sendOpts,
-            reason: cotPublisher.degradedReason,
-          });
-        }
         const cotResult = await sendFinalReply({
           channel,
           chatId,
@@ -3563,6 +3557,7 @@ async function sendCotDegradedNotice(input: {
   scope: string;
   sendOpts: { replyTo: string; replyInThread?: boolean };
   reason: string;
+  onSent: (result: unknown) => void;
 }): Promise<void> {
   log.warn('cot', 'degraded', {
     scope: input.scope,
@@ -3570,11 +3565,12 @@ async function sendCotDegradedNotice(input: {
     replyInThread: input.sendOpts.replyInThread === true,
   });
   try {
-    await input.channel.send(
+    const result = await input.channel.send(
       input.chatId,
-      { markdown: 'COT 过程消息更新失败，已停止展示过程；最终答案仍会继续发送。' },
+      { markdown: '进度消息更新失败，已停止展示过程；任务状态请以最终回复为准。' },
       input.sendOpts,
     );
+    input.onSent(result);
   } catch (err) {
     log.warn('cot', 'degraded-notice-failed', {
       scope: input.scope,

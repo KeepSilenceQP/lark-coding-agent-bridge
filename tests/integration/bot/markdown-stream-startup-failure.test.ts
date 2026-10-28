@@ -9,6 +9,7 @@ import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { requestDeferredServiceRestart } from '../../../src/runtime/deferred-service-restart.js';
 import { readRouteLease } from '../../../src/runtime/route-lease.js';
 import { makeReactionKey } from '../../../src/bot/reaction/types.js';
+import { WorkChainStore } from '../../../src/bot/reaction/work-chain.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 import { CotClient } from '../../../src/bot/cot.js';
 import { withReactionTurnId } from '../../../src/bot/reaction/turn-message.js';
@@ -86,7 +87,7 @@ interface FakeLarkChannel {
   disconnect(): Promise<void>;
   getChatMode(chatId: string): Promise<'group' | 'topic'>;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
-  send(chatId: string, content: unknown, options?: unknown): Promise<void>;
+  send(chatId: string, content: unknown, options?: unknown): Promise<unknown>;
   stream(chatId: string, input: unknown, options?: unknown): Promise<unknown>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
@@ -182,6 +183,90 @@ describe('markdown stream startup failures', () => {
     expect(h.channel.sent.filter((entry) => JSON.stringify(entry.content).includes('完成文档'))).toHaveLength(1);
     expect(h.agent.runs[0]?.stopped).toBe(false);
     delayedNotice.resolve();
+  });
+
+  it('notifies a mid-run CoT update failure immediately in the originating topic, only once', async () => {
+    const h = await createHarness();
+    h.profileConfig.preferences.messageReply = 'text';
+    h.profileConfig.preferences.messageReplyMigrated = true;
+    h.profileConfig.preferences.cotMessages = 'brief';
+    h.profileConfig.access.allowedChats.push('oc_topic');
+    vi.spyOn(CotClient.prototype, 'create').mockResolvedValue({ cot_id: 'cot_test', message_id: 'om_cot' });
+    const update = vi.spyOn(CotClient.prototype, 'update').mockRejectedValue(new Error('fetch failed'));
+    vi.spyOn(CotClient.prototype, 'complete').mockResolvedValue(undefined);
+    const registeredOutbound = vi.spyOn(WorkChainStore.prototype, 'registerOutbound');
+    const send = h.channel.send.bind(h.channel);
+    vi.spyOn(h.channel, 'send').mockImplementation(async (chatId, content, options) => {
+      await send(chatId, content, options);
+      return { messageId: 'om_cot_degraded_notice' };
+    });
+    const releaseAgent = holdFirstAgentRun(h.agent);
+    await startTestBridge(h);
+
+    try {
+      await h.channel.handlers.message?.({
+        ...message('om_cot_update_failure', 'create document'),
+        chatId: 'oc_topic',
+        chatType: 'group',
+        mentionedBot: true,
+        threadId: 'omt_topic',
+      } as NormalizedMessage);
+      await waitFor(() => update.mock.calls.length === 1);
+      await waitFor(() => cotDegradedNotices(h.channel).length === 1);
+      expect(h.agent.runs[0]?.stopped).toBe(false);
+      expect(cotDegradedNotices(h.channel)[0]).toMatchObject({
+        chatId: 'oc_topic',
+        content: { markdown: '进度消息更新失败，已停止展示过程；任务状态请以最终回复为准。' },
+        options: { replyTo: 'om_cot_update_failure', replyInThread: true },
+      });
+      expect(registeredOutbound).toHaveBeenCalledWith(expect.any(String), 'om_cot_degraded_notice');
+      expect(JSON.stringify(h.channel.sent)).not.toContain('完成文档');
+    } finally {
+      releaseAgent();
+    }
+
+    await waitFor(() => JSON.stringify(h.channel.sent).includes('完成文档'));
+    expect(cotDegradedNotices(h.channel)).toHaveLength(1);
+  });
+
+  it.each(['reject', 'hang'] as const)('preserves the final reply and queued follow-up when the CoT degraded notice send %s', async (noticeFailure) => {
+    const h = await createHarness();
+    h.profileConfig.preferences.messageReply = 'text';
+    h.profileConfig.preferences.messageReplyMigrated = true;
+    h.profileConfig.preferences.cotMessages = 'brief';
+    vi.spyOn(CotClient.prototype, 'create').mockResolvedValue({ cot_id: 'cot_test', message_id: 'om_cot' });
+    vi.spyOn(CotClient.prototype, 'update').mockRejectedValue(new Error('fetch failed'));
+    vi.spyOn(CotClient.prototype, 'complete').mockResolvedValue(undefined);
+    const releaseAgent = holdFirstAgentRun(h.agent);
+    const send = h.channel.send.bind(h.channel);
+    const delayedNotice = deferred<void>();
+    let noticeAttempts = 0;
+    vi.spyOn(h.channel, 'send').mockImplementation(async (chatId, content, options) => {
+      if ((content as { markdown?: string }).markdown?.includes('进度消息更新失败')) {
+        noticeAttempts++;
+        if (noticeFailure === 'reject') throw new Error('IM unavailable');
+        await delayedNotice.promise;
+      }
+      return send(chatId, content, options);
+    });
+    await startTestBridge(h);
+
+    try {
+      await h.channel.handlers.message?.(message('om_first', 'first'));
+      await waitFor(() => noticeAttempts === 1);
+      await h.channel.handlers.message?.(message('om_second', 'second'));
+      expect(h.agent.runOptions).toHaveLength(1);
+    } finally {
+      releaseAgent();
+    }
+
+    try {
+      await waitFor(() => h.agent.runOptions.length === 2);
+      expect(h.channel.sent.filter((entry) => JSON.stringify(entry.content).includes('完成文档'))).toHaveLength(1);
+      expect(h.agent.runs[0]?.stopped).toBe(false);
+    } finally {
+      delayedNotice.resolve();
+    }
   });
 
   it('routes a Reaction-triggered restart receipt back to the real target message', async () => {
@@ -840,6 +925,12 @@ function holdFirstAgentRun(agent: FakeAgentAdapter): () => void {
 function startupNotices(channel: FakeLarkChannel): FakeLarkChannel['sent'] {
   return channel.sent.filter((entry) =>
     (entry.content as { markdown?: string }).markdown?.includes('进度展示暂时不可用'),
+  );
+}
+
+function cotDegradedNotices(channel: FakeLarkChannel): FakeLarkChannel['sent'] {
+  return channel.sent.filter((entry) =>
+    (entry.content as { markdown?: string }).markdown?.includes('进度消息更新失败'),
   );
 }
 

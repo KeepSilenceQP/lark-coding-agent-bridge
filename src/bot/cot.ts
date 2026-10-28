@@ -167,6 +167,9 @@ export class CotPublisher {
   private buffer: CotEvent[] = [];
   private flushing: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
+  private completing: Promise<void> | undefined;
+  private completed = false;
+  private readonly onDegraded?: (reason: string) => void | Promise<void>;
 
   constructor(opts: {
     client: Pick<CotClient, 'create' | 'update' | 'complete'>;
@@ -175,6 +178,7 @@ export class CotPublisher {
     runId: string;
     scope: string;
     inputPreview: string;
+    onDegraded?: (reason: string) => void | Promise<void>;
   }) {
     this.client = opts.client;
     this.chatId = opts.chatId;
@@ -182,6 +186,7 @@ export class CotPublisher {
     this.runId = opts.runId;
     this.scope = opts.scope;
     this.inputPreview = opts.inputPreview;
+    this.onDegraded = opts.onDegraded;
   }
 
   async start(): Promise<void> {
@@ -237,13 +242,31 @@ export class CotPublisher {
       this.timer = undefined;
     }
     await this.flush();
-    if (this.disabled || !this.ref) return;
-    try {
-      await this.client.complete(this.ref, reason);
-      log.info('cot', 'completed', { cotId: this.ref.cotId, reason });
-    } catch (err) {
-      log.warn('cot', 'complete-failed', { err: err instanceof Error ? err.message : String(err) });
+    if (this.disabled) {
+      // Retry a failed best-effort close at terminal, but never hold the final
+      // reply behind a broken progress endpoint. In-flight/successful closes
+      // are shared, so we cannot close the bubble twice concurrently.
+      void this.complete('error');
+      return;
     }
+    await this.complete(reason);
+  }
+
+  private complete(reason: string): Promise<void> {
+    if (this.completing) return this.completing;
+    const ref = this.ref;
+    if (this.completed || !ref) return Promise.resolve();
+    this.completing = Promise.resolve()
+      .then(() => this.client.complete(ref, reason))
+      .then(() => {
+        this.completed = true;
+        log.info('cot', 'completed', { cotId: ref.cotId, reason });
+      })
+      .catch((err) => {
+        log.warn('cot', 'complete-failed', { err: err instanceof Error ? err.message : String(err) });
+      })
+      .finally(() => { this.completing = undefined; });
+    return this.completing;
   }
 
   private scheduleFlush(): void {
@@ -266,8 +289,23 @@ export class CotPublisher {
     this.flushing = this.client.update(this.ref, events)
       .catch((err) => {
         this.disabled = true;
-        this.degradedReason = err instanceof Error ? err.message : String(err);
+        const reason = err instanceof Error ? err.message : String(err);
+        this.degradedReason = reason;
+        this.buffer = [];
+        if (this.timer) {
+          clearTimeout(this.timer);
+          this.timer = undefined;
+        }
         log.warn('cot', 'update-failed', { err: this.degradedReason });
+        // Update delivery is ambiguous, so do not replay events. Close only
+        // the progress bubble and notify immediately; the agent keeps running
+        // independently of both outbound requests.
+        void this.complete('error');
+        void Promise.resolve().then(() => this.onDegraded?.(reason)).catch((noticeErr) => {
+          log.warn('cot', 'degraded-callback-failed', {
+            err: noticeErr instanceof Error ? noticeErr.message : String(noticeErr),
+          });
+        });
       })
       .finally(() => {
         this.flushing = undefined;

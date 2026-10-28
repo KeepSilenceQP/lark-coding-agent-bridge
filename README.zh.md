@@ -63,7 +63,7 @@ no-content/最终回复修改则做了适配，保留本 Fork 的单流最终回
 | **Reaction 驱动控制** | 每个 profile 的配置文件承载 Reaction 含义与行为，运行时修改即可生效；默认支持同意下一步、进一步解释、停止任务和 [完成] 静默标记。Bridge 会把需要处理的 Reaction 与目标消息一并交给 Agent，持久化防重状态，并保留其他未预埋 emoji 供 Agent 结合上下文判断。 | 若把 Reaction 当成孤立 emoji，可能重复旧任务、丢失被回应消息，或把停止信号错误地启动成新一轮 Agent。 |
 | **可靠的过程消息与最终回复** | COT/过程输出和最终答案彻底分开，卡片与纯文本模式都单独发送最终回复；同时补齐话题路由、CardKit 流过期、陈旧回读、Codex 空终态/持久化终态和 Markdown 渲染失败的恢复路径。 | 长任务可能留下陈旧卡片或运行中 footer、重复旧内容、误触发 fallback、回复跑出话题，或者本地已经结束却没有把最终答案送到飞书。 |
 | **延后自重启与结果回执** | 同 profile 自重启会等待当前回复和活跃任务排空，再由 detached helper 重启，并向原群、原话题或原私聊发送且只发送一条成功/失败回执。 | Bot 自部署时可能在回复中途把自己终止，重启后用户也无法确定新进程是否真正连接成功。 |
-| **维护版 Channel 与可安装产物** | Release 内置维护版 `@larksuite/channel` `0.6.0-qp.1`，基于上游 0.6.0 并保留 CardKit stream rollover 修复，以自包含的 `@penn.qp/lark-channel-bridge` npm 包和对应 GitHub Release 发布。 | rollover 可能先把前一张卡完整重发一遍再创建下一张卡，形成重复消息；file dependency 也可能在发布产物中丢失。 |
+| **维护版 Channel 与可安装产物** | Release 内置维护版 `@larksuite/channel` `0.6.0-qp.2`，基于上游 0.6.0，包含 CardKit stream rollover 和连接生命周期修复，以自包含的 `@penn.qp/lark-channel-bridge` npm 包和对应 GitHub Release 发布。 | rollover 可能重复旧内容；连接恢复可能在关闭后继续拉起旧连接；file dependency 也可能在发布产物中丢失。 |
 
 ### Fork 扩展能力速查
 
@@ -504,6 +504,8 @@ Codex profile 会读取触发 @ 的那条评论回复中附带的图片：bridge
 **bot 没反应 / agent 不回复**：通常是本机 `claude` 或 `codex` CLI 没登录，或者当前会话指向了不存在的工作目录。发 `/status` 看当前状态；`/new` 重开会话往往就好。
 
 **任务在执行，但没有进度卡片**：CoT 或流式卡片首次创建失败时，bridge 会立即尝试在原会话发送一次普通文字提示，不等待 agent 完成；任务继续执行，最终结果仍按原流程发送。网络完全不可用时，文字提示也可能发送失败。日志中的 `cot.request-failed` 包含失败阶段、耗时和底层连接错误码，可用于区分鉴权请求与 CoT 请求失败；不会记录请求正文或凭据。
+
+**进度消息停在沙漏，随后提示更新失败**：CoT 中途更新失败时，bridge 会立即尝试在原会话提示，并关闭已创建的过程消息；收尾失败时，在任务终态再尝试一次。提示和收尾都不阻塞任务或最终回复，网络故障仍可能使它们无法送达。自动连接恢复只重建 WebSocket，保留执行中的任务；主动关闭 bridge 仍会停止任务。任务最终是否完成、失败或被中断，以最终回复为准。
 
 **agent 子进程假死（卡片停在最后一帧不动）**：支持 idle 探活。agent 一段时间没输出就会被 SIGTERM kill，卡片末尾会标出自动终止原因。默认关闭。开启方式：`/config` 设全局值（分钟），或 `/timeout 10` 只对当前会话生效；`/timeout off` 关掉当前会话的探活；`/timeout default` 清掉会话覆盖，回退到全局设置。
 

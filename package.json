@@ -1,6 +1,6 @@
 {
   "name": "@penn.qp/lark-channel-bridge",
-  "version": "0.7.1-qp.7",
+  "version": "0.7.1-qp.8",
   "description": "Bridge Feishu/Lark messenger with local CLI coding agents",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -59,7 +59,7 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.4.0",
-    "@larksuite/channel": "file:vendor/larksuite-channel-0.6.0-qp.1.tgz",
+    "@larksuite/channel": "file:vendor/larksuite-channel-0.6.0-qp.2.tgz",
     "commander": "^12.1.0",
     "cross-spawn": "^7.0.6",
     "graceful-fs": "^4.2.11",

@@ -1,0 +1,33 @@
+--- a/src/keepalive.ts
++++ b/src/keepalive.ts
+@@ -53,0 +54 @@
++  let ticking = false;
+@@ -72 +73 @@
+-    const status = getConnectionStatus();
++    let status = getConnectionStatus();
+@@ -84,0 +86,8 @@
++    // stop() or the SDK's own recovery may have won while the probe awaited.
++    if (stopped) return;
++    status = getConnectionStatus();
++    if (!status || status.state === 'connected') {
++      consecutiveDown = 0;
++      networkDownTicks = 0;
++      return;
++    }
+@@ -112,0 +122 @@
++        if (stopped) return;
+@@ -120 +130,5 @@
+-    void tick().catch((err) => logger.error?.('channel: keepalive tick failed', err));
++    // Keep probe/handshake work single-flight, including custom short intervals.
++    if (stopped || ticking) return;
++    ticking = true;
++    void tick().catch((err) => logger.error?.('channel: keepalive tick failed', err))
++      .finally(() => { ticking = false; });
+--- a/src/channel.ts
++++ b/src/channel.ts
+@@ -257,0 +258 @@
++    if (!this.connected) return;
+@@ -373,0 +375 @@
++    this.connected = false;
+@@ -392 +393,0 @@
+-    this.connected = false;
