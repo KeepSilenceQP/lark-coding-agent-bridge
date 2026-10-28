@@ -61,7 +61,7 @@ no-content/最终回复修改则做了适配，保留本 Fork 的单流最终回
 | **按群定制行为** | 支持按群加载 operator prompt，并提供 `mention-only`、`owner-default`、`all-messages`、按群 `owner-allowlist` 四种响应模式，不需要为了免 @ 而向所有群成员开放 Bot。 | 一套全局 Prompt 和全局 @ 策略无法满足不同项目群的角色分工；Bot 可能在 owner 希望它响应时保持沉默，或响应范围过大。 |
 | **结构化 Agent 上下文** | Bridge 会注入消息、发送者/Bot 身份、引用消息、交互卡片和回传路由信息，并在每次 Codex run 中用 developer instructions 传递 Bridge 规则。 | 把协议规则混在普通用户文本里更容易被忽略或误解，尤其是在引用回复、卡片、Bot 发送者和 Codex 恢复会话场景。 |
 | **Reaction 驱动控制** | 每个 profile 的配置文件承载 Reaction 含义与行为，运行时修改即可生效；默认支持同意下一步、进一步解释、停止任务和 [完成] 静默标记。Bridge 会把需要处理的 Reaction 与目标消息一并交给 Agent，持久化防重状态，并保留其他未预埋 emoji 供 Agent 结合上下文判断。 | 若把 Reaction 当成孤立 emoji，可能重复旧任务、丢失被回应消息，或把停止信号错误地启动成新一轮 Agent。 |
-| **可靠的过程消息与最终回复** | COT/过程输出和最终答案彻底分开，卡片与纯文本模式都单独发送最终回复；同时补齐话题路由、CardKit 流过期、陈旧回读、Codex 空终态/持久化终态和 Markdown 渲染失败的恢复路径。 | 长任务可能留下陈旧卡片或运行中 footer、重复旧内容、误触发 fallback、回复跑出话题，或者本地已经结束却没有把最终答案送到飞书。 |
+| **可靠的过程消息与最终回复** | COT/过程输出和最终答案彻底分开，卡片与纯文本模式都单独发送最终回复；同时补齐话题路由、CardKit 流过期、陈旧回读、Codex 空终态/持久化终态和 Markdown 渲染失败的恢复路径。列表内代码块使用兼容排版，最终 Markdown 卡片还会读回检查代码内容是否保留。 | 长任务可能留下陈旧卡片或运行中 footer、重复旧内容、误触发 fallback、回复跑出话题，或者在答案结尾完整时仍静默遗漏中间的代码。 |
 | **延后自重启与结果回执** | 同 profile 自重启会等待当前回复和活跃任务排空，再由 detached helper 重启，并向原群、原话题或原私聊发送且只发送一条成功/失败回执。 | Bot 自部署时可能在回复中途把自己终止，重启后用户也无法确定新进程是否真正连接成功。 |
 | **维护版 Channel 与可安装产物** | Release 内置维护版 `@larksuite/channel` `0.6.0-qp.2`，基于上游 0.6.0，包含 CardKit stream rollover 和连接生命周期修复，以自包含的 `@penn.qp/lark-channel-bridge` npm 包和对应 GitHub Release 发布。 | rollover 可能重复旧内容；连接恢复可能在关闭后继续拉起旧连接；file dependency 也可能在发布产物中丢失。 |
 

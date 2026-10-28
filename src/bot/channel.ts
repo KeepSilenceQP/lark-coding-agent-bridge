@@ -7,6 +7,7 @@ import { createLarkChannel } from '@larksuite/channel';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
+import { parse, postprocess, preprocess } from 'micromark';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import { modelLabel, normalizeModelSelection, resolveModelArg } from '../agent/models';
 import {
@@ -3485,6 +3486,7 @@ async function sendFinalReply(input: {
           input.sendOpts,
         );
         log.info('outbound', 'sent', outboundLogFields(input, 'markdown-stream', body, lastResult as { messageId?: string } | undefined));
+        await verifyMarkdownFinalReadback(input.channel, lastResult, body);
       } catch (err) {
         log.warn('outbound', 'markdown-stream-fallback', {
           err: err instanceof Error ? err.message : String(err),
@@ -3978,9 +3980,13 @@ async function verifyMarkdownFinalReadback(
     return undefined;
   }
 
+  // Only the last card is read after rollover; earlier code may correctly live
+  // on preceding cards. For a single card, also check code before the tail.
+  const expectedCodeLines = chunkIds.length === 0 ? fencedCodeLines(expected) : [];
+
   const first = await readMarkdownMessageSnapshot(channel, readbackMessageId, messageId, chunkIds);
   if (first === undefined) return undefined;
-  if (markdownReadbackMatches(first.text, expected)) {
+  if (markdownReadbackMatches(first, expected, expectedCodeLines)) {
     log.info('stream', 'markdown-readback-match', {
       messageId,
       readbackMessageId,
@@ -3994,9 +4000,10 @@ async function verifyMarkdownFinalReadback(
   await delay(FINAL_READBACK_RETRY_MS);
   const second = await readMarkdownMessageSnapshot(channel, readbackMessageId, messageId, chunkIds);
   if (second === undefined) return undefined;
-  const matches = markdownReadbackMatches(second.text, expected);
+  const matches = markdownReadbackMatches(second, expected, expectedCodeLines);
   if (!matches) {
     const finalAnchorPresent = markdownFinalAnchorPresent(second.text, expected);
+    const missingCodeLines = missingMarkdownCodeLines(second, expectedCodeLines);
     log.warn('stream', 'markdown-readback-mismatch', {
       messageId,
       readbackMessageId,
@@ -4006,8 +4013,9 @@ async function verifyMarkdownFinalReadback(
       liveTail: tailForLog(second.text),
       expectedTail: tailForLog(expected),
       finalAnchorPresent,
+      missingCodeLines,
     });
-    if (finalAnchorPresent && !hasRunningFooter(second.text)) return false;
+    if (finalAnchorPresent && !hasRunningFooter(second.text) && missingCodeLines === 0) return false;
     const repaired = await repairStaleMarkdownCard(channel, readbackMessageId, expected);
     if (repaired) {
       await delay(FINAL_READBACK_RETRY_MS);
@@ -4018,7 +4026,7 @@ async function verifyMarkdownFinalReadback(
         chunkIds,
       );
       const repairVisible = repairedSnapshot !== undefined
-        && markdownReadbackMatches(repairedSnapshot.text, expected);
+        && markdownReadbackMatches(repairedSnapshot, expected, expectedCodeLines);
       log.info('stream', 'markdown-readback-repair-verified', {
         messageId,
         readbackMessageId,
@@ -4105,6 +4113,7 @@ async function repairStaleMarkdownCard(
 
 interface MarkdownReadbackSnapshot {
   text: string;
+  markdownText?: string;
   messageType?: string;
   createTime?: string;
   updateTime?: string;
@@ -4149,6 +4158,7 @@ async function readMarkdownMessageSnapshot(
     }
     return {
       text,
+      markdownText: extractVisibleMarkdownText(result),
       ...messageItemMetadata(item),
     };
   } catch (err) {
@@ -4261,6 +4271,26 @@ function collectText(value: unknown): string[] {
   return Object.values(value).flatMap(collectText);
 }
 
+function extractVisibleMarkdownText(value: unknown): string | undefined {
+  const item = firstMessageItem(value);
+  const content = item ? messageItemRawContent(item) : undefined;
+  if (typeof content !== 'string') return undefined;
+  const parts = collectVisibleMarkdown(parseJson(content));
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
+function collectVisibleMarkdown(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(collectVisibleMarkdown);
+  if (!value || typeof value !== 'object') return [];
+  const record = value as Record<string, unknown>;
+  if (record.tag === 'markdown' && typeof record.content === 'string') {
+    return [record.content];
+  }
+  // Read displayed Markdown elements only. Raw JSON, tags, element IDs and
+  // config strings are not evidence that a code line is visible to the user.
+  return [record.body, record.elements, record.columns].flatMap(collectVisibleMarkdown);
+}
+
 function isUnsupportedInteractiveCardContent(value: unknown): boolean {
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
@@ -4281,10 +4311,40 @@ function isDowngradedInteractiveCard(value: unknown): boolean {
   return collectText(value).some((text) => text.includes('请升级至最新版本客户端，以查看内容'));
 }
 
-function markdownReadbackMatches(live: string, expected: string): boolean {
+function markdownReadbackMatches(
+  snapshot: MarkdownReadbackSnapshot,
+  expected: string,
+  expectedCodeLines: string[],
+): boolean {
   const expectedTail = tailForLog(normalizeReadbackText(expected));
-  if (!expectedTail) return true;
-  return normalizeReadbackText(live).includes(expectedTail);
+  const tailMatches = !expectedTail || normalizeReadbackText(snapshot.text).includes(expectedTail);
+  return tailMatches && missingMarkdownCodeLines(snapshot, expectedCodeLines) === 0;
+}
+
+function fencedCodeLines(markdown: string): string[] {
+  if (!markdown.includes('```') && !markdown.includes('~~~')) return [];
+  const events = postprocess(parse().document().write(preprocess()(markdown, undefined, true)));
+  const lines = new Set<string>();
+  let inFence = false;
+  for (const [event, token, context] of events) {
+    if (token.type === 'codeFenced') inFence = event === 'enter';
+    if (inFence && event === 'enter' && token.type === 'codeFlowValue') {
+      const line = normalizeReadbackText(context.sliceSerialize(token));
+      if (line) lines.add(line);
+    }
+  }
+  return [...lines];
+}
+
+function missingMarkdownCodeLines(
+  snapshot: MarkdownReadbackSnapshot,
+  expectedCodeLines: string[],
+): number {
+  // Unknown readback shapes are not proof of loss. Keep the existing tail
+  // comparison for those instead of issuing speculative card updates.
+  if (snapshot.markdownText === undefined) return 0;
+  const live = normalizeReadbackText(snapshot.markdownText);
+  return expectedCodeLines.filter((line) => !live.includes(line)).length;
 }
 
 function markdownFinalAnchorPresent(live: string, expected: string): boolean {

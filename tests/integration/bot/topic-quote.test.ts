@@ -8,6 +8,7 @@ import { SessionCatalog } from '../../../src/session/catalog.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { PendingQueue } from '../../../src/bot/pending-queue.js';
+import { log } from '../../../src/core/logger.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
@@ -664,6 +665,11 @@ describe('passive handled-topic reactions', () => {
     });
     h.profileConfig.access.groupResponseMode = 'all-messages';
     const originalRun = h.agent.run.bind(h.agent);
+    const info = vi.spyOn(log, 'info');
+    cleanups.push(async () => { info.mockRestore(); });
+    const completedBatches = () => info.mock.calls.filter(
+      ([phase, event]) => phase === 'flush' && event === 'end',
+    ).length;
     let ready = false;
     let finish!: () => void;
     const gate = new Promise<void>(resolve => { finish = resolve; });
@@ -691,6 +697,7 @@ describe('passive handled-topic reactions', () => {
     });
     if (runKind === 'reaction') {
       await waitFor(() => h.agent.runs[0]?.waitForExitCalls === 1);
+      await waitFor(() => completedBatches() === 1);
       await h.channel.handlers.reaction?.(topicReaction('om_stream_1', 'GoGoGo'));
     }
     await waitFor(() => ready, 4000);
@@ -728,6 +735,9 @@ describe('passive handled-topic reactions', () => {
       finish();
     }
     await waitFor(() => h.agent.runs[heldRunIndex]?.waitForExitCalls === 1);
+    // Agent exit precedes final-card readback. Snapshot only after the whole
+    // batch finishes, so its readback cannot be mistaken for a passive action.
+    await waitFor(() => completedBatches() === heldRunIndex + 1);
     await addAndRemoveMarkers();
     expect(h.agent.runOptions).toHaveLength(heldRunIndex + 1);
   });

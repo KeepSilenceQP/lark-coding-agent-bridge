@@ -589,6 +589,106 @@ describe('markdown stream startup failures', () => {
     expect(h.channel.sent).toHaveLength(0);
   });
 
+  it.each([
+    ['SQL', "SELECT revision\nFROM ProactiveStateRevision\nWHERE collection = 'goal';", false],
+    ['SQL after CoT progress', "SELECT revision\nFROM ProactiveStateRevision\nWHERE collection = 'goal';", true],
+    ['text also present in card metadata', 'markdown\nstream_md', false],
+  ] as const)('repairs missing middle fenced code with an intact final tail: %s', async (_label, code, cotEnabled) => {
+    const tail = '后续说明保持完整。'.repeat(90);
+    const codeBlock = `\`\`\`sql\n${code}\n\`\`\``;
+    const finalText = cotEnabled
+      ? `2. **Agent 每轮启动时读版本号**\n   相当于执行：\n\n${codeBlock.split('\n').map(line => `   ${line}`).join('\n')}\n\n3. **与上次上下文的版本比较**\n\n${tail}`
+      : `相当于执行：\n\n${codeBlock}\n\n${tail}`;
+    const streamed: string[] = [];
+    const h = await createHarness({ stream: trackedMarkdownStream(streamed) });
+    const info = vi.spyOn(log, 'info');
+    if (cotEnabled) {
+      h.profileConfig.preferences.cotMessages = 'brief';
+      vi.spyOn(CotClient.prototype, 'create').mockResolvedValue({ cot_id: 'cot_test', message_id: 'om_cot' });
+      vi.spyOn(CotClient.prototype, 'update').mockResolvedValue(undefined);
+      vi.spyOn(CotClient.prototype, 'complete').mockResolvedValue(undefined);
+    }
+    h.agent.setEvents([
+      { type: 'text', delta: finalText },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    h.channel.rawClient.im.v1.message.get.mockImplementation(async () => ({
+      data: { items: [{ body: {
+        content: streamingCardContent(
+          h.channel.rawClient.cardkit.v1.card.update.mock.calls.length > 0
+            ? streamed.at(-1)!
+            : `相当于执行：\n\n${tail}`,
+        ),
+      } }] },
+    }));
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => info.mock.calls.some(([phase, event]) => phase === 'flush' && event === 'end'));
+
+    expect(h.channel.rawClient.im.v1.message.get).toHaveBeenCalledTimes(3);
+    expect(h.channel.rawClient.cardkit.v1.card.update).toHaveBeenCalledTimes(1);
+    const request = h.channel.rawClient.cardkit.v1.card.update.mock.calls[0]?.[0] as {
+      path: { card_id: string };
+      data: { card: { data: string } };
+    };
+    expect(request.path.card_id).toBe('card_stream');
+    const repaired = JSON.parse(request.data.card.data);
+    expect(repaired.body.elements[0].content).toBe(streamed.at(-1));
+    expect(repaired.body.elements[0].content).toContain(code);
+    if (cotEnabled) {
+      expect(repaired.body.elements[0].content).toContain(`\n${codeBlock}\n`);
+    }
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it('accepts visible fenced code despite CardKit whitespace and fence rewrites', async () => {
+    const tail = '后续说明保持完整。'.repeat(90);
+    const h = await createHarness({ stream: trackedMarkdownStream([]) });
+    h.agent.setEvents([
+      { type: 'text', delta: `相当于执行：\n\n\`\`\`sql\nSELECT revision\nFROM ProactiveStateRevision\nWHERE collection = 'goal';\n\`\`\`\n\n${tail}` },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    h.channel.rawClient.im.v1.message.get.mockResolvedValue({
+      data: { items: [{ body: {
+        content: streamingCardContent(`相当于执行：\n\`\`\`\nSELECT   revision\n\nFROM ProactiveStateRevision\n\nWHERE collection = 'goal';\n\n\`\`\`\n${tail}`),
+      } }] },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
+
+    expect(h.channel.rawClient.im.v1.message.get).toHaveBeenCalledTimes(1);
+    expect(h.channel.rawClient.cardkit.v1.card.update).not.toHaveBeenCalled();
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it('does not require earlier fenced code in a rollover tail card', async () => {
+    const tail = '后续说明保持完整。'.repeat(90);
+    const h = await createHarness({
+      stream: trackedMarkdownStream([], { messageId: 'om_head', chunkIds: ['om_tail'] }),
+    });
+    h.agent.setEvents([
+      { type: 'text', delta: `\`\`\`sql\nSELECT revision;\n\`\`\`\n\n${tail}` },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+    h.channel.rawClient.im.v1.message.get.mockResolvedValue({
+      data: { items: [{ body: { content: streamingCardContent(tail) } }] },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
+
+    expect(h.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({
+      path: { message_id: 'om_tail' },
+      params: { card_msg_content_type: 'user_card_content' },
+    });
+    expect(h.channel.rawClient.cardkit.v1.card.update).not.toHaveBeenCalled();
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
   it('skips readback for likely markdown rollover when stream returns no chunk ids', async () => {
     const finalText = '最终答案。'.repeat(9000);
     const h = await createHarness({
@@ -967,6 +1067,30 @@ function lastMarkdown(channel: FakeLarkChannel): string {
   const content = channel.sent.at(-1)?.content as { markdown?: string } | undefined;
   expect(content?.markdown).toBeTypeOf('string');
   return content?.markdown ?? '';
+}
+
+function trackedMarkdownStream(
+  contents: string[],
+  result?: { messageId: string; chunkIds: string[] },
+): StreamFn {
+  return async (_chatId, input) => {
+    const raw = sdkMock.channel!.rawClient;
+    const created = await raw.cardkit.v1.card.create({
+      data: { type: 'card_json', data: streamingCardContent('...') },
+    });
+    const sent = await raw.im.v1.message.reply({
+      path: { message_id: 'om_first' },
+      data: {
+        msg_type: 'interactive',
+        content: JSON.stringify({ type: 'card', data: { card_id: created.data.card_id } }),
+      },
+    });
+    const producer = (input as {
+      markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+    }).markdown;
+    await producer?.({ setContent: async (markdown) => { contents.push(markdown); } });
+    return result ?? { messageId: sent.data.message_id };
+  };
 }
 
 function streamingCardContent(markdown: string): string {

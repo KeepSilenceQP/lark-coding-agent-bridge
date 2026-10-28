@@ -2,6 +2,7 @@ import { deepMaskEmails } from './mask-email';
 import type { Block, FooterStatus, RunState, ToolEntry } from './run-state';
 import { renderLocalFileLinksAsPaths } from './markdown-links';
 import { preserveListQuoteContent } from './markdown-quotes';
+import { preserveListCodeContent } from './markdown-code';
 import { toolBodyMd, toolHeaderText } from './tool-render';
 
 const REASONING_MAX = 1500;
@@ -141,7 +142,7 @@ function collapsedToolSummary(tools: ToolEntry[], finalized: boolean): object {
     border: { color: 'blue', corner_radius: '5px' },
     vertical_spacing: '8px',
     padding: '8px 8px 8px 8px',
-    elements: [{ tag: 'markdown', content: preserveListQuoteContent(headerList), text_size: 'notation' }],
+    elements: [{ tag: 'markdown', content: preserveListCodeContent(preserveListQuoteContent(headerList)), text_size: 'notation' }],
   };
 }
 
@@ -160,7 +161,7 @@ function collapsiblePanel(opts: PanelOpts): object {
     border: { color: opts.border, corner_radius: '5px' },
     vertical_spacing: '8px',
     padding: '8px 8px 8px 8px',
-    elements: [{ tag: 'markdown', content: preserveListQuoteContent(opts.body), text_size: 'notation' }],
+    elements: [{ tag: 'markdown', content: preserveListCodeContent(preserveListQuoteContent(opts.body)), text_size: 'notation' }],
   };
 }
 
@@ -177,7 +178,7 @@ function panelHeader(titleMd: string): object {
 function markdown(content: string): object {
   return {
     tag: 'markdown',
-    content: preserveListQuoteContent(renderLocalFileLinksAsPaths(content)),
+    content: preserveListCodeContent(preserveListQuoteContent(renderLocalFileLinksAsPaths(content))),
   };
 }
 
