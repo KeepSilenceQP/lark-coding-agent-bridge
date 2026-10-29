@@ -192,6 +192,7 @@ export class CotPublisher {
   readonly runId: string;
   readonly scope: string;
   readonly inputPreview: string;
+  private readonly initialStepName: string;
   ref: CotRef | undefined;
   disabled = false;
   degradedReason: string | undefined;
@@ -209,6 +210,7 @@ export class CotPublisher {
     runId: string;
     scope: string;
     inputPreview: string;
+    initialStepName?: string;
     onDegraded?: (reason: string) => void | Promise<void>;
   }) {
     this.client = opts.client;
@@ -217,10 +219,11 @@ export class CotPublisher {
     this.runId = opts.runId;
     this.scope = opts.scope;
     this.inputPreview = opts.inputPreview;
+    this.initialStepName = opts.initialStepName ?? '理解用户问题';
     this.onDegraded = opts.onDegraded;
   }
 
-  async start(): Promise<void> {
+  async start(signal?: AbortSignal): Promise<void> {
     // Single chat_id-addressed create. In topics the bubble follows
     // originMessageId's thread (see CotClient.create); the caller passes an
     // in-topic origin so it lands in the topic. On any failure we disable CoT
@@ -228,6 +231,8 @@ export class CotPublisher {
     // pre-delivery connect failures may retry; replaying an ambiguous create
     // could leave a duplicate bubble spinning forever.
     let created: Record<string, unknown>;
+    const createStartedAt = Date.now();
+    log.info('cot', 'create-request', { originMessageId: this.originMessageId });
     try {
       created = await this.client.create(this.chatId, this.originMessageId);
     } catch (err) {
@@ -245,7 +250,8 @@ export class CotPublisher {
       return;
     }
     this.ref = { cotId, messageId };
-    log.info('cot', 'created', { cotId, messageId });
+    log.info('cot', 'created', { cotId, messageId, durationMs: Date.now() - createStartedAt, originMessageId: this.originMessageId });
+    if (signal?.aborted) return;
     this.enqueue('RUN_STARTED', {
       threadId: this.scope,
       runId: this.runId,
@@ -253,7 +259,16 @@ export class CotPublisher {
     });
     this.enqueue('STEP_STARTED', {
       stepId: `step-understand-${this.runId}`,
-      stepName: '理解用户问题',
+      stepName: this.initialStepName,
+    });
+    // Initialization is acknowledgement, not a throttled progress update.
+    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+    const startedAt = Date.now();
+    void this.flush().then(() => {
+      if (!this.disabled) log.info('cot', 'initial-published', {
+        durationMs: Date.now() - startedAt,
+        originMessageId: this.originMessageId,
+      });
     });
   }
 

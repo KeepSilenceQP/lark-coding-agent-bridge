@@ -77,7 +77,7 @@ describe('COT connection retries', () => {
     await publisher.start();
     publisher.enqueue('TOOL_CALL_START', { toolCallId: 'tool-1' });
 
-    await vi.advanceTimersByTimeAsync(600);
+    await vi.advanceTimersByTimeAsync(0);
     expect(publisher.disabled).toBe(false);
     publisher.enqueue('TOOL_CALL_RESULT', { toolCallId: 'tool-1' });
     await vi.advanceTimersByTimeAsync(249);
@@ -90,9 +90,9 @@ describe('COT connection retries', () => {
 
     expect(updateBodies).toHaveLength(3);
     expect(JSON.parse(updateBodies[1]!).events.map((event: { event_type: string }) => event.event_type))
-      .toEqual(['RUN_STARTED', 'STEP_STARTED', 'TOOL_CALL_START']);
+      .toEqual(['RUN_STARTED', 'STEP_STARTED']);
     expect(JSON.parse(updateBodies[2]!).events.map((event: { event_type: string }) => event.event_type))
-      .toEqual(['TOOL_CALL_RESULT']);
+      .toEqual(['TOOL_CALL_START', 'TOOL_CALL_RESULT']);
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('receive_id_type'))).toHaveLength(1);
     expect(onDegraded).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledWith('cot', 'request-retry', expect.objectContaining({
@@ -162,9 +162,9 @@ describe('COT connection retries', () => {
       onDegraded,
     );
     await publisher.start();
-    await vi.advanceTimersByTimeAsync(600);
+    await vi.advanceTimersByTimeAsync(249);
     expect(onDegraded).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(1);
     expect(publisher.disabled).toBe(true);
     expect(onDegraded).toHaveBeenCalledTimes(1);
 

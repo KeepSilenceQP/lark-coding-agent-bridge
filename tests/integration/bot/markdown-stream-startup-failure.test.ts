@@ -174,6 +174,27 @@ describe('markdown stream startup failures', () => {
     }
   });
 
+  it('closes early progress after spawn failure and still accepts the next turn', async () => {
+    const h = await createHarness();
+    h.profileConfig.preferences.cotMessages = 'brief';
+    h.profileConfig.preferences.messageReply = 'text';
+    h.profileConfig.preferences.messageReplyMigrated = true;
+    const create = vi.spyOn(CotClient.prototype, 'create').mockResolvedValue({ cot_id: 'early', message_id: 'om_early' });
+    vi.spyOn(CotClient.prototype, 'update').mockResolvedValue();
+    const complete = vi.spyOn(CotClient.prototype, 'complete').mockResolvedValue();
+    vi.spyOn(h.agent, 'run').mockImplementationOnce(() => { throw new Error('spawn failed'); });
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(message('om_spawn_failure', 'first'));
+    expect(create).toHaveBeenCalledTimes(1);
+    await waitFor(() => complete.mock.calls.length === 1);
+    expect(complete).toHaveBeenCalledWith(expect.anything(), 'error');
+    const releaseNext = holdFirstAgentRun(h.agent);
+    releaseNext();
+    await h.channel.handlers.message?.(message('om_after_failure', 'second'));
+    await waitFor(() => JSON.stringify(h.channel.sent).includes('完成文档'));
+    expect(h.agent.runOptions).toHaveLength(1);
+  });
+
   it.each(['create', 'update', 'complete'] as const)('sends the final reply and starts the queued turn while CoT %s is still pending', async (stage) => {
     const h = await createHarness();
     h.profileConfig.preferences.messageReply = 'text';
@@ -200,6 +221,7 @@ describe('markdown stream startup failures', () => {
     try {
       await h.channel.handlers.message?.(message('om_first', 'first'));
       await waitFor(() => create.mock.calls.length > 0);
+      await waitFor(() => h.agent.runOptions.length === 1);
       if (stage === 'update') await waitFor(() => update.mock.calls.length > 0);
       await h.channel.handlers.message?.(message('om_second', 'second'));
       releaseAgent();
@@ -323,6 +345,7 @@ describe('markdown stream startup failures', () => {
     try {
       await h.channel.handlers.message?.(message('om_first', 'first'));
       await waitFor(() => noticeAttempts === 1);
+      await waitFor(() => h.agent.runOptions.length === 1);
       await h.channel.handlers.message?.(message('om_second', 'second'));
       expect(h.agent.runOptions).toHaveLength(1);
     } finally {
@@ -363,6 +386,7 @@ describe('markdown stream startup failures', () => {
       } as NormalizedMessage);
       await waitFor(() => update.mock.calls.length === 1);
       await waitFor(() => cotDegradedNotices(h.channel).length === 1);
+      await waitFor(() => h.agent.runOptions.length === 1);
       expect(h.agent.runs[0]?.stopped).toBe(false);
       expect(cotDegradedNotices(h.channel)[0]).toMatchObject({
         chatId: 'oc_topic',
@@ -404,6 +428,7 @@ describe('markdown stream startup failures', () => {
     try {
       await h.channel.handlers.message?.(message('om_first', 'first'));
       await waitFor(() => noticeAttempts === 1);
+      await waitFor(() => h.agent.runOptions.length === 1);
       await h.channel.handlers.message?.(message('om_second', 'second'));
       expect(h.agent.runOptions).toHaveLength(1);
     } finally {

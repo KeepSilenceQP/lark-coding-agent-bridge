@@ -56,6 +56,7 @@ export interface LeaseHooks {
 }
 
 export interface PendingPushOptions {
+  onQueued?: (lease: WorkLease | undefined) => void;
   /** True only for trusted, real human inbound IM messages. */
   registerAsTrigger?: boolean;
 }
@@ -136,6 +137,7 @@ export class PendingQueue {
           last.triggerMessageIds.push(msg.messageId);
           this.leaseHooks?.registerTrigger?.(last.lease, msg.messageId);
         }
+        options.onQueued?.(last.lease);
         // shared lease — no new acquire
       } else {
         const lease = this.allocateLease(scope, replyTo, resolvedWorkChainId);
@@ -143,6 +145,7 @@ export class PendingQueue {
         const triggerMessageIds = registerAsTrigger ? [msg.messageId] : [];
         if (lease && registerAsTrigger) this.leaseHooks?.registerTrigger?.(lease, msg.messageId);
         existing.units.push({ kind: 'regular', messages: [msg], lease, replyTo, triggerMessageIds });
+        options.onQueued?.(lease);
       }
       existing.timer = this.isScopeBlocked(scope) ? undefined : this.armTimer(scope);
       return totalLength(existing);
@@ -155,6 +158,7 @@ export class PendingQueue {
       units: [{ kind: 'regular', messages: [msg], lease, replyTo, triggerMessageIds }],
       timer: this.isScopeBlocked(scope) ? undefined : this.armTimer(scope),
     });
+    options.onQueued?.(lease);
     return 1;
   }
 

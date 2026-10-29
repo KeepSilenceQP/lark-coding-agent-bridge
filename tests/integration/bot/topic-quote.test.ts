@@ -1,3 +1,4 @@
+import { CotClient } from '../../../src/bot/cot.js';
 import type { NormalizedMessage, ReactionEvent } from '@larksuite/channel';
 import { mkdir, writeFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -82,6 +83,37 @@ afterEach(async () => {
 });
 
 describe('topic message quote handling', () => {
+  it('keeps an unmentioned root silent, acknowledges its reply before debounce, and closes on /new', async () => {
+    const h = await createHarness({ chatMode: 'topic' });
+    h.profileConfig.preferences.cotMessages = 'brief';
+    h.profileConfig.access.topicRootRequireMention = { oc_topic_chat: true };
+    const create = vi.spyOn(CotClient.prototype, 'create').mockResolvedValue({ cot_id: 'early', message_id: 'om_early' });
+    const update = vi.spyOn(CotClient.prototype, 'update').mockResolvedValue();
+    const complete = vi.spyOn(CotClient.prototype, 'complete').mockResolvedValue();
+    try {
+      await startTestBridge(h);
+      await expectSilentIntake(h, intakeMessage({
+        messageId: 'om_silent_root', rootId: 'om_silent_root', threadId: 'omt_early',
+      }));
+      expect(create).not.toHaveBeenCalled();
+      const reply = (id: string, content: string) => message({
+        messageId: id, rootId: 'om_silent_root', parentId: 'om_silent_root', threadId: 'omt_early', content,
+      });
+      await h.channel.handlers.message?.(reply('om_accepted', '@Bridge help'));
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(update).toHaveBeenCalledTimes(1);
+      expect(h.agent.runOptions).toHaveLength(0);
+      expect(h.channel.rawClient.im.v1.message.list).not.toHaveBeenCalled();
+      await h.channel.handlers.message?.(reply('om_cancel', '/new'));
+      await waitFor(() => complete.mock.calls.length === 1);
+      await new Promise(resolve => setTimeout(resolve, 700));
+      expect(h.agent.runOptions).toHaveLength(0);
+      expect(complete).toHaveBeenCalledWith(expect.anything(), 'error');
+    } finally {
+      create.mockRestore(); update.mockRestore(); complete.mockRestore();
+    }
+  });
+
   it('does not quote the topic root when a user directly mentions the bot inside the topic', async () => {
     const h = await createHarness();
 

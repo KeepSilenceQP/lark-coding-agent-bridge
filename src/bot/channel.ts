@@ -1,3 +1,4 @@
+import { IntakeProgress } from './intake-progress';
 import type {
   LarkChannel,
   LarkChannelOptions,
@@ -1419,6 +1420,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // switch can inject a one-time "model changed" note into the next (resumed)
   // prompt. In-memory only: on restart the first run re-seeds silently.
   const lastRunModelByScope = new Map<string, string>();
+  const intakeProgress = new IntakeProgress();
   const cotClient = new CotClient({
     tenant: cfg.accounts.app.tenant,
     appId: cfg.accounts.app.id,
@@ -1502,9 +1504,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     const preparationReservation = executor.reserveScope(scope);
     if (!preparationReservation) {
       releaseFlushedTurnAfterError(scope, internalUnitId, lease);
+      if (lease) intakeProgress.close(lease.unitId);
       log.warn('flush', 'reservation-unavailable-at-dequeue', { scope });
       return;
     }
+    const unwatchProgress = intakeProgress.watchCancellation(lease?.unitId, preparationReservation.signal);
     pending.block(scope);
     activeBatchCount += 1;
     void executePendingFlushWithCleanup({
@@ -1546,6 +1550,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           batch,
           controls,
           cotClient,
+          intakeProgress,
           callbackAuth,
           activePolicyFingerprints,
           lastRunModelByScope,
@@ -1561,7 +1566,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       onFinally: async () => {
         // Safe after success (ActiveRuns.register already consumed it), abort,
         // or any pre-start failure.
+        unwatchProgress();
         preparationReservation.release();
+        if (lease) intakeProgress.close(lease.unitId);
         pending.unblock(scope);
         activeBatchCount = Math.max(0, activeBatchCount - 1);
         await maybeLaunchDeferredRestart().catch((err) =>
@@ -1581,7 +1588,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       return wcId;
     },
     acquire: (l: WorkLease) => _workChainStore?.acquireUnit(l.workChainId, l.unitId),
-    release: (l: WorkLease) => _workChainStore?.releaseUnit(l.workChainId, l.unitId),
+    release: (l: WorkLease) => {
+      intakeProgress.close(l.unitId);
+      _workChainStore?.releaseUnit(l.workChainId, l.unitId);
+    },
     registerTrigger: (l: WorkLease, messageId: string) =>
       _workChainStore?.registerTrigger(l.workChainId, messageId),
   });
@@ -1591,8 +1601,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
 
   channel.on({
     message: async (msg) => {
+      log.info('intake', 'received', {
+        msgId: msg.messageId,
+        sourceAgeMs: msg.createTime > 0 ? Date.now() - msg.createTime : undefined,
+      });
       await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, () =>
         intakeMessage({
+          intakeProgress,
+          cotClient,
           channel,
           agent,
           sessions,
@@ -2182,6 +2198,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       meetingManager?.dispose();
       controls.meeting = undefined;
       pending.cancelAll();
+      intakeProgress.closeAll();
       const [disconnectResult, stopAllResult, ...flushResults] = await Promise.allSettled([
         channel.disconnect(),
         activeRuns.stopAll(),
@@ -2275,6 +2292,8 @@ async function sendForwardFetchFailedHint(
 }
 
 interface IntakeDeps {
+  intakeProgress: IntakeProgress;
+  cotClient: CotClient;
   channel: LarkChannel;
   agent: AgentAdapter;
   sessions: SessionStore;
@@ -2477,6 +2496,36 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   const waitsForCurrentTask = pending.isBlocked(scope) || activeRuns.hasActiveOrReserved(scope);
   const size = pending.push(scope, emsg, {
     registerAsTrigger: shouldRegisterInboundTrigger(emsg),
+    onQueued: (lease) => {
+      if (!lease || getCotMessages(controls.cfg) === 'off') return;
+      deps.intakeProgress.ensure(lease.unitId, {
+        client: deps.cotClient, chatId: emsg.chatId, scope,
+        originMessageId: emsg.messageId, inputPreview: emsg.content,
+        queued: waitsForCurrentTask,
+        onCreated: (messageId) => registerOutboundLifecycle(lease.workChainId, messageId),
+        onFailed: (kind) => {
+          if (kind === 'update') {
+            void sendCotDegradedNotice({
+              channel, chatId: emsg.chatId, scope, reason: 'progress update failed',
+              sendOpts: { replyTo: emsg.messageId, replyInThread: chatMode === 'topic' && Boolean(threadId) },
+              onSent: (result) => {
+                if (result && typeof result === 'object' && 'messageId' in result)
+                  registerOutboundLifecycle(lease.workChainId, String(result.messageId));
+              },
+            });
+            return;
+          }
+          void sendStartupDisplayFailureNotice({
+            channel, chatId: emsg.chatId, scope, source: 'cot',
+            sendOpts: { replyTo: emsg.messageId, replyInThread: chatMode === 'topic' && Boolean(threadId) },
+            onSent: (result) => {
+              if (result && typeof result === 'object' && 'messageId' in result)
+                registerOutboundLifecycle(lease.workChainId, String(result.messageId));
+            },
+          });
+        },
+      });
+    },
   });
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
   if (waitsForCurrentTask && senderTypeOf(emsg) !== 'bot' && emsg.rawContentType !== 'reaction') {
@@ -2513,6 +2562,7 @@ export function shouldBypassDeniedChatForInviteGroup(
 }
 
 interface RunBatchDeps {
+  intakeProgress?: IntakeProgress;
   channel: LarkChannel;
   executor: RunExecutor;
   sessions: SessionStore;
@@ -3192,9 +3242,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (cotEnabled) {
       // Progress is a side channel: neither creating the bubble nor flushing
       // its last update may hold agent consumption, the answer, or the queue.
-      const cotProgress = new AbortController();
+      const earlyProgress = deps.intakeProgress?.get(deps.lease?.unitId);
+      const cotProgress = earlyProgress?.controller ?? new AbortController();
       const cotWorkChainId = reactionTurnMeta?.workChainId;
-      const cotPublisher = new CotPublisher({
+      const cotPublisher = earlyProgress?.publisher ?? new CotPublisher({
         client: cotClient,
         chatId,
         // The CoT bubble follows this origin message's thread. In a topic the
@@ -3222,9 +3273,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
       });
       void (async () => {
-        await cotPublisher.start();
+        if (earlyProgress) await earlyProgress.ready;
+        else await cotPublisher.start();
         if (cotPublisher.disabled) {
-          if (!cotProgress.signal.aborted) notifyStartupDisplayFailure('cot');
+          if (!earlyProgress && !cotProgress.signal.aborted) notifyStartupDisplayFailure('cot');
           return;
         }
         // Capture the original chain: a slow create may finish after the next
@@ -3236,6 +3288,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           // Close a late bubble without replaying obsolete tool/text progress.
           await cotPublisher.finish(cotProgress.signal.reason);
           return;
+        }
+        if (earlyProgress) {
+          cotPublisher.enqueue('STEP_FINISHED', { stepId: `step-understand-${cotPublisher.runId}` });
+          cotPublisher.enqueue('STEP_STARTED', { stepId: `step-execute-${cotPublisher.runId}`, stepName: '正在处理' });
         }
         await consumeCotEvents(execution.subscribe(), cotPublisher, {
           detail: cotMessages,
@@ -3262,7 +3318,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       } finally {
         // Also terminate a progress subscription when the main consumer exits
         // early (watchdog, interruption, or session-persistence failure).
-        cotProgress.abort(finalState?.terminal === 'done' ? 'done' : 'error');
+        const reason = finalState?.terminal === 'done' ? 'done' : 'error';
+        cotProgress.abort(reason);
+        if (earlyProgress && deps.lease) deps.intakeProgress?.close(deps.lease.unitId, reason);
       }
       const cotResult = await sendFinalReply({
         channel,
