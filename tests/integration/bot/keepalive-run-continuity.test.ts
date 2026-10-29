@@ -93,11 +93,14 @@ describe('automatic keepalive preserves bridge work', () => {
     expect(h.agent.runs).toHaveLength(1);
     h.release();
     await vi.waitFor(() => expect(h.agent.runs).toHaveLength(2));
-    await vi.waitFor(() => expect(fixture.channel!.send).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(fixture.channel!.send).toHaveBeenCalledTimes(3));
     expect(fixture.channel!.send).toHaveBeenNthCalledWith(1, 'oc_dm',
+      { markdown: expect.stringContaining('已收到并排队') },
+      expect.objectContaining({ replyTo: 'om_followup' }));
+    expect(fixture.channel!.send).toHaveBeenNthCalledWith(2, 'oc_dm',
       { markdown: expect.stringContaining('first complete') },
       expect.objectContaining({ replyTo: 'om_first' }));
-    expect(fixture.channel!.send).toHaveBeenNthCalledWith(2, 'oc_dm',
+    expect(fixture.channel!.send).toHaveBeenNthCalledWith(3, 'oc_dm',
       { markdown: expect.stringContaining('follow-up complete') },
       expect.objectContaining({ replyTo: 'om_followup' }));
     expect(h.agent.runs.every((run) => !run.stopped)).toBe(true);

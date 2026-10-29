@@ -2474,10 +2474,26 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // Every ordinary input unit (reply OR top-level) carries a workChain lease
   // at enqueue (DD15). PendingQueue derives replyTo from the message so all
   // producers use one inheritance contract.
+  const waitsForCurrentTask = pending.isBlocked(scope) || activeRuns.hasActiveOrReserved(scope);
   const size = pending.push(scope, emsg, {
     registerAsTrigger: shouldRegisterInboundTrigger(emsg),
   });
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
+  if (waitsForCurrentTask && senderTypeOf(emsg) !== 'bot' && emsg.rawContentType !== 'reaction') {
+    // A busy conversation must acknowledge intake before the current run
+    // ends. This side channel must never hold intake or queue progression.
+    void Promise.resolve().then(() => channel.send(emsg.chatId, {
+      markdown: '当前会话还有任务正在执行。这条消息已收到并排队，前一项结束后会继续处理。',
+    }, {
+      replyTo: emsg.messageId,
+      replyInThread: chatMode === 'topic' && Boolean(threadId),
+    })).catch((err) => {
+      log.warn('intake', 'queued-notice-failed', {
+        scope,
+        errorName: err instanceof Error ? err.name : 'UnknownError',
+      });
+    });
+  }
 }
 
 export function shouldBypassDeniedChatForInviteGroup(
@@ -2614,27 +2630,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
-  // Topic upstream context. When the bot is pulled into a topic for the FIRST
-  // time (no session yet for this scope), the topic's earlier messages — the
-  // root question that may never have @-mentioned the bot, plus prior replies —
-  // live nowhere the agent can see them. Fetch them so it isn't blind to what
-  // the user is pointing at. An already-engaged topic keeps that history in its
-  // resumed session, so we skip the fetch there.
+  // Bootstrap history follows the authoritative session decision, not the
+  // legacy SessionStore (Codex identifiers are kept in the catalog).
   let topicContext: QuotedContext[] = [];
-  if (!deps.directCorrection && mode === 'topic' && threadId && !sessions.getRaw(scope)) {
-    const exclude = new Set([...batchIds, ...quoteTargets]);
-    topicContext = await fetchTopicContext(channel, threadId, {
-      maxMessages: 40,
-      excludeIds: exclude,
-    });
-    if (topicContext.length > 0) {
-      log.info('topic', 'context-fetched', {
-        scope,
-        threadId,
-        count: topicContext.length,
-      });
-    }
-  }
+  let topicContextLoaded = false;
 
   // Detect a model switch since this scope's last run. When resuming an
   // existing conversation the transcript still claims the old model, so tell
@@ -2684,12 +2683,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       (reactionContexts && reactionContexts.length > 0) ? reactionContexts : undefined,
       projectRoleAssignment,
     );
-  log.info('prompt', 'built', {
-    promptChars: prompt.length,
-    quotes: quotes.length,
-    topicContext: topicContext.length,
-    ...(modelSwitched ? { modelSwitchedTo: modelSelection } : {}),
-  });
+  const prepareTopicPrompt = !deps.directCorrection && mode === 'topic' && Boolean(threadId);
+  if (!prepareTopicPrompt) {
+    log.info('prompt', 'built', {
+      promptChars: prompt.length, quotes: quotes.length, topicContext: 0,
+      ...(modelSwitched ? { modelSwitchedTo: modelSelection } : {}),
+    });
+  }
 
   // For topic groups: thread the reply so it lands in the same topic as the
   // user's message. Otherwise the SDK posts at top level and the user's
@@ -2783,6 +2783,29 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       scopeId: scope,
       scope: scopeContext,
       prompt,
+      ...(prepareTopicPrompt ? {
+        preparePrompt: async ({ resumeFrom }: { resumeFrom?: string }) => {
+          if (!resumeFrom && mode === 'topic' && threadId && !topicContextLoaded) {
+            topicContext = await fetchTopicContext(channel, threadId, {
+              maxMessages: 40,
+              excludeIds: new Set([...batchIds, ...quoteTargets]),
+            });
+            topicContextLoaded = true;
+            log.info('topic', 'context-fetched', { scope, threadId, count: topicContext.length });
+          }
+          const context = resumeFrom ? [] : topicContext;
+          const prepared = buildPrompt(
+            batch, attachments, quotes, context, channel.botIdentity,
+            extraInstructions, reactionContexts?.length ? reactionContexts : undefined,
+            projectRoleAssignment,
+          );
+          log.info('prompt', 'built', {
+            promptChars: prepared.length, quotes: quotes.length, topicContext: context.length,
+            ...(modelSwitched ? { modelSwitchedTo: modelSelection } : {}),
+          });
+          return prepared;
+        },
+      } : {}),
       attachments: attachments.map(toPolicyAttachment),
       access: accessDecision,
       capability,
@@ -3167,6 +3190,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
 
     if (cotEnabled) {
+      // Progress is a side channel: neither creating the bubble nor flushing
+      // its last update may hold agent consumption, the answer, or the queue.
+      const cotProgress = new AbortController();
+      const cotWorkChainId = reactionTurnMeta?.workChainId;
       const cotPublisher = new CotPublisher({
         client: cotClient,
         chatId,
@@ -3179,6 +3206,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         scope,
         inputPreview: deps.directCorrection?.corrected.text ?? lastMsg.content,
         onDegraded: (reason) => {
+          // A late failure must not announce that an already-finished task is
+          // still waiting for its final answer.
+          if (cotProgress.signal.aborted) return;
           // Notify when progress fails, independently of agent completion.
           // An unavailable IM send must not hold the final reply or next run.
           void sendCotDegradedNotice({
@@ -3191,17 +3221,34 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           });
         },
       });
-      await cotPublisher.start();
-      // A1: register the CoT bubble messageId immediately after start() so a
-      // stop reaction can correlate during streaming — not only at completion.
-      if (reactionTurnMeta && !cotPublisher.disabled && cotPublisher.ref) {
-        registerOutboundLifecycle(reactionTurnMeta.workChainId, cotPublisher.ref.messageId);
-      }
-      if (!cotPublisher.disabled) {
-        const cotDone = consumeCotEvents(execution.subscribe(), cotPublisher, {
+      void (async () => {
+        await cotPublisher.start();
+        if (cotPublisher.disabled) {
+          if (!cotProgress.signal.aborted) notifyStartupDisplayFailure('cot');
+          return;
+        }
+        // Capture the original chain: a slow create may finish after the next
+        // run starts. Registration must not change that newer run's lifecycle.
+        if (cotWorkChainId && cotPublisher.ref) {
+          registerOutboundLifecycle(cotWorkChainId, cotPublisher.ref.messageId);
+        }
+        if (cotProgress.signal.aborted) {
+          // Close a late bubble without replaying obsolete tool/text progress.
+          await cotPublisher.finish(cotProgress.signal.reason);
+          return;
+        }
+        await consumeCotEvents(execution.subscribe(), cotPublisher, {
           detail: cotMessages,
+          signal: cotProgress.signal,
         });
-        const finalState = await processAgentStream(
+      })().catch((err) => {
+        log.warn('cot', 'background-failed', { err: err instanceof Error ? err.message : String(err) });
+        if (!cotProgress.signal.aborted) notifyStartupDisplayFailure('cot');
+        void cotPublisher.finish('error').catch(() => {});
+      });
+      let finalState: RunState | undefined;
+      try {
+        finalState = await processAgentStream(
           handle,
           eventStream,
           scope,
@@ -3212,22 +3259,23 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           recoverStartupTimeout,
           observeEditableToolStart,
         );
-        await cotDone;
-        const cotResult = await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalAnswerOnlyState(finalState),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
-        _registerOutboundOnStream(cotResult);
-        finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
-        return;
+      } finally {
+        // Also terminate a progress subscription when the main consumer exits
+        // early (watchdog, interruption, or session-persistence failure).
+        cotProgress.abort(finalState?.terminal === 'done' ? 'done' : 'error');
       }
-      log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
-      notifyStartupDisplayFailure('cot');
+      const cotResult = await sendFinalReply({
+        channel,
+        chatId,
+        scope,
+        state: finalAnswerOnlyState(finalState),
+        replyMode,
+        sendOpts,
+        cardRenderOptions,
+      });
+      _registerOutboundOnStream(cotResult);
+      finalizeReactionRun(scope, reactionTurnMeta, runUnitId);
+      return;
     }
 
     if (replyMode === 'card') {

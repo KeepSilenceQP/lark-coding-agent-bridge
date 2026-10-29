@@ -36,6 +36,36 @@ describe('IM run flow', () => {
     expect(h.agent.runOptions[0]).toMatchObject({ reasoningEffort: 'ultra', serviceTier: 'default' });
   });
 
+  it('releases the scope when late context preparation fails', async () => {
+    const h = await createHarness({ defaultWorkspace: true });
+    await expect(startRunFlow({
+      scopeId: 'late-context', scope: { source: 'im', chatId: 'late-context', actorId: 'ou_user' },
+      prompt: 'hello', attachments: [], access: { ok: true, reason: 'allowed-user' },
+      capability: claudeCapability(h.profileConfig), profileConfig: h.profileConfig,
+      sessions: h.sessions, workspaces: h.workspaces, executor: h.executor, now: 1000,
+      preparePrompt: async () => { throw new Error('context failed'); },
+    })).rejects.toThrow('context failed');
+    expect(h.agent.runOptions).toHaveLength(0);
+    expect(h.activeRuns.hasActiveOrReserved('late-context')).toBe(false);
+  });
+
+  it('prepares context from the final resume decision and returns the submitted prompt', async () => {
+    const h = await createHarness({ defaultWorkspace: true });
+    h.sessions.set('late-context', 'existing', await realpath(h.tmp.workspace));
+    const preparePrompt = vi.fn(async ({ resumeFrom }: { resumeFrom?: string }) =>
+      resumeFrom ? 'current turn only' : 'bootstrap history');
+    const result = await startRunFlow({
+      scopeId: 'late-context', scope: { source: 'im', chatId: 'late-context', actorId: 'ou_user' },
+      prompt: 'hello', attachments: [], access: { ok: true, reason: 'allowed-user' },
+      capability: claudeCapability(h.profileConfig), profileConfig: h.profileConfig,
+      sessions: h.sessions, workspaces: h.workspaces, executor: h.executor, now: 1000,
+      preparePrompt,
+    });
+    expect(preparePrompt).toHaveBeenCalledWith({ resumeFrom: 'existing' });
+    expect(h.agent.runOptions[0]?.prompt).toBe('current turn only');
+    expect(result.ok && result.policy.prompt).toBe('current turn only');
+  });
+
   it('rejects missing cwd without falling back to the user home', async () => {
     const h = await createHarness();
 

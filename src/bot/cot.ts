@@ -12,10 +12,13 @@ const ENDPOINTS: Record<TenantBrand, string> = {
 const COT_UPDATE_THROTTLE_MS = 600;
 const COT_TOOL_OUTPUT_MAX = 1200;
 const COT_TEXT_MAX = 1200;
-// Bounds every CoT HTTP call. Without it a hung message_cot endpoint pins
-// start() — which runs before any agent event is drained and before the
-// plain-reply fallback — to undici's ~300s default.
+// Bound each background HTTP attempt instead of retaining progress requests
+// until undici's much longer default. Safe connect failures get one retry.
 const COT_REQUEST_TIMEOUT_MS = 15_000;
+const COT_CONNECT_RETRY_DELAY_MS = 250;
+const COT_SAFE_CONNECT_ERRORS = new Set([
+  'UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
+]);
 
 export class CotClient {
   private readonly baseUrl: string;
@@ -34,11 +37,10 @@ export class CotClient {
     const now = Date.now();
     if (this.token && this.tokenExpiresAt - now > 60_000) return this.token;
     const data = await this.withRequestDiagnostics('tenant-auth', async () => {
-      const resp = await fetch(`${this.baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
+      const resp = await this.fetchWithConnectRetry('tenant-auth', `${this.baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
-        signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
       });
       if (!resp.ok) throw new Error(`tenant token HTTP ${resp.status}`);
       const body = await resp.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
@@ -58,8 +60,7 @@ export class CotClient {
     const operation = path.includes('/complete/') ? 'cot-complete'
       : init.method === 'PUT' ? 'cot-update' : 'cot-create';
     return this.withRequestDiagnostics(operation, async () => {
-      const resp = await fetch(`${this.baseUrl}${path}`, {
-        signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
+      const resp = await this.fetchWithConnectRetry(operation, `${this.baseUrl}${path}`, {
         ...init,
         headers: {
           'Content-Type': 'application/json;charset=utf-8',
@@ -78,6 +79,32 @@ export class CotClient {
     });
   }
 
+  private async fetchWithConnectRetry(operation: string, url: string, init: RequestInit): Promise<Response> {
+    for (let attempt = 1; ; attempt++) {
+      const signal = init.signal ?? AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS);
+      try {
+        return await fetch(url, {
+          ...init,
+          // A redirect can fail to connect after the original POST succeeded.
+          // Refuse redirects so connect failures always precede delivery.
+          redirect: 'error',
+          signal,
+        });
+      } catch (err) {
+        const causeCode = transportCauseCode(err);
+        if (attempt !== 1 || signal.aborted || !(err instanceof TypeError)
+          || !causeCode || !COT_SAFE_CONNECT_ERRORS.has(causeCode)) throw err;
+        log.warn('cot', 'request-retry', {
+          operation,
+          causeCode,
+          attempt,
+          retryDelayMs: COT_CONNECT_RETRY_DELAY_MS,
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, COT_CONNECT_RETRY_DELAY_MS));
+      }
+    }
+  }
+
   private async withRequestDiagnostics<T>(operation: string, request: () => Promise<T>): Promise<T> {
     const startedAt = Date.now();
     try {
@@ -86,14 +113,12 @@ export class CotClient {
       // Do not log request/response bodies, headers or transport error objects:
       // they can contain credentials. Fetch's useful socket code is in cause.
       const error = err instanceof Error ? err : undefined;
-      const cause = error?.cause;
-      const causeCode = cause && typeof cause === 'object' && 'code' in cause ? cause.code : undefined;
       log.warn('cot', 'request-failed', {
         operation,
         durationMs: Date.now() - startedAt,
         timeoutMs: COT_REQUEST_TIMEOUT_MS,
         errorName: error?.name,
-        causeCode: typeof causeCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(causeCode) ? causeCode : undefined,
+        causeCode: transportCauseCode(err),
       });
       throw err;
     }
@@ -141,6 +166,12 @@ export class CotClient {
       body: '',
     });
   }
+}
+
+function transportCauseCode(error: unknown): string | undefined {
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = cause && typeof cause === 'object' && 'code' in cause ? cause.code : undefined;
+  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : undefined;
 }
 
 interface CotRef {
@@ -193,9 +224,9 @@ export class CotPublisher {
     // Single chat_id-addressed create. In topics the bubble follows
     // originMessageId's thread (see CotClient.create); the caller passes an
     // in-topic origin so it lands in the topic. On any failure we disable CoT
-    // and let the caller fall back to a plain reply — never retry, since a
-    // create that failed after committing server-side would leave a duplicate
-    // bubble spinning forever.
+    // and let the caller fall back to a plain reply. Only CotClient's proven
+    // pre-delivery connect failures may retry; replaying an ambiguous create
+    // could leave a duplicate bubble spinning forever.
     let created: Record<string, unknown>;
     try {
       created = await this.client.create(this.chatId, this.originMessageId);
@@ -327,7 +358,7 @@ export function finalAnswerOnlyState(state: RunState): RunState {
 export async function consumeCotEvents(
   events: AsyncIterable<AgentEvent>,
   publisher: CotPublisher,
-  opts: { detail: CotMessagesMode },
+  opts: { detail: CotMessagesMode; signal?: AbortSignal },
 ): Promise<void> {
   let reasoningOpen = false;
   let textStepOpen = false;
@@ -339,7 +370,7 @@ export async function consumeCotEvents(
   const finalStepId = `step-process-${publisher.runId}`;
 
   try {
-    for await (const evt of events) {
+    for await (const evt of interruptibleCotEvents(events, opts.signal)) {
       if (evt.type === 'system' || evt.type === 'usage') continue;
       if (evt.type === 'thinking') {
         closeTextIfNeeded();
@@ -442,7 +473,7 @@ export async function consumeCotEvents(
     }
     closeReasoningIfNeeded();
     closeTextIfNeeded();
-    await publisher.finish('done');
+    await publisher.finish(opts.signal?.aborted && opts.signal.reason === 'error' ? 'error' : 'done');
   } catch (err) {
     log.warn('cot', 'consume-failed', { err: err instanceof Error ? err.message : String(err) });
     await publisher.finish('error');
@@ -460,6 +491,45 @@ export async function consumeCotEvents(
     publisher.enqueue('TEXT_MESSAGE_END', { messageId: textMessageId });
     textMessageOpen = false;
     textMessageId = undefined;
+  }
+}
+
+async function* interruptibleCotEvents(
+  events: AsyncIterable<AgentEvent>,
+  signal?: AbortSignal,
+): AsyncIterable<AgentEvent> {
+  if (!signal) {
+    yield* events;
+    return;
+  }
+  const iterator = events[Symbol.asyncIterator]();
+  let sourceDone = false;
+  try {
+    while (!signal.aborted) {
+      let onAbort!: () => void;
+      const aborted = new Promise<undefined>((resolve) => {
+        onAbort = () => resolve(undefined);
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      try {
+        // Promise.race observes a late next() rejection even after abort wins.
+        const result = await Promise.race([Promise.resolve().then(() => iterator.next()), aborted]);
+        if (!result || signal.aborted) return;
+        if (result.done) {
+          sourceDone = true;
+          return;
+        }
+        yield result.value;
+      } finally {
+        signal.removeEventListener('abort', onAbort);
+      }
+    }
+  } finally {
+    if (!sourceDone) {
+      // Release this subscription only. Its pending next/return must not hold
+      // final delivery or stop the independently owned agent event source.
+      void Promise.resolve().then(() => iterator.return?.()).catch(() => {});
+    }
   }
 }
 

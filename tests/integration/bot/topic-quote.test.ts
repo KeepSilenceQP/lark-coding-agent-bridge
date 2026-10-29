@@ -283,6 +283,55 @@ describe('topic message quote handling', () => {
     expect(prompt).not.toContain('<topic_context>');
   });
 
+  it('bootstraps a silent topic once, resumes Codex without history, and bootstraps after reset', async () => {
+    const h = await createHarness({
+      agentKind: 'codex',
+      chatMode: 'topic',
+      threadMessages: [{
+        message_id: 'om_topic_root', msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'upstream question before the bot joined' }) },
+        sender: { id: 'ou_user', sender_type: 'user' },
+        create_time: '1760000000000', thread_id: 'omt_bootstrap',
+      }],
+      agentEvents: [
+        { type: 'system', threadId: 'codex_topic_session' },
+        { type: 'text', delta: 'answer' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+    });
+    h.profileConfig.preferences.codexEditedMessageRestart = true;
+    h.profileConfig.access.topicRootRequireMention = { oc_topic_chat: true };
+    await startTestBridge(h);
+    await expectSilentIntake(h, intakeMessage({
+      messageId: 'om_topic_root', threadId: 'omt_bootstrap',
+      rootId: 'om_topic_root', content: 'upstream question before the bot joined',
+    }));
+    const send = (id: string) => h.channel.handlers.message?.(message({
+      messageId: id, rootId: 'om_topic_root', parentId: 'om_topic_root',
+      threadId: 'omt_bootstrap', content: '@Bridge help',
+    }));
+    await send('om_first');
+    await waitFor(() => h.channel.streams.length === 1);
+    expect(h.agent.runOptions[0]?.prompt).toContain('upstream question before the bot joined');
+    expect(h.channel.rawClient.im.v1.message.list).toHaveBeenCalledTimes(1);
+    expect(h.sessions.getRaw('oc_topic_chat:omt_bootstrap')).toBeUndefined();
+
+    await send('om_second');
+    await waitFor(() => h.channel.streams.length === 2);
+    expect(h.agent.runOptions[1]?.threadId).toBe('codex_topic_session');
+    expect(h.agent.runOptions[1]?.prompt).not.toContain('<topic_context>');
+    expect(h.channel.rawClient.im.v1.message.list).toHaveBeenCalledTimes(1);
+
+    // A stale legacy entry must not hide an actual new Codex conversation.
+    h.sessions.set('oc_topic_chat:omt_bootstrap', 'legacy', await realpath(h.tmp.workspace));
+    for (const entry of h.sessionCatalog.entries()) h.sessionCatalog.archiveActive(entry);
+    await send('om_reset');
+    await waitFor(() => h.channel.streams.length === 3);
+    expect(h.agent.runOptions[2]?.threadId).toBeUndefined();
+    expect(h.agent.runOptions[2]?.prompt).toContain('upstream question before the bot joined');
+    expect(h.channel.rawClient.im.v1.message.list).toHaveBeenCalledTimes(2);
+  });
+
   it('does not recall the streamed message when the agent produces no content', async () => {
     // Restored fork behavior: never turn an empty streamed reply into a visible
     // Feishu "message recalled" system notice.
@@ -889,6 +938,7 @@ async function createHarness(options: {
   channel: FakeLarkChannel & { handlers: MessageHandlerMap };
   agent: FakeAgentAdapter;
   sessions: SessionStore;
+  sessionCatalog: SessionCatalog;
   workspaces: WorkspaceStore;
   profileConfig: ReturnType<typeof createDefaultProfileConfig>;
   controls: ReturnType<typeof createControls>;
@@ -919,6 +969,7 @@ async function createHarness(options: {
     },
   };
   const sessions = new SessionStore(join(tmp.profile, 'sessions.json'));
+  const sessionCatalog = new SessionCatalog(join(tmp.profile, 'catalog.json'));
   const workspaces = new WorkspaceStore(join(tmp.profile, 'workspaces.json'));
   const agent = new FakeAgentAdapter({
     events: options.agentEvents ?? [{ type: 'done', terminationReason: 'normal' }],
@@ -932,7 +983,7 @@ async function createHarness(options: {
     await writeFile(join(tmp.profile, 'prompts', 'groups', 'oc_activation.md'), 'activation');
     promptSessionService = await PromptSessionService.open({
       profileDir: tmp.profile, profile: 'test', sessionStore: sessions,
-      sessionCatalog: new SessionCatalog(join(tmp.profile, 'catalog.json')),
+      sessionCatalog,
     });
     await promptSessionService.prepareSession({
       identity: { scopeId: 'oc_activation', agentId: 'claude', cwdRealpath: workspace, policyFingerprint: 'activation' },
@@ -940,7 +991,7 @@ async function createHarness(options: {
     });
   }
   cleanups.push(async () => {
-    await Promise.all([sessions.flush(), workspaces.flush()]);
+    await Promise.all([sessions.flush(), sessionCatalog.flush(), workspaces.flush()]);
     await tmp.cleanup();
   });
   return {
@@ -948,6 +999,7 @@ async function createHarness(options: {
     channel,
     agent,
     sessions,
+    sessionCatalog,
     workspaces,
     profileConfig,
     controls,
@@ -960,6 +1012,7 @@ async function startTestBridge(h: {
   profileConfig: ReturnType<typeof createDefaultProfileConfig>;
   agent: FakeAgentAdapter;
   sessions: SessionStore;
+  sessionCatalog: SessionCatalog;
   workspaces: WorkspaceStore;
   controls: ReturnType<typeof createControls>;
   promptSessionService?: PromptSessionService;
@@ -968,6 +1021,7 @@ async function startTestBridge(h: {
     cfg: h.profileConfig,
     agent: h.agent,
     sessions: h.sessions,
+    sessionCatalog: h.sessionCatalog,
     workspaces: h.workspaces,
     controls: h.controls,
     promptSessionService: h.promptSessionService,

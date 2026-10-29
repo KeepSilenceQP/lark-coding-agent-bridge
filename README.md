@@ -512,6 +512,12 @@ For Codex profiles, images attached to the reply that mentions the bot are downl
 
 **Progress freezes on a spinner and reports an update failure.** A mid-run CoT update failure immediately triggers a best-effort notice in the original conversation and closes the existing progress bubble. A failed close is attempted again when the task ends. Neither operation blocks the task or final reply; a network outage can still prevent delivery. Automatic connection recovery rebuilds only the WebSocket and preserves running tasks, while an explicit bridge shutdown still stops them. The final reply reports whether the task completed, failed, or was interrupted.
 
+CoT creation, updates, and completion run in the background without delaying agent event handling, the final reply, or the next queued turn after completion. A connection failure known to precede delivery gets one retry after 250ms. Response timeouts, disconnects, and API errors are not replayed, avoiding duplicate bubbles or progress content. Once the final result is ready, late progress failures produce no notice; a late-created bubble is closed without replaying past activity. Final delivery still requires a working connection to Feishu/Lark.
+
+**Topic history repeats and progress appears late.** Topic history is bootstrapped only when the final run decision starts a new conversation. Resumed conversations neither fetch nor inject it again. First-time participation still receives upstream context, and the topic-root mention rule is preserved. The decision follows the actual session resolution, including Codex catalog and prompt-binding changes.
+
+**New messages get no feedback during a long task.** When the same conversation is busy, accepted user messages immediately trigger a best-effort queued acknowledgement addressed to the original message or topic. A failed notice does not block either task or change execution order. Separate topics have independent busy states.
+
 **The agent subprocess looks frozen (card stuck on the last frame).** The bridge supports an idle watchdog: if the agent emits nothing for N minutes, the process is killed and the card is annotated with the auto-termination reason. Disabled by default. Enable with `/config` globally, or `/timeout 10` for the current session; `/timeout off` disables it for the session; `/timeout default` clears the session override.
 
 **The agent says it cannot see an image I sent.** Upgrade to the latest version. Releases before 0.1.0 had a filename-dedup bug.

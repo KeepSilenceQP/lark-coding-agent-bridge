@@ -37,6 +37,8 @@ export interface StartRunFlowInput {
   scope: ScopeContext;
   prompt: string;
   systemPromptAddendum?: string;
+  /** Finalize context only after the authoritative session decision, before spawn. */
+  preparePrompt?: (session: { resumeFrom?: string }) => Promise<string>;
   attachments: AgentAttachment[];
   access: AccessDecision;
   capability: AgentCapability;
@@ -482,10 +484,17 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   }
 
   let execution: RunExecution;
+  let preparedPolicy = policy;
   try {
+    // Use the final decision (including prompt-binding resets), not a second
+    // lookup in a legacy store. Preparation failures must release ownership.
+    const prompt = input.preparePrompt
+      ? await input.preparePrompt({ resumeFrom })
+      : policy.prompt;
+    preparedPolicy = { ...policy, prompt };
     execution = await input.executor.submit({
       scopeId: input.scopeId,
-      policy,
+      policy: preparedPolicy,
       sessionId,
       threadId,
       systemPromptAddendum,
@@ -508,6 +517,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     });
   } catch (err) {
     promptSessionContext?.admission.finishWithoutIdentifier();
+    reservation.release();
     if (err instanceof RunRejected) {
       return {
         ok: false,
@@ -529,7 +539,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   return {
     ok: true,
     execution,
-    policy,
+    policy: preparedPolicy,
     cwdRealpath: workspace.cwdRealpath,
     ...(resumeFrom ? { resumeFrom } : {}),
     ...(promptSessionContext ? { promptSession: promptSessionContext } : {}),

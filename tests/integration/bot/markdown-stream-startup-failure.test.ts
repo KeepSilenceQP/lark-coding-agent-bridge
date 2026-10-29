@@ -105,6 +105,156 @@ afterEach(async () => {
 });
 
 describe('markdown stream startup failures', () => {
+  it('does not send busy notices for another topic, denied senders, or bot messages', async () => {
+    const h = await createHarness();
+    h.profileConfig.access.allowedChats = ['oc_dm'];
+    h.profileConfig.preferences.messageReply = 'text';
+    h.profileConfig.preferences.messageReplyMigrated = true;
+    h.profileConfig.preferences.cotMessages = 'off';
+    const releaseAgent = holdFirstAgentRun(h.agent);
+    const incoming = (id: string, threadId: string) => ({
+      ...message(id, id), chatType: 'group' as const, threadId, mentionedBot: true,
+    });
+    await startTestBridge(h);
+    try {
+      await h.channel.handlers.message?.(incoming('om_first', 'omt_busy'));
+      await waitFor(() => h.agent.runOptions.length === 1);
+      await h.channel.handlers.message?.(incoming('om_other_topic', 'omt_other'));
+      await h.channel.handlers.message?.({ ...message('om_denied', 'denied'), senderId: 'ou_denied' });
+      await h.channel.handlers.message?.({ ...incoming('om_bot', 'omt_busy'), senderType: 'bot' });
+      expect(JSON.stringify(h.channel.sent)).not.toContain('已收到并排队');
+    } finally {
+      releaseAgent();
+    }
+  });
+
+  it.each(['p2p', 'topic'].flatMap((mode) =>
+    ['ok', 'reject', 'hang'].map((outcome) => ({ mode, outcome })),
+  ))('acknowledges a queued $mode message without blocking either task when the notice send is $outcome', async ({ mode, outcome }) => {
+    const h = await createHarness();
+    h.profileConfig.access.allowedChats = ['oc_dm'];
+    h.profileConfig.preferences.messageReply = 'text';
+    h.profileConfig.preferences.messageReplyMigrated = true;
+    h.profileConfig.preferences.cotMessages = 'off';
+    const incoming = (id: string, text: string) => ({
+      ...message(id, text),
+      ...(mode === 'topic' ? { chatType: 'group' as const, threadId: 'omt_busy', mentionedBot: true } : {}),
+    });
+    const releaseAgent = holdFirstAgentRun(h.agent);
+    const send = h.channel.send.bind(h.channel);
+    const pendingNotice = deferred<void>();
+    vi.spyOn(h.channel, 'send').mockImplementation(async (chat, content, options) => {
+      if ((content as { markdown?: string }).markdown?.includes('已收到并排队')) {
+        await send(chat, content, options);
+        if (outcome === 'reject') throw new Error('notice unavailable');
+        if (outcome === 'hang') await pendingNotice.promise;
+        return { messageId: 'om_queued_notice' };
+      }
+      return send(chat, content, options);
+    });
+    await startTestBridge(h);
+    try {
+      await h.channel.handlers.message?.(incoming('om_first', 'first'));
+      await waitFor(() => h.agent.runOptions.length === 1);
+      expect(JSON.stringify(h.channel.sent)).not.toContain('已收到并排队');
+      await h.channel.handlers.message?.(incoming('om_second', 'second'));
+      await waitFor(() => h.channel.sent.some((entry) =>
+        (entry.content as { markdown?: string }).markdown?.includes('已收到并排队') === true));
+      expect(h.channel.sent.find((entry) =>
+        (entry.content as { markdown?: string }).markdown?.includes('已收到并排队'))).toMatchObject({
+        chatId: 'oc_dm', options: { replyTo: 'om_second', replyInThread: mode === 'topic' },
+      });
+      expect(h.agent.runOptions).toHaveLength(1);
+      releaseAgent();
+      await waitFor(() => JSON.stringify(h.channel.sent).includes('完成文档'));
+      await waitFor(() => h.agent.runOptions.length === 2);
+    } finally {
+      releaseAgent();
+      pendingNotice.resolve();
+    }
+  });
+
+  it.each(['create', 'update', 'complete'] as const)('sends the final reply and starts the queued turn while CoT %s is still pending', async (stage) => {
+    const h = await createHarness();
+    h.profileConfig.preferences.messageReply = 'text';
+    h.profileConfig.preferences.messageReplyMigrated = true;
+    h.profileConfig.preferences.cotMessages = 'brief';
+    const pending = deferred<void>();
+    const ref = { cot_id: 'cot_first', message_id: 'om_cot_first' };
+    const create = vi.spyOn(CotClient.prototype, 'create').mockImplementation(async (_chat, origin) =>
+      origin === 'om_first' ? ref : { cot_id: 'cot_second', message_id: 'om_cot_second' });
+    const update = vi.spyOn(CotClient.prototype, 'update').mockResolvedValue(undefined);
+    const complete = vi.spyOn(CotClient.prototype, 'complete').mockResolvedValue(undefined);
+    if (stage === 'create') create.mockImplementationOnce(async () => { await pending.promise; return ref; });
+    if (stage === 'update') update.mockImplementationOnce(() => pending.promise);
+    if (stage === 'complete') complete.mockImplementationOnce(() => pending.promise);
+    const registered = vi.spyOn(WorkChainStore.prototype, 'registerOutbound');
+    const send = h.channel.send.bind(h.channel);
+    vi.spyOn(h.channel, 'send').mockImplementation(async (chat, content, options) => {
+      await send(chat, content, options);
+      return { messageId: 'om_final_first' };
+    });
+    const releaseAgent = holdFirstAgentRun(h.agent);
+    await startTestBridge(h);
+
+    try {
+      await h.channel.handlers.message?.(message('om_first', 'first'));
+      await waitFor(() => create.mock.calls.length > 0);
+      if (stage === 'update') await waitFor(() => update.mock.calls.length > 0);
+      await h.channel.handlers.message?.(message('om_second', 'second'));
+      releaseAgent();
+      await waitFor(() => JSON.stringify(h.channel.sent).includes('完成文档'));
+      await waitFor(() => h.agent.runOptions.length === 2);
+      expect(h.agent.runs[0]?.stopped).toBe(false);
+      expect(startupNotices(h.channel)).toHaveLength(0);
+      expect(cotDegradedNotices(h.channel)).toHaveLength(0);
+    } finally {
+      releaseAgent();
+      pending.resolve();
+    }
+
+    await waitFor(() => complete.mock.calls.some(([r]) => r.cotId === 'cot_first'));
+    expect(complete.mock.calls.filter(([r]) => r.cotId === 'cot_first')).toHaveLength(1);
+    const originalChain = registered.mock.calls.find(([, id]) => id === 'om_final_first')?.[0];
+    expect(originalChain).toBeTruthy();
+    expect(registered).toHaveBeenCalledWith(originalChain, 'om_cot_first');
+    if (stage === 'create') {
+      const replayed = update.mock.calls.filter(([r]) => r.cotId === 'cot_first')
+        .flatMap(([, events]) => events).map((event) => event.event_type);
+      expect(replayed).not.toContain('TOOL_CALL_START');
+      expect(replayed).not.toContain('TEXT_MESSAGE_CONTENT');
+    }
+  });
+
+  it.each(['create', 'update'] as const)('suppresses a late CoT %s failure notice after the final reply', async (stage) => {
+    const h = await createHarness();
+    h.profileConfig.preferences.messageReply = 'text';
+    h.profileConfig.preferences.messageReplyMigrated = true;
+    h.profileConfig.preferences.cotMessages = 'brief';
+    const pending = deferred<void>();
+    const create = vi.spyOn(CotClient.prototype, 'create').mockResolvedValue({ cot_id: 'cot_first', message_id: 'om_cot_first' });
+    const update = vi.spyOn(CotClient.prototype, 'update').mockResolvedValue(undefined);
+    vi.spyOn(CotClient.prototype, 'complete').mockResolvedValue(undefined);
+    const warn = vi.spyOn(log, 'warn');
+    if (stage === 'create') create.mockImplementationOnce(async () => { await pending.promise; return {}; });
+    else update.mockImplementationOnce(() => pending.promise);
+    const releaseAgent = holdFirstAgentRun(h.agent);
+    await startTestBridge(h);
+    try {
+      await h.channel.handlers.message?.(message('om_first', 'first'));
+      await waitFor(() => create.mock.calls.length > 0);
+      if (stage === 'update') await waitFor(() => update.mock.calls.length > 0);
+      releaseAgent();
+      await waitFor(() => JSON.stringify(h.channel.sent).includes('完成文档'));
+    } finally {
+      releaseAgent();
+      pending.reject(new Error('late progress failure'));
+    }
+    await waitFor(() => warn.mock.calls.some(([phase, event]) => phase === 'cot' && event === `${stage}-failed`));
+    expect(startupNotices(h.channel)).toHaveLength(0);
+    expect(cotDegradedNotices(h.channel)).toHaveLength(0);
+  });
+
   it.each([
     { cotFails: false, streamFails: true, mode: 'markdown' as const },
     { cotFails: false, streamFails: true, mode: 'card' as const },
