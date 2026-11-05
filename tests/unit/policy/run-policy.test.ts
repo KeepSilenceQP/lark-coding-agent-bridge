@@ -99,6 +99,33 @@ describe('run policy', () => {
     });
   });
 
+  it('keeps the fingerprint stable when profile-wide access lists change', () => {
+    const input = baseInput();
+    const before = evaluateRunPolicy(input);
+    input.profileConfig.access.allowedChats.push('oc_other');
+    input.profileConfig.access.ownerNoMentionChats.push('oc_chat');
+    const after = evaluateRunPolicy(input);
+
+    expect(before.ok).toBe(true);
+    expect(after.ok).toBe(true);
+    if (!before.ok || !after.ok) throw new Error('expected run policy to allow');
+    expect(after.policyFingerprint).toBe(before.policyFingerprint);
+  });
+
+  it('changes the fingerprint when the effective access decision changes', () => {
+    const allowedUser = evaluateRunPolicy(baseInput());
+    const owner = evaluateRunPolicy({
+      ...baseInput(),
+      access: { ok: true, reason: 'owner' },
+    });
+
+    expect(allowedUser.ok).toBe(true);
+    expect(owner.ok).toBe(true);
+    if (!allowedUser.ok || !owner.ok) throw new Error('expected run policy to allow');
+    expect(owner.policyFingerprint).not.toBe(allowedUser.policyFingerprint);
+    expect(allowedUser.compatiblePolicyFingerprints).toHaveLength(1);
+  });
+
   it('fingerprints the attachment policy shape instead of concrete run attachments', () => {
     const noAttachment = evaluateRunPolicy(baseInput());
     const withAcceptedImage = evaluateRunPolicy({

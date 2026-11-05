@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ProfileConfig, SandboxMode } from '../config/profile-schema';
 import { canonicalizeJcs } from '../session/jcs';
+import type { AccessDecision } from './access';
 
 export interface FingerprintInputV2 {
   cwdRealpath: string;
@@ -44,6 +45,7 @@ export function policyFingerprint(input: FingerprintInputV2): string {
   });
 }
 
+/** Pre-fix digest retained only for exact, one-generation session adoption. */
 export function accessPolicyDigest(access: ProfileConfig['access']): string {
   return digestCanonical({
     admins: [...access.admins].sort(),
@@ -52,6 +54,18 @@ export function accessPolicyDigest(access: ProfileConfig['access']): string {
     groupResponseMode: access.groupResponseMode,
     requireMentionInGroup: access.requireMentionInGroup,
     ownerNoMentionChats: [...access.ownerNoMentionChats].sort(),
+  });
+}
+
+/**
+ * Session identity depends on the access result for this accepted request,
+ * rather than every entry in the profile-wide allowlists. Access is still
+ * evaluated for every request before a run can start.
+ */
+export function accessDecisionDigest(access: AccessDecision): string {
+  return digestCanonical({
+    ok: access.ok,
+    reason: access.reason,
   });
 }
 

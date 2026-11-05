@@ -8,6 +8,7 @@ import { ensureGroupPromptSnapshot } from '../../../src/session/group-prompt-fil
 import {
   createPromptBindingActivationMarker,
   createPromptBindingLedger,
+  promptBindingIdentityKey,
 } from '../../../src/session/prompt-binding-ledger.js';
 import {
   DEFAULT_PROMPT_ACTIVATION_TIMEOUT_MS,
@@ -155,6 +156,63 @@ describe('PromptSessionService', () => {
       agentSessionId: 'thread-1',
       binding: fresh.binding,
       systemPromptAddendum: 'version one',
+    });
+  });
+
+  it('promotes a compatible pre-fix policy identity without replacing its pinned session', async () => {
+    const profileDir = await temporaryProfile();
+    const groupsDir = join(profileDir, 'prompts', 'groups');
+    await mkdir(groupsDir, { recursive: true });
+    await writeFile(join(groupsDir, 'chat-1.md'), 'group role', { mode: 0o600 });
+    const catalog = new SessionCatalog(join(profileDir, 'sessions.json.catalog.json'));
+    const service = await PromptSessionService.open({
+      profileDir,
+      profile: 'work',
+      sessionCatalog: catalog,
+      sessionStore: new SessionStore(join(profileDir, 'sessions.json')),
+      now: () => 1_720_000_000_000,
+      createInstallId: () => 'install-compatible-policy',
+    });
+    const oldIdentity = { ...identity(), policyFingerprint: 'policy-before-fix' };
+    const fresh = await service.prepareSession({ identity: oldIdentity, origin: groupOrigin() });
+    if (fresh.kind !== 'fresh') throw new Error('expected fresh decision');
+    await service.recordIdentifier({
+      identity: oldIdentity,
+      origin: groupOrigin(),
+      binding: fresh.binding,
+      generation: fresh.generation,
+      agentSessionId: 'thread-before-fix',
+    });
+
+    await expect(
+      service.prepareSession({
+        identity: identity(),
+        origin: groupOrigin(),
+        existingAgentSessionId: 'thread-different',
+        compatiblePolicyFingerprints: ['policy-before-fix'],
+      }),
+    ).rejects.toThrow('does not match the catalog session');
+
+    await expect(
+      service.prepareSession({
+        identity: identity(),
+        origin: groupOrigin(),
+        existingAgentSessionId: 'thread-before-fix',
+        compatiblePolicyFingerprints: ['policy-before-fix'],
+      }),
+    ).resolves.toMatchObject({
+      kind: 'resume',
+      agentSessionId: 'thread-before-fix',
+      binding: fresh.binding,
+    });
+    expect(catalog.activeFor(identity())).toMatchObject({ threadId: 'thread-before-fix' });
+    expect(service.health).toMatchObject({
+      health: 'healthy',
+      ledger: {
+        activeByIdentity: {
+          [promptBindingIdentityKey(identity())]: 'codex:thread-before-fix',
+        },
+      },
     });
   });
 
