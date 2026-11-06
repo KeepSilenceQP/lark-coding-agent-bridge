@@ -568,7 +568,26 @@ export function evictInFlightReactionEntry(params: {
 }
 
 const DEBOUNCE_MS = 600;
-const STREAM_TERMINAL_GRACE_MS = 3000;
+const DEFAULT_STREAM_TERMINAL_GRACE_MS = 3000;
+
+/**
+ * How long to wait for an already-open progress stream to finish after the
+ * agent reached a terminal state. Opening/updating a Feishu card is a network
+ * round trip that can be much slower than the agent itself; a short window
+ * turns a slow card into a lost final answer. Deployments on slow links can
+ * raise this without a code change.
+ */
+function streamTerminalGraceMs(): number {
+  const raw = process.env.LARK_CHANNEL_STREAM_TERMINAL_GRACE_MS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_STREAM_TERMINAL_GRACE_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    log.warn('stream', 'invalid-terminal-grace', { value: raw });
+    return DEFAULT_STREAM_TERMINAL_GRACE_MS;
+  }
+  return parsed;
+}
+
 const FINAL_READBACK_RETRY_MS = 250;
 const FINAL_READBACK_TIMEOUT_MS = 2000;
 const TAIL_COMPARE_CHARS = 500;
@@ -4205,6 +4224,7 @@ async function awaitRenderAwareStream(input: {
   renderDone: Promise<RunState>;
   producerStarted: () => boolean;
   onStartupFailure: () => void;
+  abandon?: () => void;
   deliverFinal?: (state: RunState) => Promise<boolean>;
   verifyFinal?: (streamValue: unknown, state: RunState) => Promise<boolean | undefined>;
   fallback: (state: RunState) => Promise<void>;
@@ -4224,6 +4244,7 @@ async function awaitRenderAwareStream(input: {
       if (!input.producerStarted()) input.onStartupFailure();
       const rendered = await renderResult;
       if (!rendered.ok) throw rendered.err;
+      input.abandon?.();
       await runFallbackReply(input.mode, rendered.state, input.fallback);
       return;
     }
@@ -4233,37 +4254,41 @@ async function awaitRenderAwareStream(input: {
   if (first.kind === 'stream') {
     const rendered = await renderResult;
     if (!rendered.ok) throw rendered.err;
-    if (await input.deliverFinal?.(rendered.state)) return;
+    if (await input.deliverFinal?.(rendered.state)) { input.abandon?.(); return; }
     await runFallbackOnFinalMismatch(input, first.value, rendered.state);
     return;
   }
 
-  if (await input.deliverFinal?.(first.state)) return;
+  if (await input.deliverFinal?.(first.state)) { input.abandon?.(); return; }
 
   if (!input.producerStarted()) {
     log.warn('stream', 'producer-not-started-before-agent-terminal', { mode: input.mode });
+    input.abandon?.();
     await runFallbackReply(input.mode, first.state, input.fallback);
     return;
   }
 
   const terminal = await Promise.race([
     streamResult,
-    delay(STREAM_TERMINAL_GRACE_MS).then(() => undefined),
+    delay(streamTerminalGraceMs()).then(() => undefined),
   ]);
   if (!terminal) {
     log.warn('stream', 'terminal-grace-expired', {
       mode: input.mode,
-      graceMs: STREAM_TERMINAL_GRACE_MS,
+      graceMs: streamTerminalGraceMs(),
     });
     void streamResult.then((result) => {
       if (!result.ok) {
         log.fail('stream', result.err, { mode: input.mode, step: 'stream-terminal-late' });
       }
     });
+    input.abandon?.();
+    await runFallbackReply(input.mode, first.state, input.fallback);
     return;
   }
   if (!terminal.ok) {
     log.fail('stream', terminal.err, { mode: input.mode, step: 'stream-terminal' });
+    input.abandon?.();
     await runFallbackReply(input.mode, first.state, input.fallback);
     return;
   }
