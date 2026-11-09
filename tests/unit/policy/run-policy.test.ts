@@ -176,6 +176,34 @@ describe('run policy', () => {
     });
   });
 
+  it('uses frozen access only for migration while keeping every other policy boundary live', () => {
+    const input = baseInput();
+    const before = evaluateRunPolicy(input);
+    if (!before.ok) throw new Error('expected allow');
+    const oldFingerprint = before.compatiblePolicyFingerprints![0];
+    input.profileConfig.access.ownerNoMentionChats.push('unrelated-chat');
+    const after = evaluateRunPolicy(input);
+    if (!after.ok) throw new Error('expected allow');
+    expect(after.compatiblePolicyFingerprints).toContain(oldFingerprint);
+    expect(after.compatiblePolicyFingerprints?.[0]).toBe(oldFingerprint);
+    for (const change of [
+      { cwdRealpath: '/other-workspace' },
+      { codexHome: '/other-codex-home' },
+      { inheritCodexHome: true },
+      { scope: { ...input.scope, chatId: 'another-chat' } },
+      { scope: { ...input.scope, threadId: 'another-topic' } },
+      { scope: { ...input.scope, resourceBindings: [{ kind: 'doc' as const, id: 'doc-other', verified: true }] } },
+      { profileConfig: { ...input.profileConfig, permissions: { defaultAccess: 'read-only' as const, maxAccess: 'read-only' as const } } },
+      { profileConfig: { ...input.profileConfig, attachments: { ...input.profileConfig.attachments, maxCount: 1 } } },
+    ]) {
+      const changed = evaluateRunPolicy({ ...input, ...change });
+      if (!changed.ok) throw new Error('expected allow with distinct identity');
+      expect(changed.compatiblePolicyFingerprints).not.toContain(oldFingerprint);
+    }
+    expect(evaluateRunPolicy({ ...input, access: { ok: false, reason: 'denied-chat' } }))
+      .toMatchObject({ ok: false, rejectReason: { code: 'access-denied' } });
+  });
+
   it('is pure policy calculation and does not import IO or API clients', () => {
     const source = readFileSync(join(process.cwd(), 'src/policy/run-policy.ts'), 'utf8');
 

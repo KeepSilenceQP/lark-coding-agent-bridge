@@ -9,11 +9,13 @@ import {
 import {
   createRootConfig,
   loadRootConfig,
+  persistSessionCompatibilityBaseline,
   removeProfile,
   runtimeProfileConfig,
   saveRootConfig,
 } from '../../../src/config/profile-store';
 import { resolveAppPaths } from '../../../src/config/app-paths';
+import { accessPolicyDigest } from '../../../src/policy/fingerprint';
 
 const roots: string[] = [];
 
@@ -34,6 +36,26 @@ async function tmpRoot(): Promise<string> {
 }
 
 describe('profile store canonical serialization', () => {
+  it('persists the old access baseline before any group runs and keeps it across edits and restarts', async () => {
+    const configPath = join(await tmpRoot(), 'config.json');
+    const profile = createDefaultProfileConfig({ agentKind: 'claude', accounts: { app } });
+    delete profile.sessionCompatibility; // Actual pre-upgrade on-disk schema.
+    await saveRootConfig(createRootConfig('work', profile), configPath);
+    const expected = accessPolicyDigest(profile.access);
+    await persistSessionCompatibilityBaseline(configPath);
+    const initial = JSON.parse(await readFile(configPath, 'utf8'));
+    expect(initial.profiles.work.sessionCompatibility.legacyAccessPolicyDigest).toBe(expected);
+
+    const root = (await loadRootConfig(configPath))!;
+    root.profiles.work!.access.ownerNoMentionChats.push('unrelated-chat');
+    await saveRootConfig(root, configPath);
+    const beforeRestart = await readFile(configPath, 'utf8');
+    await persistSessionCompatibilityBaseline(configPath);
+    expect(await readFile(configPath, 'utf8')).toBe(beforeRestart);
+    expect((await loadRootConfig(configPath))!.profiles.work!.sessionCompatibility)
+      .toEqual({ legacyAccessPolicyDigest: expected });
+  });
+
   it('saves stored root and profile config without unknown root fields or runtime-only profile fields', async () => {
     const root = await tmpRoot();
     const configPath = join(root, 'config.json');

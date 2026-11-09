@@ -1,4 +1,4 @@
-import { realpath } from 'node:fs/promises';
+import { mkdir, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { claudeCapability, codexCapability } from '../../../src/agent/capability.js';
@@ -12,9 +12,11 @@ import {
   type StartRunFlowInput,
 } from '../../../src/bot/run-flow.js';
 import { createDefaultProfileConfig, type ProfileConfig } from '../../../src/config/profile-schema.js';
+import { createRootConfig, loadRootConfig, saveRootConfig } from '../../../src/config/profile-store.js';
 import { RunExecutor } from '../../../src/runtime/run-executor.js';
 import { SessionCatalog } from '../../../src/session/catalog.js';
 import { SessionStore } from '../../../src/session/store.js';
+import { PromptSessionService } from '../../../src/session/prompt-session-service.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
@@ -151,6 +153,50 @@ describe('agent-aware run-flow resume', () => {
       sessionId: undefined,
       threadId: 'thread-before-fix',
     });
+  });
+
+  it('migrates a dormant old group after another group changes access and the bridge restarts', async () => {
+    const h = await createHarness('codex');
+    const probe = await start(h);
+    if (!probe.ok) throw new Error('expected probe run');
+    await collect(probe.execution.subscribe());
+    const oldIdentity = {
+      scopeId: 'chat-1', agentId: 'codex' as const, cwdRealpath: probe.cwdRealpath,
+      policyFingerprint: probe.policy.compatiblePolicyFingerprints![0]!,
+    };
+    const origin = { source: 'im' as const, scopeId: 'chat-1', chatId: 'chat-1', chatType: 'group' as const };
+    await mkdir(join(h.tmp.profile, 'prompts/groups'), { recursive: true });
+    await writeFile(join(h.tmp.profile, 'prompts/groups/chat-1.md'), 'keep the original pinned role');
+    const openService = () => PromptSessionService.open({
+      profileDir: h.tmp.profile, profile: 'work', sessionCatalog: h.catalog, sessionStore: h.sessions,
+    });
+    const service = await openService();
+    const fresh = await service.prepareSession({ identity: oldIdentity, origin });
+    if (fresh.kind !== 'fresh') throw new Error('expected fresh legacy session');
+    await service.recordIdentifier({ identity: oldIdentity, origin, binding: fresh.binding,
+      generation: fresh.generation, agentSessionId: 'thread-before-upgrade' });
+
+    // The group remains idle while another group is invited, then the process restarts.
+    const configPath = join(h.tmp.profile, 'config.json');
+    await saveRootConfig(createRootConfig('work', h.profileConfig), configPath);
+    const root = (await loadRootConfig(configPath))!;
+    root.profiles.work!.access.ownerNoMentionChats.push('chat-other');
+    await saveRootConfig(root, configPath);
+    h.profileConfig = (await loadRootConfig(configPath))!.profiles.work!;
+    const reopened = await openService();
+    const resumed = await start(h, { promptSession: { service: reopened, origin } });
+    if (!resumed.ok) throw new Error('expected resumed run');
+    expect(resumed.resumeFrom).toBe('thread-before-upgrade');
+    expect(resumed.promptSession?.decision).toMatchObject({ kind: 'resume', binding: fresh.binding });
+    expect(h.agent.runOptions.at(-1)?.threadId).toBe('thread-before-upgrade');
+    await collect(resumed.execution.subscribe());
+    const identity = { ...oldIdentity, policyFingerprint: resumed.policy.policyFingerprint };
+    expect(h.catalog.activeFor(identity)?.threadId).toBe('thread-before-upgrade');
+
+    await reopened.resetSession({ identity, origin });
+    const reset = await start(h, { promptSession: { service: reopened, origin } });
+    if (!reset.ok) throw new Error('expected fresh run after reset');
+    expect(reset.resumeFrom).toBeUndefined();
   });
 
   it('does not resume when the policy fingerprint changes', async () => {
@@ -401,7 +447,7 @@ async function collect(events: AsyncIterable<unknown>): Promise<void> {
   }
 }
 
-async function start(h: Awaited<ReturnType<typeof createHarness>>) {
+async function start(h: Awaited<ReturnType<typeof createHarness>>, overrides: Partial<StartRunFlowInput> = {}) {
   const input = {
     scopeId: 'chat-1',
     scope: { source: 'im', chatId: 'chat-1', actorId: 'ou_user' },
@@ -418,6 +464,7 @@ async function start(h: Awaited<ReturnType<typeof createHarness>>) {
     workspaces: h.workspaces,
     executor: h.executor,
     now: 1000,
+    ...overrides,
   } satisfies StartRunFlowInput & { sessionCatalog: SessionCatalog };
   return startRunFlow(input);
 }

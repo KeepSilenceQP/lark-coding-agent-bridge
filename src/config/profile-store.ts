@@ -61,6 +61,7 @@ type StoredProfileConfig = Pick<
   | 'secrets'
   | 'preferences'
   | 'access'
+  | 'sessionCompatibility'
   | 'workspaces'
   | 'permissions'
   | 'codex'
@@ -102,6 +103,7 @@ function serializeProfileConfig(profile: ProfileConfig): StoredProfileConfig {
     ...(profile.secrets ? { secrets: profile.secrets } : {}),
     preferences: profile.preferences,
     access: profile.access,
+    ...(profile.sessionCompatibility ? { sessionCompatibility: profile.sessionCompatibility } : {}),
     workspaces: profile.workspaces,
     permissions: profile.permissions,
     ...(profile.codex ? { codex: profile.codex } : {}),
@@ -132,6 +134,22 @@ export async function withConfigFileLock<T>(configPath: string, fn: () => Promis
   } finally {
     await release();
   }
+}
+
+/** Capture the upgrade baseline before accepting messages or config mutations. */
+export async function persistSessionCompatibilityBaseline(configPath: string): Promise<void> {
+  const needsBaseline = (raw: unknown): raw is RootConfig =>
+    isRootConfig(raw) && Object.values(raw.profiles).some(
+      (profile) => profile.sessionCompatibility?.legacyAccessPolicyDigest === undefined,
+    );
+  // Already-migrated configurations must not introduce an earlier lock into
+  // runtime preparation (which may itself be coordinating another writer).
+  if (!needsBaseline(JSON.parse(await readFile(configPath, 'utf8')))) return;
+  await withConfigFileLock(configPath, async () => {
+    const raw = JSON.parse(await readFile(configPath, 'utf8')) as unknown;
+    if (!needsBaseline(raw)) return;
+    await saveRootConfig(normalizeRootConfig(raw), configPath);
+  });
 }
 
 export async function readActiveProfile(rootDir?: string): Promise<string | undefined> {

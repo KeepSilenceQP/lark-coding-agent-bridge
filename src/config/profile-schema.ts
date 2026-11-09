@@ -1,4 +1,5 @@
 import type { BotRegistry } from './bot-registry';
+import { accessPolicyDigest } from '../policy/fingerprint';
 import type {
   AppCredentials,
   AppPreferences,
@@ -163,6 +164,8 @@ export interface ProfileConfig {
   secrets?: SecretsConfig;
   preferences: Omit<AppPreferences, 'access' | 'requireMentionInGroup'>;
   access: ProfileAccess;
+  /** Frozen pre-migration access digest; never recompute it after allowlist edits. */
+  sessionCompatibility?: { legacyAccessPolicyDigest: string };
   workspaces: {
     default?: string;
   };
@@ -248,6 +251,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     secrets?: SecretsConfig;
     preferences?: (AppPreferences & { access?: Partial<ProfileAccess> }) | undefined;
     access?: Partial<ProfileAccess>;
+    sessionCompatibility?: { legacyAccessPolicyDigest?: unknown };
     workspaces?: {
       default?: unknown;
       // Legacy workspace authorization fields are accepted for config
@@ -281,6 +285,13 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     raw.access ?? raw.preferences?.access,
     raw.preferences?.requireMentionInGroup,
   );
+  const legacyAccessDigest = raw.sessionCompatibility?.legacyAccessPolicyDigest;
+  if (
+    legacyAccessDigest !== undefined &&
+    (typeof legacyAccessDigest !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(legacyAccessDigest))
+  ) {
+    throw new Error('invalid session compatibility access digest');
+  }
   const { permissions, source: permissionSource } = normalizePermissions({
     permissions: raw.permissions,
     sandbox: raw.sandbox,
@@ -299,6 +310,9 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     ...(raw.secrets ? { secrets: raw.secrets } : {}),
     preferences,
     access,
+    sessionCompatibility: {
+      legacyAccessPolicyDigest: legacyAccessDigest ?? accessPolicyDigest(access),
+    },
     workspaces,
     sandbox,
     permissions,

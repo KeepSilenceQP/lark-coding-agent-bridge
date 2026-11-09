@@ -141,10 +141,18 @@ export function evaluateRunPolicy(input: RunPolicyInput): RunPolicyResult {
     ...fingerprintBase,
     accessPolicyDigest: accessDecisionDigest(input.access),
   });
-  const legacyFingerprint = policyFingerprint({
-    ...fingerprintBase,
-    accessPolicyDigest: legacyAccessDigest,
-  });
+  // Dormant pre-upgrade sessions must survive unrelated allowlist edits before
+  // their first resumed turn, including across process restarts. Only the access
+  // digest is historical: every other policy boundary is recomputed live.
+  const legacyAccessDigests =
+    input.scope.source === 'comment' && input.access.reason === 'comment-mention'
+      ? [legacyAccessDigest]
+      : [input.profileConfig.sessionCompatibility?.legacyAccessPolicyDigest, legacyAccessDigest];
+  const compatiblePolicyFingerprints = [
+    ...new Set(legacyAccessDigests
+      .filter((digest): digest is string => digest !== undefined)
+      .map((digest) => policyFingerprint({ ...fingerprintBase, accessPolicyDigest: digest }))),
+  ].filter((fingerprint) => fingerprint !== currentFingerprint);
 
   return {
     ok: true,
@@ -158,8 +166,8 @@ export function evaluateRunPolicy(input: RunPolicyInput): RunPolicyResult {
     attachments: input.attachments,
     expiresAt: input.now + (input.ttlMs ?? DEFAULT_TTL_MS),
     policyFingerprint: currentFingerprint,
-    ...(legacyFingerprint !== currentFingerprint
-      ? { compatiblePolicyFingerprints: [legacyFingerprint] }
+    ...(compatiblePolicyFingerprints.length > 0
+      ? { compatiblePolicyFingerprints }
       : {}),
   };
 }

@@ -24,6 +24,7 @@ import {
   hasPermissionDefaultsMigration,
   loadRootConfig,
   markPermissionDefaultsMigration,
+  persistSessionCompatibilityBaseline,
   readActiveProfile,
   runtimeProfileConfig,
   saveRootConfig,
@@ -171,6 +172,9 @@ export async function resolveProfileRuntime(
       throw new Error(`profile not found: ${profile}`);
     }
     assertRequestedAgentMatchesExistingProfile(profile, profileConfig, requestedAgent);
+    await persistSessionCompatibilityBaseline(configPath);
+    rootConfig = (await loadRootConfig(configPath))!;
+    profileConfig = rootConfig.profiles[profile]!;
     const preparedDefaultWorkspace = await prepareProfileDefaultWorkspace(
       rootConfig,
       profile,
