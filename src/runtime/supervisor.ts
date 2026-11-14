@@ -1,4 +1,5 @@
 import pkg from '../../package.json';
+import { SupervisorRestartBarrier } from './supervisor-restart';
 import { startChannel as realStartChannel, type BridgeChannel } from '../bot/channel';
 import type { Controls } from '../commands';
 import type { AppPaths } from '../config/app-paths';
@@ -85,6 +86,7 @@ class ManagedProfile {
     private workspaces: WorkspaceStore,
     private startChannelFn: StartChannelFn,
     private onExitCommand: (profile: string) => void,
+    private restartBarrier: SupervisorRestartBarrier,
   ) {}
 
   get appId(): string {
@@ -126,6 +128,7 @@ class ManagedProfile {
         workspaces: this.workspaces,
         controls: this.controls,
         appPaths: this.appPaths,
+        supervisorRestart: this.restartBarrier,
       });
       const botName = this.bridge.channel.botIdentity?.name;
       if (botName) {
@@ -266,6 +269,7 @@ class ManagedProfile {
         workspaces: this.workspaces,
         controls: nextControls,
         appPaths: nextRuntime.appPaths,
+        supervisorRestart: this.restartBarrier,
       });
       try {
         await this.bridge.disconnect();
@@ -307,6 +311,8 @@ class ManagedProfile {
  */
 export class Supervisor {
   private managed = new Map<string, ManagedProfile>();
+  private restartBarrier = new SupervisorRestartBarrier((error) =>
+    log.fail('service', error, { step: 'supervisor-restart-helper' }));
 
   constructor(private opts: SupervisorOptions) {}
 
@@ -332,6 +338,7 @@ export class Supervisor {
 
   /** Bring a profile online inside this process. Throws on lock/app conflict. */
   async startProfile(profile: string): Promise<void> {
+    if (this.restartBarrier.isRestarting()) throw new Error('supervisor 正在重启，暂不接受新的 profile');
     if (this.managed.has(profile)) return;
 
     const runtime = await resolveProfileRuntime({
@@ -404,6 +411,7 @@ export class Supervisor {
       workspaces,
       this.startChannelFn,
       (p) => void this.stopProfile(p).catch(() => undefined),
+      this.restartBarrier,
     );
     await managed.bringUp(new Date().toISOString());
     this.managed.set(appPaths.profile, managed);
@@ -427,6 +435,7 @@ export class Supervisor {
 
   /** Stop every profile — for process shutdown. */
   async shutdown(): Promise<void> {
+    this.restartBarrier.dispose();
     const all = [...this.managed.values()];
     this.managed.clear();
     await Promise.allSettled(all.map((m) => m.stop()));

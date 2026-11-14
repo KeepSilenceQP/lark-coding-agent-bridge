@@ -315,6 +315,10 @@ export class PendingQueue {
 
   // ── query ──
 
+  hasPending(): boolean {
+    return this.map.size > 0;
+  }
+
   pendingCount(scope: string): number {
     const entry = this.map.get(scope);
     return entry ? totalLength(entry) : 0;

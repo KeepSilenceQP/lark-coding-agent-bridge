@@ -22,6 +22,7 @@ export interface ReturnRoute {
 export type ReceiptKind = 'success' | 'failure';
 
 export interface PendingRequest {
+  serviceId?: 'supervisor';
   receiptId: string;
   profile: string;
   oldPid: number;

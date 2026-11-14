@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServiceAdapter } from '../../../src/daemon/service-adapter';
 import type { ProcessEntry } from '../../../src/runtime/registry';
+import { createRouteLease, readRouteLease } from '../../../src/runtime/route-lease';
+import { createPending, readPending } from '../../../src/runtime/restart-receipt';
 
 const mocks = vi.hoisted(() => ({
   adapter: undefined as unknown as ServiceAdapter,
@@ -578,6 +580,65 @@ describe('profile-aware service commands', () => {
     expect(mocks.adapter.deleteFile).toHaveBeenCalled();
     expect(lines).toContain('✓ 已清除后台运行注册');
     expect(lines).toContain('  (配置 / 日志 / 会话保留在 /tmp/lark-channel-home)');
+  });
+
+  it.each([
+    { webUi: false, scenario: 'valid profile', pid: '1234', ok: true },
+    { webUi: true, scenario: 'valid web-ui', pid: '1234', ok: true },
+    { webUi: false, scenario: 'wrong service PID', pid: '5555', ok: false },
+    { webUi: false, scenario: 'expired route', pid: '1234', ok: false },
+    { webUi: false, scenario: 'pending exists', pid: '1234', ok: false },
+  ])('preserves profile routing and validates supervisor ownership: $scenario', async ({ webUi, scenario, pid, ok }) => {
+    const root = await mkdtemp(join(tmpdir(), 'bridge-supervisor-restart-'));
+    mocks.rootDir = root;
+    const keys = ['LARK_CHANNEL', 'LARK_CHANNEL_PROFILE', 'LARK_CHANNEL_BRIDGE_PID', 'LARK_CHANNEL_ROUTE_ID'];
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    const supervisor = { ...mocks.adapter,
+      fileExists: vi.fn(() => true), isRunning: vi.fn(() => true),
+      parseStatus: vi.fn(() => ({ pid })),
+    };
+    mocks.getServiceAdapter.mockImplementation((id: string) => id === 'supervisor'
+      ? supervisor : { ...mocks.adapter, fileExists: () => false });
+    const profileDir = join(root, 'profiles', 'codex-dev');
+    const lease = await createRouteLease(profileDir, {
+      chatId: 'oc_original', threadId: 'omt_original', replyTo: 'om_original',
+      bridgePid: 1234, serviceId: 'supervisor',
+      ...(scenario === 'expired route' ? { ttlMs: -1 } : {}),
+    });
+    if (scenario === 'pending exists') await createPending(profileDir, {
+      receiptId: 'first-request', profile: 'codex-dev', oldPid: 1234,
+      requestedAt: new Date().toISOString(), returnRoute: { chatId: 'oc_first', replyTo: 'om_first' },
+    });
+    process.env.LARK_CHANNEL = '1';
+    process.env.LARK_CHANNEL_PROFILE = 'codex-dev';
+    process.env.LARK_CHANNEL_BRIDGE_PID = '1234';
+    process.env.LARK_CHANNEL_ROUTE_ID = lease!.routeId;
+    const exit = vi.spyOn(process, 'exit').mockImplementation((code) => { throw new Error(`exit:${code}`); });
+    try {
+      const request = runServiceRestart(webUi ? { webUi: true } : { profile: 'codex-dev' });
+      if (ok) {
+        await request;
+        expect(await readPending(profileDir)).toMatchObject({
+          profile: 'codex-dev', oldPid: 1234, serviceId: 'supervisor',
+          returnRoute: { chatId: 'oc_original', threadId: 'omt_original', replyTo: 'om_original' },
+        });
+        expect(await readRouteLease(profileDir, lease!.routeId)).toBeUndefined();
+      } else {
+        await expect(request).rejects.toThrow('exit:1');
+        expect(await readRouteLease(profileDir, lease!.routeId)).toBeDefined();
+        if (scenario === 'pending exists') {
+          expect(await readPending(profileDir)).toMatchObject({ receiptId: 'first-request' });
+        } else expect(await readPending(profileDir)).toBeUndefined();
+      }
+      expect(supervisor.restart).not.toHaveBeenCalled();
+      expect(supervisor.start).not.toHaveBeenCalled();
+    } finally {
+      exit.mockRestore();
+      for (const key of keys) {
+        restoreEnv(key, previous[key]);
+      }
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('defers a same-profile bridge-bound restart instead of killing its active run', async () => {
