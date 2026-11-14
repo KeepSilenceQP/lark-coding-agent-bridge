@@ -25,6 +25,7 @@ describe('Codex app-server turn state probe', () => {
       status: 'completed',
       finalText: 'persisted final answer',
       itemCount: 3,
+      progressToken: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
     const requests = (await readFile(fake.recordPath, 'utf8'))
       .trim()
@@ -39,9 +40,27 @@ describe('Codex app-server turn state probe', () => {
       { method: 'thread/read', params: { threadId: 'thread-1', includeTurns: true } },
     ]);
   });
+
+  it('extracts only explicit foreground links and whitelisted progress metadata', async () => {
+    const spawn = { type: 'collabAgentToolCall', tool: 'spawnAgent', senderThreadId: 'thread-1',
+      status: 'completed', prompt: 'private-child-prompt' };
+    const fake = await createFakeAppServer([
+      { ...spawn, id: 'front', runInBackground: false, receiverThreadIds: ['child'] },
+      { ...spawn, id: 'back', runInBackground: true, receiverThreadIds: ['background'] },
+      { ...spawn, id: 'unknown', receiverThreadIds: ['ambiguous'] },
+      { ...spawn, id: 'other', senderThreadId: 'other-parent', runInBackground: false,
+        receiverThreadIds: ['unrelated'] },
+      { type: 'commandExecution', id: 'tool', status: 'inProgress',
+        command: 'private-command', aggregatedOutput: 'private-tool-output' },
+    ]);
+    cleanup.push(fake.dir);
+    const state = await createCodexTurnStateProbe({ binary: fake.path, profileStateDir: fake.dir })('thread-1');
+    expect(state).toMatchObject({ foregroundChildThreadIds: ['child'], hasRunningTool: true });
+    expect(JSON.stringify(state)).not.toContain('private-');
+  });
 });
 
-async function createFakeAppServer(): Promise<{
+async function createFakeAppServer(items?: unknown[]): Promise<{
   dir: string;
   path: string;
   recordPath: string;
@@ -74,11 +93,11 @@ rl.on('line', (line) => {
             {
               id: 'turn-current',
               status: 'completed',
-              items: [
+              items: ${items ? JSON.stringify(items) : `[
                 { type: 'agentMessage', text: 'interim note', phase: 'commentary' },
                 { type: 'agentMessage', text: 'superseded final answer', phase: 'final_answer' },
                 { type: 'agentMessage', text: 'persisted final answer', phase: 'final_answer' }
-              ]
+              ]`}
             }
           ]
         }

@@ -18,6 +18,7 @@ import type {
 } from '../types';
 import { buildCodexArgs } from './argv';
 import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
+import { CodexForegroundActivity } from './foreground-activity';
 import {
   CodexDeveloperInstructionsUnsupported,
   verifyCodexDeveloperInstructions,
@@ -283,6 +284,9 @@ export class CodexAdapter implements AgentAdapter {
     child.stdin.end(opts.prompt, 'utf8');
 
     const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
+    const foregroundActivity = terminalProbe && this.stdoutIdleProbeMs > 0
+      ? new CodexForegroundActivity(terminalProbe, opts.threadId, preparedProbe?.turnId)
+      : undefined;
 
     return {
       runId: opts.runId,
@@ -296,7 +300,11 @@ export class CodexAdapter implements AgentAdapter {
         preparedProbe?.turnId,
         terminalProbe,
         redactPrompt,
+        foregroundActivity,
       ),
+      checkIdleActivity: foregroundActivity
+        ? (idleTimeoutMs) => foregroundActivity.check(idleTimeoutMs)
+        : undefined,
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
         stopReason = 'interrupted';
@@ -377,6 +385,7 @@ async function* createEventStream(
   baselineTurnId: string | undefined,
   turnStateProbe: CodexTurnStateProbe | undefined,
   redactPrompt: (value: string) => string,
+  foregroundActivity?: CodexForegroundActivity,
 ): AsyncGenerator<AgentEvent> {
   const translator = new CodexJsonlTranslator();
   if (!child.pid) {
@@ -414,7 +423,9 @@ async function* createEventStream(
     }
     terminalProbeInFlight = true;
     try {
-      const latest = await turnStateProbe(currentThreadId);
+      const latest = foregroundActivity
+        ? await foregroundActivity.read()
+        : await turnStateProbe(currentThreadId);
       if (
         streamClosed ||
         !latest ||
@@ -494,7 +505,10 @@ async function* createEventStream(
             : typeof raw.threadId === 'string'
               ? raw.threadId
               : undefined;
-        if (threadId) currentThreadId = threadId;
+        if (threadId) {
+          currentThreadId = threadId;
+          foregroundActivity?.setThreadId(threadId);
+        }
       }
       const translated = translator.translate(parsed).map((event) =>
         event.type === 'error'
@@ -513,6 +527,7 @@ async function* createEventStream(
     }
   } finally {
     streamClosed = true;
+    foregroundActivity?.close();
     if (stdoutIdleTimer) clearInterval(stdoutIdleTimer);
     if (silentExitTimer) clearTimeout(silentExitTimer);
     child.removeListener('exit', closeSilentStdout);

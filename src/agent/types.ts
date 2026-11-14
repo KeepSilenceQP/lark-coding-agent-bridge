@@ -87,6 +87,11 @@ export interface AgentRun {
    * prompt is safe. Implementations must fail closed.
    */
   canRetryAfterNoOutput?(): Promise<boolean>;
+  /** Reconcile verified foreground-child progress before an ordinary idle stop. */
+  checkIdleActivity?(idleTimeoutMs: number): Promise<{
+    remainingMs: number;
+    timeoutMs: number;
+  } | undefined>;
 }
 
 /**

@@ -6,6 +6,45 @@ import { processAgentStream } from '../../../src/bot/channel';
 afterEach(() => vi.useRealTimers());
 
 describe('Codex tool lifecycle through the idle watchdog', () => {
+  it('ignores a pending idle probe after new output and normal completion', async () => {
+    vi.useFakeTimers();
+    const resume = deferred();
+    const probe = deferred();
+    const events = (async function* (): AsyncGenerator<AgentEvent> {
+      yield { type: 'text', delta: 'working' };
+      await resume.promise;
+      yield { type: 'done', terminationReason: 'normal' };
+    })();
+    const stop = vi.fn(async () => {});
+    const checkIdleActivity = vi.fn(async () => { await probe.promise; return undefined; });
+    const result = processAgentStream(
+      { interrupted: false, run: { runId: 'probe-race', events, stop,
+        waitForExit: async () => true, checkIdleActivity } },
+      events, 'probe-race', 600_000, undefined, vi.fn(), vi.fn(async () => {}),
+    );
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(checkIdleActivity).toHaveBeenCalledOnce();
+    resume.resolve();
+    await expect(result).resolves.toMatchObject({ terminal: 'done' });
+    probe.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when foreground activity cannot be checked', async () => {
+    vi.useFakeTimers();
+    const stopped = deferred();
+    const events = (async function* (): AsyncGenerator<AgentEvent> { await stopped.promise; })();
+    const stop = vi.fn(async () => stopped.resolve());
+    const result = processAgentStream(
+      { interrupted: false, run: { runId: 'probe-error', events, stop, waitForExit: async () => true,
+        checkIdleActivity: async () => { throw new Error('unsupported'); } } },
+      events, 'probe-error', 600_000, undefined, vi.fn(), vi.fn(async () => {}),
+    );
+    await vi.advanceTimersByTimeAsync(600_000);
+    await expect(result).resolves.toMatchObject({ terminal: 'idle_timeout' });
+  });
+
   it('excludes blocked progress delivery but still times out a silent agent after delivery resumes', async () => {
     vi.useFakeTimers();
     const stopped = deferred();
