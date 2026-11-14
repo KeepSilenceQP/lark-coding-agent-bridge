@@ -58,9 +58,16 @@ describe('Codex app-server turn state probe', () => {
     expect(state).toMatchObject({ foregroundChildThreadIds: ['child'], hasRunningTool: true });
     expect(JSON.stringify(state)).not.toContain('private-');
   });
+
+  it.each(['subAgent', 'subagent'])('reads the immutable source parent in %s form', async (key) => {
+    const fake = await createFakeAppServer([], { source: { [key]: { thread_spawn: { parent_thread_id: 'parent' } } } });
+    cleanup.push(fake.dir);
+    const state = await createCodexTurnStateProbe({ binary: fake.path, profileStateDir: fake.dir })('thread-1');
+    expect(state?.parentThreadId).toBe('parent');
+  });
 });
 
-async function createFakeAppServer(items?: unknown[]): Promise<{
+async function createFakeAppServer(items?: unknown[], threadFields: Record<string, unknown> = {}): Promise<{
   dir: string;
   path: string;
   recordPath: string;
@@ -88,6 +95,7 @@ rl.on('line', (line) => {
       id: request.id,
       result: {
         thread: {
+          ...${JSON.stringify(threadFields)},
           turns: [
             { id: 'turn-before', status: 'completed' },
             {
