@@ -6,6 +6,54 @@ import { processAgentStream } from '../../../src/bot/channel';
 afterEach(() => vi.useRealTimers());
 
 describe('Codex tool lifecycle through the idle watchdog', () => {
+  it('excludes blocked progress delivery but still times out a silent agent after delivery resumes', async () => {
+    vi.useFakeTimers();
+    const stopped = deferred();
+    const events = (async function* (): AsyncGenerator<AgentEvent> {
+      yield { type: 'text', delta: 'working' };
+      await stopped.promise;
+    })();
+    const stop = vi.fn(async () => stopped.resolve());
+    let firstFlush = true;
+    const result = processAgentStream(
+      { interrupted: false, run: { runId: 'delivery', events, stop, waitForExit: async () => true } },
+      events, 'delivery', 600_000, undefined, vi.fn(), async () => {
+        if (!firstFlush) return;
+        firstFlush = false;
+        await delay(660_000);
+      },
+    );
+    await vi.advanceTimersByTimeAsync(660_000);
+    expect(stop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(599_999);
+    expect(stop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toMatchObject({ terminal: 'idle_timeout', idleTimeoutMinutes: 10 });
+  });
+
+  it('retains the bounded tool silence deadline after subtracting blocked delivery time', async () => {
+    vi.useFakeTimers();
+    const stopped = deferred();
+    const events = (async function* (): AsyncGenerator<AgentEvent> {
+      yield { type: 'tool_use', id: 'tool', name: 'wait', input: {}, maxSilenceMs: 65 * 60_000 };
+      await stopped.promise;
+    })();
+    const stop = vi.fn(async () => stopped.resolve());
+    let firstFlush = true;
+    const result = processAgentStream(
+      { interrupted: false, run: { runId: 'bounded-delivery', events, stop, waitForExit: async () => true } },
+      events, 'bounded-delivery', 600_000, undefined, vi.fn(), async () => {
+        if (!firstFlush) return;
+        firstFlush = false;
+        await delay(10 * 60_000);
+      },
+    );
+    await vi.advanceTimersByTimeAsync(75 * 60_000 - 1);
+    expect(stop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toMatchObject({ terminal: 'idle_timeout', idleTimeoutMinutes: 65 });
+  });
+
   it.each(['collab_tool_call', 'mcp_tool_call'])(
     'bounds a silent %s even when identical updates keep arriving', async (type) => {
       vi.useFakeTimers();
