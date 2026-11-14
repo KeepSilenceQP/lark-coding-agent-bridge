@@ -15,6 +15,8 @@ export function routeLeaseDir(profileDir: string): string {
 // ── Types ──────────────────────────────────────────────────────────────
 
 export interface RouteLease {
+  /** Hosting service, supplied by the runtime rather than the agent. */
+  serviceId?: 'supervisor';
   routeId: string;
   chatId: string;
   threadId?: string;
@@ -26,6 +28,7 @@ export interface RouteLease {
 }
 
 export interface RouteLeaseInput {
+  serviceId?: 'supervisor';
   chatId: string;
   threadId?: string;
   replyTo: string;
@@ -62,6 +65,7 @@ export async function createRouteLease(
   const now = new Date();
   const ttl = input.ttlMs ?? DEFAULT_LEASE_TTL_MS;
   const lease: RouteLease = {
+    ...(input.serviceId ? { serviceId: input.serviceId } : {}),
     routeId,
     chatId: input.chatId,
     threadId: input.threadId,

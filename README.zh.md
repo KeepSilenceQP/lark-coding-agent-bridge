@@ -241,7 +241,13 @@ lark-channel-bridge status --profile codex
 - 每次重启请求只会收到恰好一条回执（成功或失败），通过稳定幂等键（`uuid`）去重。
 - 同 profile 自重启**禁止**直接调用 `launchctl`、`systemctl`、`schtasks` 或 `kill` bridge PID，必须走延后路径。
 
-对**其它** profile 的外部重启（以及常规 `start` / `stop` 操作）不受影响，仍走原有 service-manager 路径。
+**Supervisor 托管模式**也使用同一条 `restart --profile <当前 profile>` 命令。运行时在任务路由中记录实际托管服务，CLI 校验服务 PID 后登记整体重启请求。此时会等待 supervisor 下所有 profile 已接收的任务、排队工作及回复收尾，再启动一次 helper；成功或失败仍通过发起请求的 profile 返回原群、话题或私聊。同一进程内有多个 profile 同时请求时只执行一次服务重启，各自保留回执。helper 启动后停止接收新任务，新 IM 消息收到稍后重试提示。进程内 `/reconnect` 不会加载升级后的程序，不能替代服务重启。
+
+在 Bridge 会话内显式调用 `restart --web-ui` 也走延后路径，不能绕过回复保护。旧运行实例没有 supervisor 路由元数据时不会猜测服务归属，需要先在终端完成一次 supervisor 重启以加载本功能。重启范围是整个 supervisor，而非只重启命令中命名的 Bot。
+
+如果 helper 启动或服务操作失败，仍存活的旧 supervisor 会恢复所有 profile 的任务准入，并复用同一回执状态机报告失败；helper 与旧进程不会重复发送回执。
+
+对**独立后台服务的其它** profile 的外部重启（以及常规 `start` / `stop` 操作）仍走原有 service-manager 路径。
 
 ## 命令速查
 

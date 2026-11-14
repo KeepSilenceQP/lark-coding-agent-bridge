@@ -227,6 +227,10 @@ export class ActiveRuns {
     return [...this.handles.values()];
   }
 
+  isIdle(): boolean {
+    return this.handles.size === 0 && this.reservations.size === 0 && this.replacements.size === 0;
+  }
+
   scopes(): string[] {
     return [...this.handles.keys()];
   }

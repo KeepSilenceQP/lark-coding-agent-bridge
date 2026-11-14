@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { SpawnOptions } from 'node:child_process';
+import type { EventEmitter } from 'node:events';
 import { mergeProcessEnv, spawnProcess } from '../platform/spawn';
 import { receiptDir, createPending as createPendingReceipt, readPending } from './restart-receipt';
 
@@ -9,6 +10,7 @@ const MARKER_FILE = '.deferred-service-restart.json';
 // ── Old marker (backward compat) ───────────────────────────────────────
 
 export interface DeferredServiceRestartMarker {
+  serviceId?: 'supervisor';
   profile: string;
   bridgePid?: number;
   requestedAt: string;
@@ -33,6 +35,7 @@ export async function requestDeferredServiceRestart(
  * - undefined: nothing pending
  */
 export interface PendingRestartNew {
+  serviceId?: 'supervisor';
   format: 'new';
   receiptId: string;
   profile: string;
@@ -42,6 +45,7 @@ export interface PendingRestartNew {
 }
 
 export interface PendingRestartOld {
+  serviceId?: 'supervisor';
   format: 'old';
   profile: string;
 }
@@ -64,6 +68,7 @@ export async function consumeDeferredServiceRestart(
       oldPid: newPending.oldPid,
       returnRoute: newPending.returnRoute,
       deployRevision: newPending.deployRevision,
+      ...(newPending.serviceId ? { serviceId: newPending.serviceId } : {}),
     };
   }
 
@@ -79,12 +84,15 @@ export async function consumeDeferredServiceRestart(
   }
   await rm(target, { force: true });
   if (marker.bridgePid !== undefined && marker.bridgePid !== bridgePid) return undefined;
-  return { format: 'old', profile: marker.profile };
+  return { format: 'old', profile: marker.profile,
+    ...(marker.serviceId ? { serviceId: marker.serviceId } : {}) };
 }
 
 export function launchDeferredServiceRestart(
   profile: string,
   options: {
+    serviceId?: 'supervisor';
+    onFailure?: (error: unknown) => void;
     spawn?: SpawnRestartHelper;
     execPath?: string;
     cliPath?: string;
@@ -101,7 +109,7 @@ export function launchDeferredServiceRestart(
   });
   const child = (options.spawn ?? spawnProcess)(
     execPath,
-    [cliPath, 'restart', '--profile', profile],
+    [cliPath, 'restart', ...(options.serviceId === 'supervisor' ? ['--web-ui'] : []), '--profile', profile],
     {
       detached: true,
       stdio: 'ignore',
@@ -109,6 +117,12 @@ export function launchDeferredServiceRestart(
       env,
     },
   );
+  if (options.onFailure) {
+    child.once?.('error', options.onFailure);
+    child.once?.('exit', (code: number | null) => {
+      if (code !== 0) options.onFailure?.(new Error(`restart helper exited with code ${code ?? 'signal'}`));
+    });
+  }
   child.unref();
 }
 
@@ -116,6 +130,7 @@ export function launchDeferredServiceRestart(
 
 interface SpawnedRestartHelper {
   unref(): void;
+  once?: EventEmitter['once'];
 }
 
 type SpawnRestartHelper = (

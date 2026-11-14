@@ -8,6 +8,7 @@ import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { requestDeferredServiceRestart } from '../../../src/runtime/deferred-service-restart.js';
 import { readRouteLease } from '../../../src/runtime/route-lease.js';
+import { SupervisorRestartBarrier } from '../../../src/runtime/supervisor-restart.js';
 import { makeReactionKey } from '../../../src/bot/reaction/types.js';
 import { WorkChainStore } from '../../../src/bot/reaction/work-chain.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
@@ -497,6 +498,53 @@ describe('markdown stream startup failures', () => {
     );
     expect(lastMarkdown(h.channel)).toContain('agent 失败');
     expect(lastMarkdown(h.channel)).toContain('codex exited with code 1');
+  });
+
+  it('drains all supervisor profiles and their queued replies before launching one service restart', async () => {
+    const contents: string[] = [];
+    const supervisor = new SupervisorRestartBarrier();
+    cleanups.push(async () => supervisor.dispose());
+    const launch = vi.fn();
+    const h = await createHarness({ stream: async (_chatId, input) => {
+      const producer = (input as { markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void> }).markdown;
+      await producer?.({ setContent: async (markdown) => { contents.push(markdown); } });
+    } });
+    h.agent.setEvents([{ type: 'text', delta: 'restart reply finished' }, { type: 'done', terminationReason: 'normal' }]);
+    await requestDeferredServiceRestart(h.tmp.profile, {
+      profile: 'codex', serviceId: 'supervisor', bridgePid: process.pid, requestedAt: new Date().toISOString(),
+    });
+    await startTestBridge(h, launch, supervisor);
+    const other = await createHarness();
+    other.controls.profile = 'other';
+    other.agent.setEvents([
+      [{ type: 'text', delta: 'other first reply' }, { type: 'done', terminationReason: 'normal' }],
+      [{ type: 'text', delta: 'other queued reply' }, { type: 'done', terminationReason: 'normal' }],
+    ]);
+    const releaseOther = holdFirstAgentRun(other.agent);
+    await startTestBridge(other, launch, supervisor);
+    try {
+      await other.channel.handlers.message?.(message('om_other', 'other work'));
+      await waitFor(() => other.agent.runOptions.length === 1);
+      await other.channel.handlers.message?.(message('om_queued', 'queued work'));
+      await h.channel.handlers.message?.(message('om_restart', 'restart'));
+      await waitFor(() => contents.some((text) => text.includes('restart reply finished')));
+      expect(launch).not.toHaveBeenCalled();
+      const lease = await readRouteLease(h.tmp.profile, h.agent.runOptions[0]!.routeId!);
+      expect(lease?.serviceId).toBe('supervisor');
+      releaseOther();
+      await waitFor(() => launch.mock.calls.length === 1, 4000);
+      expect(other.agent.runOptions).toHaveLength(2);
+      expect(launch).toHaveBeenCalledWith('codex', expect.objectContaining({ serviceId: 'supervisor' }));
+      await other.channel.handlers.message?.(message('om_after_launch', 'must retry'));
+      expect(other.agent.runOptions).toHaveLength(2);
+      expect(JSON.stringify(other.channel.sent)).toContain('本条消息尚未进入任务队列');
+      const options = launch.mock.calls[0]?.[1] as { onFailure?: (error: unknown) => void };
+      options.onFailure?.(new Error('helper failed after launch'));
+      await other.channel.handlers.message?.(message('om_after_failure', 'accept after failure'));
+      await waitFor(() => other.agent.runOptions.length === 3);
+    } finally {
+      releaseOther();
+    }
   });
 
   it('launches a deferred self-restart only after the terminal reply is rendered', async () => {
@@ -1063,7 +1111,8 @@ async function startTestBridge(h: {
   sessions: SessionStore;
   workspaces: WorkspaceStore;
   controls: ReturnType<typeof createControls>;
-}, launchDeferredRestart?: (profile: string) => void): Promise<void> {
+}, launchDeferredRestart?: (profile: string, options?: { serviceId?: 'supervisor' }) => void,
+supervisorRestart?: SupervisorRestartBarrier): Promise<void> {
   const bridge = await startChannel({
     cfg: h.profileConfig,
     agent: h.agent,
@@ -1077,6 +1126,7 @@ async function startTestBridge(h: {
       profileDir: h.tmp.profile,
     },
     launchDeferredRestart,
+    supervisorRestart,
   });
   cleanups.push(() => bridge.disconnect());
 }

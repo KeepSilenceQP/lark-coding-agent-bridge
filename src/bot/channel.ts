@@ -34,6 +34,8 @@ import {
 } from '../card/run-state';
 import { renderText } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
+import { guardSupervisorHandlers, type SupervisorRestartBarrier } from '../runtime/supervisor-restart';
+import { sendHelperFailureReceipt } from '../runtime/restart-failure-receipt';
 import { ensureBotRegistrySelfRegistration } from '../config/bot-registry-service';
 import type { AppConfig } from '../config/schema';
 import { isCodexEditedMessageRestartEnabled } from '../config/profile-schema';
@@ -1162,7 +1164,10 @@ export interface StartChannelDeps {
   controls: Controls;
   appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'> &
     Partial<Pick<AppPaths, 'profileDir'>>;
-  launchDeferredRestart?: (profile: string) => void;
+  launchDeferredRestart?: (profile: string, options?: {
+    serviceId?: 'supervisor'; onFailure?: (error: unknown) => void;
+  }) => void;
+  supervisorRestart?: SupervisorRestartBarrier;
 }
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
@@ -1378,6 +1383,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           profile: controls.profile,
           bridgePid: process.pid,
           requestedAt: new Date().toISOString(),
+          ...(requested.serviceId ? { serviceId: requested.serviceId } : {}),
         });
       }
       return;
@@ -1388,7 +1394,27 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       format: requested.format,
       ...(requested.format === 'new' ? { receiptId: requested.receiptId } : {}),
     });
-    (deps.launchDeferredRestart ?? launchDeferredServiceRestart)(controls.profile);
+    const launch = () => {
+      if (requested.serviceId) {
+        (deps.launchDeferredRestart ?? launchDeferredServiceRestart)(controls.profile, {
+          serviceId: requested.serviceId,
+          onFailure: (error) => deps.supervisorRestart?.fail(error),
+        });
+      } else {
+        (deps.launchDeferredRestart ?? launchDeferredServiceRestart)(controls.profile);
+      }
+    };
+    if (requested.serviceId === 'supervisor') {
+      if (!deps.supervisorRestart) throw new Error('supervisor restart requested from a classic runtime');
+      deps.supervisorRestart.request(launch, () => {
+        const receipt = requested.format === 'new'
+          ? sendHelperFailureReceipt(controls.profile, { profileDir }, requested.receiptId,
+              requested.returnRoute, 'service-action-failure')
+          : Promise.resolve();
+        void receipt.catch((error) => log.fail('receipt', error, { step: 'supervisor-helper-failure' }))
+          .finally(() => { deferredRestartLaunching = false; });
+      });
+    } else launch();
   };
 
   // Resolve the App Secret to plaintext. The config field can be a literal
@@ -1557,6 +1583,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           scope,
           mode,
           profileDir: deps.appPaths?.profileDir,
+          restartServiceId: deps.supervisorRestart ? 'supervisor' : undefined,
           editedMessageRestarts,
           preparationReservation,
           initialInterruptEpoch,
@@ -1599,7 +1626,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // Counter for stdout reconnect escalation; reset on `reconnected`.
   let consecutiveReconnects = 0;
 
-  channel.on({
+  const unregisterRestartParticipant = deps.supervisorRestart?.register({
+    isIdle: () => activeBatchCount === 0 && !pending.hasPending() && activeRuns.isIdle(),
+    pause: () => activeRuns.pauseNewRuns('supervisor-service-restart'),
+  });
+  channel.on(guardSupervisorHandlers({
     message: async (msg) => {
       log.info('intake', 'received', {
         msgId: msg.messageId,
@@ -1811,6 +1842,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
                   scope: record.scope,
                   mode: record.threadId ? 'topic' : record.chatType === 'p2p' ? 'p2p' : 'group',
                   profileDir: deps.appPaths?.profileDir,
+                  restartServiceId: deps.supervisorRestart ? 'supervisor' : undefined,
                   lease,
                   editedMessageRestarts,
                   directCorrection: {
@@ -2063,7 +2095,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         log.fail('ws', err, { code: err.code });
       }
     },
-  });
+  }, deps.supervisorRestart, async (name, args) => {
+    if (name !== 'message') return;
+    const msg = args[0] as NormalizedMessage;
+    await channel.send(msg.chatId, { text: '服务正在重启，本条消息尚未进入任务队列，请稍后重试。' }, {
+      replyTo: msg.messageId,
+      ...(msg.threadId ? { replyInThread: true } : {}),
+    }).catch((err) => log.fail('service', err, { step: 'restart-intake-notice' }));
+  }));
 
   // In-meeting agent. Created before connect() so the `vc.bot.*` handlers are
   // installed on the event dispatcher before any push can arrive; sessions are
@@ -2105,7 +2144,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     controls.meeting = meetingManager;
   }
 
-  await channel.connect();
+  try {
+    await channel.connect();
+  } catch (error) {
+    unregisterRestartParticipant?.();
+    throw error;
+  }
   // Owner identity is persisted per app. Resolve it only when missing; normal
   // restarts do not depend on the application API and no polling timer exists.
   if (!controls.botOwnerId) await controls.refreshOwner(channel);
@@ -2190,6 +2234,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   return {
     channel,
     disconnect: async () => {
+      unregisterRestartParticipant?.();
       activeRuns.pauseNewRuns('bridge-disconnect');
       knownChatsRefresh.stop();
       // Stop meeting timers but stay in the meetings: /reconnect tears the
@@ -2562,6 +2607,7 @@ export function shouldBypassDeniedChatForInviteGroup(
 }
 
 interface RunBatchDeps {
+  restartServiceId?: 'supervisor';
   intakeProgress?: IntakeProgress;
   channel: LarkChannel;
   executor: RunExecutor;
@@ -2787,6 +2833,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   let routeLeaseId: string | undefined;
   if (deps.profileDir) {
     const lease = await createRouteLease(deps.profileDir, {
+      ...(deps.restartServiceId ? { serviceId: deps.restartServiceId } : {}),
       chatId,
       threadId,
       replyTo: replyToId,

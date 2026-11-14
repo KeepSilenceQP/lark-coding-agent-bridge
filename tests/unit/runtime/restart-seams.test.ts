@@ -860,6 +860,7 @@ async function setupRestartMocks(): Promise<RestartMocks> {
   }));
 
   vi.mock('../../../src/daemon/paths', () => ({
+    SUPERVISOR_SERVICE_ID: 'supervisor',
     daemonStdoutPath: (profile: string) => `/tmp/lark-channel-home/profiles/${profile}/logs/daemon/stdout.log`,
     daemonStderrPath: (profile: string) => `/tmp/lark-channel-home/profiles/${profile}/logs/daemon/stderr.log`,
   }));

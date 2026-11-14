@@ -22,22 +22,15 @@ import { requestDeferredServiceRestart } from '../../runtime/deferred-service-re
 import {
   createPending,
   readPending,
-  deletePending,
-  createClaim,
-  readClaim,
-  createAttempt,
-  createTerminal,
-  readTerminal,
-  cleanupReceiptArtifacts,
   makeReceiptId,
-  makeClaimUuid,
 } from '../../runtime/restart-receipt';
 import {
   validateRouteLease,
   deleteRouteLease,
   returnRouteFromLease,
 } from '../../runtime/route-lease';
-import { sendRestartReceipt } from '../../runtime/restart-receipt-sender';
+import { sendHelperFailureReceipt } from '../../runtime/restart-failure-receipt';
+export { sendHelperFailureReceipt } from '../../runtime/restart-failure-receipt';
 
 export interface ServiceStartOptions {
   profile?: string;
@@ -483,7 +476,37 @@ export async function runServiceStop(opts: ServiceProfileOptions = {}): Promise<
  * `start` and goes through the full install + start path.
  */
 export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promise<void> {
-  const { serviceId, profile, webUi } = await resolveServiceTarget(opts);
+  const boundProfile = process.env.LARK_CHANNEL === '1'
+    ? process.env.LARK_CHANNEL_PROFILE?.trim() : undefined;
+  const effectiveOptions = boundProfile && !opts.profile && !opts.webUi
+    ? { ...opts, profile: boundProfile } : opts;
+  let { serviceId, profile, webUi } = await resolveServiceTarget(effectiveOptions);
+  if (boundProfile && opts.webUi && opts.profile && opts.profile !== boundProfile) {
+    console.error('✗ supervisor 自重启必须保留当前 profile 的回传路由。');
+    process.exit(1);
+  }
+  const selfRestart = Boolean(boundProfile && (!opts.profile || opts.profile === boundProfile));
+  if (selfRestart) profile = boundProfile;
+  else if (opts.webUi && opts.profile) profile = opts.profile;
+  const appPaths = profile ? resolveAppPaths({ rootDir: paths.rootDir, profile }) : undefined;
+  const bridgePid = positiveInt(process.env.LARK_CHANNEL_BRIDGE_PID);
+  const routeId = selfRestart ? process.env.LARK_CHANNEL_ROUTE_ID?.trim() : undefined;
+  if (routeId && (!bridgePid || !appPaths)) {
+    console.error('✗ 当前任务缺少有效的 bridge 进程身份，未安排重启。');
+    process.exit(1);
+  }
+  const validation = routeId && bridgePid && appPaths
+    ? await validateRouteLease(appPaths.profileDir, routeId, bridgePid) : undefined;
+  if (validation && !validation.ok) {
+    console.error(`✗ 无法安排重启: ${validation.reason}`);
+    process.exit(1);
+  }
+  const pending = !boundProfile && appPaths ? await readPending(appPaths.profileDir) : undefined;
+  if ((validation?.ok && validation.lease.serviceId === SUPERVISOR_SERVICE_ID) ||
+      pending?.serviceId === SUPERVISOR_SERVICE_ID) {
+    serviceId = SUPERVISOR_SERVICE_ID;
+    webUi = true;
+  }
   const adapter = requireAdapter(
     'restart',
     serviceId,
@@ -497,23 +520,16 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
     );
     process.exit(1);
   }
-  if (
-    !webUi &&
-    profile &&
-    process.env.LARK_CHANNEL === '1' &&
-    process.env.LARK_CHANNEL_PROFILE === profile
-  ) {
-    const appPaths = resolveAppPaths({ rootDir: paths.rootDir, profile });
-    const bridgePid = positiveInt(process.env.LARK_CHANNEL_BRIDGE_PID);
-    const routeId = process.env.LARK_CHANNEL_ROUTE_ID?.trim() || undefined;
+  if (selfRestart && profile && appPaths) {
+    if (webUi && (!validation?.ok || validation.lease.serviceId !== SUPERVISOR_SERVICE_ID ||
+        !bridgePid || !adapter.isRunning() ||
+        Number(adapter.parseStatus(adapter.describeStatus()).pid) !== bridgePid)) {
+      console.error('✗ 无法验证当前任务由此 supervisor 托管；请从终端重启 supervisor 加载支持安全重启的版本。');
+      process.exit(1);
+    }
 
     // If a route lease is available, use the new receipt system.
-    if (routeId && bridgePid) {
-      const validation = await validateRouteLease(appPaths.profileDir, routeId, bridgePid);
-      if (!validation.ok) {
-        console.error(`✗ 无法安排重启: ${validation.reason}`);
-        process.exit(1);
-      }
+    if (routeId && bridgePid && validation?.ok) {
       const returnRoute = returnRouteFromLease(validation.lease);
       const receiptId = makeReceiptId();
       const pendingCreated = await createPending(appPaths.profileDir, {
@@ -522,6 +538,7 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
         oldPid: bridgePid,
         requestedAt: new Date().toISOString(),
         returnRoute,
+        ...(webUi ? { serviceId: SUPERVISOR_SERVICE_ID } : {}),
       });
       if (!pendingCreated) {
         console.error('✗ 已有待处理的重启请求。请等当前完成后重试。');
@@ -529,7 +546,9 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
       }
       // Delete lease only AFTER pending is created
       await deleteRouteLease(appPaths.profileDir, routeId);
-      console.log('✓ 已安排在当前任务完成后重启；本次回复完成前不会中断 bridge。');
+      console.log(webUi
+        ? '✓ 已安排在此 supervisor 的所有已接收任务完成后整体重启；完成回复后才执行，并回传重启结果。'
+        : '✓ 已安排在当前任务完成后重启；本次回复完成前不会中断 bridge。');
       return;
     }
 
@@ -542,12 +561,16 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
     console.log('✓ 已安排在当前任务完成后重启；本次回复完成前不会中断 bridge。');
     return;
   }
-  const waitProfile = webUi ? await resolveServiceProfile(undefined) : profile!;
+  const waitProfile = profile ?? await resolveServiceProfile(undefined);
+  if (!boundProfile && pending?.serviceId === SUPERVISOR_SERVICE_ID && appPaths) {
+    await helperRestartAndWait(waitProfile, adapter, appPaths);
+    return;
+  }
   if (adapter.isRunning()) {
     // Helper mode: if we were spawned by the deferred restart drain, handle
     // the failure receipt path. The helper strips LARK_CHANNEL so the
     // bridge-bound branch above doesn't fire.
-    if (!webUi && (!process.env.LARK_CHANNEL || process.env.LARK_CHANNEL !== '1')) {
+    if (!boundProfile && (!webUi || pending?.serviceId === SUPERVISOR_SERVICE_ID)) {
       await helperRestartAndWait(waitProfile, adapter, resolveAppPaths({ rootDir: paths.rootDir, profile: waitProfile }));
       return;
     }
@@ -669,23 +692,70 @@ export async function helperRestartAndWait(
     allowBootstrap: false,
   });
   const appId = cfg.accounts?.app?.id ?? '';
+  const beforeRegistry = readRegistry();
   const beforePids = new Set(
-    readRegistry()
-      .filter((e) => e.appId === appId && e.profileName === profile)
+    beforeRegistry
+      .filter((e) => e.appId === appId && e.profileName === profile &&
+        (pending.serviceId !== SUPERVISOR_SERVICE_ID || e.pid === pending.oldPid))
       .map((e) => e.pid),
   );
 
+  const targets = [{ profile, appPaths, pending, appId, beforePids }];
+  if (pending.serviceId === SUPERVISOR_SERVICE_ID) {
+    const root = await loadRootConfig(appPaths.configFile);
+    const profiles = new Set([
+      ...beforeRegistry.filter((entry) => entry.pid === pending.oldPid).map((entry) => entry.profileName),
+      ...Object.keys(root?.profiles ?? {}),
+    ]);
+    for (const siblingProfile of profiles) {
+      if (siblingProfile === profile) continue;
+      const siblingPaths = resolveAppPaths({ rootDir: appPaths.rootDir, profile: siblingProfile });
+      const sibling = await readPending(siblingPaths.profileDir);
+      if (sibling?.serviceId !== SUPERVISOR_SERVICE_ID || sibling.oldPid !== pending.oldPid ||
+          sibling.profile !== siblingProfile) continue;
+      const entry = beforeRegistry.find((entry) => entry.profileName === siblingProfile);
+      const siblingAppId = entry?.appId ?? (await resolveRuntime({
+        profile: siblingProfile, allowBootstrap: false,
+      })).cfg.accounts?.app?.id ?? '';
+      targets.push({ profile: siblingProfile, appPaths: siblingPaths, pending: sibling,
+        appId: siblingAppId, beforePids: new Set([pending.oldPid]) });
+    }
+  }
+  let missing = targets;
+  const observeConnections = (): boolean => {
+    const live = readRegistry();
+    missing = targets.filter((target) => !live.some((entry) =>
+      entry.appId === target.appId && entry.profileName === target.profile &&
+      !target.beforePids.has(entry.pid) && Boolean(entry.botName)));
+    return missing.length === 0;
+  };
+  const sendFailures = async (reason: 'service-action-failure' | 'startup-timeout') => {
+    for (const target of missing) {
+      try {
+        await sendFailure(target.profile, target.appPaths,
+          target.pending.receiptId, target.pending.returnRoute, reason);
+      } catch {
+        console.error(`✗ profile「${target.profile}」重启失败通知发送异常，其他 profile 的通知继续处理。`);
+      }
+    }
+  };
+
   // Execute restart
-  const r = await adapter.restart();
+  const running = adapter.isRunning();
+  const currentServicePid = pending.serviceId === SUPERVISOR_SERVICE_ID && running
+    ? positiveInt(adapter.parseStatus(adapter.describeStatus()).pid) : undefined;
+  if (pending.serviceId === SUPERVISOR_SERVICE_ID && running && !currentServicePid) {
+    await sendFailures('service-action-failure');
+    console.error('✗ 无法验证 supervisor 的进程身份，未执行重启。');
+    doExit(1);
+  }
+  // A concurrently completed restart must not be followed by a second one.
+  const alreadyReplaced = currentServicePid !== undefined && currentServicePid !== pending.oldPid;
+  const r = alreadyReplaced ? { ok: true, stderr: '' }
+    : await (running ? adapter.restart() : adapter.start());
   if (!r.ok) {
     // Service action failure → claim failure + send
-    await sendFailure(
-      profile,
-      appPaths,
-      pending.receiptId,
-      pending.returnRoute,
-      'service-action-failure',
-    );
+    await sendFailures('service-action-failure');
     console.error(`✗ 重启失败 (service action): ${formatServiceStderr(r.stderr)}`);
     doExit(1);
   }
@@ -694,24 +764,16 @@ export async function helperRestartAndWait(
   console.log('正在等待新 bot 连接...');
   const timeoutMs = deps?.waitTimeoutMs ?? 30_000;
   const deadline = Date.now() + timeoutMs;
-  let newEntry: ReturnType<typeof readRegistry>[number] | undefined;
+  observeConnections();
 
-  while (Date.now() < deadline) {
-    const live = readRegistry();
-    newEntry = live.find(
-      (e) =>
-        e.appId === appId &&
-        e.profileName === profile &&
-        !beforePids.has(e.pid) &&
-        Boolean(e.botName),
-    );
-    if (newEntry) break;
+  while (missing.length > 0 && Date.now() < deadline) {
+    if (observeConnections()) break;
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  if (newEntry) {
+  if (missing.length === 0) {
     // New bridge connected — helper exits silently (new bridge sends success)
-    console.log(`✓ 新 bot ${newEntry.botName} 已连接 (pid ${newEntry.pid})，由新进程发送成功通知。`);
+    console.log('✓ 请求重启的 bot 均已连接，由新进程发送成功通知。');
     return;
   }
 
@@ -721,117 +783,17 @@ export async function helperRestartAndWait(
   console.log('⚠ 30 秒内未观察到新 bot 连接，进行最终复查...');
   const finalDeadline = Date.now() + finalWindowMs;
   while (Date.now() < finalDeadline) {
-    const live = readRegistry();
-    newEntry = live.find(
-      (e) =>
-        e.appId === appId &&
-        e.profileName === profile &&
-        !beforePids.has(e.pid) &&
-        Boolean(e.botName),
-    );
-    if (newEntry) {
-      console.log(`✓ 最终复查: 新 bot ${newEntry.botName} 已连接 (pid ${newEntry.pid})，由新进程发送成功通知。`);
+    if (observeConnections()) {
+      console.log('✓ 最终复查: 请求重启的 bot 均已连接，由新进程发送成功通知。');
       return;
     }
     await new Promise((r) => setTimeout(r, 500));
   }
 
   // Still no new bridge → send failure receipt
-  await sendFailure(
-    profile,
-    appPaths,
-    pending.receiptId,
-    pending.returnRoute,
-    'startup-timeout',
-  );
+  await sendFailures('startup-timeout');
   console.error('✗ 重启失败 (startup-timeout): 新 bot 未在超时时间内连接。');
   doExit(1);
-}
-
-/**
- * Send a failure receipt from the helper. Uses the receipt state machine
- * to ensure exactly-once delivery.
- */
-export async function sendHelperFailureReceipt(
-  profile: string,
-  appPaths: ReturnType<typeof resolveAppPaths>,
-  receiptId: string,
-  returnRoute: { chatId: string; threadId?: string; replyTo: string },
-  reason: 'service-action-failure' | 'startup-timeout',
-): Promise<void> {
-  const kind = 'failure' as const;
-  const uuid = makeClaimUuid(receiptId, kind);
-
-  // Check terminal — if already exists, don't send
-  if (await readTerminal(appPaths.profileDir, receiptId)) {
-    await cleanupReceiptArtifacts(appPaths.profileDir, receiptId).catch(() => {});
-    return;
-  }
-
-  // Primitive A: claim (immutable)
-  const claimed = await createClaim(appPaths.profileDir, {
-    receiptId,
-    kind,
-    payload: returnRoute,
-    uuid,
-    claimedAt: new Date().toISOString(),
-  });
-  if (!claimed) {
-    // Already claimed — check if by us or another
-    const existing = await readClaim(appPaths.profileDir, receiptId);
-    if (existing && existing.kind !== kind) {
-      // Another actor claimed with a different kind — don't flip
-      return;
-    }
-  }
-
-  // Primitive A: attempt lease
-  const attempted = await createAttempt(appPaths.profileDir, {
-    receiptId,
-    ownerPid: process.pid,
-    attemptedAt: new Date().toISOString(),
-  });
-  if (!attempted) return; // another actor owns the attempt
-
-  // Primitive C: delete pending
-  await deletePending(appPaths.profileDir, receiptId);
-
-  // Read terminal again
-  if (await readTerminal(appPaths.profileDir, receiptId)) {
-    await cleanupReceiptArtifacts(appPaths.profileDir, receiptId).catch(() => {});
-    return;
-  }
-
-  // Send failure receipt
-  const result = await sendRestartReceipt({
-    profile,
-    returnRoute,
-    receiptId,
-    kind,
-    uuid,
-    reason,
-  });
-
-  if (result.ok && result.messageId) {
-    await createTerminal(appPaths.profileDir, {
-      receiptId,
-      kind,
-      outcome: 'completed',
-      messageId: result.messageId,
-    });
-    console.log(`✓ 已发送失败通知: ${reason}`);
-  } else {
-    await createTerminal(appPaths.profileDir, {
-      receiptId,
-      kind,
-      outcome: 'delivery-failed',
-      reason,
-    });
-    console.error(`✗ 发送失败通知失败: ${reason}`);
-  }
-
-  // Clean up
-  await cleanupReceiptArtifacts(appPaths.profileDir, receiptId).catch(() => {});
 }
 
 async function resolveServiceProfile(explicitProfile: string | undefined): Promise<string> {

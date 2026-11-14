@@ -252,7 +252,13 @@ This guarantees:
 - Exactly one receipt (success or failure) is delivered per restart request, with a stable idempotency key (`uuid`).
 - Directly calling `launchctl`, `systemctl`, `schtasks`, or `kill` on the bridge PID is prohibited for same-profile self-restarts — the deferred path must be used.
 
-External restarts of **other** profiles (and standard `start` / `stop` operations) are unaffected and follow the normal service-manager path.
+**Supervisor-hosted profiles** use the same `restart --profile <current-profile>` command. The runtime records the hosting service in the task's route lease; the CLI verifies the service PID before recording a whole-supervisor restart. All hosted profiles' accepted tasks, queues, and replies drain before one helper starts. Each requesting profile retains its original chat/topic receipt, even when several profiles request the same service restart. Once the helper starts, new IM messages receive a retry notice instead of entering a queue that would be lost. An in-process `/reconnect` does not load an upgraded bridge program.
+
+An explicit `restart --web-ui` inside a bridge session also follows the deferred path. Older runtimes without supervisor route metadata fail closed; restart the supervisor once from a terminal to load this support. This restarts the entire supervisor, including its other hosted bots.
+
+If the helper cannot start or its service operation fails, the surviving supervisor reopens admission for every hosted profile and reports failure through the same receipt state machine, without duplicate notifications from the helper and old process.
+
+External restarts of **other independently registered** profile services (and standard `start` / `stop` operations) still follow the normal service-manager path.
 
 ## Commands
 
