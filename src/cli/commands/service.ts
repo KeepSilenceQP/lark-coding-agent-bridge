@@ -30,6 +30,8 @@ import {
   returnRouteFromLease,
 } from '../../runtime/route-lease';
 import { sendHelperFailureReceipt } from '../../runtime/restart-failure-receipt';
+import { withSupervisorRestartLock } from '../../runtime/supervisor-restart-lock';
+import { saveSupervisorRestartProfiles } from '../../runtime/supervisor-resume';
 export { sendHelperFailureReceipt } from '../../runtime/restart-failure-receipt';
 
 export interface ServiceStartOptions {
@@ -502,8 +504,17 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
     process.exit(1);
   }
   const pending = !boundProfile && appPaths ? await readPending(appPaths.profileDir) : undefined;
+  // Pre-qp.15 runtimes already defer a helper until their final reply, but
+  // their leases cannot identify the shared service. Prove ownership using
+  // the OS service PID instead of inferring it from a profile/service file.
+  let legacySupervisor = false;
+  if (validation?.ok && bridgePid && !validation.lease.serviceId) {
+    const supervisor = getServiceAdapter(SUPERVISOR_SERVICE_ID, WEB_UI_RUN_ARGS);
+    legacySupervisor = Boolean(supervisor?.fileExists() && supervisor.isRunning() &&
+      positiveInt(supervisor.parseStatus(supervisor.describeStatus()).pid) === bridgePid);
+  }
   if ((validation?.ok && validation.lease.serviceId === SUPERVISOR_SERVICE_ID) ||
-      pending?.serviceId === SUPERVISOR_SERVICE_ID) {
+      legacySupervisor || pending?.serviceId === SUPERVISOR_SERVICE_ID) {
     serviceId = SUPERVISOR_SERVICE_ID;
     webUi = true;
   }
@@ -521,10 +532,10 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
     process.exit(1);
   }
   if (selfRestart && profile && appPaths) {
-    if (webUi && (!validation?.ok || validation.lease.serviceId !== SUPERVISOR_SERVICE_ID ||
+    if (webUi && (!validation?.ok || (!legacySupervisor && validation.lease.serviceId !== SUPERVISOR_SERVICE_ID) ||
         !bridgePid || !adapter.isRunning() ||
         Number(adapter.parseStatus(adapter.describeStatus()).pid) !== bridgePid)) {
-      console.error('✗ 无法验证当前任务由此 supervisor 托管；请从终端重启 supervisor 加载支持安全重启的版本。');
+      console.error('✗ 无法验证当前任务由此 supervisor 托管，未安排重启。');
       process.exit(1);
     }
 
@@ -539,6 +550,7 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
         requestedAt: new Date().toISOString(),
         returnRoute,
         ...(webUi ? { serviceId: SUPERVISOR_SERVICE_ID } : {}),
+        ...(legacySupervisor ? { legacySupervisor: true } : {}),
       });
       if (!pendingCreated) {
         console.error('✗ 已有待处理的重启请求。请等当前完成后重试。');
@@ -546,7 +558,9 @@ export async function runServiceRestart(opts: ServiceProfileOptions = {}): Promi
       }
       // Delete lease only AFTER pending is created
       await deleteRouteLease(appPaths.profileDir, routeId);
-      console.log(webUi
+      console.log(legacySupervisor
+        ? '✓ 已安排旧版 supervisor 首次升级重启：此 profile 的回复完成后自动整体重启并回传结果。旧运行时不能排空其他 profile 的任务，其他任务可能被中断。'
+        : webUi
         ? '✓ 已安排在此 supervisor 的所有已接收任务完成后整体重启；完成回复后才执行，并回传重启结果。'
         : '✓ 已安排在当前任务完成后重启；本次回复完成前不会中断 bridge。');
       return;
@@ -671,6 +685,26 @@ export async function helperRestartAndWait(
     waitTimeoutMs?: number;
   },
 ): Promise<void> {
+  const pending = await readPending(appPaths.profileDir);
+  if (pending?.serviceId === SUPERVISOR_SERVICE_ID) {
+    // Old profiles each launch their own helper. Serialize through the whole
+    // restart/readback, then re-read pending: the new process may already
+    // have consumed it while another helper held the service lock.
+    await withSupervisorRestartLock(appPaths.rootDir, async () => {
+      if (!await readPending(appPaths.profileDir)) return;
+      await performHelperRestartAndWait(profile, adapter, appPaths, deps);
+    });
+    return;
+  }
+  await performHelperRestartAndWait(profile, adapter, appPaths, deps);
+}
+
+async function performHelperRestartAndWait(
+  profile: string,
+  adapter: ServiceAdapter,
+  appPaths: ReturnType<typeof resolveAppPaths>,
+  deps: Parameters<typeof helperRestartAndWait>[3],
+): Promise<void> {
   const resolveRuntime = deps?.resolveRuntime ??
     (await import('../../runtime/profile-runtime')).resolveProfileRuntime;
   const readRegistry = deps?.readRegistry ??
@@ -751,6 +785,12 @@ export async function helperRestartAndWait(
   }
   // A concurrently completed restart must not be followed by a second one.
   const alreadyReplaced = currentServicePid !== undefined && currentServicePid !== pending.oldPid;
+  if (pending.serviceId === SUPERVISOR_SERVICE_ID && !alreadyReplaced) {
+    await saveSupervisorRestartProfiles(appPaths.rootDir, pending.oldPid, [
+      ...targets.map((target) => target.profile),
+      ...beforeRegistry.filter((entry) => entry.pid === pending.oldPid).map((entry) => entry.profileName),
+    ]);
+  }
   const r = alreadyReplaced ? { ok: true, stderr: '' }
     : await (running ? adapter.restart() : adapter.start());
   if (!r.ok) {

@@ -86,6 +86,24 @@ describe('supervisor restart helper receipts', () => {
     expect(h.failure).not.toHaveBeenCalled();
   });
 
+  it('serializes legacy profile helpers so concurrent requests restart the shared service only once', async () => {
+    const h = await fixture();
+    let pid = 1234;
+    h.adapter.parseStatus = () => ({ pid: String(pid) });
+    h.readRegistry.mockReset().mockImplementation(() => pid === 1234 ? h.old : h.fresh);
+    h.adapter.restart = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      pid = 5678;
+      return { ok: true, stderr: '' };
+    });
+    await Promise.all([
+      helperRestartAndWait('trae-cli', h.adapter, h.paths, h.deps),
+      helperRestartAndWait('codex', h.adapter, resolveAppPaths({ rootDir: h.rootDir, profile: 'codex' }), h.deps),
+    ]);
+    expect(h.adapter.restart).toHaveBeenCalledOnce();
+    expect(h.failure).not.toHaveBeenCalled();
+  });
+
   it('does not operate on a supervisor whose PID cannot be verified', async () => {
     const h = await fixture();
     h.adapter.parseStatus = () => ({});

@@ -585,6 +585,12 @@ describe('profile-aware service commands', () => {
   it.each([
     { webUi: false, scenario: 'valid profile', pid: '1234', ok: true },
     { webUi: true, scenario: 'valid web-ui', pid: '1234', ok: true },
+    { webUi: false, scenario: 'legacy profile', pid: '1234', ok: true },
+    { webUi: true, scenario: 'legacy web-ui', pid: '1234', ok: true },
+    { webUi: false, scenario: 'legacy stale profile file', pid: '1234', ok: true },
+    { webUi: false, scenario: 'legacy wrong service PID', pid: '5555', ok: false },
+    { webUi: false, scenario: 'legacy missing service PID', pid: '', ok: false },
+    { webUi: false, scenario: 'legacy stopped service', pid: '1234', ok: false },
     { webUi: false, scenario: 'wrong service PID', pid: '5555', ok: false },
     { webUi: false, scenario: 'expired route', pid: '1234', ok: false },
     { webUi: false, scenario: 'pending exists', pid: '1234', ok: false },
@@ -594,15 +600,15 @@ describe('profile-aware service commands', () => {
     const keys = ['LARK_CHANNEL', 'LARK_CHANNEL_PROFILE', 'LARK_CHANNEL_BRIDGE_PID', 'LARK_CHANNEL_ROUTE_ID'];
     const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
     const supervisor = { ...mocks.adapter,
-      fileExists: vi.fn(() => true), isRunning: vi.fn(() => true),
+      fileExists: vi.fn(() => true), isRunning: vi.fn(() => scenario !== 'legacy stopped service'),
       parseStatus: vi.fn(() => ({ pid })),
     };
     mocks.getServiceAdapter.mockImplementation((id: string) => id === 'supervisor'
-      ? supervisor : { ...mocks.adapter, fileExists: () => false });
+      ? supervisor : { ...mocks.adapter, fileExists: () => scenario === 'legacy stale profile file' });
     const profileDir = join(root, 'profiles', 'codex-dev');
     const lease = await createRouteLease(profileDir, {
       chatId: 'oc_original', threadId: 'omt_original', replyTo: 'om_original',
-      bridgePid: 1234, serviceId: 'supervisor',
+      bridgePid: 1234, ...(!scenario.startsWith('legacy') ? { serviceId: 'supervisor' as const } : {}),
       ...(scenario === 'expired route' ? { ttlMs: -1 } : {}),
     });
     if (scenario === 'pending exists') await createPending(profileDir, {
