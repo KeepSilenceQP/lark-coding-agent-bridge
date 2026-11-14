@@ -2,6 +2,7 @@ import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { readLegacyForegroundMetadata } from './legacy-foreground';
 import {
   mergeProcessEnv,
   spawnProcess,
@@ -21,6 +22,9 @@ export interface CodexTurnState {
   foregroundChildThreadIds?: string[];
   progressToken?: string;
   hasRunningTool?: boolean;
+  foregroundLinkSource?: 'legacy-rollout';
+  foregroundProbeReason?: string;
+  foregroundCandidateCount?: number;
 }
 
 export type CodexTurnStateProbe = (threadId: string) => Promise<CodexTurnState | undefined>;
@@ -112,12 +116,11 @@ async function readLatestTurn(
         fail(new Error(stringValue(error?.message) ?? 'codex app-server rejected thread/read'));
         return;
       }
-      try {
-        resolve(parseLatestTurn(response.result, threadId));
+      void parseLatestTurn(response.result, threadId).then((state) => {
+        if (settled) return;
+        resolve(state);
         cleanup();
-      } catch (error) {
-        fail(error);
-      }
+      }, fail);
     });
 
     try {
@@ -157,7 +160,7 @@ function threadReadRequest(threadId: string) {
   };
 }
 
-function parseLatestTurn(input: unknown, threadId: string): CodexTurnState | undefined {
+async function parseLatestTurn(input: unknown, threadId: string): Promise<CodexTurnState | undefined> {
   const result = recordValue(input);
   const thread = recordValue(result?.thread);
   if (!Array.isArray(thread?.turns)) {
@@ -178,9 +181,14 @@ function parseLatestTurn(input: unknown, threadId: string): CodexTurnState | und
   }
   const finalText = parseFinalAgentText(latest.items);
   const children = new Set<string>();
+  const candidates = new Set<string>();
   let hasRunningTool = false;
   const progress = latest.items.map((value) => {
     const item = recordValue(value);
+    if (item?.type === 'subAgentActivity' && item.kind === 'started') {
+      const childId = stringValue(item.agentThreadId);
+      if (childId && childId !== threadId) candidates.add(childId);
+    }
     if (item?.type === 'collabAgentToolCall' && item.tool === 'spawnAgent' &&
         item.senderThreadId === threadId && item.runInBackground === false &&
         item.status !== 'failed' && Array.isArray(item.receiverThreadIds)) {
@@ -195,7 +203,14 @@ function parseLatestTurn(input: unknown, threadId: string): CodexTurnState | und
     return [item?.id, item?.type, item?.status,
       typeof item?.aggregatedOutput === 'string' ? item.aggregatedOutput.length : undefined];
   });
-  const parentThreadId = stringValue(thread.parentThreadId);
+  const source = recordValue(thread.source);
+  const subAgent = recordValue(source?.subAgent ?? source?.subagent);
+  const spawnSource = recordValue(subAgent?.thread_spawn);
+  const parentThreadId = stringValue(thread.parentThreadId) ?? stringValue(spawnSource?.parent_thread_id);
+  const legacy = !children.size && candidates.size
+    ? await readLegacyForegroundMetadata(thread.path, threadId, id, [...candidates]) : undefined;
+  for (const childId of legacy?.childThreadIds ?? []) children.add(childId);
+  if (legacy) progress.push(['legacy-foreground-results', ...legacy.completedCallIds]);
   return {
     id, status, itemCount: latest.items.length,
     progressToken: createHash('sha256').update(JSON.stringify(progress)).digest('hex'),
@@ -203,6 +218,8 @@ function parseLatestTurn(input: unknown, threadId: string): CodexTurnState | und
     ...(parentThreadId ? { parentThreadId } : {}),
     ...(children.size ? { foregroundChildThreadIds: [...children] } : {}),
     ...(hasRunningTool ? { hasRunningTool: true } : {}),
+    ...(legacy?.reason === 'verified' ? { foregroundLinkSource: 'legacy-rollout' as const } : {}),
+    ...(legacy ? { foregroundProbeReason: legacy.reason, foregroundCandidateCount: candidates.size } : {}),
   };
 }
 

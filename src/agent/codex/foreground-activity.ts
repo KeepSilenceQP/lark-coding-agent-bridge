@@ -1,4 +1,5 @@
 import type { CodexTurnState, CodexTurnStateProbe } from './turn-state-probe';
+import { log } from '../../core/logger';
 
 const TOOL_SILENCE_MS = 65 * 60_000;
 const MAX_CHILDREN = 8;
@@ -18,6 +19,9 @@ export class CodexForegroundActivity {
   private pending: Promise<CodexTurnState | undefined> | undefined;
   private closed = false;
   private completedAt: number | undefined;
+  private parentToken: string | undefined;
+  private parentProgressAt: number | undefined;
+  private diagnosticToken: string | undefined;
 
   constructor(
     private readonly probe: CodexTurnStateProbe,
@@ -50,18 +54,45 @@ export class CodexForegroundActivity {
     // Leave time for the existing terminal recovery to deliver a persisted
     // parent final; an idle check itself must never manufacture completion.
     if (this.completedAt !== undefined) {
-      return { remainingMs: this.completedAt + idleTimeoutMs - Date.now(), timeoutMs: idleTimeoutMs };
+      return this.reportCheck({ remainingMs: this.completedAt + idleTimeoutMs - Date.now(), timeoutMs: idleTimeoutMs }, 'parent-completed');
     }
     let deadline: { remainingMs: number; timeoutMs: number } | undefined;
     const observed = [...this.children.values()];
     const active = observed.filter((child) => child.active);
+    if (!active.length && this.parentProgressAt !== undefined) {
+      const remainingMs = this.parentProgressAt + idleTimeoutMs - Date.now();
+      if (remainingMs > 0) return this.reportCheck({ remainingMs, timeoutMs: idleTimeoutMs }, 'parent-progress');
+    }
     // Finished older children must not shorten a newer foreground wait.
     for (const child of active.length ? active : observed) {
       const timeoutMs = child.hasRunningTool ? TOOL_SILENCE_MS : idleTimeoutMs;
       const remainingMs = child.lastProgressAt + timeoutMs - Date.now();
       if (!deadline || remainingMs < deadline.remainingMs) deadline = { remainingMs, timeoutMs };
     }
-    return deadline;
+    return this.reportCheck(deadline, deadline ? 'child-progress' : 'no-verified-activity');
+  }
+
+  private reportCheck(
+    result: { remainingMs: number; timeoutMs: number } | undefined,
+    reason: string,
+  ): typeof result {
+    log.info('agent', 'idle-activity-check', {
+      threadId: this.threadId, turnId: this.parentTurnId, childCount: this.children.size,
+      parentProgressAt: this.parentProgressAt, remainingMs: result?.remainingMs, reason,
+    });
+    return result;
+  }
+
+  private reportParent(parent: CodexTurnState | undefined, reason: string): void {
+    const token = JSON.stringify([parent?.id, parent?.status, parent?.foregroundCandidateCount,
+      parent?.foregroundChildThreadIds, reason]);
+    if (token === this.diagnosticToken) return;
+    log.info('agent', 'foreground-probe', {
+      threadId: this.threadId, turnId: parent?.id, turnStatus: parent?.status,
+      candidateCount: parent?.foregroundCandidateCount ?? 0,
+      verifiedCount: parent?.foregroundChildThreadIds?.length ?? 0, reason,
+    });
+    this.diagnosticToken = token;
   }
 
   private async readCurrent(): Promise<CodexTurnState | undefined> {
@@ -70,6 +101,7 @@ export class CodexForegroundActivity {
     if (this.closed) return undefined;
     if (parent && parent.id !== this.baselineTurnId &&
         (!this.parentTurnId || parent.id === this.parentTurnId) && parent.status === 'completed') {
+      this.reportParent(parent, 'parent-completed');
       this.completedAt ??= Date.now();
       this.children.clear();
       return parent;
@@ -77,10 +109,19 @@ export class CodexForegroundActivity {
     this.completedAt = undefined;
     if (!parent || parent.id === this.baselineTurnId || parent.status !== 'inProgress' ||
         (this.parentTurnId && parent.id !== this.parentTurnId)) {
+      this.reportParent(parent, !parent ? 'no-parent-state' : parent.id === this.baselineTurnId ?
+        'baseline-turn' : parent.status !== 'inProgress' ? 'parent-not-running' : 'different-parent-turn');
       this.children.clear();
+      this.parentToken = undefined;
+      this.parentProgressAt = undefined;
       return parent;
     }
     this.parentTurnId = parent.id;
+    const token = JSON.stringify([parent.itemCount, parent.progressToken]);
+    if (this.parentToken !== undefined && token !== this.parentToken) this.parentProgressAt = Date.now();
+    this.parentToken = token;
+    this.reportParent(parent, parent.foregroundProbeReason ??
+      (parent.foregroundChildThreadIds?.length ? 'api-links' : 'no-foreground-links'));
     // Bound probe work without letting completed spawn history crowd out the
     // most recent foreground children in a long parent turn.
     const ids = [...new Set(parent.foregroundChildThreadIds ?? [])].slice(-MAX_CHILDREN);
@@ -91,7 +132,13 @@ export class CodexForegroundActivity {
     if (this.closed) return undefined;
     const next = new Map<string, ChildProgress>();
     for (const { id, state } of states) {
-      if (!state || state.parentThreadId !== threadId) continue;
+      if (!state || (state.parentThreadId !== threadId &&
+          !(state.parentThreadId === undefined && parent.foregroundLinkSource === 'legacy-rollout'))) {
+        log.info('agent', 'foreground-child-skipped', {
+          threadId, childThreadId: id, reason: state ? 'parent-mismatch' : 'probe-unavailable',
+        });
+        continue;
+      }
       const previous = this.observations.get(id);
       // Initial completed history is not fresh activity. An observed transition
       // to completion gives the parent its normal idle interval to continue.

@@ -23,6 +23,28 @@ function fixture() {
 }
 
 describe('verified foreground child progress', () => {
+  it('renews parent activity when a result is persisted before stdout catches up', async () => {
+    const { activity, parent } = fixture();
+    parent.foregroundChildThreadIds = undefined;
+    parent.progressToken = 'before-result';
+    await activity.read();
+    await vi.advanceTimersByTimeAsync(599_000);
+    parent.progressToken = 'result-persisted';
+    expect(await activity.check(600_000)).toMatchObject({ remainingMs: 600_000 });
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(await activity.check(600_000)).toBeUndefined();
+  });
+
+  it('accepts a missing child parent field only with a verified legacy parent spawn', async () => {
+    const { activity, parent, child } = fixture();
+    child.parentThreadId = undefined;
+    expect(await activity.check(600_000)).toBeUndefined();
+    parent.foregroundLinkSource = 'legacy-rollout';
+    expect(await activity.check(600_000)).toMatchObject({ remainingMs: 600_000 });
+    child.parentThreadId = 'different-parent';
+    expect(await activity.check(600_000)).toBeUndefined();
+  });
+
   it('renews only on changed lifecycle evidence and expires a static running status', async () => {
     const { activity, child } = fixture();
     expect(await activity.check(600_000)).toEqual({ remainingMs: 600_000, timeoutMs: 600_000 });

@@ -134,23 +134,39 @@ belongs to the current adapter stream and run.
 
 Some compatible runtimes complete the spawn item while a foreground child is
 still working. Before an ordinary idle stop, the adapter now reconciles this
-case through the supported `app-server thread/read` API. TraeX 0.213.1's
-generated protocol exposes `collabAgentToolCall.runInBackground`,
-`senderThreadId`, and `receiverThreadIds`. Only an explicit
-`runInBackground: false` on the current parent turn qualifies; the child must
-also report the matching `parentThreadId`. Missing fields, background children,
-unrelated threads, pre-run history, and failed probes do not grant an extension.
+case through `app-server thread/read`. When available, it uses an explicit
+`collabAgentToolCall.runInBackground: false` on the current parent turn and
+verifies the child's `parentThreadId` or `source.subAgent.thread_spawn` parent.
+Generated protocol declarations alone do not prove that persisted history is
+serialized with these fields: verify actual responses from the target runtime.
+
+TraeX 0.204.1 can reconstruct the parent with only `subAgentActivity`, omit
+`collabAgentToolCall`, and omit the child's `parentThreadId`. Such an activity
+item is only a candidate, not proof of foreground work. For this legacy shape,
+the probe reads only the parent rollout path returned by the API. It validates
+the filename and `session_meta.id`, rejects symlinks, and reads at most a 256 KiB
+header and a 2 MiB tail. It correlates the current turn's `history_mutation`
+Agent call with `collab_agent_spawn_end.run_in_background: false` and the API's
+candidate child ID. A matching `function_call_output` closes that wait. No
+other sessions are discovered or scanned; record bodies are discarded after
+extracting whitelisted lifecycle metadata. Unverified links, background
+children, different turns, unsupported records and failed reads do not grant
+an extension. If a child explicitly reports a different parent, it is rejected.
 
 The existing stdout-idle probe observes those children periodically. Changed
 item lifecycle metadata renews their ordinary idle interval; repeatedly reading
 the same `inProgress` status does not. An actual in-progress child tool retains
 the bounded 65-minute silence policy. An observed child completion gives the
 parent one ordinary interval to continue, without manufacturing a parent final.
-Checks are isolated per run, limited to the eight most recently linked children, and
-never scan private rollout files or discover arbitrary sessions. Diagnostics
-contain only scope and remaining time; prompts and tool contents are not logged.
-Runtime upgrades still require a real new/resumed group-turn check: an older
-runtime that omits the foreground metadata cannot use this fallback.
+Changed lifecycle metadata on the current parent also renews its idle interval:
+a result already persisted while stdout is silent must not be discarded by a
+stale idle countdown. Initial snapshots and repeated unchanged reads do not
+count as new parent progress. Checks are isolated per run and limited to the
+eight most recently linked children. `foreground-probe`,
+`foreground-child-skipped` and `idle-activity-check` diagnostics explain parent
+status, link verification, skip reasons, last parent progress and deadlines;
+they never include paths, prompts, tool contents or reasoning. Validate both
+the legacy serialized response and actual new/resumed group runs after changes.
 
 As a bridge compatibility policy, MCP and collaboration calls have a **65-minute
 silence limit** while run idle detection is enabled. Changed structured progress
