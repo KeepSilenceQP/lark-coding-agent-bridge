@@ -618,53 +618,58 @@ describe('CodexAdapter process contract', () => {
     );
   });
 
-  it('does not probe persisted terminal state while a Codex tool is still in flight', async () => {
-    const fake = await createFakeCodex({
-      lines: [
-        { type: 'thread.started', thread_id: 'thread-long-tool' },
-        {
-          type: 'item.started',
-          item: {
-            id: 'tool-long',
-            type: 'command_execution',
-            command: './gradlew compile',
+  it.each(['command_execution', 'collab_tool_call', 'mcp_tool_call'])(
+    'does not probe persisted terminal state while a Codex %s is still in flight',
+    async (type) => {
+      const fake = await createFakeCodex({
+        lines: [
+          { type: 'thread.started', thread_id: 'thread-long-tool' },
+          {
+            type: 'item.started',
+            item: {
+              id: 'tool-long',
+              type,
+              command: './gradlew compile',
+              status: 'in_progress',
+              tool: 'wait',
+            },
           },
-        },
-      ],
-      exitDelayMs: 180,
-    });
-    cleanup.push(fake.dir);
-    const turnStateProbe = vi
-      .fn()
-      .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed', itemCount: 1 })
-      .mockResolvedValue({
-        id: 'turn-current',
-        status: 'completed',
-        itemCount: 3,
-        finalText: 'must not be recovered while the tool is running',
+        ],
+        exitDelayMs: 180,
       });
-    const adapter = new CodexAdapter({
-      binary: fake.path,
-      profileStateDir: fake.dir,
-      stdoutIdleProbeMs: 20,
-      turnStateProbe,
-    } as ConstructorParameters<typeof CodexAdapter>[0]);
-    const options = {
-      runId: 'run-long-tool',
-      prompt: 'run a long build',
-      cwd: await realpath(fake.dir),
-      threadId: 'thread-long-tool',
-    };
+      cleanup.push(fake.dir);
+      const turnStateProbe = vi
+        .fn()
+        .mockResolvedValueOnce({ id: 'turn-before-run', status: 'completed', itemCount: 1 })
+        .mockResolvedValue({
+          id: 'turn-current',
+          status: 'completed',
+          itemCount: 3,
+          finalText: 'must not be recovered while the tool is running',
+        });
+      const adapter = new CodexAdapter({
+        binary: fake.path,
+        profileStateDir: fake.dir,
+        stdoutIdleProbeMs: 20,
+        turnStateProbe,
+      } as ConstructorParameters<typeof CodexAdapter>[0]);
+      const options = {
+        runId: 'run-long-tool',
+        prompt: 'run a long build',
+        cwd: await realpath(fake.dir),
+        threadId: 'thread-long-tool',
+      };
 
-    await adapter.prepareRun(options);
-    const events = await collect(adapter.run(options).events);
+      await adapter.prepareRun(options);
+      const events = await collect(adapter.run(options).events);
 
-    expect(events).toContainEqual(expect.objectContaining({ type: 'tool_use', id: 'tool-long' }));
-    expect(events).not.toContainEqual(
-      expect.objectContaining({ type: 'text', delta: 'must not be recovered while the tool is running' }),
-    );
-    expect(turnStateProbe).toHaveBeenCalledTimes(1);
-  });
+      expect(events).toContainEqual(expect.objectContaining({ type: 'tool_use', id: 'tool-long' }));
+      expect(events).not.toContainEqual(
+        expect.objectContaining({ type: 'text', delta: 'must not be recovered while the tool is running' }),
+      );
+      expect(turnStateProbe).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('does not duplicate a persisted final answer that stdout already delivered', async () => {
     const finalText = 'the complete answer';

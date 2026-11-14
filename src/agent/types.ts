@@ -7,7 +7,15 @@ export type AgentEvent =
   | { type: 'system'; sessionId?: string; threadId?: string; cwd?: string; model?: string }
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string }
-  | { type: 'tool_use'; id: string; name: string; input: unknown }
+  | {
+      type: 'tool_use';
+      id: string;
+      name: string;
+      input: unknown;
+      /** Optional bound on silence during a foreground tool call. */
+      maxSilenceMs?: number;
+    }
+  | { type: 'tool_progress'; id: string }
   | { type: 'tool_result'; id: string; output: string; isError: boolean }
   | {
       type: 'usage';
