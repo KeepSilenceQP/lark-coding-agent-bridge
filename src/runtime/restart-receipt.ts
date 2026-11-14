@@ -23,6 +23,8 @@ export type ReceiptKind = 'success' | 'failure';
 
 export interface PendingRequest {
   serviceId?: 'supervisor';
+  /** Ownership proven by OS PID for a runtime without shared-drain support. */
+  legacySupervisor?: boolean;
   receiptId: string;
   profile: string;
   oldPid: number;

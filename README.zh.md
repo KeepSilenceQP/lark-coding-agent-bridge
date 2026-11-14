@@ -243,7 +243,9 @@ lark-channel-bridge status --profile codex
 
 **Supervisor 托管模式**也使用同一条 `restart --profile <当前 profile>` 命令。运行时在任务路由中记录实际托管服务，CLI 校验服务 PID 后登记整体重启请求。此时会等待 supervisor 下所有 profile 已接收的任务、排队工作及回复收尾，再启动一次 helper；成功或失败仍通过发起请求的 profile 返回原群、话题或私聊。同一进程内有多个 profile 同时请求时只执行一次服务重启，各自保留回执。helper 启动后停止接收新任务，新 IM 消息收到稍后重试提示。进程内 `/reconnect` 不会加载升级后的程序，不能替代服务重启。
 
-在 Bridge 会话内显式调用 `restart --web-ui` 也走延后路径，不能绕过回复保护。旧运行实例没有 supervisor 路由元数据时不会猜测服务归属，需要先在终端完成一次 supervisor 重启以加载本功能。重启范围是整个 supervisor，而非只重启命令中命名的 Bot。
+在 Bridge 会话内显式调用 `restart --web-ui` 也走延后路径，不能绕过回复保护。旧 supervisor（包括 `qp.13`、`qp.14`）首次升级无需外部终端：更新后的 CLI 校验现有任务路由，并将 bridge PID 与操作系统 supervisor 服务 PID 精确匹配；旧运行时发完自身回复后启动新版 helper。helper 保留原会话回执，恢复重启前已在线的 profile，且不修改默认 profile。多个旧 profile 同时请求时，对同一服务的重启会串行协调；无法核实服务归属时拒绝执行。
+
+旧运行时首次迁移保证发起 profile 的回复完成后再整体重启，但旧代码没有跨 profile 排空能力，该次服务重启可能中断其他 profile 未完成的任务。加载新版 supervisor 后，后续自重启会等待所有 profile 的任务和回复收尾。服务重启范围始终是整个 supervisor。
 
 如果 helper 启动或服务操作失败，仍存活的旧 supervisor 会恢复所有 profile 的任务准入，并复用同一回执状态机报告失败；helper 与旧进程不会重复发送回执。
 

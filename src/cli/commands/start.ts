@@ -26,6 +26,7 @@ import { startUiServer } from '../../ui/server';
 import { readUiSidecar, removeUiSidecar, writeUiSidecar } from '../../ui/sidecar';
 import type { UiServerHandle } from '../../ui/types';
 import { Supervisor } from '../../runtime/supervisor';
+import { startSupervisorProfiles } from '../../runtime/supervisor-resume';
 import { acquireHostLock } from '../../runtime/host-lock';
 import { preFlightChecks } from '../preflight';
 import { promptAndStopActiveBridgeMigrationConflict } from './migrate';
@@ -490,18 +491,18 @@ async function runSupervisorConsole(opts: StartOptions): Promise<void> {
     log.warn('ui', 'server-start-failed', { err: String(err) });
   }
 
-  try {
-    await supervisor.startProfile(appPaths.profile);
-    console.log(`✓ profile「${appPaths.profile}」已上线`);
-  } catch (err) {
-    console.warn(
-      `⚠️ active profile「${appPaths.profile}」启动失败：${err instanceof Error ? err.message : String(err)}`,
-    );
-    log.warn('supervisor', 'active-start-failed', {
-      profile: appPaths.profile,
-      err: String(err),
-    });
-  }
+  await startSupervisorProfiles({
+    rootDir: appPaths.rootDir,
+    defaultProfile: appPaths.profile,
+    startProfile: async (profile) => {
+      await supervisor.startProfile(profile);
+      console.log(`✓ profile「${profile}」已上线`);
+    },
+    onError: (profile, err) => {
+      console.warn(`⚠️ profile「${profile}」启动失败：${err instanceof Error ? err.message : String(err)}`);
+      log.warn('supervisor', 'profile-start-failed', { profile, err: String(err) });
+    },
+  });
 
   let shuttingDown = false;
   const shutdown = async (sig: string): Promise<void> => {
