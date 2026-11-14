@@ -4,7 +4,7 @@ import { basename, isAbsolute } from 'node:path';
 
 const MAX_HEADER_BYTES = 256 * 1024;
 const MAX_TAIL_BYTES = 2 * 1024 * 1024;
-const MAX_RECORD_BYTES = 256 * 1024;
+const MAX_RECORD_BYTES = MAX_TAIL_BYTES;
 
 export interface LegacyForegroundMetadata {
   childThreadIds: string[];

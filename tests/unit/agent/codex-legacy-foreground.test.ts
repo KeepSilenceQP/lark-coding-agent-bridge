@@ -48,6 +48,14 @@ describe('bounded legacy foreground metadata', () => {
     });
   });
 
+  it('accepts lifecycle metadata from a large call record within the bounded window', async () => {
+    const { path } = await fixture();
+    const { readFile } = await import('node:fs/promises');
+    const text = (await readFile(path, 'utf8')).replace('private-test-prompt', 'x'.repeat(300 * 1024));
+    await writeFile(path, text);
+    expect((await readLegacyForegroundMetadata(path, 'parent', 'current', ['child'])).childThreadIds).toEqual(['child']);
+  });
+
   it('rejects unrelated filenames and symlinked rollout paths', async () => {
     const { dir, path } = await fixture();
     expect((await readLegacyForegroundMetadata(join(dir, 'config.json'), 'parent', 'current', ['child'])).reason).toBe('untrusted-path');
