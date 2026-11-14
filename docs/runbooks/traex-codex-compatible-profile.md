@@ -130,8 +130,27 @@ unchanged updates are not progress.
 An outstanding foreground tool suspends the ordinary run idle countdown.
 After its result, the ordinary countdown resumes. A completed `spawn_agent`
 does not keep the parent alive just because the child remains running. State
-belongs to the current adapter stream and run; the bridge does not scan other
-sessions or private rollout files for activity.
+belongs to the current adapter stream and run.
+
+Some compatible runtimes complete the spawn item while a foreground child is
+still working. Before an ordinary idle stop, the adapter now reconciles this
+case through the supported `app-server thread/read` API. TraeX 0.213.1's
+generated protocol exposes `collabAgentToolCall.runInBackground`,
+`senderThreadId`, and `receiverThreadIds`. Only an explicit
+`runInBackground: false` on the current parent turn qualifies; the child must
+also report the matching `parentThreadId`. Missing fields, background children,
+unrelated threads, pre-run history, and failed probes do not grant an extension.
+
+The existing stdout-idle probe observes those children periodically. Changed
+item lifecycle metadata renews their ordinary idle interval; repeatedly reading
+the same `inProgress` status does not. An actual in-progress child tool retains
+the bounded 65-minute silence policy. An observed child completion gives the
+parent one ordinary interval to continue, without manufacturing a parent final.
+Checks are isolated per run, limited to the eight most recently linked children, and
+never scan private rollout files or discover arbitrary sessions. Diagnostics
+contain only scope and remaining time; prompts and tool contents are not logged.
+Runtime upgrades still require a real new/resumed group-turn check: an older
+runtime that omits the foreground metadata cannot use this fallback.
 
 As a bridge compatibility policy, MCP and collaboration calls have a **65-minute
 silence limit** while run idle detection is enabled. Changed structured progress

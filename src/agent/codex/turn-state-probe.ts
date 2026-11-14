@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   mergeProcessEnv,
   spawnProcess,
@@ -16,6 +17,10 @@ export interface CodexTurnState {
   status: CodexTurnStatus;
   itemCount: number;
   finalText?: string;
+  parentThreadId?: string;
+  foregroundChildThreadIds?: string[];
+  progressToken?: string;
+  hasRunningTool?: boolean;
 }
 
 export type CodexTurnStateProbe = (threadId: string) => Promise<CodexTurnState | undefined>;
@@ -107,9 +112,12 @@ async function readLatestTurn(
         fail(new Error(stringValue(error?.message) ?? 'codex app-server rejected thread/read'));
         return;
       }
-      const state = parseLatestTurn(response.result);
-      resolve(state);
-      cleanup();
+      try {
+        resolve(parseLatestTurn(response.result, threadId));
+        cleanup();
+      } catch (error) {
+        fail(error);
+      }
     });
 
     try {
@@ -149,11 +157,14 @@ function threadReadRequest(threadId: string) {
   };
 }
 
-function parseLatestTurn(input: unknown): CodexTurnState | undefined {
+function parseLatestTurn(input: unknown, threadId: string): CodexTurnState | undefined {
   const result = recordValue(input);
   const thread = recordValue(result?.thread);
   if (!Array.isArray(thread?.turns)) {
     throw new Error('codex app-server returned malformed thread/read response');
+  }
+  if (thread.id !== undefined && thread.id !== threadId) {
+    throw new Error('codex app-server returned a different thread');
   }
   const latest = recordValue(thread.turns.at(-1));
   if (!latest) return undefined;
@@ -166,7 +177,33 @@ function parseLatestTurn(input: unknown): CodexTurnState | undefined {
     throw new Error('codex app-server returned latest turn without items');
   }
   const finalText = parseFinalAgentText(latest.items);
-  return { id, status, itemCount: latest.items.length, ...(finalText ? { finalText } : {}) };
+  const children = new Set<string>();
+  let hasRunningTool = false;
+  const progress = latest.items.map((value) => {
+    const item = recordValue(value);
+    if (item?.type === 'collabAgentToolCall' && item.tool === 'spawnAgent' &&
+        item.senderThreadId === threadId && item.runInBackground === false &&
+        item.status !== 'failed' && Array.isArray(item.receiverThreadIds)) {
+      for (const child of item.receiverThreadIds) {
+        if (typeof child === 'string' && child && child !== threadId) children.add(child);
+      }
+    }
+    if (['commandExecution', 'mcpToolCall', 'collabAgentToolCall'].includes(String(item?.type)) &&
+        item?.status === 'inProgress') hasRunningTool = true;
+    // Only lifecycle metadata and output length enter the in-memory fingerprint.
+    // Prompts, tool inputs/results and reasoning are never retained or logged.
+    return [item?.id, item?.type, item?.status,
+      typeof item?.aggregatedOutput === 'string' ? item.aggregatedOutput.length : undefined];
+  });
+  const parentThreadId = stringValue(thread.parentThreadId);
+  return {
+    id, status, itemCount: latest.items.length,
+    progressToken: createHash('sha256').update(JSON.stringify(progress)).digest('hex'),
+    ...(finalText ? { finalText } : {}),
+    ...(parentThreadId ? { parentThreadId } : {}),
+    ...(children.size ? { foregroundChildThreadIds: [...children] } : {}),
+    ...(hasRunningTool ? { hasRunningTool: true } : {}),
+  };
 }
 
 function parseFinalAgentText(input: unknown): string | undefined {

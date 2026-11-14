@@ -3868,6 +3868,7 @@ export async function processAgentStream(
   //  - any non-tool event arrives while the set is empty.
   let idleFired = false;
   let timer: NodeJS.Timeout | undefined;
+  let idleGeneration = 0;
   let startupFired = false;
   let startupTimer: NodeJS.Timeout | undefined;
   const inFlightTools = new Map<string, { maxSilenceMs?: number; lastProgressAt: number }>();
@@ -3883,10 +3884,11 @@ export async function processAgentStream(
       /* stop errors are non-fatal */
     });
   };
-  const armOrPauseIdle = (): void => {
+  const armOrPauseIdle = (idleDelayMs = idleTimeoutMs): void => {
     if (!idleTimeoutMs) return;
     if (timer) clearTimeout(timer);
     timer = undefined;
+    const generation = ++idleGeneration;
     if (inFlightTools.size > 0) {
       let earliest: { remainingMs: number; timeoutMs: number } | undefined;
       for (const tool of inFlightTools.values()) {
@@ -3903,8 +3905,24 @@ export async function processAgentStream(
       return;
     }
     timer = setTimeout(() => {
-      stopForTimeout('idle', idleTimeoutMs);
-    }, idleTimeoutMs);
+      void (async () => {
+        let activity: { remainingMs: number; timeoutMs: number } | undefined;
+        try {
+          activity = await handle.run.checkIdleActivity?.(idleTimeoutMs);
+        } catch {
+          log.warn('agent', 'foreground-activity-check-failed', { scope });
+        }
+        // New output, delivery backpressure, cancellation or completion wins
+        // over a probe that was still pending when the deadline expired.
+        if (generation !== idleGeneration || handle.interrupted || state.terminal !== 'running') return;
+        if (activity && activity.remainingMs > 0) {
+          log.info('agent', 'foreground-child-progress', { scope, remainingMs: activity.remainingMs });
+          armOrPauseIdle(Math.min(idleTimeoutMs, activity.remainingMs));
+          return;
+        }
+        stopForTimeout('idle', activity?.timeoutMs ?? idleTimeoutMs);
+      })();
+    }, idleDelayMs);
   };
   armOrPauseIdle();
   if (startupTimeoutMs) {
@@ -3996,6 +4014,7 @@ export async function processAgentStream(
       // it, stdout can already contain tool starts/results that we cannot
       // consume yet. That wait is not evidence of agent inactivity.
       const deliveryStartedAt = Date.now();
+      idleGeneration++;
       if (timer) clearTimeout(timer);
       timer = undefined;
       try {
@@ -4014,6 +4033,7 @@ export async function processAgentStream(
       if (state.terminal !== 'running') break;
     }
   } finally {
+    idleGeneration++;
     if (timer) clearTimeout(timer);
     if (startupTimer) clearTimeout(startupTimer);
   }
