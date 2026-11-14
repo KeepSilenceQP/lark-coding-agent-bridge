@@ -27,7 +27,7 @@ export async function readLegacyForegroundMetadata(
     return empty('untrusted-path');
   }
   try {
-    const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
     try {
       const stat = await file.stat();
       if (!stat.isFile()) return empty('untrusted-path');
