@@ -2,6 +2,70 @@ import { describe, expect, it } from 'vitest';
 import { CodexJsonlTranslator } from '../../../src/agent/codex/jsonl.js';
 
 describe('Codex JSONL translator', () => {
+  it.each(['command_execution', 'collab_tool_call', 'mcp_tool_call'])(
+    'pairs %s once across duplicate, updated, and late lifecycle events',
+    (type) => {
+      const translator = new CodexJsonlTranslator();
+      const item = {
+        id: 'tool-1', type, status: 'in_progress', tool: 'wait', command: 'build',
+        server: 'test-server', aggregated_output: '',
+        // Private inputs must not be copied into the translated card data.
+        arguments: { private: 'private-argument' }, prompt: 'private-child-prompt',
+      };
+      const start = translator.translate({ type: 'item.started', item });
+      expect(start).toMatchObject([{ type: 'tool_use', id: 'tool-1', name: type }]);
+      expect(JSON.stringify(start)).not.toContain('private-');
+      expect(translator.translate({ type: 'item.started', item })).toEqual([]);
+      expect(translator.translate({ type: 'item.updated', item })).toEqual([]);
+      const updated = {
+        ...item,
+        aggregated_output: 'real progress',
+        agents_states: { child: { status: 'completed' } },
+        result: { content: [{ type: 'text', text: 'real progress' }] },
+      };
+      expect(translator.translate({ type: 'item.updated', item: updated })).toEqual([
+        { type: 'tool_progress', id: 'tool-1' },
+      ]);
+      expect(translator.translate({ type: 'item.updated', item: updated })).toEqual([]);
+      const completed = { ...updated, status: 'completed', exit_code: 0 };
+      expect(translator.translate({ type: 'item.updated', item: completed })).toMatchObject([
+        { type: 'tool_result', id: 'tool-1', isError: false },
+      ]);
+      expect(translator.translate({ type: 'item.completed', item: completed })).toEqual([]);
+      expect(translator.translate({ type: 'item.started', item })).toEqual([]);
+      expect(translator.translate({ type: 'item.updated', item: updated })).toEqual([]);
+    },
+  );
+
+  it.each(['failed', 'cancelled', 'canceled', 'interrupted', 'declined'])(
+    'closes a tool on a %s update',
+    (status) => {
+      const translator = new CodexJsonlTranslator();
+      const item = { id: 'cancelled-tool', type: 'collab_tool_call', tool: 'wait' };
+      translator.translate({ type: 'item.started', item });
+      expect(translator.translate({ type: 'item.updated', item: { ...item, status } })).toEqual([
+        { type: 'tool_result', id: 'cancelled-tool', output: status, isError: true },
+      ]);
+      expect(translator.translate({ type: 'item.started', item })).toEqual([]);
+    },
+  );
+
+  it('recovers missing starts but never reopens a completed ID or tracks malformed tools', () => {
+    const translator = new CodexJsonlTranslator();
+    const item = { id: 'missing-start', type: 'mcp_tool_call', status: 'in_progress' };
+    expect(translator.translate({ type: 'item.updated', item })).toMatchObject([
+      { type: 'tool_use', id: 'missing-start' },
+    ]);
+    const late = { ...item, id: 'late-start', status: 'completed' };
+    expect(translator.translate({ type: 'item.completed', item: late })).toMatchObject([
+      { type: 'tool_result', id: 'late-start' },
+    ]);
+    expect(translator.translate({ type: 'item.started', item: { ...late, status: 'in_progress' } })).toEqual([]);
+    expect(translator.translate({ type: 'item.started', item: { type: 'collab_tool_call' } })).toEqual([]);
+    expect(translator.translate({ type: 'item.updated', item: { ...item, id: 'unknown-status', status: 'unknown' } })).toEqual([]);
+    expect(translator.translate({ type: 'item.updated', item: { id: 'future', type: 'unknown' } })).toEqual([]);
+  });
+
   it('translates thread, text, command execution, usage, and completion events', () => {
     const t = new CodexJsonlTranslator();
 

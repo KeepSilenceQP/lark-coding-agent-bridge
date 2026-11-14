@@ -3810,8 +3810,9 @@ export async function processAgentStream(
   // OAuth URL and blocking until the user clicks authorize). In that
   // case there's no event stream activity from claude itself, only the
   // tool subprocess running. We track which tool_use ids haven't matched
-  // a tool_result yet, and pause the watchdog whenever the set is
-  // non-empty.
+  // a tool_result yet. Unbounded legacy tools pause the ordinary idle
+  // watchdog; bounded tools retain their own per-call silence deadline.
+  // Only progress for that call renews its deadline, not unrelated output.
   //
   // The watchdog re-arms when:
   //  - a tool_result drains the in-flight set to zero, OR
@@ -3820,9 +3821,11 @@ export async function processAgentStream(
   let timer: NodeJS.Timeout | undefined;
   let startupFired = false;
   let startupTimer: NodeJS.Timeout | undefined;
-  const inFlightTools = new Set<string>();
+  const inFlightTools = new Map<string, { maxSilenceMs?: number; lastProgressAt: number }>();
+  let firedTimeoutMs: number | undefined;
   const stopForTimeout = (kind: 'idle' | 'startup', timeoutMs: number): void => {
-    if (idleFired || startupFired) return;
+    if (idleFired || startupFired || state.terminal !== 'running') return;
+    firedTimeoutMs = timeoutMs;
     if (kind === 'idle') idleFired = true;
     else startupFired = true;
     handle.interrupted = true;
@@ -3835,7 +3838,21 @@ export async function processAgentStream(
     if (!idleTimeoutMs) return;
     if (timer) clearTimeout(timer);
     timer = undefined;
-    if (inFlightTools.size > 0) return;
+    if (inFlightTools.size > 0) {
+      let earliest: { remainingMs: number; timeoutMs: number } | undefined;
+      for (const tool of inFlightTools.values()) {
+        if (!tool.maxSilenceMs) continue;
+        const remainingMs = tool.lastProgressAt + tool.maxSilenceMs - Date.now();
+        if (!earliest || remainingMs < earliest.remainingMs) {
+          earliest = { remainingMs, timeoutMs: tool.maxSilenceMs };
+        }
+      }
+      if (earliest) {
+        const { remainingMs, timeoutMs } = earliest;
+        timer = setTimeout(() => stopForTimeout('idle', timeoutMs), Math.max(0, remainingMs));
+      }
+      return;
+    }
     timer = setTimeout(() => {
       stopForTimeout('idle', idleTimeoutMs);
     }, idleTimeoutMs);
@@ -3864,7 +3881,12 @@ export async function processAgentStream(
       // closes it. Other event types are bookkept after the if/else.
       if (evt.type === 'tool_use') {
         onToolStarted?.();
-        inFlightTools.add(evt.id);
+        if (!inFlightTools.has(evt.id)) {
+          inFlightTools.set(evt.id, {
+            maxSilenceMs: evt.maxSilenceMs,
+            lastProgressAt: Date.now(),
+          });
+        }
         log.info('agent', 'tool-in-flight', {
           tool: evt.name,
           inFlight: inFlightTools.size,
@@ -3872,8 +3894,15 @@ export async function processAgentStream(
       } else if (evt.type === 'tool_result') {
         inFlightTools.delete(evt.id);
         log.info('agent', 'tool-done', { inFlight: inFlightTools.size });
+      } else if (evt.type === 'tool_progress') {
+        const tool = inFlightTools.get(evt.id);
+        if (!tool) continue;
+        tool.lastProgressAt = Date.now();
       }
       armOrPauseIdle();
+
+      // Progress updates renew activity without duplicating the tool card.
+      if (evt.type === 'tool_progress') continue;
 
       if (evt.type === 'system') {
         try {
@@ -3959,7 +3988,7 @@ export async function processAgentStream(
   // mid-flush → user sees 'idle_timeout' on a successful run".
   if (state.terminal === 'running') {
     if (idleFired || startupFired) {
-      const timeoutMs = startupFired ? startupTimeoutMs! : idleTimeoutMs!;
+      const timeoutMs = firedTimeoutMs ?? (startupFired ? startupTimeoutMs! : idleTimeoutMs!);
       state = markIdleTimeout(state, Math.round(timeoutMs / 60_000));
     } else if (handle.interrupted) {
       state = handle.superseded ? markSuperseded(state) : markInterrupted(state);

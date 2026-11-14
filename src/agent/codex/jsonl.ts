@@ -1,4 +1,5 @@
 import type { AgentEvent } from '../types';
+import { isDeepStrictEqual } from 'node:util';
 import { log } from '../../core/logger';
 
 export type CodexFinishReason = 'normal' | 'failed' | 'interrupted' | 'timeout';
@@ -8,12 +9,18 @@ export interface ProtocolDriftState {
   anomalies: number;
 }
 
+// Bridge compatibility policy: allow long foreground waits plus scheduling
+// grace, but bound silence when an MCP/collab completion is lost.
+const TOOL_MAX_SILENCE_MS = 65 * 60_000;
+
 export class CodexJsonlTranslator {
   private threadId: string | undefined;
   private terminal = false;
   private lastNonTerminalError: string | undefined;
   private lastAgentMessage: string | undefined;
   private readonly startedItems = new Set<string>();
+  private readonly completedItems = new Set<string>();
+  private readonly toolProgress = new Map<string, readonly unknown[]>();
   private drift: ProtocolDriftState = {
     unknownEvents: 0,
     anomalies: 0,
@@ -34,6 +41,8 @@ export class CodexJsonlTranslator {
         return [];
       case 'item.started':
         return this.translateItemStarted(raw);
+      case 'item.updated':
+        return this.translateItemStarted(raw, true);
       case 'item.completed':
         return this.translateItemCompleted(raw);
       case 'agent_message':
@@ -85,24 +94,39 @@ export class CodexJsonlTranslator {
     return [{ type: 'system', threadId }];
   }
 
-  private translateItemStarted(raw: Record<string, unknown>): AgentEvent[] {
+  private translateItemStarted(raw: Record<string, unknown>, updated = false): AgentEvent[] {
     const item = recordValue(raw.item);
-    if (!item || item.type !== 'command_execution') return [];
-    this.lastAgentMessage = undefined;
+    if (!item || !isToolItem(item)) return [];
     const id = stringValue(item.id);
     if (!id) {
       this.drift.anomalies++;
       return [];
     }
+    if (this.completedItems.has(id)) return [];
+    if (isTerminalToolStatus(item.status)) return this.translateItemCompleted(raw);
+    if (item.status !== undefined && item.status !== 'in_progress') return [];
+    this.lastAgentMessage = undefined;
+    const progress = toolProgressValue(item);
+    if (this.startedItems.has(id)) {
+      if (!updated || isDeepStrictEqual(this.toolProgress.get(id), progress)) return [];
+      this.toolProgress.set(id, progress);
+      return [{ type: 'tool_progress', id }];
+    }
     this.startedItems.add(id);
+    this.toolProgress.set(id, progress);
     return [
       {
         type: 'tool_use',
         id,
-        name: 'command_execution',
-        input: {
-          command: stringValue(item.command) ?? '',
-        },
+        name: String(item.type),
+        ...(item.type !== 'command_execution' ? { maxSilenceMs: TOOL_MAX_SILENCE_MS } : {}),
+        // Do not copy MCP arguments or child prompts into cards/logs.
+        input: item.type === 'command_execution'
+          ? { command: stringValue(item.command) ?? '' }
+          : {
+              tool: stringValue(item.tool) ?? '',
+              ...(item.type === 'mcp_tool_call' ? { server: stringValue(item.server) ?? '' } : {}),
+            },
       },
     ];
   }
@@ -114,24 +138,31 @@ export class CodexJsonlTranslator {
       const message = stringValue(item.text ?? item.message);
       return message ? this.emitAgentMessage(message) : [];
     }
-    if (item.type !== 'command_execution') return [];
+    if (!isToolItem(item)) return [];
     this.lastAgentMessage = undefined;
     const id = stringValue(item.id);
     if (!id) {
       this.drift.anomalies++;
       return [];
     }
+    if (this.completedItems.has(id)) return [];
     if (!this.startedItems.has(id)) {
       this.drift.anomalies++;
     }
     this.startedItems.delete(id);
+    this.completedItems.add(id);
+    this.toolProgress.delete(id);
     const exitCode = numberValue(item.exit_code);
     return [
       {
         type: 'tool_result',
         id,
-        output: stringValue(item.output ?? item.aggregated_output ?? item.stdout) ?? '',
-        isError: exitCode !== undefined && exitCode !== 0,
+        output: item.type === 'command_execution'
+          ? stringValue(item.output ?? item.aggregated_output ?? item.stdout) ?? ''
+          : stringValue(item.status) ?? 'completed',
+        isError: (exitCode !== undefined && exitCode !== 0) ||
+          (isTerminalToolStatus(item.status) && item.status !== 'completed') ||
+          Boolean(item.error),
       },
     ];
   }
@@ -188,6 +219,24 @@ export class CodexJsonlTranslator {
     log.warn('jsonl', 'error_event', { message: truncate(message, 500) });
     return [];
   }
+}
+
+function isToolItem(item: Record<string, unknown>): boolean {
+  return item.type === 'command_execution' || item.type === 'collab_tool_call' ||
+    item.type === 'mcp_tool_call';
+}
+
+function isTerminalToolStatus(status: unknown): boolean {
+  return typeof status === 'string' &&
+    ['completed', 'failed', 'cancelled', 'canceled', 'interrupted', 'declined'].includes(status);
+}
+
+function toolProgressValue(item: Record<string, unknown>): readonly unknown[] {
+  if (item.type === 'command_execution') {
+    return [stringValue(item.output ?? item.aggregated_output ?? item.stdout) ?? ''];
+  }
+  if (item.type === 'collab_tool_call') return [recordValue(item.agents_states) ?? {}];
+  return [item.result ?? null];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

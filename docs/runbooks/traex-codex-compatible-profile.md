@@ -116,6 +116,42 @@ TraeX or the bridge is upgraded.
 
 ## Troubleshooting boundary
 
+### Tool activity and the idle watchdog
+
+The protocol baseline is Codex CLI 0.165.0's
+[exec JSONL types](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/exec/src/exec_events.rs).
+The translator pairs `command_execution`, `collab_tool_call`, and
+`mcp_tool_call` items by ID across `item.started`, `item.updated`, and
+`item.completed`. A terminal status on an update also closes the call. Missing
+starts can be recovered from an update; duplicates and late starts after a
+completion do not reopen the call. Unknown types, invalid IDs, and repeated
+unchanged updates are not progress.
+
+An outstanding foreground tool suspends the ordinary run idle countdown.
+After its result, the ordinary countdown resumes. A completed `spawn_agent`
+does not keep the parent alive just because the child remains running. State
+belongs to the current adapter stream and run; the bridge does not scan other
+sessions or private rollout files for activity.
+
+As a bridge compatibility policy, MCP and collaboration calls have a **65-minute
+silence limit** while run idle detection is enabled. Changed structured progress
+on that call renews its limit; duplicate events, retry errors, and activity on
+other calls do not. This permits long foreground waits without allowing a lost
+completion event to disable the watchdog forever. It is separate from the
+ordinary run idle setting, which still applies whenever no tool is outstanding.
+Existing command and Claude tool timeout behavior is unchanged. A compatible
+runtime with foreground calls longer than 65 minutes must report genuine
+`item.updated` progress within that window. This is a bridge policy, not a
+claim about TraeX's own tool timeout defaults.
+
+MCP arguments, child prompts, and returned private message bodies are not copied
+into tool cards by this lifecycle mapping. Cards show tool identity and status.
+Validate the actual runtime's stdout event shape before attributing an incident
+to this path; persisted session `event_msg` records are not the exec JSONL wire
+protocol. A passing replay test does not replace new/resumed Feishu turn checks.
+
+### Other compatibility failures
+
 - If the executable is missing or moved, repair the profile's stored absolute
   path through the normal profile/config workflow; do not silently fall back to
   `codex`.
