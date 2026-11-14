@@ -9,6 +9,61 @@ import { processAgentStream } from '../../src/bot/channel';
 // Wire shapes follow codex-rs/exec/src/exec_events.rs at rust-v0.165.0.
 // This is a subprocess contract replay, not a live model/Feishu test.
 describe('Codex stdout through the bridge idle watchdog', () => {
+  it('does not mistake slow progress delivery for agent silence while a tool is already on stdout', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'bridge-slow-delivery-'));
+    let run: AgentRun | undefined;
+    try {
+      const binary = join(dir, 'fake-codex.mjs');
+      await writeFile(binary, [
+        '#!/usr/bin/env node',
+        'const emit = (event) => console.log(JSON.stringify(event));',
+        'process.stdin.resume();',
+        'process.stdin.on("end", () => {',
+        '  emit({ type: "agent_message", message: "working" });',
+        '  emit({ type: "item.started", item: { id: "cmd", type: "command_execution", status: "in_progress", command: "build" } });',
+        '  setTimeout(() => {',
+        '    emit({ type: "item.completed", item: { id: "cmd", type: "command_execution", status: "completed", exit_code: 0 } });',
+        '    emit({ type: "turn.completed" });',
+        '  }, 1500);',
+        '});',
+      ].join('\n'), 'utf8');
+      await chmod(binary, 0o755);
+      run = new CodexAdapter({ binary, profileStateDir: dir, stdoutIdleProbeMs: 0 }).run({
+        runId: 'slow-delivery', prompt: 'protocol replay', cwd: await realpath(dir),
+      });
+      const iterator = run.events[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      expect(first.value).toMatchObject({ type: 'text', delta: 'working' });
+      const events = (async function* (): AsyncGenerator<AgentEvent> {
+        try {
+          yield first.value!;
+          for (;;) {
+            const next = await iterator.next();
+            if (next.done) break;
+            yield next.value;
+          }
+        } finally {
+          await iterator.return?.();
+        }
+      })();
+      const stop = vi.spyOn(run, 'stop');
+      let firstFlush = true;
+      const result = await processAgentStream(
+        { run, interrupted: false }, events, 'slow-delivery', 500, undefined, vi.fn(),
+        async () => {
+          if (!firstFlush) return;
+          firstFlush = false;
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        },
+      );
+      expect(result).toMatchObject({ terminal: 'done' });
+      expect(stop).not.toHaveBeenCalled();
+    } finally {
+      await run?.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['collab_tool_call', 'mcp_tool_call'])(
     'waits for a real subprocess %s result beyond the ordinary idle interval', async (type) => {
       const dir = await mkdtemp(join(tmpdir(), 'bridge-tool-watchdog-'));

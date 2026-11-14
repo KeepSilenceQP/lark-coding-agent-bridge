@@ -3992,7 +3992,22 @@ export async function processAgentStream(
       if (state.footer !== prevFooter || state.terminal !== prevTerminal) {
         log.info('card', 'transition', { footer: state.footer, terminal: state.terminal });
       }
-      await flush(state);
+      // Delivery applies backpressure to this async iterator. While awaiting
+      // it, stdout can already contain tool starts/results that we cannot
+      // consume yet. That wait is not evidence of agent inactivity.
+      const deliveryStartedAt = Date.now();
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      try {
+        await flush(state);
+      } finally {
+        const deliveryWaitMs = Date.now() - deliveryStartedAt;
+        for (const tool of inFlightTools.values()) tool.lastProgressAt += deliveryWaitMs;
+        if (deliveryWaitMs >= 5_000) {
+          log.warn('agent', 'delivery-backpressure', { scope, deliveryWaitMs, inFlight: inFlightTools.size });
+        }
+        armOrPauseIdle();
+      }
       // Stop iterating as soon as we have a terminal state. Some claude
       // versions don't close stdout immediately after the result event, which
       // would leave the for-await waiting forever otherwise.

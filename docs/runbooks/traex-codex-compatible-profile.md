@@ -144,6 +144,16 @@ runtime with foreground calls longer than 65 minutes must report genuine
 `item.updated` progress within that window. This is a bridge policy, not a
 claim about TraeX's own tool timeout defaults.
 
+Progress-card delivery applies backpressure to the event reader. Time spent
+awaiting delivery is excluded from ordinary idle and tool-silence accounting:
+the next tool lifecycle event can already be buffered on stdout while the
+reader is waiting on the messaging API. After delivery returns, the watchdog
+continues normally. Delivery waits of at least five seconds produce
+`agent.delivery-backpressure` diagnostics with elapsed time and in-flight count,
+without prompts, tool arguments, or message bodies. This prevents delivery
+latency from being misclassified as agent silence; it does not establish that
+an unrelated timeout incident has the same cause.
+
 MCP arguments, child prompts, and returned private message bodies are not copied
 into tool cards by this lifecycle mapping. Cards show tool identity and status.
 Validate the actual runtime's stdout event shape before attributing an incident
