@@ -365,8 +365,8 @@ describe('markdown stream startup failures', () => {
     h.profileConfig.preferences.cotMessages = 'brief';
     h.profileConfig.access.allowedChats.push('oc_topic');
     vi.spyOn(CotClient.prototype, 'create').mockResolvedValue({ cot_id: 'cot_test', message_id: 'om_cot' });
-    const update = vi.spyOn(CotClient.prototype, 'update').mockRejectedValue(new Error('fetch failed'));
-    vi.spyOn(CotClient.prototype, 'complete').mockResolvedValue(undefined);
+    const update = vi.spyOn(CotClient.prototype, 'update').mockRejectedValueOnce(new DOMException('timed out', 'TimeoutError')).mockResolvedValue();
+    const complete = vi.spyOn(CotClient.prototype, 'complete').mockResolvedValue(undefined);
     const registeredOutbound = vi.spyOn(WorkChainStore.prototype, 'registerOutbound');
     const send = h.channel.send.bind(h.channel);
     vi.spyOn(h.channel, 'send').mockImplementation(async (chatId, content, options) => {
@@ -388,9 +388,12 @@ describe('markdown stream startup failures', () => {
       await waitFor(() => cotDegradedNotices(h.channel).length === 1);
       await waitFor(() => h.agent.runOptions.length === 1);
       expect(h.agent.runs[0]?.stopped).toBe(false);
+      expect(complete).not.toHaveBeenCalled();
+      await waitFor(() => update.mock.calls.some(([, events]) => JSON.stringify(events).includes('最新进度：')));
+      expect(complete).not.toHaveBeenCalled();
       expect(cotDegradedNotices(h.channel)[0]).toMatchObject({
         chatId: 'oc_topic',
-        content: { markdown: '进度消息更新失败，已停止展示过程；任务状态请以最终回复为准。' },
+        content: { markdown: '进度展示暂时中断，任务未因此停止；最终状态请以最终回复为准。' },
         options: { replyTo: 'om_cot_update_failure', replyInThread: true },
       });
       expect(registeredOutbound).toHaveBeenCalledWith(expect.any(String), 'om_cot_degraded_notice');
@@ -401,6 +404,8 @@ describe('markdown stream startup failures', () => {
 
     await waitFor(() => JSON.stringify(h.channel.sent).includes('完成文档'));
     expect(cotDegradedNotices(h.channel)).toHaveLength(1);
+    await waitFor(() => complete.mock.calls.some(([, reason]) => reason === 'done'));
+    expect(complete.mock.calls.every(([, reason]) => reason === 'done')).toBe(true);
   });
 
   it.each(['reject', 'hang'] as const)('preserves the final reply and queued follow-up when the CoT degraded notice send %s', async (noticeFailure) => {
@@ -416,7 +421,7 @@ describe('markdown stream startup failures', () => {
     const delayedNotice = deferred<void>();
     let noticeAttempts = 0;
     vi.spyOn(h.channel, 'send').mockImplementation(async (chatId, content, options) => {
-      if ((content as { markdown?: string }).markdown?.includes('进度消息更新失败')) {
+      if ((content as { markdown?: string }).markdown?.includes('进度展示暂时中断')) {
         noticeAttempts++;
         if (noticeFailure === 'reject') throw new Error('IM unavailable');
         await delayedNotice.promise;
@@ -1205,7 +1210,7 @@ function startupNotices(channel: FakeLarkChannel): FakeLarkChannel['sent'] {
 
 function cotDegradedNotices(channel: FakeLarkChannel): FakeLarkChannel['sent'] {
   return channel.sent.filter((entry) =>
-    (entry.content as { markdown?: string }).markdown?.includes('进度消息更新失败'),
+    (entry.content as { markdown?: string }).markdown?.includes('进度展示暂时中断'),
   );
 }
 

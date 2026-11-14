@@ -3276,7 +3276,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         if (earlyProgress) await earlyProgress.ready;
         else await cotPublisher.start();
         if (cotPublisher.disabled) {
-          if (!earlyProgress && !cotProgress.signal.aborted) notifyStartupDisplayFailure('cot');
+          if (!earlyProgress && !cotProgress.signal.aborted && !cotPublisher.degradedReason) notifyStartupDisplayFailure('cot');
           return;
         }
         // Capture the original chain: a slow create may finish after the next
@@ -3300,7 +3300,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       })().catch((err) => {
         log.warn('cot', 'background-failed', { err: err instanceof Error ? err.message : String(err) });
         if (!cotProgress.signal.aborted) notifyStartupDisplayFailure('cot');
-        void cotPublisher.finish('error').catch(() => {});
+        // A progress-side failure cannot determine the task's terminal status.
+        // The main consumer below will close the bubble with the true outcome.
       });
       let finalState: RunState | undefined;
       try {
@@ -3321,6 +3322,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         const reason = finalState?.terminal === 'done' ? 'done' : 'error';
         cotProgress.abort(reason);
         if (earlyProgress && deps.lease) deps.intakeProgress?.close(deps.lease.unitId, reason);
+        else void cotPublisher.finish(reason).catch(() => {});
       }
       const cotResult = await sendFinalReply({
         channel,
@@ -3675,7 +3677,7 @@ async function sendCotDegradedNotice(input: {
   try {
     const result = await input.channel.send(
       input.chatId,
-      { markdown: '进度消息更新失败，已停止展示过程；任务状态请以最终回复为准。' },
+      { markdown: '进度展示暂时中断，任务未因此停止；最终状态请以最终回复为准。' },
       input.sendOpts,
     );
     input.onSent(result);

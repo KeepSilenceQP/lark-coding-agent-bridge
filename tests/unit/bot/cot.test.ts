@@ -165,7 +165,7 @@ describe('COT connection retries', () => {
     await vi.advanceTimersByTimeAsync(249);
     expect(onDegraded).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-    expect(publisher.disabled).toBe(true);
+    expect(publisher.disabled).toBe(false);
     expect(onDegraded).toHaveBeenCalledTimes(1);
 
     await consumeCotEvents(iterate([
@@ -458,7 +458,7 @@ describe('COT event mapping', () => {
 
     expect(publisher.disabled).toBe(true);
     expect(publisher.degradedReason).toBe('field validation failed');
-    expect(client.completed).toEqual(['error']);
+    expect(client.completed).toEqual(['done']);
   });
 });
 
@@ -468,7 +468,7 @@ describe('COT mid-run degradation', () => {
     vi.restoreAllMocks();
   });
 
-  it('notifies and closes the stale bubble before the agent finishes, without replaying updates', async () => {
+  it('notifies without closing the bubble before the agent finishes or replaying updates', async () => {
     vi.useFakeTimers();
     const client = new FakeCotClient();
     const update = vi.spyOn(client, 'update').mockRejectedValue(new Error('fetch failed'));
@@ -481,11 +481,12 @@ describe('COT mid-run degradation', () => {
 
     expect(onDegraded).toHaveBeenCalledTimes(1);
     expect(onDegraded).toHaveBeenCalledWith('fetch failed');
-    expect(client.completed).toEqual(['error']);
+    expect(client.completed).toEqual([]);
     publisher.enqueue('TOOL_CALL_RESULT', { toolCallId: 'running-tool' });
     await publisher.finish('done');
+    await vi.advanceTimersByTimeAsync(0);
     expect(update).toHaveBeenCalledTimes(1);
-    expect(client.completed).toEqual(['error']);
+    expect(client.completed).toEqual(['done']);
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -513,7 +514,7 @@ describe('COT mid-run degradation', () => {
     release();
   });
 
-  it('retries a failed bubble close at terminal without sending another degradation notice', async () => {
+  it('allows terminal close retry with the true outcome and no second degradation notice', async () => {
     vi.useFakeTimers();
     const client = new FakeCotClient();
     vi.spyOn(client, 'update').mockRejectedValue(new Error('fetch failed'));
@@ -524,13 +525,163 @@ describe('COT mid-run degradation', () => {
     const publisher = degradedPublisher(client, onDegraded);
     await publisher.start();
     await vi.advanceTimersByTimeAsync(600);
+    expect(complete).not.toHaveBeenCalled();
+
+    await publisher.finish('done');
+    await vi.advanceTimersByTimeAsync(0);
     expect(complete).toHaveBeenCalledTimes(1);
 
     await publisher.finish('done');
     await vi.advanceTimersByTimeAsync(0);
     expect(complete).toHaveBeenCalledTimes(2);
-    expect(complete).toHaveBeenLastCalledWith(publisher.ref, 'error');
+    expect(complete).toHaveBeenLastCalledWith(publisher.ref, 'done');
     expect(onDegraded).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('COT interrupted progress recovery', () => {
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  it('recovers a timed-out update with a fresh summary instead of replaying ambiguous events', async () => {
+    vi.useFakeTimers();
+    const client = new FakeCotClient();
+    const update = vi.spyOn(client, 'update');
+    const onDegraded = vi.fn();
+    const publisher = degradedPublisher(client, onDegraded);
+    await publisher.start();
+    await vi.advanceTimersByTimeAsync(0);
+    update.mockRejectedValueOnce(new DOMException('timed out', 'TimeoutError'));
+    publisher.enqueue('TOOL_CALL_START', { toolCallId: 'uncertain-tool', title: '正在检查文件' });
+    await vi.advanceTimersByTimeAsync(600);
+
+    expect(publisher.disabled).toBe(false);
+    expect(client.completed).toEqual([]);
+    expect(onDegraded).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(update).toHaveBeenCalledTimes(3);
+    const recovery = update.mock.calls[2]![1];
+    expect(recovery.map(e => e.event_type)).toEqual(['STEP_STARTED', 'STEP_FINISHED']);
+    expect(JSON.stringify(recovery)).toContain('正在检查文件');
+    expect(JSON.stringify(recovery)).not.toContain('uncertain-tool');
+
+    publisher.enqueue('TEXT_MESSAGE_CONTENT', { messageId: 'missing-start', delta: 'new output' });
+    await vi.advanceTimersByTimeAsync(600);
+    expect(update.mock.calls[3]![1].map(e => e.event_type)).toEqual(['STEP_STARTED', 'STEP_FINISHED']);
+    expect(JSON.stringify(update.mock.calls[3]![1])).not.toContain('missing-start');
+    for (let i = 0; i < 100; i++) {
+      publisher.enqueue('TEXT_MESSAGE_CONTENT', { messageId: 'missing-start', delta: 'more output' });
+      await vi.advanceTimersByTimeAsync(600);
+    }
+    expect(update).toHaveBeenCalledTimes(4);
+    await publisher.finish('done');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.completed).toEqual(['done']);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['done', 'error'])('does not label progress failure as task failure before the actual %s result', async (result) => {
+    vi.useFakeTimers();
+    const client = new FakeCotClient();
+    vi.spyOn(client, 'update').mockRejectedValue(new Error('field validation failed'));
+    const publisher = degradedPublisher(client, vi.fn());
+    await publisher.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.completed).toEqual([]);
+    await publisher.finish(result);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.completed).toEqual([result]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('cancels backoff at terminal and ignores later progress', async () => {
+    vi.useFakeTimers();
+    const client = new FakeCotClient();
+    const update = vi.spyOn(client, 'update').mockRejectedValue(new DOMException('timed out', 'TimeoutError'));
+    const publisher = degradedPublisher(client, vi.fn());
+    await publisher.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await publisher.finish('done');
+    publisher.enqueue('TEXT_MESSAGE_CONTENT', { delta: 'late progress' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(client.completed).toEqual(['done']);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('backs off persistent outages, coalesces new progress, and notifies only once', async () => {
+    vi.useFakeTimers();
+    const client = new FakeCotClient();
+    const update = vi.spyOn(client, 'update').mockRejectedValue(new DOMException('timed out', 'TimeoutError'));
+    const onDegraded = vi.fn();
+    const publisher = degradedPublisher(client, onDegraded);
+    await publisher.start();
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 1000; i++) {
+      publisher.enqueue('TOOL_CALL_START', { toolCallId: `tool-${i}`, title: `检查文件 ${i}` });
+    }
+    let calls = 1;
+    const stepIds = new Set<string>();
+    for (const delay of [1000, 2000, 4000, 8000, 16000, 30000, 30000]) {
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(update).toHaveBeenCalledTimes(calls);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(update).toHaveBeenCalledTimes(++calls);
+      const batch = update.mock.calls.at(-1)![1];
+      expect(batch).toHaveLength(2);
+      expect(JSON.stringify(batch)).toContain('检查文件 999');
+      expect(JSON.stringify(batch)).not.toContain('tool-');
+      stepIds.add(JSON.parse(batch[0]!.content).stepId);
+    }
+    expect(stepIds.size).toBe(7);
+    expect(onDegraded).toHaveBeenCalledTimes(1);
+    expect(client.completed).toEqual([]);
+    await publisher.finish('done');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(update).toHaveBeenCalledTimes(calls);
+    expect(client.completed).toEqual(['done']);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('sends progress received while a recovery snapshot is in flight', async () => {
+    vi.useFakeTimers();
+    const client = new FakeCotClient();
+    const update = vi.spyOn(client, 'update').mockRejectedValueOnce(new DOMException('timed out', 'TimeoutError'));
+    const publisher = degradedPublisher(client, vi.fn());
+    await publisher.start();
+    await vi.advanceTimersByTimeAsync(0);
+    let resolve!: () => void;
+    update.mockReturnValueOnce(new Promise<void>(done => { resolve = done; }));
+    await vi.advanceTimersByTimeAsync(1000);
+    publisher.enqueue('TOOL_CALL_START', { title: '正在运行测试' });
+    resolve();
+    await vi.advanceTimersByTimeAsync(600);
+    expect(update).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify(update.mock.calls[2]![1])).toContain('正在运行测试');
+    await publisher.finish('done');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('suppresses degradation and recovery after an in-flight update fails at terminal', async () => {
+    vi.useFakeTimers();
+    const client = new FakeCotClient();
+    const update = vi.spyOn(client, 'update');
+    const onDegraded = vi.fn();
+    const publisher = degradedPublisher(client, onDegraded);
+    await publisher.start();
+    await vi.advanceTimersByTimeAsync(0);
+    let reject!: (error: Error) => void;
+    update.mockReturnValueOnce(new Promise<void>((_, fail) => { reject = fail; }));
+    publisher.enqueue('TOOL_CALL_START', { toolCallId: 'tool' });
+    await vi.advanceTimersByTimeAsync(600);
+    const finishing = publisher.finish('done');
+    reject(new DOMException('timed out', 'TimeoutError'));
+    await finishing;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(onDegraded).not.toHaveBeenCalled();
+    expect(client.completed).toEqual(['done']);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

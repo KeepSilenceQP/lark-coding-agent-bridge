@@ -16,6 +16,7 @@ const COT_TEXT_MAX = 1200;
 // until undici's much longer default. Safe connect failures get one retry.
 const COT_REQUEST_TIMEOUT_MS = 15_000;
 const COT_CONNECT_RETRY_DELAY_MS = 250;
+const COT_RECOVERY_MAX_DELAY_MS = 30_000;
 const COT_SAFE_CONNECT_ERRORS = new Set([
   'UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
 ]);
@@ -174,6 +175,13 @@ function transportCauseCode(error: unknown): string | undefined {
   return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : undefined;
 }
 
+function isTransientCotUpdateError(error: unknown): boolean {
+  return error instanceof Error && (
+    error.name === 'TimeoutError' || error instanceof TypeError ||
+    /^COT HTTP (?:408|429|5\d\d)$/.test(error.message)
+  );
+}
+
 interface CotRef {
   cotId: string;
   messageId: string;
@@ -201,6 +209,13 @@ export class CotPublisher {
   private timer: NodeJS.Timeout | undefined;
   private completing: Promise<void> | undefined;
   private completed = false;
+  private terminalReason: string | undefined;
+  private snapshotMode = false;
+  private publishedSummary: string | undefined;
+  private snapshotNumber = 0;
+  private updateFailures = 0;
+  private degradationNotified = false;
+  private latestProgress: string;
   private readonly onDegraded?: (reason: string) => void | Promise<void>;
 
   constructor(opts: {
@@ -220,6 +235,7 @@ export class CotPublisher {
     this.scope = opts.scope;
     this.inputPreview = opts.inputPreview;
     this.initialStepName = opts.initialStepName ?? '理解用户问题';
+    this.latestProgress = this.initialStepName;
     this.onDegraded = opts.onDegraded;
   }
 
@@ -265,7 +281,7 @@ export class CotPublisher {
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
     const startedAt = Date.now();
     void this.flush().then(() => {
-      if (!this.disabled) log.info('cot', 'initial-published', {
+      if (!this.disabled && !this.degradedReason) log.info('cot', 'initial-published', {
         durationMs: Date.now() - startedAt,
         originMessageId: this.originMessageId,
       });
@@ -273,8 +289,24 @@ export class CotPublisher {
   }
 
   enqueue(eventType: string, content: unknown): void {
-    if (this.disabled || !this.ref) return;
-    this.buffer.push({
+    if (this.disabled || this.terminalReason !== undefined || !this.ref) return;
+    const fields = content && typeof content === 'object' ? content as Record<string, unknown> : {};
+    switch (eventType) {
+      case 'STEP_STARTED':
+        this.latestProgress = typeof fields.stepName === 'string' ? fields.stepName.slice(0, 120) : '正在处理';
+        break;
+      case 'TOOL_CALL_START':
+        this.latestProgress = typeof fields.title === 'string' ? fields.title.slice(0, 120) : '正在调用工具';
+        break;
+      case 'TOOL_CALL_RESULT': this.latestProgress = '工具调用已返回，正在继续处理'; break;
+      case 'REASONING_MESSAGE_CONTENT': this.latestProgress = '正在思考'; break;
+      case 'TEXT_MESSAGE_CONTENT': this.latestProgress = '正在输出'; break;
+      case 'RUN_FINISHED': case 'RUN_ERROR': this.latestProgress = '正在收尾'; break;
+    }
+    // Once delivery becomes uncertain, keep only the latest status. Deltas and
+    // tool results may refer to a start event that never reached the server.
+    if (this.snapshotMode && this.updateFailures === 0 && this.latestProgress === this.publishedSummary) return;
+    if (!this.snapshotMode) this.buffer.push({
       event_type: eventType,
       content: JSON.stringify(content),
       timestamp: Date.now(),
@@ -283,19 +315,24 @@ export class CotPublisher {
   }
 
   async finish(reason: string): Promise<void> {
+    this.terminalReason ??= reason;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    await this.flush();
-    if (this.disabled) {
-      // Retry a failed best-effort close at terminal, but never hold the final
-      // reply behind a broken progress endpoint. In-flight/successful closes
-      // are shared, so we cannot close the bubble twice concurrently.
-      void this.complete('error');
+    if (this.disabled || this.snapshotMode) {
+      this.buffer = [];
+      // Do not retry progress at terminal. Finish after any outstanding update
+      // settles, using the real task outcome, without blocking its final reply.
+      void Promise.resolve(this.flushing).then(() => this.complete(this.terminalReason!));
       return;
     }
-    await this.complete(reason);
+    await this.flush();
+    if (this.disabled || this.snapshotMode) {
+      void this.complete(this.terminalReason);
+      return;
+    }
+    await this.complete(this.terminalReason);
   }
 
   private complete(reason: string): Promise<void> {
@@ -315,12 +352,13 @@ export class CotPublisher {
     return this.completing;
   }
 
-  private scheduleFlush(): void {
-    if (this.timer || this.flushing) return;
+  private scheduleFlush(delayMs = COT_UPDATE_THROTTLE_MS): void {
+    if (this.timer || this.flushing || this.terminalReason !== undefined) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
       void this.flush();
-    }, COT_UPDATE_THROTTLE_MS);
+    }, delayMs);
+    this.timer.unref();
   }
 
   private async flush(): Promise<void> {
@@ -330,11 +368,25 @@ export class CotPublisher {
       if (this.buffer.length > 0 && !this.disabled) await this.flush();
       return;
     }
-    const events = this.buffer.splice(0);
+    const snapshotId = `progress-${this.runId}-${++this.snapshotNumber}`;
+    const summary = this.snapshotMode ? this.latestProgress : undefined;
+    if (summary !== undefined && this.updateFailures === 0 && summary === this.publishedSummary) return;
+    const events = summary !== undefined ? [
+      { event_type: 'STEP_STARTED', content: JSON.stringify({ stepId: snapshotId, stepName: `最新进度：${summary}` }), timestamp: Date.now() },
+      { event_type: 'STEP_FINISHED', content: JSON.stringify({ stepId: snapshotId }), timestamp: Date.now() },
+    ] : this.buffer.splice(0);
     if (events.length === 0) return;
     this.flushing = this.client.update(this.ref, events)
+      .then(() => {
+        if (this.updateFailures > 0) log.info('cot', 'recovered', { mode: 'summary' });
+        this.updateFailures = 0;
+        this.degradedReason = undefined;
+        if (summary !== undefined) this.publishedSummary = summary;
+      })
       .catch((err) => {
-        this.disabled = true;
+        this.disabled = !isTransientCotUpdateError(err);
+        this.snapshotMode = !this.disabled;
+        this.updateFailures++;
         const reason = err instanceof Error ? err.message : String(err);
         this.degradedReason = reason;
         this.buffer = [];
@@ -343,10 +395,11 @@ export class CotPublisher {
           this.timer = undefined;
         }
         log.warn('cot', 'update-failed', { err: this.degradedReason });
-        // Update delivery is ambiguous, so do not replay events. Close only
-        // the progress bubble and notify immediately; the agent keeps running
-        // independently of both outbound requests.
-        void this.complete('error');
+        // Do not replay an ambiguous event batch, recreate the bubble, or
+        // report a failed task. Recovery uses independent, fresh summary steps.
+        // Only the actual task terminal may close this bubble.
+        if (this.terminalReason !== undefined || this.degradationNotified) return;
+        this.degradationNotified = true;
         void Promise.resolve().then(() => this.onDegraded?.(reason)).catch((noticeErr) => {
           log.warn('cot', 'degraded-callback-failed', {
             err: noticeErr instanceof Error ? noticeErr.message : String(noticeErr),
@@ -355,7 +408,10 @@ export class CotPublisher {
       })
       .finally(() => {
         this.flushing = undefined;
-        if (this.buffer.length > 0 && !this.disabled) this.scheduleFlush();
+        if (this.disabled) return;
+        if (this.updateFailures > 0) {
+          this.scheduleFlush(Math.min(1000 * 2 ** Math.min(this.updateFailures - 1, 5), COT_RECOVERY_MAX_DELAY_MS));
+        } else if (this.buffer.length > 0 || (this.snapshotMode && this.latestProgress !== this.publishedSummary)) this.scheduleFlush();
       });
     await this.flushing;
   }
