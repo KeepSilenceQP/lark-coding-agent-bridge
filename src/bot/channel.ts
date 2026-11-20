@@ -56,6 +56,8 @@ import {
 import { canRunBotAdminCommand, canUseDm, canUseGroup, isGroupChatGuest } from '../policy/access';
 import { meetingAccessConverged, meetingEffectiveAccess } from '../meeting/authz';
 import { describeMeetingError, MeetingManager } from '../meeting/manager';
+import { resolveWorkingDirectory } from '../policy/workspace';
+import { batchInstructions, landAttachmentBatch, renderAttachmentNotice, type LandedBatch } from '../media/batch';
 import type { VcRequestClient } from '../meeting/api';
 import { attachMeetingAgent, summarizeEndedMeeting } from '../meeting/orchestrator';
 import type { ScopeContext } from '../policy/run-policy';
@@ -2756,6 +2758,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
+  // Dropped attachments are never silent. Empty when everything was accepted.
+  const attachmentNotice = renderAttachmentNotice(attachments);
+  if (attachmentNotice) log.info('attachment', 'notice', { text: attachmentNotice });
+
   // Collect any reply-quote targets in the batch. Dedup so the same target
   // quoted by multiple messages in one batch only fetches once. Filter out
   // ids that are themselves in the batch — those are already in the prompt.
@@ -2785,6 +2791,30 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   let topicContext: QuotedContext[] = [];
   let topicContextLoaded = false;
 
+  // Several attachments → also link them into a batch directory in the
+  // workspace. buildPrompt runs before startRunFlow resolves the cwd, so
+  // resolve it here with the same inputs. A convenience only: on failure the
+  // per-attachment paths are still in the prompt.
+  let attachmentBatch: LandedBatch | undefined;
+  try {
+    const wsReq = attachments.filter(a => a.decision === 'accepted').length >= controls.profileConfig.attachments.batchThreshold
+      ? workspaces.cwdFor(scope) ?? controls.profileConfig.workspaces.default ?? '' : '';
+    const ws = wsReq ? await resolveWorkingDirectory(wsReq) : undefined;
+    if (ws?.ok) {
+      attachmentBatch = await landAttachmentBatch(attachments, ws.cwdRealpath, controls.profileConfig.attachments);
+      if (attachmentBatch) {
+        log.info('attachment', 'batch-landed', {
+          dir: attachmentBatch.dir,
+          count: attachmentBatch.count,
+          linked: attachmentBatch.items.filter((i) => i.linked).length,
+        });
+      }
+    }
+  } catch (err) {
+    log.warn('attachment', 'batch-failed', { err: String(err) });
+    attachmentBatch = undefined;
+  }
+
   // Detect a model switch since this scope's last run. When resuming an
   // existing conversation the transcript still claims the old model, so tell
   // the (now-switched) agent its model changed — otherwise it keeps echoing
@@ -2806,6 +2836,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       ]
     : undefined;
 
+  const allInstructions = [...(extraInstructions ?? []), ...(attachmentBatch ? batchInstructions(attachmentBatch) : [])];
   // F1: Detect reaction batches and collect reactionContexts via internal store
   const reactionContexts: unknown[] | undefined = isReactionBatch
     ? getReactionContexts(reactionTurnId ? [reactionTurnId] : [])
@@ -2829,7 +2860,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       quotes,
       topicContext,
       channel.botIdentity,
-      extraInstructions,
+      allInstructions.length ? allInstructions : undefined,
       (reactionContexts && reactionContexts.length > 0) ? reactionContexts : undefined,
       projectRoleAssignment,
     );
@@ -2948,7 +2979,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           const context = resumeFrom ? [] : topicContext;
           const prepared = buildPrompt(
             batch, attachments, quotes, context, channel.botIdentity,
-            extraInstructions, reactionContexts?.length ? reactionContexts : undefined,
+            allInstructions.length ? allInstructions : undefined, reactionContexts?.length ? reactionContexts : undefined,
             projectRoleAssignment,
           );
           log.info('prompt', 'built', {
