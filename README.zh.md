@@ -481,6 +481,27 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 
 `owner-allowlist` 模式下，需配合 `ownerNoMentionChats` 指定生效的群聊。该字段独立于 `allowedChats`，只对 owner 的无 @ 消息生效。维护命令（需在目标群 @ 当前 Bot）：`/invite owner-default group` 和 `/remove owner-default group`。多 Bot 各自独立配置，不做中央互斥。
 
+### 群内指定用户的对话授权
+
+应用 Owner 可在目标群中使用真实的 @ 授权或撤销某人的对话权限：
+
+```text
+@小P /invite @张三 group
+@小P /remove @张三 group
+```
+
+授权仅限当前群、当前 Bot/profile，不授予其他群或私聊权限。获准用户必须明确 @ 该 Bot，
+只能进行普通对话，不能使用任何斜杠指令（包括 `/help`、`/new`、`/stop` 和未知指令），
+也不能通过卡片按钮或 Reaction 发起控制操作。Owner 原有指令保持有效。
+
+Owner 与获准用户共享该群已有会话；Owner 执行 `/new` 后，大家后续使用同一个新会话。
+不同群和不同 Bot 的会话仍隔离；话题消息继续沿用原有的按话题隔离规则。
+
+首次指定用户授权会为该群启用定向访问：普通群成员仅有名单内用户可以使用，优先于
+`/invite group` 的全群白名单和 team 模式；Owner 权限保留；名单中的非 Owner 在该群均只有对话权限。
+撤销最后一个用户后仍保留空名单，防止回退为全群开放。未配置定向访问的群保留原有行为。
+名单保存在当前 profile 的 `access.groupUsers`，重启后仍有效。
+
 `access.topicRootRequireMention` 控制指定群的话题首条消息是否必须显式 @ 当前 Bot，
 默认关闭。owner 或管理员在目标群 @ 当前 Bot 并发送
 `/config topic-root-mention on` 即可开启，也可以使用 Web 控制台对应群的开关；

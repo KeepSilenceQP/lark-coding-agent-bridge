@@ -7,7 +7,7 @@ import type { ProcessPool } from '../bot/process-pool';
 import type { CallbackAuth } from './callback-auth';
 import { runCommandHandler, type CommandContext, type Controls } from '../commands';
 import { log } from '../core/logger';
-import { canUseDm, canUseGroup } from '../policy/access';
+import { canUseDm, canUseGroup, isGroupChatGuest } from '../policy/access';
 import type { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
@@ -66,6 +66,8 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   // Done before the access check so we know the chat mode (p2p vs group)
   // and can skip the chat allowlist for DMs.
   const { scope, threadId, mode } = await resolveScope(deps);
+  // A signed shared card is not an escalation of the operator's permissions.
+  if (mode !== 'p2p' && isGroupChatGuest(deps.controls.profileConfig, deps.controls, chatId, operatorId)) return;
 
   const accessDecision =
     mode === 'p2p'

@@ -11,6 +11,24 @@ import {
 } from '../../../src/policy/run-policy';
 
 describe('run policy', () => {
+  it('shares the existing owner fingerprint for group guests without merging other groups or DMs', () => {
+    const cfg = profile();
+    const groupScope = { source: 'im' as const, chatType: 'group' as const, chatId: 'oc_shared', actorId: 'ou_owner' };
+    const ownerBefore = evaluateRunPolicy(baseInput({ profileConfig: cfg, scope: groupScope, access: { ok: true, reason: 'owner' } }));
+    cfg.access.groupUsers = { oc_shared: ['ou_a', 'ou_b'] };
+    const run = (actorId: string, chatId = 'oc_shared', chatType: 'group' | 'p2p' = 'group') => evaluateRunPolicy(baseInput({
+      profileConfig: cfg, scope: { ...groupScope, actorId, chatId, chatType }, access: { ok: true, reason: 'allowed-group-user' },
+    }));
+    const a = run('ou_a'); const b = run('ou_b');
+    if (!ownerBefore.ok || !a.ok || !b.ok) throw new Error('expected allowed');
+    expect(a.policyFingerprint).toBe(ownerBefore.policyFingerprint);
+    expect(b.policyFingerprint).toBe(a.policyFingerprint);
+    const other = run('ou_a', 'oc_other'); const dm = run('ou_a', 'oc_shared', 'p2p');
+    if (!other.ok || !dm.ok) throw new Error('expected allowed');
+    expect(other.policyFingerprint).not.toBe(a.policyFingerprint);
+    expect(dm.policyFingerprint).not.toBe(a.policyFingerprint);
+  });
+
   it('rejects when the upstream access decision denies the actor', () => {
     const result = evaluateRunPolicy({
       ...baseInput(),

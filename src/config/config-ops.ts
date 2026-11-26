@@ -91,6 +91,7 @@ export async function saveAccessConfig(
           access: {
             allowedUsers: access.allowedUsers,
             allowedChats: access.allowedChats,
+            groupUsers: access.groupUsers,
             admins: access.admins,
             botAdmins: access.botAdmins,
             ownerNoMentionChats: access.ownerNoMentionChats,

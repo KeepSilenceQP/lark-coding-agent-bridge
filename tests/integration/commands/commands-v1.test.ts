@@ -26,6 +26,7 @@ interface RunOverrides {
   chatMode?: CommandContext['chatMode'];
   mentions?: NormalizedMessage['mentions'];
   rawContent?: string;
+  mentionedBot?: boolean;
 }
 
 interface Harness {
@@ -305,6 +306,59 @@ describe('Bridge command contracts', () => {
     ).resolves.toBe(true);
     root = await loadRootConfig(h.controls.configPath);
     expect(root?.profiles.claude?.access.allowedUsers).not.toContain('ou-alice');
+  });
+
+  it('grants and revokes owner-managed conversational users only in the current group and profile', async () => {
+    const h = await createHarness();
+    const group = { senderId: 'ou-owner', chatMode: 'group' as const, mentionedBot: true,
+      mentions: [mention('ou-alice', 'Alice')] };
+    await h.run('/remove @Alice group', group);
+    expect(h.controls.profileConfig.access.groupUsers).toBeUndefined();
+    await h.run('/invite @Alice group', { ...group,
+      mentions: [{ ...botMention('ou_bot', 'Bridge'), key: '@_user_1' }, { ...mention('ou-alice', 'Alice'), key: '@_user_2' }],
+      rawContent: JSON.stringify({ text: '@_user_1 /invite @_user_2 group' }),
+    });
+    let root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.groupUsers).toEqual({ 'chat-1': ['ou-alice'] });
+    expect(root?.profiles.claude?.access.allowedChats).toEqual([]);
+    expect(root?.profiles.claude?.access.allowedUsers).toEqual([]);
+    expect(lastMarkdown(h.channel)).toContain('不能执行任何指令');
+    await h.run('/invite @Alice group', group);
+    expect(h.controls.profileConfig.access.groupUsers?.['chat-1']).toEqual(['ou-alice']);
+    await h.run('/invite @Alice group', { ...group, chatId: 'chat-2' });
+    await h.run('/remove @Alice group', group);
+    root = await loadRootConfig(h.controls.configPath);
+    expect(root?.profiles.claude?.access.groupUsers).toEqual({ 'chat-1': [], 'chat-2': ['ou-alice'] });
+  });
+
+  it('requires the owner, a group, explicit bot mention, and real user mentions for selective grants', async () => {
+    const h = await createHarness();
+    const group = { senderId: 'ou-owner', chatMode: 'group' as const, mentionedBot: true,
+      mentions: [mention('ou-alice', 'Alice')] };
+    await h.run('/invite @Alice group', { ...group, senderId: 'ou-admin' });
+    expect(lastMarkdown(h.channel)).toContain('只有应用 Owner');
+    await h.run('/invite @Alice group', { ...group, chatMode: 'p2p' });
+    await h.run('/invite @Alice group', { ...group, mentionedBot: false });
+    await h.run('/invite @Fake group', { ...group, mentions: [] });
+    await h.run('/invite user @Alice group', group);
+    expect(h.controls.profileConfig.access.groupUsers).toBeUndefined();
+    expect(h.controls.profileConfig.access.allowedChats).toEqual([]);
+  });
+
+  it('blocks every guest slash command including public and unknown commands without changing the session', async () => {
+    const h = await createHarness();
+    await h.run('/invite @Alice group', { senderId: 'ou-owner', chatMode: 'group', mentionedBot: true,
+      mentions: [mention('ou-alice', 'Alice')] });
+    h.controls.profileConfig.access.admins.push('ou-alice');
+    h.sessions.set('chat-1', 'shared-session', h.tmp.workspace);
+    for (const command of ['/new', '/help', '/status', '/stop', '/not-a-bridge-command', '/invite @Bob group']) {
+      await expect(h.run(command, { senderId: 'ou-alice', chatMode: 'group' })).resolves.toBe(true);
+      expect(lastMarkdown(h.channel)).toContain('不能执行任何指令');
+      expect(h.sessions.getRaw('chat-1')?.sessionId).toBe('shared-session');
+    }
+    // Preserve owner commands for the very same scope.
+    await h.run('/new', { senderId: 'ou-owner', chatMode: 'group' });
+    expect(h.sessions.getRaw('chat-1')?.sessionId).toBeUndefined();
   });
 
   it('adds every known bot group through /invite all group', async () => {
@@ -1511,12 +1565,12 @@ async function createHarness(): Promise<Harness> {
     const scope = overrides.scope ?? chatId;
     return tryHandleCommand({
       channel: channel as unknown as CommandContext['channel'],
-      msg: message(content, {
+      msg: { ...message(content, {
         chatId,
         senderId: overrides.senderId ?? 'ou-admin',
         mentions: overrides.mentions ?? [],
         rawContent: overrides.rawContent,
-      }),
+      }), mentionedBot: overrides.mentionedBot ?? false },
       scope,
       chatMode: overrides.chatMode ?? 'p2p',
       sessions,

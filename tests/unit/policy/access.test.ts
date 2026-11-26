@@ -85,6 +85,18 @@ describe('access policy', () => {
     expect(canUseGroup(allowed, ownerControls, 'chat_other', 'ou_other').ok).toBe(false);
   });
 
+  it('enforces selective users per group and profile, including empty revoked groups over broad access', () => {
+    const profile = profileWithAccess({ allowedChats: ['chat_a'], groupUsers: { chat_a: ['ou_guest'] } });
+    expect(canUseGroup(profile, ownerControls, 'chat_a', 'ou_guest')).toEqual({ ok: true, reason: 'allowed-group-user' });
+    expect(canUseGroup(profile, ownerControls, 'chat_b', 'ou_guest').ok).toBe(false);
+    expect(canUseGroup(profileWithAccess(), ownerControls, 'chat_a', 'ou_guest').ok).toBe(false);
+    expect(canUseDm(profile, ownerControls, 'ou_guest').ok).toBe(false);
+    expect(canUseGroup(profile, ownerControls, 'chat_a', 'ou_other').ok).toBe(false);
+    profile.access.groupUsers = { chat_a: [] };
+    expect(canUseGroup(profile, ownerControls, 'chat_a', 'ou_guest').ok).toBe(false);
+    expect(canUseGroup(profile, ownerControls, 'chat_a', 'ou_owner').ok).toBe(true);
+  });
+
   it('lets admins use groups before the chat is allowlisted', () => {
     const profile = profileWithAccess({ admins: ['ou_admin'] });
 

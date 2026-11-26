@@ -82,6 +82,8 @@ export interface AppAccess {
   allowedUsers?: string[];
   /** chat_id allowlist for groups the bot responds in. Does not apply to p2p. */
   allowedChats?: string[];
+  /** Per-group conversational users; presence enables selective access for that group. */
+  groupUsers?: Record<string, string[]>;
   /** open_id list with admin privileges. Gates sensitive commands
    * (/account, /config, /exit, /reconnect, /doctor, /cd, /ws, /doc,
    * /invite, /remove). */
