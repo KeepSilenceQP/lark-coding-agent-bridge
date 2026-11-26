@@ -41,4 +41,4 @@
 - 冻结最终代码后执行 `pnpm exec vitest run --maxWorkers=2 --minWorkers=1`：182 个测试文件通过，2105 项通过、33 项跳过。
 - `pnpm typecheck`、`pnpm build`、`git diff --check` 均通过。
 - `pnpm privacy:tree` 因缺少私有 denylist 输入无法执行；未使用替代规则绕过该发布检查。
-- 未更改运行 profile 的授权、未安装部署、未合入主干；真实飞书多用户验证仍待部署后执行。
+- 上述本地验证时未更改运行 profile 的授权、未安装部署、未合入主干；真实飞书多用户验证仍待部署后执行。
