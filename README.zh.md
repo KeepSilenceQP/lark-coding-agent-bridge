@@ -46,6 +46,8 @@ no-content/最终回复修改则做了适配，保留本 Fork 的单流最终回
 上游来源历史边界，不是两仓库的 Git merge base。只有下一批上游修改完成集成并通过
 验证后，才能更新这个锚点。
 
+2026-11-26 另选择性纳入上游开放 PR #351、#347、#348–350 和 #340：批量附件目录与拒绝记录、进度流挂起后的最终回复兜底、会议生命周期与权限完善，以及最终回复本地图片混排。保留本 Fork 的群授权、session、Reaction 和 CardKit 恢复逻辑；来源、配置与冲突取舍见[集成记录](docs/integrations/2026-11-26-selected-upstream-features.md)。这些 PR 尚未进入上游 main，因此不移动上述同步锚点。
+
 [English README](./README.md)
 
 ## 本 Fork 维护的增强能力
@@ -420,6 +422,8 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 | `~/.lark-channel/registry/locks/` | profile lock 和 app lock |
 
 设置 `LARK_CHANNEL_HOME=/path/to/state` 可以迁移整棵本地状态目录。`LARK_CHANNEL_LOG_DAYS` 可以调整日志保留天数。
+
+`LARK_CHANNEL_STREAM_TERMINAL_GRACE_MS`（默认 `3000`）控制 agent 结束后，bridge 等待已打开的进度卡完成的时长。飞书网络较慢时调大；若卡片仍未在期限内完成，bridge 会放弃该卡片并以普通消息发送最终结果，不会再静默结束。
 
 ## 访问控制
 

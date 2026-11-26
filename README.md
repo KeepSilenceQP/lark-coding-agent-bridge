@@ -50,6 +50,8 @@ merge base because the incorporated changes were conflict-adapted in the fork.
 Do not advance this anchor until the next upstream batch has been integrated
 and verified.
 
+The 2026-11-26 selection also integrates open upstream PRs #351, #347, #348–350 and #340: attachment batches and rejection records, terminal delivery after stalled progress, meeting lifecycle/authorization, and inline local images. Fork group access, sessions, reactions and CardKit recovery remain in place. See the [integration record](docs/integrations/2026-11-26-selected-upstream-features.md) for provenance and conflict decisions. These PRs are not on upstream main, so the synchronization anchor above is unchanged.
+
 [中文 README](./README.zh.md)
 
 ## Enhancements maintained in this fork
@@ -420,6 +422,8 @@ The legacy `sandbox` field is still readable for old configs. After the bridge s
 | `~/.lark-channel/registry/locks/` | Profile and app locks |
 
 Set `LARK_CHANNEL_HOME=/path/to/state` to move all local bridge state. `LARK_CHANNEL_LOG_DAYS` overrides log retention.
+
+`LARK_CHANNEL_STREAM_TERMINAL_GRACE_MS` (default `3000`) controls how long the bridge waits for an already-open progress card to finish after the agent reaches a terminal state. Raise it on slow Feishu networks; if the card still does not settle in time, the bridge abandons it and delivers the final state as a normal reply instead of staying silent.
 
 ## Access control
 

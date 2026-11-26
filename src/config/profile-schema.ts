@@ -7,6 +7,7 @@ import type {
   SecretsConfig,
 } from './schema';
 import {
+  isAccessMode,
   normalizePermissions,
   permissionsToLegacySandbox,
   type AccessMode,
@@ -71,6 +72,14 @@ export interface AttachmentConfig {
   imageMaxBytes: number;
   cacheTtlMs: number;
   cacheMaxBytes: number;
+  /**
+   * From this many accepted attachments in one batch on, they are also linked
+   * into `<workspace>/.lark-batches/<time>-<hash>/` (in delivery order, real
+   * file names, plus a manifest.json) so the agent can address "the 3rd one".
+   */
+  batchThreshold: number;
+  /** How many batch directories to keep; oldest are removed first. */
+  batchKeep: number;
 }
 
 export type CommentConfig = Record<string, never>;
@@ -120,7 +129,25 @@ export interface MeetingConfig {
   summaryOnEnd: boolean;
   /** Preferred destination for that summary. See {@link MeetingSummaryTarget}. */
   summaryTarget: MeetingSummaryTarget;
+  /**
+   * Who may drive the agent from in-meeting chat. Joining a meeting makes the
+   * bot visible to every participant; it does not make every participant
+   * allowed to run it.
+   *  - `dm-policy`: the same people who may DM the bot (owner, team mode,
+   *    admins, allowedUsers).
+   *  - `admins-only`: only those who may run admin commands.
+   */
+  access: MeetingAccess;
+  /** Access tier for runs triggered from meeting chat (capped by the profile's maxAccess). */
+  executionAccess: AccessMode;
+  /**
+   * Word that, right after the trigger, runs one request with the profile's
+   * default access instead of `executionAccess`. Empty = no elevation at all.
+   */
+  elevateWord: string;
 }
+
+export type MeetingAccess = 'dm-policy' | 'admins-only';
 
 export type LarkCliIdentityPreset = 'bot-only' | 'user-default';
 
@@ -327,6 +354,8 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
       imageMaxBytes: numberOr(raw.attachments?.imageMaxBytes, 25 * 1024 * 1024),
       cacheTtlMs: numberOr(raw.attachments?.cacheTtlMs, 24 * 60 * 60 * 1000),
       cacheMaxBytes: numberOr(raw.attachments?.cacheMaxBytes, 512 * 1024 * 1024),
+      batchThreshold: clampNumber(raw.attachments?.batchThreshold, 1, 100, ATTACHMENT_BATCH_DEFAULTS.batchThreshold),
+      batchKeep: clampNumber(raw.attachments?.batchKeep, 1, 500, ATTACHMENT_BATCH_DEFAULTS.batchKeep),
     },
     comments,
     meeting,
@@ -484,7 +513,14 @@ export const MEETING_DEFAULTS: MeetingConfig = {
   pollIntervalMs: 3000,
   summaryOnEnd: false,
   summaryTarget: 'origin',
+  // Unconfigured = safe: the DM allowlist decides, runs are read-only and
+  // there is no way to elevate.
+  access: 'dm-policy',
+  executionAccess: 'read-only',
+  elevateWord: '',
 };
+
+export const ATTACHMENT_BATCH_DEFAULTS = { batchThreshold: 3, batchKeep: 20 } as const;
 
 function normalizeMeeting(input: unknown): MeetingConfig {
   const raw = (input && typeof input === 'object' ? input : {}) as {
@@ -496,6 +532,9 @@ function normalizeMeeting(input: unknown): MeetingConfig {
     pollIntervalMs?: unknown;
     summaryOnEnd?: unknown;
     summaryTarget?: unknown;
+    access?: unknown;
+    executionAccess?: unknown;
+    elevateWord?: unknown;
   };
   const trigger = typeof raw.trigger === 'string' && raw.trigger.trim() ? raw.trigger.trim() : MEETING_DEFAULTS.trigger;
   return {
@@ -517,6 +556,12 @@ function normalizeMeeting(input: unknown): MeetingConfig {
       raw.summaryTarget === 'owner' || raw.summaryTarget === 'origin'
         ? raw.summaryTarget
         : MEETING_DEFAULTS.summaryTarget,
+    access: raw.access === 'admins-only' ? 'admins-only' : MEETING_DEFAULTS.access,
+    executionAccess: isAccessMode(raw.executionAccess) ? raw.executionAccess : MEETING_DEFAULTS.executionAccess,
+    elevateWord:
+      typeof raw.elevateWord === 'string' && raw.elevateWord.trim()
+        ? raw.elevateWord.trim()
+        : MEETING_DEFAULTS.elevateWord,
   };
 }
 

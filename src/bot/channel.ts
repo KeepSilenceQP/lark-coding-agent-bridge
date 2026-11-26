@@ -54,7 +54,10 @@ import {
   toPromptAttachment,
 } from '../media/attachment';
 import { canRunBotAdminCommand, canUseDm, canUseGroup, isGroupChatGuest } from '../policy/access';
-import { MeetingManager } from '../meeting/manager';
+import { meetingAccessConverged, meetingEffectiveAccess } from '../meeting/authz';
+import { describeMeetingError, MeetingManager } from '../meeting/manager';
+import { resolveWorkingDirectory } from '../policy/workspace';
+import { batchInstructions, landAttachmentBatch, renderAttachmentNotice, type LandedBatch } from '../media/batch';
 import type { VcRequestClient } from '../meeting/api';
 import { attachMeetingAgent, summarizeEndedMeeting } from '../meeting/orchestrator';
 import type { ScopeContext } from '../policy/run-policy';
@@ -132,6 +135,8 @@ import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
 import { resolveTopicMessage } from './topic-message';
+import { buildLocalImagePost } from './local-images';
+import { createProgressRenderer } from './progress-renderer';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { handleReactionEvent } from './reaction/pipeline';
 import {
@@ -564,7 +569,26 @@ export function evictInFlightReactionEntry(params: {
 }
 
 const DEBOUNCE_MS = 600;
-const STREAM_TERMINAL_GRACE_MS = 3000;
+const DEFAULT_STREAM_TERMINAL_GRACE_MS = 3000;
+
+/**
+ * How long to wait for an already-open progress stream to finish after the
+ * agent reached a terminal state. Opening/updating a Feishu card is a network
+ * round trip that can be much slower than the agent itself; a short window
+ * turns a slow card into a lost final answer. Deployments on slow links can
+ * raise this without a code change.
+ */
+function streamTerminalGraceMs(): number {
+  const raw = process.env.LARK_CHANNEL_STREAM_TERMINAL_GRACE_MS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_STREAM_TERMINAL_GRACE_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    log.warn('stream', 'invalid-terminal-grace', { value: raw });
+    return DEFAULT_STREAM_TERMINAL_GRACE_MS;
+  }
+  return parsed;
+}
+
 const FINAL_READBACK_RETRY_MS = 250;
 const FINAL_READBACK_TIMEOUT_MS = 2000;
 const TAIL_COMPARE_CHARS = 500;
@@ -2134,6 +2158,31 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           ...(sessionCatalog ? { sessionCatalog } : {}),
           workspaces,
         }).catch((err) => log.warn('meeting', 'summary-failed', { err: String(err) })),
+      onAutoJoinFailed: (meetingNo, err) => {
+        if (!controls.botOwnerId) return;
+        void channel
+          .send(controls.botOwnerId, {
+            markdown:
+              `⚠️ **会议智能体** · 被邀请入会（会议号 ${meetingNo}），但自动入会失败：${describeMeetingError(err)}\n` +
+              `可以私聊发 \`/meeting join ${meetingNo}\` 重试。`,
+          })
+          .catch((e) => log.warn('meeting', 'owner-notify-failed', { kind: 'auto-join-failed', err: String(e) }));
+      },
+      // Live meetings survive a restart (dispose() doesn't leave); record them
+      // so the next start can re-adopt instead of going deaf mid-meeting.
+      ...(deps.appPaths?.mediaDir
+        ? { stateFile: join(dirname(deps.appPaths.mediaDir), 'meetings.json') }
+        : {}),
+      onResumeEnded: (meeting, err) => {
+        if (!controls.botOwnerId) return;
+        void channel
+          .send(controls.botOwnerId, {
+            markdown:
+              `⚠️ **会议智能体** · bridge 重启后没能接回会议「${meeting.topic ?? meeting.meetingNo}」（${meeting.meetingNo}）：${describeMeetingError(err)}\n` +
+              '如果会议已经结束，这场没有纪要。',
+          })
+          .catch((e) => log.warn('meeting', 'owner-notify-failed', { kind: 'resume-ended', err: String(e) }));
+      },
       onSession: (session) =>
         attachMeetingAgent({
           session,
@@ -2147,6 +2196,15 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         }),
     });
     meetingManager.attachPush();
+    // One line per start that proves the in-meeting gate is in this build and
+    // shows its effective setting.
+    log.info('meeting', 'authz-active', {
+      gate: meetingConfig().access,
+      executionAccess: meetingConfig().executionAccess,
+      effective: meetingEffectiveAccess(controls.profileConfig, false),
+      converged: meetingAccessConverged(controls.profileConfig),
+      elevateWord: meetingConfig().elevateWord || '(disabled)',
+    });
     controls.meeting = meetingManager;
   }
 
@@ -2159,6 +2217,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // Owner identity is persisted per app. Resolve it only when missing; normal
   // restarts do not depend on the application API and no polling timer exists.
   if (!controls.botOwnerId) await controls.refreshOwner(channel);
+  // Re-adopt meetings after the persisted owner identity is available.
+  if (meetingManager) {
+    void meetingManager.resume().catch(err => log.warn('meeting', 'resume-failed', { err: String(err) }));
+  }
   const knownChatsRefresh = startKnownChatsRefreshTimer(channel, controls);
 
   const identity = channel.botIdentity;
@@ -2717,6 +2779,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
+  // Dropped attachments are never silent. Empty when everything was accepted.
+  const attachmentNotice = renderAttachmentNotice(attachments);
+  if (attachmentNotice) log.info('attachment', 'notice', { text: attachmentNotice });
+
   // Collect any reply-quote targets in the batch. Dedup so the same target
   // quoted by multiple messages in one batch only fetches once. Filter out
   // ids that are themselves in the batch — those are already in the prompt.
@@ -2746,6 +2812,30 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   let topicContext: QuotedContext[] = [];
   let topicContextLoaded = false;
 
+  // Several attachments → also link them into a batch directory in the
+  // workspace. buildPrompt runs before startRunFlow resolves the cwd, so
+  // resolve it here with the same inputs. A convenience only: on failure the
+  // per-attachment paths are still in the prompt.
+  let attachmentBatch: LandedBatch | undefined;
+  try {
+    const wsReq = attachments.filter(a => a.decision === 'accepted').length >= controls.profileConfig.attachments.batchThreshold
+      ? workspaces.cwdFor(scope) ?? controls.profileConfig.workspaces.default ?? '' : '';
+    const ws = wsReq ? await resolveWorkingDirectory(wsReq) : undefined;
+    if (ws?.ok) {
+      attachmentBatch = await landAttachmentBatch(attachments, ws.cwdRealpath, controls.profileConfig.attachments);
+      if (attachmentBatch) {
+        log.info('attachment', 'batch-landed', {
+          dir: attachmentBatch.dir,
+          count: attachmentBatch.count,
+          linked: attachmentBatch.items.filter((i) => i.linked).length,
+        });
+      }
+    }
+  } catch (err) {
+    log.warn('attachment', 'batch-failed', { err: String(err) });
+    attachmentBatch = undefined;
+  }
+
   // Detect a model switch since this scope's last run. When resuming an
   // existing conversation the transcript still claims the old model, so tell
   // the (now-switched) agent its model changed — otherwise it keeps echoing
@@ -2767,6 +2857,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       ]
     : undefined;
 
+  const allInstructions = [...(extraInstructions ?? []), ...(attachmentBatch ? batchInstructions(attachmentBatch) : [])];
   // F1: Detect reaction batches and collect reactionContexts via internal store
   const reactionContexts: unknown[] | undefined = isReactionBatch
     ? getReactionContexts(reactionTurnId ? [reactionTurnId] : [])
@@ -2790,7 +2881,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       quotes,
       topicContext,
       channel.botIdentity,
-      extraInstructions,
+      allInstructions.length ? allInstructions : undefined,
       (reactionContexts && reactionContexts.length > 0) ? reactionContexts : undefined,
       projectRoleAssignment,
     );
@@ -2909,7 +3000,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           const context = resumeFrom ? [] : topicContext;
           const prepared = buildPrompt(
             batch, attachments, quotes, context, channel.botIdentity,
-            extraInstructions, reactionContexts?.length ? reactionContexts : undefined,
+            allInstructions.length ? allInstructions : undefined, reactionContexts?.length ? reactionContexts : undefined,
             projectRoleAssignment,
           );
           log.info('prompt', 'built', {
@@ -3388,6 +3479,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         else void cotPublisher.finish(reason).catch(() => {});
       }
       const cotResult = await sendFinalReply({
+        cwd,
         channel,
         chatId,
         scope,
@@ -3407,6 +3499,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       let cardCtrl:
         | { update(next: object | ((current: object) => object)): Promise<void> }
         | undefined;
+      let abandoned = false;
+      const progressRenderer = createProgressRenderer<RunState>(async (state) => {
+        await cardCtrl?.update(renderCard(filterForPrefs(state), cardRenderOptions));
+      });
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -3416,9 +3512,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         recordSession,
         async (state) => {
           latestState = state;
-          if (cardCtrl) {
-            await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
-          }
+          if (cardCtrl) progressRenderer.enqueue(state);
         },
         recoverStartupTimeout,
         observeEditableToolStart,
@@ -3430,11 +3524,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             initial: renderCard(initialState, cardRenderOptions),
             producer: async (ctrl) => {
               producerStarted = true;
+              if (abandoned) return;
               cardCtrl = ctrl;
               // Register outbound IMMEDIATELY so stop can correlate during streaming.
               _registerOutboundOnStream(ctrl);
-              await ctrl.update(renderCard(filterForPrefs(latestState), cardRenderOptions));
+              progressRenderer.enqueue(latestState);
               await renderDone;
+              await progressRenderer.settle();
             },
           },
         },
@@ -3449,18 +3545,20 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         mode: replyMode,
         streamDone,
         renderDone,
+        abandon: () => { abandoned = true; progressRenderer.abandon(); },
+        deliverFinal: async (state) => {
+          const result = await sendFinalReply({ cwd, localImagesOnly: true, channel, chatId, scope,
+            state: filterForPrefs(state), replyMode, sendOpts, cardRenderOptions });
+          if (result) _registerOutboundOnStream(result);
+          return result !== undefined;
+        },
         producerStarted: () => producerStarted,
         onStartupFailure: () => notifyStartupDisplayFailure('stream'),
         fallback: async (state) => {
-          // F18: If this reaction run was superseded, mark the card state
           const fallbackState = isReactionTurn ? markSuperseded(state) : state;
-          // R2-F4: register the fallback outbound so stop can correlate it.
-          const fbResult = await channel.send(
-            chatId,
-            { card: renderCard(filterForPrefs(fallbackState), cardRenderOptions) },
-            sendOpts,
-          );
-          _registerOutboundOnStream(fbResult);
+          const result = await sendFinalReply({ cwd, channel, chatId, scope,
+            state: filterForPrefs(fallbackState), replyMode, sendOpts, cardRenderOptions });
+          _registerOutboundOnStream(result);
         },
       });
       // Reaction lifecycle: mark terminal after render+stream complete
@@ -3504,6 +3602,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           throw err;
         }
       };
+      let abandoned = false;
+      const progressRenderer = createProgressRenderer<RunState>(async (state) => {
+        await setMarkdownContent(state.terminal === 'running' ? 'update' : 'terminal',
+          renderMarkdownStreamText(filterForPrefs(state)));
+      });
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -3513,10 +3616,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         recordSession,
         async (state) => {
           latestState = state;
-          if (markdownCtrl) {
-            const markdown = renderMarkdownStreamText(filterForPrefs(state));
-            await setMarkdownContent(state.terminal === 'running' ? 'update' : 'terminal', markdown);
-          }
+          if (markdownCtrl) progressRenderer.enqueue(state);
         },
         recoverStartupTimeout,
         observeEditableToolStart,
@@ -3527,12 +3627,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           {
             markdown: async (ctrl) => {
               producerStarted = true;
+              if (abandoned) return;
               markdownCtrl = ctrl;
               // Register outbound IMMEDIATELY so stop can correlate during streaming.
               _registerOutboundOnStream(ctrl);
-              const initialMarkdown = renderMarkdownStreamText(filterForPrefs(latestState));
-              await setMarkdownContent('initial', initialMarkdown);
+              progressRenderer.enqueue(latestState);
               const finalState = await renderDone;
+              await progressRenderer.settle();
               const finalMarkdown = renderMarkdownStreamText(filterForPrefs(finalState));
               log.info('stream', 'markdown-producer-final', {
                 terminal: finalState.terminal,
@@ -3563,6 +3664,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         mode: replyMode,
         streamDone,
         renderDone,
+        abandon: () => { abandoned = true; progressRenderer.abandon(); },
+        deliverFinal: async (state) => {
+          const result = await sendFinalReply({ cwd, localImagesOnly: true, channel, chatId, scope,
+            state: filterForPrefs(state), replyMode, sendOpts, cardRenderOptions });
+          if (result) _registerOutboundOnStream(result);
+          return result !== undefined;
+        },
         producerStarted: () => producerStarted,
         onStartupFailure: () => notifyStartupDisplayFailure('stream'),
         verifyFinal: async (streamValue, state) =>
@@ -3572,12 +3680,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             renderMarkdownStreamText(filterForPrefs(state)),
           ),
         fallback: async (state) => {
-          const body = renderText(filterForPrefs(state));
-          if (body.trim()) {
-            // R2-F4: register the fallback outbound so stop can correlate it.
-            const fbResult = await channel.send(chatId, { markdown: body }, sendOpts);
-            _registerOutboundOnStream(fbResult);
-          }
+          const result = await sendFinalReply({ cwd, channel, chatId, scope,
+            state: filterForPrefs(state), replyMode: 'text', sendOpts, cardRenderOptions });
+          _registerOutboundOnStream(result);
         },
       });
       // Reaction lifecycle: mark terminal after render+stream complete
@@ -3598,6 +3703,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         observeEditableToolStart,
       );
       const sendResult = await sendFinalReply({
+        cwd,
         channel,
         chatId,
         scope,
@@ -3626,6 +3732,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 }
 
 async function sendFinalReply(input: {
+  cwd: string;
+  localImagesOnly?: boolean;
   channel: LarkChannel;
   chatId: string;
   scope: string;
@@ -3636,6 +3744,26 @@ async function sendFinalReply(input: {
 }): Promise<unknown> {
   const body = renderText(input.state);
   let lastResult: unknown;
+
+  const post = await buildLocalImagePost({
+    body, scope: input.scope, cwd: input.cwd,
+    uploadImage: async (image) => {
+      const result = await input.channel.rawClient.im.v1.image.create({ data: { image_type: 'message', image } });
+      return result?.image_key ?? '';
+    },
+  });
+  if (post) {
+    try {
+      lastResult = await input.channel.send(input.chatId, { post }, input.sendOpts);
+    } catch (err) {
+      log.warn('outbound', 'image-post-fallback', { scope: input.scope, err: err instanceof Error ? err.message : String(err) });
+      lastResult = await input.channel.send(input.chatId, { markdown: body }, input.sendOpts);
+    }
+    if (!streamMessageId(lastResult)) throw new Error('Image reply returned no message receipt');
+    log.info('outbound', 'sent', outboundLogFields(input, 'post', body, lastResult as { messageId?: string }));
+    return lastResult;
+  }
+  if (input.localImagesOnly) return undefined;
 
   if (input.replyMode === 'card') {
     lastResult = await input.channel.send(
@@ -4111,6 +4239,8 @@ async function awaitRenderAwareStream(input: {
   renderDone: Promise<RunState>;
   producerStarted: () => boolean;
   onStartupFailure: () => void;
+  abandon?: () => void;
+  deliverFinal?: (state: RunState) => Promise<boolean>;
   verifyFinal?: (streamValue: unknown, state: RunState) => Promise<boolean | undefined>;
   fallback: (state: RunState) => Promise<void>;
 }): Promise<void> {
@@ -4129,6 +4259,7 @@ async function awaitRenderAwareStream(input: {
       if (!input.producerStarted()) input.onStartupFailure();
       const rendered = await renderResult;
       if (!rendered.ok) throw rendered.err;
+      input.abandon?.();
       await runFallbackReply(input.mode, rendered.state, input.fallback);
       return;
     }
@@ -4138,34 +4269,41 @@ async function awaitRenderAwareStream(input: {
   if (first.kind === 'stream') {
     const rendered = await renderResult;
     if (!rendered.ok) throw rendered.err;
+    if (await input.deliverFinal?.(rendered.state)) { input.abandon?.(); return; }
     await runFallbackOnFinalMismatch(input, first.value, rendered.state);
     return;
   }
 
+  if (await input.deliverFinal?.(first.state)) { input.abandon?.(); return; }
+
   if (!input.producerStarted()) {
     log.warn('stream', 'producer-not-started-before-agent-terminal', { mode: input.mode });
+    input.abandon?.();
     await runFallbackReply(input.mode, first.state, input.fallback);
     return;
   }
 
   const terminal = await Promise.race([
     streamResult,
-    delay(STREAM_TERMINAL_GRACE_MS).then(() => undefined),
+    delay(streamTerminalGraceMs()).then(() => undefined),
   ]);
   if (!terminal) {
     log.warn('stream', 'terminal-grace-expired', {
       mode: input.mode,
-      graceMs: STREAM_TERMINAL_GRACE_MS,
+      graceMs: streamTerminalGraceMs(),
     });
     void streamResult.then((result) => {
       if (!result.ok) {
         log.fail('stream', result.err, { mode: input.mode, step: 'stream-terminal-late' });
       }
     });
+    input.abandon?.();
+    await runFallbackReply(input.mode, first.state, input.fallback);
     return;
   }
   if (!terminal.ok) {
     log.fail('stream', terminal.err, { mode: input.mode, step: 'stream-terminal' });
+    input.abandon?.();
     await runFallbackReply(input.mode, first.state, input.fallback);
     return;
   }
