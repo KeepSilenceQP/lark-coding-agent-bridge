@@ -19,6 +19,7 @@ export interface AccessDecision {
     | 'allowed-user'
     | 'allowed-admin'
     | 'allowed-chat'
+    | 'allowed-group-user'
     | 'allowed-public'
     | 'comment-mention'
     | 'denied-user'
@@ -51,10 +52,26 @@ export function canUseGroup(
   senderId: string,
 ): AccessDecision {
   if (isCreator(controls, senderId)) return allow('owner');
+  if (Object.hasOwn(profile.access.groupUsers ?? {}, chatId)) {
+    if (profile.access.groupUsers?.[chatId]?.includes(senderId)) return allow('allowed-group-user');
+    if (profile.access.admins.includes(senderId)) return allow('allowed-admin');
+    return deny('denied-chat');
+  }
   if (profile.mode === 'team') return allow('allowed-team');
   if (profile.access.admins.includes(senderId)) return allow('allowed-admin');
   if (profile.access.allowedChats.includes(chatId)) return allow('allowed-chat');
   return deny('denied-chat');
+}
+
+/** Guests have conversation access only, even in a broadly allowed group. */
+export function isGroupChatGuest(
+  profile: ProfileConfig,
+  controls: RuntimeControls,
+  chatId: string,
+  senderId: string,
+): boolean {
+  return !isCreator(controls, senderId) &&
+    Boolean(profile.access.groupUsers?.[chatId]?.includes(senderId));
 }
 
 /** Per-chat @ policy used by the web console; explicit chat values win. */

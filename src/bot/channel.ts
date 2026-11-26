@@ -53,7 +53,7 @@ import {
   toPolicyAttachment,
   toPromptAttachment,
 } from '../media/attachment';
-import { canRunBotAdminCommand, canUseDm, canUseGroup } from '../policy/access';
+import { canRunBotAdminCommand, canUseDm, canUseGroup, isGroupChatGuest } from '../policy/access';
 import { MeetingManager } from '../meeting/manager';
 import type { VcRequestClient } from '../meeting/api';
 import { attachMeetingAgent, summarizeEndedMeeting } from '../meeting/orchestrator';
@@ -1718,6 +1718,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
               pending,
               channel,
               checkAccess: (record) => {
+                if (record.chatType !== 'p2p' && isGroupChatGuest(
+                  controls.profileConfig, controls, record.chatId, record.authorId,
+                )) return false;
                 const access = record.chatType === 'p2p'
                   ? canUseDm(controls.profileConfig, controls, record.authorId)
                   : canUseGroup(
@@ -1898,6 +1901,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             checkAccess: (chatType, chatId, senderId) => {
               if (chatType === 'p2p') {
                 return canUseDm(controls.profileConfig, controls, senderId);
+              }
+              if (isGroupChatGuest(controls.profileConfig, controls, chatId, senderId)) {
+                return { ok: false, reason: 'denied-user' };
               }
               return canUseGroup(controls.profileConfig, controls, chatId, senderId);
             },
@@ -2454,6 +2460,10 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // pending queues, runs, and cards. Explicit @bot messages retain their
   // original path; owner-default is a narrow opt-in for owner messages with
   // no structured mention of any account.
+  const guest = msg.chatType !== 'p2p' && isGroupChatGuest(
+    controls.profileConfig, controls, msg.chatId, msg.senderId,
+  );
+  if (guest && (!msg.mentionedBot || msg.mentionAll)) return;
   const mentionOverride = controls.profileConfig.access.chatRequireMention?.[msg.chatId];
   const groupResponseDecision = decideGroupResponse({
     chatType: msg.chatType,
@@ -2657,7 +2667,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     promptSessionService,
     workspaces,
     media,
-    batch,
     controls,
     cotClient,
     callbackAuth,
@@ -2666,6 +2675,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     scope,
     mode,
   } = deps;
+  const batch = deps.batch.filter(message => {
+    if (message.chatType === 'p2p') return canUseDm(controls.profileConfig, controls, message.senderId).ok;
+    if (!canUseGroup(controls.profileConfig, controls, message.chatId, message.senderId).ok) return false;
+    return !isGroupChatGuest(controls.profileConfig, controls, message.chatId, message.senderId) ||
+      (message.mentionedBot && !message.mentionAll && message.rawContentType !== ('reaction' as never));
+  });
   if (batch.length === 0) return;
   const firstMsg = batch[0];
   const lastMsg = batch[batch.length - 1];
@@ -2812,6 +2827,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       : canUseGroup(controls.profileConfig, controls, firstMsg.chatId, firstMsg.senderId);
   const scopeContext: ScopeContext = {
     source: 'im',
+    chatType: firstMsg.chatType,
     chatId,
     actorId: firstMsg.senderId,
     ...(threadId ? { threadId } : {}),

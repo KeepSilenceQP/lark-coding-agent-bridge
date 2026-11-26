@@ -28,6 +28,7 @@ export async function commandSessionCatalogIdentity(input: {
   const policy = evaluateRunPolicy({
     scope: {
       source: 'im',
+      chatType: input.msg.chatType,
       chatId: input.msg.chatId,
       actorId: input.msg.senderId,
       ...(input.mode === 'topic' && input.msg.threadId ? { threadId: input.msg.threadId } : {}),

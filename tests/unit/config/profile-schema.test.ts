@@ -17,6 +17,17 @@ const app = {
 };
 
 describe('profile schema', () => {
+  it('normalizes selective group users without losing empty restrictions or migrating legacy groups', () => {
+    const cfg = normalizeProfileConfig({
+      ...createDefaultProfileConfig({ agentKind: 'claude', accounts: { app } }),
+      access: { allowedChats: ['oc_legacy'], groupUsers: { oc_a: ['ou_a', 'ou_a', 7], oc_empty: [], oc_invalid: null } },
+    });
+    expect(cfg.access.groupUsers).toEqual({ oc_a: ['ou_a'], oc_empty: [], oc_invalid: [] });
+    expect(cfg.access.allowedChats).toEqual(['oc_legacy']);
+    const legacy = normalizeProfileConfig({ ...cfg, access: { allowedChats: ['oc_legacy'] } });
+    expect(legacy.access.groupUsers).toBeUndefined();
+  });
+
   it('defaults the topic-root mention gate off and normalizes only boolean per-chat values', () => {
     const fresh = createDefaultProfileConfig({ agentKind: 'claude', accounts: { app } });
     expect(fresh.access).not.toHaveProperty('topicRootRequireMention');

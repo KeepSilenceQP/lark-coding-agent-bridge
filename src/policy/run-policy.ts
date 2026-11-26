@@ -19,6 +19,7 @@ import {
 
 export interface ScopeContext {
   source: 'im' | 'card' | 'comment' | 'meeting';
+  chatType?: 'p2p' | 'group';
   chatId?: string;
   threadId?: string;
   actorId: string;
@@ -137,9 +138,14 @@ export function evaluateRunPolicy(input: RunPolicyInput): RunPolicyResult {
     codexHome: input.codexHome,
     inheritCodexHome: input.inheritCodexHome ?? false,
   };
+  // A selectively shared group is one conversation, irrespective of who spoke.
+  // Use the existing owner fingerprint to retain the owner's active session.
+  const sharedGroup = (input.scope.source === 'im' || input.scope.source === 'card') &&
+    input.scope.chatType === 'group' &&
+    Object.hasOwn(input.profileConfig.access.groupUsers ?? {}, input.scope.chatId ?? '');
   const currentFingerprint = policyFingerprint({
     ...fingerprintBase,
-    accessPolicyDigest: accessDecisionDigest(input.access),
+    accessPolicyDigest: accessDecisionDigest(sharedGroup ? { ok: true, reason: 'owner' } : input.access),
   });
   // Dormant pre-upgrade sessions must survive unrelated allowlist edits before
   // their first resumed turn, including across process restarts. Only the access
@@ -150,6 +156,7 @@ export function evaluateRunPolicy(input: RunPolicyInput): RunPolicyResult {
       : [input.profileConfig.sessionCompatibility?.legacyAccessPolicyDigest, legacyAccessDigest];
   const compatiblePolicyFingerprints = [
     ...new Set(legacyAccessDigests
+      .concat(sharedGroup ? [accessDecisionDigest(input.access)] : [])
       .filter((digest): digest is string => digest !== undefined)
       .map((digest) => policyFingerprint({ ...fingerprintBase, accessPolicyDigest: digest }))),
   ].filter((fingerprint) => fingerprint !== currentFingerprint);

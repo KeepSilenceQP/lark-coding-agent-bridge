@@ -30,6 +30,8 @@ export interface ProfileAccess {
   owner?: AppOwnerIdentity;
   allowedUsers: string[];
   allowedChats: string[];
+  /** Selective group access. An empty entry keeps the group closed to non-admins. */
+  groupUsers?: Record<string, string[]>;
   admins: string[];
   botAdmins: string[];
   groupResponseMode: GroupResponseMode;
@@ -390,10 +392,18 @@ function normalizeAccess(
   const owner = normalizeAppOwnerIdentity(access?.owner);
   const chatRequireMention = normalizeChatMentionMap(access?.chatRequireMention);
   const topicRootRequireMention = normalizeChatMentionMap(access?.topicRootRequireMention);
+  const groupUsers: Record<string, string[]> = Object.create(null);
+  if (access?.groupUsers && typeof access.groupUsers === 'object' && !Array.isArray(access.groupUsers)) {
+    for (const [chatId, users] of Object.entries(access.groupUsers)) {
+      // Preserve empty/invalid entries as closed rather than falling back to broad access.
+      if (chatId) groupUsers[chatId] = [...new Set(stringArray(users))];
+    }
+  }
   return {
     ...(owner ? { owner } : {}),
     allowedUsers: stringArray(access?.allowedUsers),
     allowedChats: stringArray(access?.allowedChats),
+    ...(Object.keys(groupUsers).length > 0 ? { groupUsers } : {}),
     admins: stringArray(access?.admins),
     botAdmins: stringArray(access?.botAdmins),
     groupResponseMode,

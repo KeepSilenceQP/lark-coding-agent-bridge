@@ -73,6 +73,7 @@ export interface ConfigView {
   access: {
     allowedUsers: string[];
     allowedChats: string[];
+    groupUsers?: Record<string, string[]>;
     admins: string[];
     /** Per-chat @-mention override (chat_id → bool); overrides the global
      * requireMentionInGroup. Absent chats follow the global setting. */
@@ -461,6 +462,7 @@ function accessView(access: ProfileAccess): ConfigView['access'] {
   return {
     allowedUsers: access.allowedUsers,
     allowedChats: access.allowedChats,
+    groupUsers: access.groupUsers,
     admins: access.admins,
     chatRequireMention: access.chatRequireMention ?? {},
     topicRootRequireMention: access.topicRootRequireMention ?? {},

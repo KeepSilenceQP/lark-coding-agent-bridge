@@ -69,6 +69,8 @@ import {
   canUseDm,
   canUseGroup,
   isBotAdmin,
+  isCreator,
+  isGroupChatGuest,
   type AccessDecision,
   type OwnerRefreshState,
   type RuntimeControls,
@@ -321,6 +323,11 @@ function resolveCommandGate(
 export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
   const trimmed = commandContent(ctx.msg).trim();
   if (!trimmed.startsWith('/')) return false;
+  // Before handler lookup: unknown slash commands must not fall through to the agent.
+  if (isGuestCommandContext(ctx)) {
+    await reply(ctx, '❌ 你在本群只有对话权限，不能执行任何指令。');
+    return true;
+  }
   const parts = trimmed.split(/\s+/);
   const cmd = parts[0] ?? '';
   const args = parts.slice(1).join(' ');
@@ -420,6 +427,8 @@ export async function runCommandHandler(
   args: string,
   ctx: CommandContext,
 ): Promise<boolean> {
+  // A signed card is not an escalation of the operator's permissions.
+  if (isGuestCommandContext(ctx)) return true;
   const h = handlers[`/${name}`];
   if (!h) return false;
 
@@ -447,6 +456,12 @@ export async function runCommandHandler(
     reportMetric('command_fail', 1, { step: 'handler' });
   }
   return true;
+}
+
+function isGuestCommandContext(ctx: CommandContext): boolean {
+  return ctx.chatMode !== 'p2p' && isGroupChatGuest(
+    ctx.controls.profileConfig, ctx.controls, ctx.msg.chatId, ctx.msg.senderId,
+  );
 }
 
 /**
@@ -2498,7 +2513,46 @@ async function recallMessage(ctx: CommandContext, messageId: string): Promise<vo
 
 // ────────────── /invite and /remove — access lists ──────────────
 
+async function handleGroupUserAccess(args: string, ctx: CommandContext, remove: boolean): Promise<boolean> {
+  const text = args.trim();
+  if (!/(?:^|\s)group(?:\s|$)/i.test(text) || /^(?:group|(?:all|owner-default)\s+group)$/i.test(text)) return false;
+  const verb = remove ? 'remove' : 'invite';
+  const targets = mentionTargets(ctx);
+  let grammar = text;
+  for (const mention of ctx.msg.mentions ?? []) {
+    for (const candidate of mentionTextCandidates(mention)) grammar = grammar.split(candidate).join('');
+  }
+  if (grammar.trim().toLowerCase() !== 'group' || targets.length === 0) {
+    await reply(ctx, `用法：\`@当前Bot /${verb} @某人 group\`，请使用真实的用户 @。`);
+    return true;
+  }
+  if (ctx.chatMode === 'p2p' || !ctx.msg.mentionedBot) {
+    await reply(ctx, '❌ 请在目标群中 @ 当前 Bot 执行群内用户授权命令。');
+    return true;
+  }
+  if (!isCreator(ctx.controls, ctx.msg.senderId)) {
+    await reply(ctx, '❌ 只有应用 Owner 可以管理群内用户的对话授权。');
+    return true;
+  }
+  const chatId = ctx.msg.chatId;
+  await saveAccessConfig(ctx, current => {
+    // Removing a never-granted user must not enable selective mode in a legacy group.
+    if (remove && !Object.hasOwn(current.groupUsers ?? {}, chatId)) return current;
+    const users = new Set(current.groupUsers?.[chatId] ?? []);
+    for (const target of targets) {
+      if (remove) users.delete(target.openId);
+      else users.add(target.openId);
+    }
+    return { ...current, groupUsers: { ...current.groupUsers, [chatId]: [...users] } };
+  });
+  await reply(ctx, remove
+    ? '✅ 已撤销指定用户在本群对本 Bot 的对话授权。'
+    : '✅ 已授权指定用户在本群 @ 本 Bot 对话，共享当前群会话；不能执行任何指令。');
+  return true;
+}
+
 async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
+  if (await handleGroupUserAccess(args, ctx, false)) return;
   const tokens = args.trim().split(/\s+/).filter(Boolean).map((token) => token.toLowerCase());
 
   // owner-default group — precise grammar, must be exactly ['owner-default', 'group'].
@@ -2596,6 +2650,7 @@ async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
     await reply(
       ctx,
       '用法：\n' +
+        '• `@当前Bot /invite @某人 group` — Owner 授权该用户在本群对话（无指令权限）\n' +
         '• `/invite user @某人` — 加入允许私聊\n' +
         '• `/invite admin @某人` — 加入管理员\n' +
         '• `/invite group` — 把当前群加入响应群名单\n' +
@@ -2672,6 +2727,7 @@ async function handleInvite(args: string, ctx: CommandContext): Promise<void> {
 }
 
 async function handleRemove(args: string, ctx: CommandContext): Promise<void> {
+  if (await handleGroupUserAccess(args, ctx, true)) return;
   const tokens = args.trim().split(/\s+/).filter(Boolean).map((token) => token.toLowerCase());
 
   // owner-default group — precise grammar, mirror of handleInvite
@@ -2734,6 +2790,7 @@ async function handleRemove(args: string, ctx: CommandContext): Promise<void> {
     await reply(
       ctx,
       '用法：\n' +
+        '• `@当前Bot /remove @某人 group` — Owner 撤销该用户在本群的对话授权\n' +
         '• `/remove user @某人` — 移出用户白名单\n' +
         '• `/remove admin @某人` — 移出管理员\n' +
         '• `/remove group` — 把当前群移出响应群名单\n' +
@@ -3049,6 +3106,7 @@ async function saveAccessConfig(
           access: {
             allowedUsers: access.allowedUsers,
             allowedChats: access.allowedChats,
+            groupUsers: access.groupUsers,
             admins: access.admins,
             botAdmins: access.botAdmins,
             ownerNoMentionChats: access.ownerNoMentionChats,

@@ -604,6 +604,77 @@ describe('per-chat topic-root mention policy', () => {
   });
 });
 
+describe('selective group conversation users', () => {
+  it.each(['claude', 'codex'] as const)('shares the existing %s owner session across guests and owner /new', async agentKind => {
+    const h = await createHarness({ chatMode: 'group', agentKind, activatedPrompts: true });
+    h.controls.botOwnerId = 'ou_owner';
+    await startTestBridge(h);
+    const send = async (senderId: string, id: string, content = 'continue discussion', session = 'shared-session') => {
+      const count = h.agent.runOptions.length;
+      h.agent.setEvents([
+        agentKind === 'codex' ? { type: 'system', threadId: session } : { type: 'system', sessionId: session },
+        { type: 'done', terminationReason: 'normal' },
+      ]);
+      await h.channel.handlers.message?.(intakeMessage({ messageId: id, senderId, content, mentionedBot: true }));
+      await waitFor(() => h.agent.runOptions.length > count && h.agent.runs[count]?.waitForExitCalls === 1, 4000);
+      return h.agent.runOptions[count]!;
+    };
+    await send('ou_owner', 'om_owner_start');
+    // Granting guests must not invalidate the owner's active thread.
+    h.profileConfig.access.groupUsers = { oc_topic_chat: ['ou_alice', 'ou_bob'] };
+    const field = agentKind === 'codex' ? 'threadId' : 'sessionId';
+    expect((await send('ou_alice', 'om_alice'))[field]).toBe('shared-session');
+    expect((await send('ou_bob', 'om_bob'))[field]).toBe('shared-session');
+    expect((await send('ou_owner', 'om_owner_again'))[field]).toBe('shared-session');
+    await h.channel.handlers.message?.(intakeMessage({ messageId: 'om_owner_new', senderId: 'ou_owner', content: '/new', mentionedBot: true }));
+    expect((await send('ou_alice', 'om_alice_new', 'new discussion', 'new-session'))[field]).toBeUndefined();
+    expect((await send('ou_bob', 'om_bob_new', 'continue', 'new-session'))[field]).toBe('new-session');
+  }, 20000);
+
+  it('requires explicit @ even in all-messages mode and never runs guest slash commands', async () => {
+    const h = await createHarness({ chatMode: 'group' });
+    h.profileConfig.access.groupUsers = { oc_topic_chat: ['ou_user'] };
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    h.profileConfig.access.chatRequireMention = { oc_topic_chat: false };
+    await startTestBridge(h);
+    await expectSilentIntake(h, intakeMessage({ content: 'unmentioned' }));
+    for (const content of ['/help', '/new', '/stop', '/unknown-command']) {
+      await h.channel.handlers.message?.(intakeMessage({ content, mentionedBot: true }));
+      expect(h.agent.runOptions).toHaveLength(0);
+      expect(JSON.stringify(h.channel.sent.at(-1)?.content)).toContain('不能执行任何指令');
+    }
+    // Raw @ placeholders must be recognized even if normalization preserves display names.
+    await h.channel.handlers.message?.(intakeMessage({
+      content: '@Bridge /new', mentionedBot: true,
+      mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'Bridge', isBot: true }],
+      raw: { message: { content: JSON.stringify({ text: '@_user_1 /new' }) } },
+    }));
+    expect(h.agent.runOptions).toHaveLength(0);
+  });
+
+  it('rechecks a guest revoked while waiting in debounce before starting an agent', async () => {
+    const h = await createHarness({ chatMode: 'group' });
+    h.profileConfig.access.groupUsers = { oc_topic_chat: ['ou_user'] };
+    await startTestBridge(h);
+    vi.useFakeTimers();
+    try {
+      await h.channel.handlers.message?.(intakeMessage({ mentionedBot: true }));
+      h.profileConfig.access.groupUsers = { oc_topic_chat: [] };
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(h.agent.runOptions).toHaveLength(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('blocks a guest control reaction in the authorized group', async () => {
+    const h = await createHarness({ chatMode: 'group' });
+    h.profileConfig.access.groupUsers = { oc_topic_chat: ['ou_user'] };
+    h.profileConfig.access.groupResponseMode = 'all-messages';
+    await startTestBridge(h);
+    await h.channel.handlers.reaction?.(topicReaction('om_stream_1', 'GoGoGo'));
+    expect(h.agent.runOptions).toHaveLength(0);
+  });
+});
+
 describe('reaction continuation with activated prompt bindings', () => {
   it.each((['claude', 'codex'] as const).flatMap(agentKind => [
     { chatMode: 'p2p' as const, threadId: undefined },

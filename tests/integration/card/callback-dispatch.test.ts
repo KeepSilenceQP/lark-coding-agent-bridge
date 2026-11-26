@@ -45,6 +45,21 @@ describe('signed card callback dispatch', () => {
     expect(deniedRun.stopped).toBe(false);
   });
 
+  it('rejects guest commands and agent callbacks even with valid signed tokens', async () => {
+    const h = await createHarness();
+    h.controls.profileConfig.access.groupUsers = { oc_group: ['ou_operator'] };
+    h.controls.profileConfig.access.admins = ['ou_operator'];
+    const run = h.agent.run({ runId: 'run-active', prompt: 'running' }) as FakeAgentRun;
+    h.activeRuns.register('oc_group', run);
+    await h.dispatch({ cmd: 'stop', __bridge_cb: true, bridge_token: h.token('stop') });
+    await h.dispatch({ cmd: 'status' });
+    await h.dispatch({ __bridge_cb: true, bridge_token: h.token('agent_callback'), choice: 'yes' });
+    expect(run.stopped).toBe(false);
+    expect(h.pending.cancel('oc_group')).toEqual([]);
+    expect(h.channel.sent).toEqual([]);
+    expect(h.controls.restart).not.toHaveBeenCalled();
+  });
+
   it('forwards signed bridge callbacks without leaking auth fields into the agent payload', async () => {
     const h = await createHarness();
     const activeRun = h.agent.run({ runId: 'run-active', prompt: 'running' });
