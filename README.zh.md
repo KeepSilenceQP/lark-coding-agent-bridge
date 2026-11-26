@@ -486,8 +486,8 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 应用 Owner 可在目标群中使用真实的 @ 授权或撤销某人的对话权限：
 
 ```text
-@小P /invite @张三 group
-@小P /remove @张三 group
+@BridgeBot /invite @张三 group
+@BridgeBot /remove @张三 group
 ```
 
 授权仅限当前群、当前 Bot/profile，不授予其他群或私聊权限。获准用户必须明确 @ 该 Bot，
