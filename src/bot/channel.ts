@@ -136,6 +136,7 @@ import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quo
 import { lookupMessageThreadId } from './thread-id';
 import { resolveTopicMessage } from './topic-message';
 import { buildLocalImagePost } from './local-images';
+import { createProgressRenderer } from './progress-renderer';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { handleReactionEvent } from './reaction/pipeline';
 import {
@@ -3498,6 +3499,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       let cardCtrl:
         | { update(next: object | ((current: object) => object)): Promise<void> }
         | undefined;
+      let abandoned = false;
+      const progressRenderer = createProgressRenderer<RunState>(async (state) => {
+        await cardCtrl?.update(renderCard(filterForPrefs(state), cardRenderOptions));
+      });
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -3507,9 +3512,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         recordSession,
         async (state) => {
           latestState = state;
-          if (cardCtrl) {
-            await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
-          }
+          if (cardCtrl) progressRenderer.enqueue(state);
         },
         recoverStartupTimeout,
         observeEditableToolStart,
@@ -3521,11 +3524,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             initial: renderCard(initialState, cardRenderOptions),
             producer: async (ctrl) => {
               producerStarted = true;
+              if (abandoned) return;
               cardCtrl = ctrl;
               // Register outbound IMMEDIATELY so stop can correlate during streaming.
               _registerOutboundOnStream(ctrl);
-              await ctrl.update(renderCard(filterForPrefs(latestState), cardRenderOptions));
+              progressRenderer.enqueue(latestState);
               await renderDone;
+              await progressRenderer.settle();
             },
           },
         },
@@ -3539,7 +3544,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       await awaitRenderAwareStream({
         mode: replyMode,
         streamDone,
-        renderDone: renderDone,
+        renderDone,
+        abandon: () => { abandoned = true; progressRenderer.abandon(); },
         deliverFinal: async (state) => {
           const result = await sendFinalReply({ cwd, localImagesOnly: true, channel, chatId, scope,
             state: filterForPrefs(state), replyMode, sendOpts, cardRenderOptions });
@@ -3596,6 +3602,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           throw err;
         }
       };
+      let abandoned = false;
+      const progressRenderer = createProgressRenderer<RunState>(async (state) => {
+        await setMarkdownContent(state.terminal === 'running' ? 'update' : 'terminal',
+          renderMarkdownStreamText(filterForPrefs(state)));
+      });
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -3605,10 +3616,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         recordSession,
         async (state) => {
           latestState = state;
-          if (markdownCtrl) {
-            const markdown = renderMarkdownStreamText(filterForPrefs(state));
-            await setMarkdownContent(state.terminal === 'running' ? 'update' : 'terminal', markdown);
-          }
+          if (markdownCtrl) progressRenderer.enqueue(state);
         },
         recoverStartupTimeout,
         observeEditableToolStart,
@@ -3619,12 +3627,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           {
             markdown: async (ctrl) => {
               producerStarted = true;
+              if (abandoned) return;
               markdownCtrl = ctrl;
               // Register outbound IMMEDIATELY so stop can correlate during streaming.
               _registerOutboundOnStream(ctrl);
-              const initialMarkdown = renderMarkdownStreamText(filterForPrefs(latestState));
-              await setMarkdownContent('initial', initialMarkdown);
+              progressRenderer.enqueue(latestState);
               const finalState = await renderDone;
+              await progressRenderer.settle();
               const finalMarkdown = renderMarkdownStreamText(filterForPrefs(finalState));
               log.info('stream', 'markdown-producer-final', {
                 terminal: finalState.terminal,
@@ -3654,7 +3663,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       await awaitRenderAwareStream({
         mode: replyMode,
         streamDone,
-        renderDone: renderDone,
+        renderDone,
+        abandon: () => { abandoned = true; progressRenderer.abandon(); },
         deliverFinal: async (state) => {
           const result = await sendFinalReply({ cwd, localImagesOnly: true, channel, chatId, scope,
             state: filterForPrefs(state), replyMode, sendOpts, cardRenderOptions });
@@ -3743,7 +3753,12 @@ async function sendFinalReply(input: {
     },
   });
   if (post) {
-    lastResult = await input.channel.send(input.chatId, { post }, input.sendOpts);
+    try {
+      lastResult = await input.channel.send(input.chatId, { post }, input.sendOpts);
+    } catch (err) {
+      log.warn('outbound', 'image-post-fallback', { scope: input.scope, err: err instanceof Error ? err.message : String(err) });
+      lastResult = await input.channel.send(input.chatId, { markdown: body }, input.sendOpts);
+    }
     if (!streamMessageId(lastResult)) throw new Error('Image reply returned no message receipt');
     log.info('outbound', 'sent', outboundLogFields(input, 'post', body, lastResult as { messageId?: string }));
     return lastResult;

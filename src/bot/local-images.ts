@@ -1,11 +1,12 @@
-import { open, realpath } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open, realpath, stat as statPath } from 'node:fs/promises';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { log } from '../core/logger';
 
 // Skip fenced/inline code; recognize inline images with angle-bracket paths,
 // escaped characters, optional titles and one level of parentheses in paths.
-const MARKDOWN_TOKEN = /(`{3,}|~{3,})[^\n]*\n[\s\S]*?^\1[^\n]*$|(`+)[^`]*?\2|!\[((?:\\.|[^\]\\])*)\]\(\s*(<[^>\n]+>|(?:\\.|[^\s()\\]|\((?:\\.|[^()\\])*\))+)\s*(?:"[^"\n]*"|'[^'\n]*')?\s*\)/gm;
+const MARKDOWN_TOKEN = /(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^\1[^\n]*$|(?![\s\S]))|(`+)[^`]*?\2|!\[((?:\\.|[^\]\\])*)\]\(\s*(<[^>\n]+>|(?:\\.|[^\s()\\]|\((?:\\.|[^()\\])*\))+)\s*(?:"[^"\n]*"|'[^'\n]*')?\s*\)/gm;
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff', '.ico']);
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
@@ -18,9 +19,16 @@ async function readLocalImage(path: string, cwd: string): Promise<Buffer> {
   if (!IMAGE_EXTENSIONS.has(extname(file).toLowerCase())) {
     throw new Error('不支持的图片格式');
   }
-  const handle = await open(file, 'r');
+  const handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const stat = await handle.stat();
+    const verifiedPath = await realpath(file);
+    const verifiedRel = relative(root, verifiedPath);
+    const verifiedStat = await statPath(verifiedPath);
+    if (verifiedRel === '..' || verifiedRel.startsWith(`..${sep}`) || isAbsolute(verifiedRel)
+      || verifiedStat.dev !== stat.dev || verifiedStat.ino !== stat.ino) {
+      throw new Error('图片在读取期间发生变化');
+    }
     if (!stat.isFile() || stat.size === 0 || stat.size > MAX_IMAGE_BYTES) {
       throw new Error('图片必须是非空文件，且不超过 10 MB');
     }
@@ -48,7 +56,9 @@ export async function buildLocalImagePost(input: {
   scope: string;
   cwd: string;
   uploadImage: (source: Buffer) => Promise<string>;
+  uploadTimeoutMs?: number;
 }): Promise<{ zh_cn: { title: string; content: PostElement[][] } } | undefined> {
+  const deadline = Date.now() + (input.uploadTimeoutMs ?? 15_000);
   const uploaded = new Map<string, PostElement>();
   const content: PostElement[][] = [];
   let offset = 0;
@@ -70,7 +80,16 @@ export async function buildLocalImagePost(input: {
     if (!element) {
       try {
         const source = await readLocalImage(path, input.cwd);
-        const imageKey = await input.uploadImage(source);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error('图片上传超时');
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let imageKey: string;
+        try {
+          imageKey = await Promise.race([
+            input.uploadImage(source),
+            new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('图片上传超时')), remaining); }),
+          ]);
+        } finally { if (timer) clearTimeout(timer); }
         if (!imageKey?.trim()) throw new Error('图片上传未返回 image_key');
         element = { tag: 'img', image_key: imageKey };
       } catch (err) {

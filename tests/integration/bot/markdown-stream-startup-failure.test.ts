@@ -1,5 +1,5 @@
 import type { NormalizedMessage } from '@larksuite/channel';
-import { realpath } from 'node:fs/promises';
+import { realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
@@ -101,12 +101,100 @@ const cleanups: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   sdkMock.channel = undefined;
   sdkMock.createLarkChannel.mockClear();
   await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
 describe('markdown stream startup failures', () => {
+  it.each(['text', 'markdown', 'card'].flatMap((mode) => [false, true].map((cot) => ({ mode, cot }))))(
+    'embeds local images in order in a $mode topic reply (CoT=$cot)', async ({ mode, cot }) => {
+      const h = await createHarness({ stream: async (_chatId, input) => {
+        const p = input as { markdown?: (ctrl: { setContent: () => Promise<void> }) => Promise<void>;
+          card?: { producer: (ctrl: { update: () => Promise<void> }) => Promise<void> } };
+        await p.markdown?.({ setContent: async () => {} });
+        await p.card?.producer({ update: async () => {} });
+        return { messageId: 'om_progress' };
+      } });
+      h.profileConfig.preferences.messageReply = mode as 'text' | 'markdown' | 'card';
+      h.profileConfig.preferences.messageReplyMigrated = true;
+      h.profileConfig.preferences.cotMessages = cot ? 'brief' : 'off';
+      h.profileConfig.access.allowedChats = ['oc_dm'];
+      await writeFile(join(h.tmp.workspace, 'result image.png'), 'image fixture');
+      h.agent.setEvents([{ type: 'text', delta: 'Before\n![result](<./result image.png>)\nAfter' },
+        { type: 'done', terminationReason: 'normal' }]);
+      await startTestBridge(h);
+      await h.channel.handlers.message?.({ ...message('om_image', 'run'), chatType: 'group',
+        threadId: 'omt_image', rootId: 'om_root', mentionedBot: true });
+      await waitFor(() => h.channel.sent.some((entry) => 'post' in (entry.content as object)));
+      const posts = h.channel.sent.filter((entry) => 'post' in (entry.content as object));
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toMatchObject({ options: { replyTo: 'om_image', replyInThread: true }, content: {
+        post: { zh_cn: { content: [[{ tag: 'md', text: 'Before\n' }],
+          [{ tag: 'img', image_key: 'img_uploaded' }], [{ tag: 'md', text: '\nAfter' }]] } },
+      } });
+      expect(h.channel.rawClient.im.v1.image.create).toHaveBeenCalledTimes(1);
+    });
+
+  it.each(['card', 'markdown'].flatMap((mode) => ['create', 'update'].map((stage) => ({ mode, stage }))))(
+    'delivers the final answer and next queued turn while $mode $stage hangs', async ({ mode, stage }) => {
+      vi.stubEnv('LARK_CHANNEL_STREAM_TERMINAL_GRACE_MS', '20');
+      const gate = deferred<void>();
+      let entered = false;
+      const h = await createHarness({ stream: async (_chatId, input) => {
+        if (stage === 'create') { entered = true; await gate.promise; }
+        const update = async () => { if (stage === 'update') { entered = true; await gate.promise; } };
+        const p = input as { markdown?: (ctrl: { setContent: () => Promise<void> }) => Promise<void>;
+          card?: { producer: (ctrl: { update: () => Promise<void> }) => Promise<void> } };
+        await p.markdown?.({ setContent: update });
+        await p.card?.producer({ update });
+        return { messageId: 'om_late_progress' };
+      } });
+      h.profileConfig.preferences.messageReply = mode as 'card' | 'markdown';
+      h.profileConfig.preferences.messageReplyMigrated = true;
+      h.profileConfig.preferences.cotMessages = 'off';
+      h.agent.setEvents([
+        [{ type: 'text', delta: '完整答案' }, { type: 'done', terminationReason: 'normal' }],
+        [{ type: 'text', delta: '后续答案' }, { type: 'done', terminationReason: 'normal' }],
+      ]);
+      await startTestBridge(h);
+      try {
+        await h.channel.handlers.message?.(message('om_first', 'first'));
+        await waitFor(() => entered);
+        await h.channel.handlers.message?.(message('om_second', 'second'));
+        await waitFor(() => JSON.stringify(h.channel.sent).includes('后续答案'));
+        expect(h.agent.runOptions).toHaveLength(2);
+        expect(h.channel.sent.filter((entry) => JSON.stringify(entry.content).includes('完整答案'))).toHaveLength(1);
+        const count = h.channel.sent.length;
+        gate.resolve();
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        expect(h.channel.sent).toHaveLength(count);
+      } finally { gate.resolve(); }
+    });
+
+  it('keeps the final text when image upload or rich-post delivery fails', async () => {
+    const h = await createHarness();
+    h.profileConfig.preferences.messageReply = 'text';
+    h.profileConfig.preferences.messageReplyMigrated = true;
+    h.profileConfig.preferences.cotMessages = 'off';
+    await writeFile(join(h.tmp.workspace, 'result.png'), 'fixture');
+    h.channel.rawClient.im.v1.image.create.mockRejectedValue(new Error('upload denied'));
+    const send = h.channel.send.bind(h.channel);
+    vi.spyOn(h.channel, 'send').mockImplementation(async (chat, content, opts) => {
+      if ('post' in (content as object)) throw new Error('post unavailable');
+      return send(chat, content, opts);
+    });
+    h.agent.setEvents([{ type: 'text', delta: '保留文字 ![image](result.png) 完整结尾' },
+      { type: 'done', terminationReason: 'normal' }]);
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(message('om_image', 'run'));
+    await waitFor(() => h.channel.sent.length > 0);
+    expect(h.channel.sent).toHaveLength(1);
+    expect(JSON.stringify(h.channel.sent)).toContain('保留文字');
+    expect(JSON.stringify(h.channel.sent)).toContain('完整结尾');
+  });
+
   it('does not send busy notices for another topic, denied senders, or bot messages', async () => {
     const h = await createHarness();
     h.profileConfig.access.allowedChats = ['oc_dm'];
@@ -1196,6 +1284,7 @@ function createFakeLarkChannel(options: {
     },
     async send(chatId, content, options) {
       sent.push({ chatId, content, options });
+      return { messageId: `om_sent_${sent.length}` };
     },
     stream: options.stream ?? (async () => {
       await new Promise<void>(() => {});

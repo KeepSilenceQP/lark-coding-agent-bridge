@@ -62,9 +62,11 @@ export function safeAttachmentName(index: number, a: Pick<BatchAttachment, 'orig
   if (!name) name = `${a.kind ?? 'file'}.${a.mime ? safeExtensionForMime(a.mime) : 'bin'}`;
   if (name.length > 80) {
     const dot = name.lastIndexOf('.');
-    const ext = dot > 0 ? name.slice(dot) : '';
+    const ext = dot > 0 && name.length - dot <= 16 ? name.slice(dot) : '';
     name = name.slice(0, 80 - ext.length) + ext;
   }
+  // File systems bound names in bytes; keep multibyte original names usable.
+  while (Buffer.byteLength(name, 'utf8') > 220) name = Array.from(name).slice(0, -1).join('');
   return `${String(index + 1).padStart(2, '0')}-${name}`;
 }
 
@@ -72,6 +74,7 @@ export interface LandedBatch {
   dir: string;
   count: number;
   items: Array<{
+    deliveryIndex: number;
     name: string;
     kind: string;
     mime?: string;
@@ -108,7 +111,7 @@ export async function landAttachmentBatch(
     throw new Error(`${ATTACHMENT_BATCH_DIR} is not a plain directory inside the workspace`);
   }
   const stamp = now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
-  const short = (accepted[0]?.hash ?? String(now.getTime())).slice(0, 8);
+  const short = (accepted[0]?.hash ?? String(now.getTime())).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8) || 'batch';
   // Random suffix: two scopes sharing a workspace can land the same first file in the same second.
   const dir = join(root, `${stamp}-${short}-${randomBytes(3).toString('hex')}`);
   await mkdir(dir);
@@ -125,6 +128,7 @@ export async function landAttachmentBatch(
       }
     }
     items.push({
+      deliveryIndex: attachments.indexOf(a) + 1,
       name,
       kind: a.kind,
       ...(a.mime ? { mime: a.mime } : {}),
@@ -137,7 +141,12 @@ export async function landAttachmentBatch(
   }
   await writeFile(
     join(dir, 'manifest.json'),
-    JSON.stringify({ createdAt: now.toISOString(), count: items.length, items }, null, 2),
+    JSON.stringify({ createdAt: now.toISOString(), count: items.length, items,
+      rejected: attachments.flatMap((a, index) => a.decision === 'rejected' ? [{
+        deliveryIndex: index + 1, kind: a.kind, size: a.size,
+        originalName: a.originalName, reason: a.rejectionReason,
+      }] : []),
+    }, null, 2),
     'utf8',
   );
   await pruneAttachmentBatches(root, cfg.batchKeep).catch((err) =>
@@ -171,7 +180,7 @@ export async function pruneAttachmentBatches(root: string, keep: number): Promis
 export function batchInstructions(batch: LandedBatch): string[] {
   return [
     `本次的 ${batch.count} 个附件已按投递顺序整理到批次目录：${batch.dir}`,
-    '目录里是带真实文件名的符号链接（序号前缀 = 投递顺序，如 01- 02-），另有 manifest.json 记录类型/大小/原始文件名。',
-    '用户说「第几张」时按序号对应。也可直接读 <user_input> 里的单个附件路径。',
+    '目录里是带真实文件名的符号链接（序号前缀 = 投递顺序，如 01- 02-），另有 manifest.json 记录类型/大小/原始文件名、原始投递序号 deliveryIndex 和被拒绝的附件 rejected。',
+    '文件名前缀是已接收附件的序号；用户说「第几张」时结合 manifest 的原始投递序号和拒绝记录对应，不要将被拒绝的附件算作已收到。也可直接读 <user_input> 里的单个附件路径。',
   ];
 }

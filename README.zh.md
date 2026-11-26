@@ -46,6 +46,8 @@ no-content/最终回复修改则做了适配，保留本 Fork 的单流最终回
 上游来源历史边界，不是两仓库的 Git merge base。只有下一批上游修改完成集成并通过
 验证后，才能更新这个锚点。
 
+2026-11-26 另选择性纳入上游开放 PR #351、#347、#348–350 和 #340：批量附件目录与拒绝记录、进度流挂起后的最终回复兜底、会议生命周期与权限完善，以及最终回复本地图片混排。保留本 Fork 的群授权、session、Reaction 和 CardKit 恢复逻辑；来源、配置与冲突取舍见[集成记录](docs/integrations/2026-11-26-selected-upstream-features.md)。这些 PR 尚未进入上游 main，因此不移动上述同步锚点。
+
 [English README](./README.md)
 
 ## 本 Fork 维护的增强能力

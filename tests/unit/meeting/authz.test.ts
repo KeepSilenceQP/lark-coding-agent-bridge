@@ -56,6 +56,11 @@ describe('meetingAuthzGate', () => {
     expect(meetingAuthzGate(deps(profile({ mode: 'team' })).d, { from: { id: 'ou_x' } }, 'q', none).ok).toBe(true);
   });
 
+  it('does not extend a group-only guest grant to meeting control', () => {
+    const pc = profile({ access: { groupUsers: { oc_group: ['ou_guest'] } } });
+    expect(meetingAuthzGate(deps(pc).d, { from: { id: 'ou_guest' } }, 'q', none).ok).toBe(false);
+  });
+
   it('admins-only refuses allowedUsers', () => {
     const pc = profile({ meeting: { access: 'admins-only' }, access: { allowedUsers: ['ou_a'], admins: ['ou_admin'] } });
     expect(meetingAuthzGate(deps(pc).d, { from: { id: 'ou_a' } }, 'q', none).ok).toBe(false);

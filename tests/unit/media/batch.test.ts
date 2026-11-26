@@ -34,6 +34,13 @@ describe('renderAttachmentNotice', () => {
 });
 
 describe('safeAttachmentName', () => {
+  it('bounds long extensions and multibyte original names', () => {
+    const ext = safeAttachmentName(0, { originalName: `name.${'x'.repeat(500)}`, mime: '', kind: 'file' });
+    expect(ext.length).toBeLessThanOrEqual(83);
+    const unicode = safeAttachmentName(0, { originalName: `${'图片'.repeat(100)}.png`, mime: 'image/png', kind: 'image' });
+    expect(Buffer.byteLength(unicode)).toBeLessThan(256);
+  });
+
   it('keeps only the base name and numbers it', () => {
     expect(safeAttachmentName(0, { originalName: '../../etc/passwd', kind: 'file', mime: '' })).toBe('01-passwd');
     expect(safeAttachmentName(9, { originalName: '..hidden', kind: 'file', mime: '' })).toBe('10-hidden');
@@ -48,7 +55,7 @@ describe('landAttachmentBatch', () => {
     const cfg = { batchThreshold: 2, batchKeep: 5 };
     expect(await landAttachmentBatch([att()], ws, cfg)).toBeUndefined();
     const b = await landAttachmentBatch(
-      [att({ originalName: 'one.png' }), att({ decision: 'rejected' }), att({ originalName: 'two.png', path: '/cache/b.png' })],
+      [att({ originalName: 'one.png' }), att({ decision: 'rejected', rejectionReason: 'file-too-large', originalName: 'blocked.pdf' }), att({ originalName: 'two.png', path: '/cache/b.png' })],
       ws,
       cfg,
       new Date('2026-11-20T10:00:00Z'),
@@ -58,6 +65,9 @@ describe('landAttachmentBatch', () => {
     expect(await readlink(join(b!.dir, '02-two.png'))).toBe('/cache/b.png');
     const manifest = JSON.parse(await readFile(join(b!.dir, 'manifest.json'), 'utf8'));
     expect(manifest.count).toBe(2);
+    expect(manifest.items.map((item: { deliveryIndex: number }) => item.deliveryIndex)).toEqual([1, 3]);
+    expect(manifest.rejected).toEqual([{ deliveryIndex: 2, kind: 'image', size: 10,
+      originalName: 'blocked.pdf', reason: 'file-too-large' }]);
   });
 
   it('prunes the oldest batches, only real batch directories', async () => {

@@ -13,6 +13,25 @@ async function workspace() {
   return dir;
 }
 describe('local image replies', () => {
+  it('does not upload image examples in an unfinished code fence', async () => {
+    const cwd = await workspace();
+    await writeFile(join(cwd, 'one.png'), 'fixture');
+    const uploadImage = vi.fn();
+    expect(await buildLocalImagePost({ body: 'Example:\n```md\n![one](one.png)', scope: 'scope', cwd,
+      uploadImage })).toBeUndefined();
+    expect(uploadImage).not.toHaveBeenCalled();
+  });
+
+  it('finishes a stalled image upload and keeps surrounding text', async () => {
+    const cwd = await workspace();
+    await writeFile(join(cwd, 'one.png'), 'fixture');
+    const post = await buildLocalImagePost({ body: 'Before ![one](one.png) After', scope: 'scope', cwd,
+      uploadTimeoutMs: 10, uploadImage: () => new Promise(() => {}) });
+    expect(JSON.stringify(post)).toContain('Before');
+    expect(JSON.stringify(post)).toContain('After');
+    expect(JSON.stringify(post)).toContain('上传失败');
+  });
+
   it('resolves local paths without changing code or remote images', async () => {
     const cwd = await workspace();
     await writeFile(join(cwd, 'result (1).png'), 'image');

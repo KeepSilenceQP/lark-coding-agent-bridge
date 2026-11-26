@@ -50,6 +50,8 @@ merge base because the incorporated changes were conflict-adapted in the fork.
 Do not advance this anchor until the next upstream batch has been integrated
 and verified.
 
+The 2026-11-26 selection also integrates open upstream PRs #351, #347, #348–350 and #340: attachment batches and rejection records, terminal delivery after stalled progress, meeting lifecycle/authorization, and inline local images. Fork group access, sessions, reactions and CardKit recovery remain in place. See the [integration record](docs/integrations/2026-11-26-selected-upstream-features.md) for provenance and conflict decisions. These PRs are not on upstream main, so the synchronization anchor above is unchanged.
+
 [中文 README](./README.zh.md)
 
 ## Enhancements maintained in this fork
